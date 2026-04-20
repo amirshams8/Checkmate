@@ -1,0 +1,315 @@
+name: Build APK
+
+on:
+  workflow_run:
+    workflows: ["Extract Repo Source to TXT"]
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # ---------------- BUILD (never hard-fails) ----------------
+      - name: Build Debug APK and capture log
+        id: gradle_build
+        continue-on-error: true
+        run: |
+          chmod +x ./gradlew
+          mkdir -p build_error_logs
+          ./gradlew assembleDebug --no-daemon --stacktrace --info \
+            2>&1 | tee build_error_logs/build_output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+      # ---------------- APK UPLOAD ----------------
+      - name: Upload Debug APK
+        if: steps.gradle_build.outputs.exit_code == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      # ---------------- ENHANCED ERROR EXTRACTION ----------------
+      - name: Extract errors (enhanced for native builds)
+        if: steps.gradle_build.outputs.exit_code != '0'
+        run: |
+          mkdir -p build_error_logs
+
+          {
+            echo "==== GRADLE BUILD ERROR REPORT ===="
+            echo
+            echo "-- CMAKE CONFIGURATION ERRORS --"
+            grep -A 5 "CMake Error" build_error_logs/build_output.txt || echo "No CMake errors"
+            echo
+            echo "-- NINJA BUILD ERRORS --"
+            grep -B 3 -A 3 "ninja: build stopped" build_error_logs/build_output.txt || echo "No ninja errors"
+            echo
+            echo "-- C++ COMPILATION ERRORS --"
+            grep -E "error: |undefined reference|fatal error:" build_error_logs/build_output.txt | head -50 || echo "No C++ errors"
+            echo
+            echo "-- MISSING HEADERS/LIBRARIES --"
+            grep -E "No such file|cannot find|ld returned" build_error_logs/build_output.txt || echo "No missing deps"
+            echo
+            echo "-- KOTLIN/JAVA ERRORS --"
+            grep -E "\.kt:[0-9]+:[0-9]+ error|\.java:[0-9]+: error|^e: " build_error_logs/build_output.txt || echo "No Kotlin/Java errors"
+            echo
+            echo "-- XML RESOURCE ERRORS --"
+            grep -E "\.xml:[0-9]+:" build_error_logs/build_output.txt || echo "No XML errors"
+            echo
+            echo "-- BUILD TASK FAILURES --"
+            grep -E "BUILD FAILED|FAILURE: Build failed|Task.*FAILED" build_error_logs/build_output.txt || echo "No task failures"
+            echo
+            echo "-- EXCEPTION STACK TRACES --"
+            grep -A 10 "Exception" build_error_logs/build_output.txt | head -100 || echo "No exceptions"
+            echo
+            echo "-- NATIVE BUILD LOG (last 100 lines) --"
+            grep -E "(Building CXX|Linking CXX|CMake|ninja)" build_error_logs/build_output.txt | tail -100 || echo "No native build log"
+          } > build_error_logs/error_summary.txt
+
+          echo "==== ERROR SUMMARY ===="
+          cat build_error_logs/error_summary.txt
+
+          # Save tail of full log
+          tail -1000 build_error_logs/build_output.txt > build_error_logs/build_tail.txt
+
+      # ---------------- EXTRACT ERROR SOURCE FILES WITH PYTHON (FIXED PATH HANDLING) ----------------
+      - name: Extract source code of error files with highlighted error lines
+        if: steps.gradle_build.outputs.exit_code != '0'
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import re
+          import os
+          from pathlib import Path
+          from collections import defaultdict
+
+          ERROR_LOG = "build_error_logs/build_output.txt"
+          OUTPUT = "build_error_logs/error_files.txt"
+          REPO_ROOT = os.getcwd()
+
+          print(f"Repository root: {REPO_ROOT}")
+
+          # Read error log
+          with open(ERROR_LOG, 'r', encoding='utf-8', errors='ignore') as f:
+              error_log = f.read()
+
+          # Dictionary to store file -> [(line_num, error_msg)]
+          error_map = defaultdict(list)
+
+          def normalize_path(filepath):
+              """Normalize file path to be relative to repo root"""
+              # Remove file:// prefix
+              filepath = re.sub(r'^file:/+', '', filepath)
+              
+              # Remove leading slashes
+              filepath = filepath.lstrip('/')
+              
+              # Extract relative path from GitHub Actions workspace path
+              # Pattern: /home/runner/work/REPO_NAME/REPO_NAME/actual/path
+              match = re.search(r'/home/runner/work/[^/]+/[^/]+/(.+)', filepath)
+              if match:
+                  filepath = match.group(1)
+              
+              # Also handle pattern: home/runner/work/REPO_NAME/REPO_NAME/actual/path (no leading /)
+              match = re.search(r'home/runner/work/[^/]+/[^/]+/(.+)', filepath)
+              if match:
+                  filepath = match.group(1)
+              
+              return filepath
+
+          # Pattern for Kotlin errors: e: file:///path/to/file.kt:line:col error message
+          kt_pattern = r'e:\s+(?:file://)?([^\s:]+\.kt):(\d+):(\d+)\s+(.+)'
+          for match in re.finditer(kt_pattern, error_log):
+              filepath = normalize_path(match.group(1))
+              line_num = int(match.group(2))
+              error_msg = match.group(4).strip()
+              error_map[filepath].append((line_num, error_msg))
+
+          # Pattern for Java errors
+          java_pattern = r'([a-zA-Z0-9_./\-]+\.java):(\d+):\s+error:\s+(.+)'
+          for match in re.finditer(java_pattern, error_log):
+              filepath = normalize_path(match.group(1))
+              line_num = int(match.group(2))
+              error_msg = match.group(3).strip()
+              error_map[filepath].append((line_num, error_msg))
+
+          # Pattern for XML errors
+          xml_pattern = r'([a-zA-Z0-9_./\-]+\.xml):(\d+):(\d+):\s+(.+)'
+          for match in re.finditer(xml_pattern, error_log):
+              filepath = normalize_path(match.group(1))
+              line_num = int(match.group(2))
+              error_msg = match.group(4).strip()
+              error_map[filepath].append((line_num, error_msg))
+
+          # Pattern for C++ errors
+          cpp_pattern = r'([a-zA-Z0-9_./\-]+\.(cpp|c|h|hpp)):(\d+):(\d+):\s+error:\s+(.+)'
+          for match in re.finditer(cpp_pattern, error_log):
+              filepath = normalize_path(match.group(1))
+              line_num = int(match.group(3))
+              error_msg = match.group(5).strip()
+              error_map[filepath].append((line_num, error_msg))
+
+          print(f"\nDetected {len(error_map)} error file(s)")
+
+          # Write output
+          with open(OUTPUT, 'w', encoding='utf-8') as out:
+              out.write("==== SOURCE CODE (ERROR FILES WITH HIGHLIGHTED LINES) ====\n\n")
+              
+              if not error_map:
+                  out.write("No error files detected\n")
+              else:
+                  for filepath in sorted(error_map.keys()):
+                      print(f"Processing: {filepath}")
+                      
+                      # Construct actual file path
+                      actual_path = os.path.join(REPO_ROOT, filepath)
+                      
+                      if not os.path.isfile(actual_path):
+                          print(f"  ⚠️  File not found at: {actual_path}")
+                          out.write(f"//===== FILE: {filepath} (NOT FOUND) =====\n")
+                          out.write(f"// Expected at: {actual_path}\n\n")
+                          continue
+                      
+                      print(f"  ✅ Found at: {actual_path}")
+                      out.write(f"//===== FILE: {filepath} =====\n\n")
+                      
+                      # Write error summary
+                      errors = sorted(set(error_map[filepath]))
+                      out.write(f"// ❌ ERRORS IN THIS FILE ({len(errors)} error(s)):\n")
+                      for line_num, msg in errors:
+                          out.write(f"// Line {line_num}: {msg}\n")
+                      out.write("\n")
+                      
+                      # Create set of error lines for quick lookup
+                      error_lines = {line_num for line_num, _ in errors}
+                      
+                      # Write file content with line numbers and markers
+                      try:
+                          with open(actual_path, 'r', encoding='utf-8', errors='ignore') as f:
+                              for line_num, line in enumerate(f, 1):
+                                  # Remove trailing newline for consistent formatting
+                                  line = line.rstrip('\n\r')
+                                  if line_num in error_lines:
+                                      out.write(f"{line_num:4d} ❌ {line}\n")
+                                  else:
+                                      out.write(f"{line_num:4d}    {line}\n")
+                          print(f"  ✅ Extracted {line_num} lines")
+                      except Exception as e:
+                          print(f"  ❌ Error reading file: {e}")
+                          out.write(f"// Error reading file: {e}\n")
+                      
+                      out.write("\n\n")
+
+          # Save list of error files
+          with open("build_error_logs/error_file_list.txt", 'w') as f:
+              for filepath in sorted(error_map.keys()):
+                  f.write(f"{filepath}\n")
+
+          print(f"\n✅ Error extraction complete")
+          print(f"Error files written to: {OUTPUT}")
+
+          PYTHON_SCRIPT
+
+      # ---------------- COMMIT ERROR REPORT WITH CONFLICT HANDLING ----------------
+      - name: Commit & push error report (with conflict resolution)
+        if: steps.gradle_build.outputs.exit_code != '0'
+        run: |
+          git config user.name "build-error-bot"
+          git config user.email "bot@users.noreply.github.com"
+          
+          # Add changes
+          git add build_error_logs/
+          
+          # Try to commit
+          if git commit -m "Build failed - error report (exit code: ${{ steps.gradle_build.outputs.exit_code }})"; then
+            echo "Changes committed successfully"
+            
+            # Try to push with retry logic
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            PUSH_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              if git push origin main; then
+                echo "✅ Push successful"
+                PUSH_SUCCESS=true
+                break
+              else
+                echo "⚠️ Push failed, attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES"
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  echo "Pulling latest changes and retrying..."
+                  
+                  # Stash our commit temporarily
+                  git reset --soft HEAD^
+                  git stash
+                  
+                  # Pull with rebase
+                  git pull --rebase origin main || {
+                    echo "Pull failed, trying merge strategy"
+                    git rebase --abort 2>/dev/null || true
+                    git pull origin main
+                  }
+                  
+                  # Restore our changes
+                  git stash pop || true
+                  git add build_error_logs/
+                  git commit -m "Build failed - error report (exit code: ${{ steps.gradle_build.outputs.exit_code }})" || true
+                  
+                  # Wait a bit before retry
+                  sleep 2
+                fi
+              fi
+            done
+            
+            if [ "$PUSH_SUCCESS" = false ]; then
+              echo "⚠️ Push failed after $MAX_RETRIES attempts, but continuing anyway"
+              echo "Error logs are still available in the job artifacts"
+            fi
+          else
+            echo "No changes to commit or commit failed"
+          fi
+
+      # ---------------- UPLOAD ERROR LOGS AS ARTIFACT (FALLBACK) ----------------
+      - name: Upload error logs as artifact
+        if: steps.gradle_build.outputs.exit_code != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-error-logs
+          path: build_error_logs/
+          retention-days: 30
+
+      # ---------------- FAIL THE JOB ----------------
+      - name: Mark build as failed
+        if: steps.gradle_build.outputs.exit_code != '0'
+        run: |
+          echo "::error::Build failed with exit code ${{ steps.gradle_build.outputs.exit_code }}"
+          echo "Check build_error_logs/error_summary.txt for details"
+          echo "Error logs also available as workflow artifact: build-error-logs"
+          exit 1
