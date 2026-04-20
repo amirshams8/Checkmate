@@ -1,43 +1,1119 @@
-//===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/WhatsAppNotificationListener.kt =====
-package com.checkmate.automation
+//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
+package com.checkmate.service
 
-import android.service.notification.NotificationListenerService
-import android.service.notification.StatusBarNotification
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.*
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.AttentionPhase
+import com.checkmate.core.tts.CheckmateTTS
+import kotlinx.coroutines.*
 
-/**
- * Listens to WhatsApp notifications to detect guardian replies.
- * e.g. Guardian replies "OK" or "Call me" → logged / acted on.
- */
-class WhatsAppNotificationListener : NotificationListenerService() {
+class AttentionCycleService : Service() {
 
     companion object {
-        private const val TAG      = "WA_Listener"
-        private const val WHATSAPP = "com.whatsapp"
-    }
+        private const val CHANNEL_ID = "attention_cycle_channel"
+        private const val NOTIF_ID   = 42
+        const val EXTRA_TASK_ID      = "task_id"
+        const val EXTRA_TASK_NAME    = "task_name"
+        const val EXTRA_DURATION_MIN = "duration_min"
 
-    override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn?.packageName != WHATSAPP) return
+        fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
+            val intent = Intent(context, AttentionCycleService::class.java).apply {
+                putExtra(EXTRA_TASK_ID,      taskId)
+                putExtra(EXTRA_TASK_NAME,    taskName)
+                putExtra(EXTRA_DURATION_MIN, durationMinutes)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(intent)
+            else
+                context.startService(intent)
+        }
 
-        val extras = sbn.notification?.extras ?: return
-        val text   = extras.getCharSequence("android.text")?.toString() ?: return
-        val title  = extras.getCharSequence("android.title")?.toString() ?: return
-
-        val guardianNumber = CheckmatePrefs.getString("guardian_number", null) ?: return
-        Log.d(TAG, "WA notification from $title: $text")
-
-        if (isGuardianMessage(title, guardianNumber)) {
-            CheckmatePrefs.putString("last_guardian_reply", text)
-            CheckmatePrefs.putLong("last_guardian_reply_at", System.currentTimeMillis())
-            Log.d(TAG, "Guardian replied: $text")
+        fun stop(context: Context) {
+            context.stopService(Intent(context, AttentionCycleService::class.java))
         }
     }
 
-    private fun isGuardianMessage(title: String, guardianNumber: String): Boolean {
-        val clean = guardianNumber.replace(Regex("[^0-9]"), "")
-        return title.contains(clean) || title.contains("Guardian", ignoreCase = true)
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var cycleJob: Job? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
     }
 
-    override fun onNotificationRemoved(sbn: StatusBarNotification?) {}
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)       ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)     ?: "Task"
+        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+
+        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
+        AttentionCycleManager.start(taskId, taskName, durationMin)
+        startCycleLoop(taskName)
+        return START_NOT_STICKY
+    }
+
+    private fun startCycleLoop(taskName: String) {
+        cycleJob?.cancel()
+        cycleJob = scope.launch {
+            while (isActive) {
+                val cs = AttentionCycleManager.tick()
+
+                val notif = buildNotification(
+                    phaseLabel(cs.phase, cs.phaseSecondsLeft),
+                    taskName,
+                    cs.totalSessionSeconds,
+                    cs.cycleIndex,
+                    cs.needsAttentionCheck
+                )
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
+
+                if (cs.phaseJustChanged) {
+                    when (cs.phase) {
+                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
+                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
+                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
+                        AttentionPhase.DONE        -> {
+                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
+                            stopSelf()
+                            return@launch
+                        }
+                    }
+                }
+
+                // Fix: phaseSecondsLeft is Long — compare with 0L, not 0 (Int)
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L) {
+                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
+                }
+
+                delay(1_000)
+            }
+        }
+    }
+
+    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
+        val m    = secondsLeft / 60
+        val s    = secondsLeft % 60
+        val time = String.format("%d:%02d", m, s)
+        return when (phase) {
+            AttentionPhase.FOCUS       -> "FOCUS — $time"
+            AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $time"
+            AttentionPhase.LONG_BREAK  -> "LONG BREAK — $time"
+            AttentionPhase.DONE        -> "SESSION COMPLETE"
+        }
+    }
+
+    private fun buildNotification(
+        phaseText:    String,
+        taskName:     String,
+        totalSeconds: Long    = 0L,
+        cycleIndex:   Int     = 0,
+        needsCheck:   Boolean = false
+    ): Notification {
+        val totalMin = totalSeconds / 60
+        val totalSec = totalSeconds % 60
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(if (needsCheck) "⚡ $phaseText — TAP ✅ TO CONFIRM" else phaseText)
+            .setContentText("$taskName  •  Session: ${totalMin}m ${totalSec}s  •  Cycle $cycleIndex")
+            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
+            .setOngoing(true)
+            .setOnlyAlertOnce(!needsCheck)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+    }
+
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        else
+            startForeground(NOTIF_ID, notification)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() {
+        cycleJob?.cancel()
+        scope.cancel()
+        AttentionCycleManager.reset()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 }
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeScreen.kt =====
+package com.checkmate.ui.home
+
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.service.AttentionCycleService
+import com.checkmate.ui.theme.*
+
+@Composable
+fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
+    val state by vm.state.collectAsState()
+    val context = LocalContext.current
+
+    Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
+        LazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                HomeHeader(
+                    completedCount = state.completedToday,
+                    totalCount     = state.tasks.size,
+                    streakDays     = state.streakDays
+                )
+            }
+            item {
+                DayProgressBar(completed = state.completedToday, total = state.tasks.size)
+            }
+            if (state.psycheMessage.isNotBlank()) {
+                item { PsycheMessageCard(message = state.psycheMessage) }
+            }
+            if (state.tasks.isEmpty()) {
+                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }) }
+            } else {
+                items(state.tasks, key = { it.id }) { task ->
+                    TaskCard(
+                        task     = task,
+                        isActive = state.activeTaskId == task.id,
+                        onStart  = { vm.startTask(context, task) },
+                        onDone   = { vm.markDone(context, task) },
+                        onSkip   = { vm.markSkip(context, task) }
+                    )
+                }
+            }
+            item { Spacer(Modifier.height(16.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
+    Row(
+        modifier              = Modifier.fillMaxWidth(),
+        verticalAlignment     = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column {
+            Text("Today", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+            Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
+        }
+        if (streakDays > 0) {
+            Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
+                Row(
+                    modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Fix: Icons.Default.LocalFire does not exist — correct name is LocalFireDepartment
+                    Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DayProgressBar(completed: Int, total: Int) {
+    val progress = if (total == 0) 0f else completed.toFloat() / total.toFloat()
+    val animatedProgress by animateFloatAsState(
+        targetValue   = progress,
+        animationSpec = tween(600, easing = FastOutSlowInEasing),
+        label         = "progress"
+    )
+    Column {
+        LinearProgressIndicator(
+            progress   = { animatedProgress },
+            modifier   = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+            color      = AccentGreen,
+            trackColor = White10,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text       = "${(progress * 100).toInt()}% complete",
+            fontSize   = 11.sp,
+            color      = White30,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun PsycheMessageCard(message: String) {
+    Surface(
+        shape  = RoundedCornerShape(10.dp),
+        color  = BgCardAlt,
+        border = BorderStroke(0.5.dp, AccentBlue.copy(alpha = 0.3f))
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Psychology, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(10.dp))
+            Text(message, fontSize = 13.sp, color = White90, lineHeight = 18.sp)
+        }
+    }
+}
+
+@Composable
+private fun TaskCard(
+    task: StudyTask,
+    isActive: Boolean,
+    onStart: () -> Unit,
+    onDone: () -> Unit,
+    onSkip: () -> Unit
+) {
+    val borderColor = when {
+        isActive                       -> AccentGreen
+        task.state == TaskState.DONE   -> AccentGreen.copy(alpha = 0.3f)
+        task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
+        else                           -> White10
+    }
+    Surface(
+        shape  = RoundedCornerShape(14.dp),
+        color  = if (isActive) BgCardAlt else BgCard,
+        border = BorderStroke(1.dp, borderColor)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier              = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text          = task.subject.uppercase(),
+                        fontSize      = 11.sp,
+                        fontWeight    = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                        color         = subjectColor(task.subject),
+                        fontFamily    = FontFamily.Monospace
+                    )
+                }
+                Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text       = task.topic,
+                fontSize   = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color      = if (task.state == TaskState.DONE) White60 else White90
+            )
+            if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text     = if (task.state == TaskState.DONE) "✓ Completed" else "✗ Skipped",
+                    fontSize = 12.sp,
+                    color    = if (task.state == TaskState.DONE) AccentGreen else AccentRed
+                )
+                return@Column
+            }
+            Spacer(Modifier.height(12.dp))
+            if (isActive) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick  = onDone,
+                        colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Done", fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedButton(
+                        onClick = onSkip,
+                        border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                        colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
+                    ) { Text("Skip") }
+                }
+            } else {
+                Button(
+                    onClick  = onStart,
+                    colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled  = task.state == TaskState.PENDING
+                ) {
+                    Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Start Now", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyPlanCard(onPlan: () -> Unit) {
+    Surface(shape = RoundedCornerShape(14.dp), color = BgCard, border = BorderStroke(1.dp, White10)) {
+        Column(
+            modifier            = Modifier.fillMaxWidth().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Default.EventNote, null, tint = White30, modifier = Modifier.size(40.dp))
+            Spacer(Modifier.height(12.dp))
+            Text("No plan for today", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(6.dp))
+            Text("Set up your exam and subjects to generate a daily plan", fontSize = 13.sp, color = White60)
+            Spacer(Modifier.height(16.dp))
+            Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
+                Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        }
+    }
+}
+
+private fun subjectColor(subject: String) = when (subject.lowercase()) {
+    "biology"   -> Color(0xFF00C896)
+    "chemistry" -> Color(0xFF4A9EFF)
+    "physics"   -> Color(0xFFFFB347)
+    "math", "maths" -> Color(0xFFFF4757)
+    else        -> Color(0xFF9090A8)
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/stats/StatsScreen.kt =====
+package com.checkmate.ui.stats
+
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.checkmate.ui.theme.*
+
+@Composable
+fun StatsScreen(vm: StatsViewModel = viewModel()) {
+    val state by vm.state.collectAsState()
+
+    Column(
+        modifier            = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Spacer(Modifier.height(20.dp))
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            Text("Stats", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+            Text("Your performance overview", fontSize = 13.sp, color = White60)
+        }
+        Row(
+            modifier              = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Fix: Icons.Default.LocalFire does not exist — correct name is LocalFireDepartment
+            StatTile("Streak", "${state.streakDays}d", Icons.Default.LocalFireDepartment, AccentAmber, Modifier.weight(1f))
+            StatTile("Today",  "${state.todayCompletion}%", Icons.Default.Today,     AccentGreen, Modifier.weight(1f))
+            StatTile("Week",   "${state.weekCompletion}%",  Icons.Default.DateRange,  AccentBlue,  Modifier.weight(1f))
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            color    = BgCard,
+            border   = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("This Week", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(16.dp))
+                WeeklyBarChart(state.weeklyData)
+            }
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            color    = BgCard,
+            border   = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("By Subject", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(12.dp))
+                state.subjectStats.forEach { (subject, pct) ->
+                    SubjectBar(subject, pct)
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            color    = BgCard,
+            border   = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Attention Quality", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                    AttentionStat("Checks Passed", "${state.attentionChecksPassed}")
+                    AttentionStat("Checks Missed", "${state.attentionChecksMissed}")
+                    AttentionStat("Avg Focus",     "${state.avgFocusMinutes}m")
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun StatTile(label: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector, color: Color, modifier: Modifier) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(12.dp), color = BgCard, border = BorderStroke(0.5.dp, White10)) {
+        Column(modifier = Modifier.padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(icon, null, tint = color, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.height(6.dp))
+            Text(value, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = color)
+            Text(label, fontSize = 11.sp, color = White60)
+        }
+    }
+}
+
+@Composable
+private fun WeeklyBarChart(data: List<Pair<String, Int>>) {
+    val maxVal = data.maxOfOrNull { it.second }?.coerceAtLeast(1) ?: 1
+    Row(
+        modifier              = Modifier.fillMaxWidth().height(100.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment     = Alignment.Bottom
+    ) {
+        data.forEach { (day, pct) ->
+            Column(
+                modifier            = Modifier.weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                Box(
+                    modifier         = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 4.dp),
+                    contentAlignment = Alignment.BottomCenter
+                ) {
+                    val barHeight = (pct.toFloat() / maxVal) * 80f
+                    Box(
+                        modifier = Modifier
+                            .width(28.dp)
+                            .height(barHeight.coerceAtLeast(4f).dp)
+                            .clip(RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp))
+                            .background(if (pct >= 70) AccentGreen else if (pct >= 40) AccentAmber else AccentRed)
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(day, fontSize = 10.sp, color = White60, fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SubjectBar(subject: String, pct: Int) {
+    Column {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(subject, fontSize = 13.sp, color = White90)
+            Text("$pct%", fontSize = 13.sp, color = White60, fontFamily = FontFamily.Monospace)
+        }
+        Spacer(Modifier.height(4.dp))
+        LinearProgressIndicator(
+            progress   = { pct / 100f },
+            modifier   = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
+            color      = AccentGreen,
+            trackColor = White10
+        )
+    }
+}
+
+@Composable
+private fun AttentionStat(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = White90)
+        Text(label, fontSize = 11.sp, color = White60)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/AppSelectorScreen.kt =====
+package com.checkmate.ui.settings
+
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.theme.*
+
+data class AppInfo(val name: String, val packageName: String)
+
+@Composable
+fun AppSelectorScreen(onBack: () -> Unit) {
+    val context      = LocalContext.current
+    val pm           = context.packageManager
+    val savedBlocked = remember {
+        (CheckmatePrefs.getString("blocked_apps", "") ?: "")
+            .split(",").filter { it.isNotBlank() }.toMutableSet()
+    }
+    // Fix: mutableStateSetOf is not available without extra import — use mutableStateOf with a Set instead
+    var blockedApps by remember { mutableStateOf(savedBlocked.toSet()) }
+
+    val installedApps = remember {
+        pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 }
+            .filter { it.packageName != context.packageName }
+            .map { AppInfo(pm.getApplicationLabel(it).toString(), it.packageName) }
+            .sortedBy { it.name }
+    }
+
+    var search by remember { mutableStateOf("") }
+    val filtered = installedApps.filter { it.name.contains(search, ignoreCase = true) }
+
+    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = {
+                CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
+                onBack()
+            }) {
+                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+            }
+            Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+
+        OutlinedTextField(
+            value         = search,
+            onValueChange = { search = it },
+            label         = { Text("Search apps", color = White30) },
+            modifier      = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            singleLine    = true,
+            leadingIcon   = { Icon(Icons.Default.Search, null, tint = White60) },
+            colors        = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "  ${blockedApps.size} app(s) blocked during STUDY mode",
+            fontSize = 12.sp,
+            color    = White60,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        )
+        Spacer(Modifier.height(8.dp))
+
+        LazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(filtered, key = { it.packageName }) { app ->
+                val isBlocked = app.packageName in blockedApps
+                Surface(
+                    shape  = RoundedCornerShape(10.dp),
+                    color  = if (isBlocked) AccentRed.copy(alpha = 0.08f) else BgCard,
+                    border = BorderStroke(1.dp, if (isBlocked) AccentRed.copy(alpha = 0.4f) else White10),
+                    onClick = {
+                        blockedApps = if (isBlocked)
+                            blockedApps - app.packageName
+                        else
+                            blockedApps + app.packageName
+                    }
+                ) {
+                    Row(
+                        modifier          = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(app.name, fontSize = 14.sp, color = White90)
+                            Text(app.packageName, fontSize = 10.sp, color = White30)
+                        }
+                        if (isBlocked) {
+                            Icon(Icons.Default.Block, null, tint = AccentRed, modifier = Modifier.size(20.dp))
+                        }
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/planner/PlannerViewModel.kt =====
+package com.checkmate.ui.planner
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.AdaptivePlanner
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.PlannerState
+import com.checkmate.planner.model.SubjectConfig
+import com.checkmate.planner.model.StudyTask
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+/**
+ * UI state for the planner screen — separate from modules:planner PlannerState
+ * which is the config passed to AdaptivePlanner.
+ */
+data class PlannerUiState(
+    val examType:       String             = "NEET",
+    val examDate:       String             = "",
+    val studyStartTime: String             = "06:00",
+    val studyEndTime:   String             = "22:00",
+    val subjects:       List<SubjectConfig> = listOf(
+        SubjectConfig("Biology",   3),
+        SubjectConfig("Chemistry", 2),
+        SubjectConfig("Physics",   2)
+    ),
+    val guardianNumber: String             = "",
+    val ttsEnabled:     Boolean            = true,
+    val isGenerating:   Boolean            = false,
+    val generatedTasks: List<StudyTask>    = emptyList()
+)
+
+class PlannerViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(PlannerUiState())
+    val state: StateFlow<PlannerUiState> = _state.asStateFlow()
+
+    init { loadSaved() }
+
+    private fun loadSaved() {
+        _state.update { s -> s.copy(
+            examType       = CheckmatePrefs.getString("exam_type",        "NEET")  ?: "NEET",
+            examDate       = CheckmatePrefs.getString("exam_date",        "")      ?: "",
+            studyStartTime = CheckmatePrefs.getString("study_start",      "06:00") ?: "06:00",
+            studyEndTime   = CheckmatePrefs.getString("study_end",        "22:00") ?: "22:00",
+            guardianNumber = CheckmatePrefs.getString("guardian_number",  "")      ?: "",
+            ttsEnabled     = CheckmatePrefs.getBoolean("tts_enabled",     true)
+        )}
+        val subjectsRaw = CheckmatePrefs.getString("subjects_config", null)
+        if (!subjectsRaw.isNullOrBlank()) {
+            val subjects = subjectsRaw.split(";").mapNotNull { entry ->
+                val parts = entry.split(":")
+                if (parts.size == 2) SubjectConfig(parts[0], parts[1].toIntOrNull() ?: 1) else null
+            }
+            if (subjects.isNotEmpty()) _state.update { it.copy(subjects = subjects) }
+        }
+    }
+
+    fun setExam(exam: String) {
+        _state.update { it.copy(examType = exam) }
+        CheckmatePrefs.putString("exam_type", exam)
+    }
+
+    fun setExamDate(date: String) {
+        _state.update { it.copy(examDate = date) }
+        CheckmatePrefs.putString("exam_date", date)
+    }
+
+    fun setStudyStart(time: String) {
+        _state.update { it.copy(studyStartTime = time) }
+        CheckmatePrefs.putString("study_start", time)
+    }
+
+    fun setStudyEnd(time: String) {
+        _state.update { it.copy(studyEndTime = time) }
+        CheckmatePrefs.putString("study_end", time)
+    }
+
+    fun setGuardianNumber(number: String) {
+        _state.update { it.copy(guardianNumber = number) }
+        CheckmatePrefs.putString("guardian_number", number)
+    }
+
+    fun setTtsEnabled(enabled: Boolean) {
+        _state.update { it.copy(ttsEnabled = enabled) }
+        CheckmatePrefs.putBoolean("tts_enabled", enabled)
+    }
+
+    fun addSubject() {
+        val updated = _state.value.subjects + SubjectConfig("", 1)
+        _state.update { it.copy(subjects = updated) }
+        saveSubjects(updated)
+    }
+
+    fun removeSubject(index: Int) {
+        val updated = _state.value.subjects.toMutableList().also { it.removeAt(index) }
+        _state.update { it.copy(subjects = updated) }
+        saveSubjects(updated)
+    }
+
+    fun updateSubjectName(index: Int, name: String) {
+        val updated = _state.value.subjects.toMutableList()
+        updated[index] = updated[index].copy(name = name)
+        _state.update { it.copy(subjects = updated) }
+        saveSubjects(updated)
+    }
+
+    fun updateSubjectWeight(index: Int, weight: Int) {
+        val updated = _state.value.subjects.toMutableList()
+        updated[index] = updated[index].copy(weightage = weight)
+        _state.update { it.copy(subjects = updated) }
+        saveSubjects(updated)
+    }
+
+    private fun saveSubjects(subjects: List<SubjectConfig>) {
+        val raw = subjects.joinToString(";") { "${it.name}:${it.weightage}" }
+        CheckmatePrefs.putString("subjects_config", raw)
+    }
+
+    fun generatePlan(context: Context) {
+        val s = _state.value
+        if (s.isGenerating) return
+        _state.update { it.copy(isGenerating = true, generatedTasks = emptyList()) }
+        viewModelScope.launch {
+            val config = PlannerState(
+                examType       = s.examType,
+                examDate       = s.examDate,
+                subjects       = s.subjects.filter { it.name.isNotBlank() },
+                studyStartTime = s.studyStartTime,
+                studyEndTime   = s.studyEndTime
+            )
+            val tasks = try {
+                AdaptivePlanner.generateDailyPlan(context, config)
+            } catch (e: Exception) {
+                emptyList()
+            }
+            _state.update { it.copy(isGenerating = false, generatedTasks = tasks) }
+        }
+    }
+
+    fun savePlan(context: Context) {
+        PlanStore.saveTodayTasks(_state.value.generatedTasks)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/planner/PlannerScreen.kt =====
+package com.checkmate.ui.planner
+
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.ui.theme.*
+
+@Composable
+fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel()) {
+    val state   = vm.state.collectAsState().value
+    val context = LocalContext.current
+
+    LazyColumn(
+        modifier            = Modifier.fillMaxSize().background(BgDark),
+        contentPadding      = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            Text("Study Plan", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = White90)
+            Text("Configure your exam to generate an adaptive daily plan", fontSize = 13.sp, color = White60)
+        }
+
+        // ── Exam type ──
+        item {
+            SectionCard(title = "Exam") {
+                val exams = listOf("NEET", "JEE", "UPSC", "CA", "GATE", "Custom")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    exams.forEach { exam ->
+                        FilterChip(
+                            selected = state.examType == exam,
+                            onClick  = { vm.setExam(exam) },
+                            label    = { Text(exam, fontSize = 12.sp) },
+                            colors   = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = AccentGreen,
+                                selectedLabelColor     = Color.Black
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Exam date ──
+        item {
+            SectionCard(title = "Exam Date") {
+                OutlinedTextField(
+                    value           = state.examDate,
+                    onValueChange   = vm::setExamDate,
+                    label           = { Text("DD/MM/YYYY", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors          = plannerFieldColors()
+                )
+            }
+        }
+
+        // ── Study window ──
+        item {
+            SectionCard(title = "Study Window") {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value         = state.studyStartTime,
+                        onValueChange = vm::setStudyStart,
+                        label         = { Text("Start (e.g. 06:00)", color = White30) },
+                        singleLine    = true,
+                        modifier      = Modifier.weight(1f),
+                        colors        = plannerFieldColors()
+                    )
+                    OutlinedTextField(
+                        value         = state.studyEndTime,
+                        onValueChange = vm::setStudyEnd,
+                        label         = { Text("End (e.g. 22:00)", color = White30) },
+                        singleLine    = true,
+                        modifier      = Modifier.weight(1f),
+                        colors        = plannerFieldColors()
+                    )
+                }
+            }
+        }
+
+        // ── Subjects + weightage ──
+        item {
+            SectionCard(title = "Subjects") {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    state.subjects.forEachIndexed { index, subject ->
+                        Row(
+                            verticalAlignment     = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value         = subject.name,
+                                onValueChange = { vm.updateSubjectName(index, it) },
+                                label         = { Text("Subject", color = White30) },
+                                singleLine    = true,
+                                modifier      = Modifier.weight(2f),
+                                colors        = plannerFieldColors()
+                            )
+                            OutlinedTextField(
+                                value           = subject.weightage.toString(),
+                                onValueChange   = { vm.updateSubjectWeight(index, it.toIntOrNull() ?: 1) },
+                                label           = { Text("Weight", color = White30) },
+                                singleLine      = true,
+                                modifier        = Modifier.weight(1f),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors          = plannerFieldColors()
+                            )
+                            IconButton(onClick = { vm.removeSubject(index) }) {
+                                Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                    TextButton(onClick = vm::addSubject) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Add Subject")
+                    }
+                }
+            }
+        }
+
+        // ── Guardian WhatsApp ──
+        item {
+            SectionCard(title = "Guardian WhatsApp") {
+                OutlinedTextField(
+                    value           = state.guardianNumber,
+                    onValueChange   = vm::setGuardianNumber,
+                    label           = { Text("+91XXXXXXXXXX", color = White30) },
+                    placeholder     = { Text("Enter guardian phone number", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                    leadingIcon     = { Icon(Icons.Default.Phone, null, tint = AccentGreen) },
+                    colors          = plannerFieldColors()
+                )
+                if (state.guardianNumber.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Weekly reports will be sent to this number via WhatsApp",
+                        fontSize = 11.sp,
+                        color    = White60
+                    )
+                }
+            }
+        }
+
+        // ── Attention cycle settings ──
+        item {
+            SectionCard(title = "Attention Cycle") {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Focus block: 30 min  →  Short break: 5 min", fontSize = 13.sp, color = White60)
+                    Text("After 2 focus blocks: Long break 10 min",    fontSize = 13.sp, color = White60)
+                    Text("✅ button confirms attention every 30 min",   fontSize = 13.sp, color = White60)
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Voice reminders", fontSize = 13.sp, color = White90, modifier = Modifier.weight(1f))
+                        Switch(
+                            checked         = state.ttsEnabled,
+                            onCheckedChange = vm::setTtsEnabled,
+                            colors          = SwitchDefaults.colors(
+                                checkedThumbColor = AccentGreen,
+                                checkedTrackColor = AccentGreen.copy(alpha = 0.3f)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Generate Plan button ──
+        item {
+            Button(
+                onClick  = { vm.generatePlan(context) },
+                enabled  = !state.isGenerating,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape    = RoundedCornerShape(14.dp),
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                if (state.isGenerating) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.Black, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Generating plan…", fontWeight = FontWeight.Bold, color = Color.Black)
+                } else {
+                    Icon(Icons.Default.AutoAwesome, null, modifier = Modifier.size(20.dp), tint = Color.Black)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Generate Today's Plan", fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+            }
+        }
+
+        if (state.generatedTasks.isNotEmpty()) {
+            item {
+                Text("Today's Plan", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            }
+            items(state.generatedTasks) { task ->
+                Surface(
+                    shape  = RoundedCornerShape(10.dp),
+                    color  = BgCard,
+                    border = BorderStroke(1.dp, White10)
+                ) {
+                    Row(
+                        modifier          = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(task.subject,  fontSize = 11.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
+                            Text(task.topic,    fontSize = 15.sp, color = White90)
+                        }
+                        Text("${task.durationMinutes}m", fontSize = 13.sp, color = White60)
+                    }
+                }
+            }
+            item {
+                Button(
+                    onClick  = { vm.savePlan(context); navController.navigate("home") },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors   = ButtonDefaults.buttonColors(containerColor = AccentBlue)
+                ) {
+                    Text("Use This Plan", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+private fun SectionCard(title: String, content: @Composable () -> Unit) {
+    Surface(
+        shape  = RoundedCornerShape(12.dp),
+        color  = BgCard,
+        border = BorderStroke(0.5.dp, White10)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(title, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = White60)
+            Spacer(Modifier.height(10.dp))
+            content()
+        }
+    }
+}
+
+@Composable
+private fun plannerFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor   = AccentGreen,
+    unfocusedBorderColor = White30,
+    cursorColor          = AccentGreen,
+    focusedLabelColor    = AccentGreen,
+    focusedTextColor     = White90,
+    unfocusedTextColor   = White90
+)
