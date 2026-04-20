@@ -11,8 +11,10 @@ import com.checkmate.core.CheckmatePrefs
  */
 class WhatsAppNotificationListener : NotificationListenerService() {
 
-    private const val TAG      = "WA_Listener"
-    private const val WHATSAPP = "com.whatsapp"
+    companion object {
+        private const val TAG      = "WA_Listener"
+        private const val WHATSAPP = "com.whatsapp"
+    }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn?.packageName != WHATSAPP) return
@@ -24,7 +26,6 @@ class WhatsAppNotificationListener : NotificationListenerService() {
         val guardianNumber = CheckmatePrefs.getString("guardian_number", null) ?: return
         Log.d(TAG, "WA notification from $title: $text")
 
-        // Store last guardian message for potential reaction
         if (isGuardianMessage(title, guardianNumber)) {
             CheckmatePrefs.putString("last_guardian_reply", text)
             CheckmatePrefs.putLong("last_guardian_reply_at", System.currentTimeMillis())
