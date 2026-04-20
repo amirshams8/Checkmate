@@ -15,7 +15,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -26,7 +25,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
-import com.checkmate.service.AttentionCycleService
 import com.checkmate.ui.theme.*
 
 @Composable
@@ -88,7 +86,6 @@ private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
                     modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Fix: Icons.Default.LocalFire does not exist — correct name is LocalFireDepartment
                     Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
                     Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
@@ -147,17 +144,20 @@ private fun TaskCard(
     onSkip: () -> Unit
 ) {
     val borderColor = when {
-        isActive                       -> AccentGreen
-        task.state == TaskState.DONE   -> AccentGreen.copy(alpha = 0.3f)
+        isActive                        -> AccentGreen
+        task.state == TaskState.DONE    -> AccentGreen.copy(alpha = 0.3f)
         task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
-        else                           -> White10
+        else                            -> White10
     }
+
     Surface(
         shape  = RoundedCornerShape(14.dp),
         color  = if (isActive) BgCardAlt else BgCard,
         border = BorderStroke(1.dp, borderColor)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
+
+            // ── Header row ────────────────────────────────────────────────
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -177,13 +177,36 @@ private fun TaskCard(
                 }
                 Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
             }
+
             Spacer(Modifier.height(8.dp))
+
+            // ── Topic ─────────────────────────────────────────────────────
             Text(
                 text       = task.topic,
                 fontSize   = 17.sp,
                 fontWeight = FontWeight.SemiBold,
-                color      = if (task.state == TaskState.DONE) White60 else White90
+                color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
             )
+
+            // ── Action area ───────────────────────────────────────────────
+            // FIX: The original code used `return@Column` to bail out early when
+            // a task was DONE or SKIPPED. This caused two crashes confirmed in logcat:
+            //
+            //   PID 29484 @ 02:26:09 — IndexOutOfBoundsException: Index -1 out of
+            //   bounds for length 0 at androidx.compose.runtime.Stack.pop (Stack.kt:26)
+            //   via ComposerImpl.exitGroup → end → endGroup → endRoot
+            //
+            //   PID 15159 @ 02:26:29 — ArrayIndexOutOfBoundsException: length=0;
+            //   index=-5 at SlotReader.groupKey (SlotTable.kt:957) inside LazyList
+            //   measurement (LazyListMeasure.kt:195)
+            //
+            // Root cause: `return@Column` exits the Column lambda early, leaving
+            // Compose's internal slot table with unmatched group push/pop entries.
+            // On the next recomposition or LazyColumn re-measure the runtime tries
+            // to pop a group that was never pushed → crash.
+            //
+            // Fix: replace early-return with if/else so every code path emits the
+            // same number of Compose group open/close pairs.
             if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -191,36 +214,49 @@ private fun TaskCard(
                     fontSize = 12.sp,
                     color    = if (task.state == TaskState.DONE) AccentGreen else AccentRed
                 )
-                return@Column
-            }
-            Spacer(Modifier.height(12.dp))
-            if (isActive) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick  = onDone,
-                        colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Done", fontWeight = FontWeight.Bold)
-                    }
-                    OutlinedButton(
-                        onClick = onSkip,
-                        border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
-                        colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
-                    ) { Text("Skip") }
-                }
             } else {
-                Button(
-                    onClick  = onStart,
-                    colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled  = task.state == TaskState.PENDING
-                ) {
-                    Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Start Now", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(12.dp))
+
+                if (isActive) {
+                    // Running task → Done + Skip
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick  = onDone,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Done", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onSkip,
+                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
+                        ) { Text("Skip") }
+                    }
+                } else {
+                    // FIX: Previously Skip was only shown when isActive=true, so tapping
+                    // Skip on a PENDING task did nothing (button wasn't even rendered).
+                    // Now PENDING tasks show Start + Skip side by side.
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick  = onStart,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                            modifier = Modifier.weight(1f),
+                            enabled  = task.state == TaskState.PENDING
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Start Now", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick  = onSkip,
+                            border   = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors   = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                            enabled  = task.state == TaskState.PENDING
+                        ) { Text("Skip") }
+                    }
                 }
             }
         }
@@ -248,9 +284,9 @@ private fun EmptyPlanCard(onPlan: () -> Unit) {
 }
 
 private fun subjectColor(subject: String) = when (subject.lowercase()) {
-    "biology"   -> Color(0xFF00C896)
-    "chemistry" -> Color(0xFF4A9EFF)
-    "physics"   -> Color(0xFFFFB347)
+    "biology"       -> Color(0xFF00C896)
+    "chemistry"     -> Color(0xFF4A9EFF)
+    "physics"       -> Color(0xFFFFB347)
     "math", "maths" -> Color(0xFFFF4757)
-    else        -> Color(0xFF9090A8)
+    else            -> Color(0xFF9090A8)
 }
