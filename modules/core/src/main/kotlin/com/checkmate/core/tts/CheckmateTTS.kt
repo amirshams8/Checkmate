@@ -5,6 +5,8 @@ import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -40,15 +42,13 @@ object CheckmateTTS {
 
         val elevenKey = CheckmatePrefs.getString("elevenlabs_key", null)
         if (!elevenKey.isNullOrBlank()) {
-            // Try ElevenLabs first (fire and forget)
-            kotlinx.coroutines.GlobalScope.run {
-                kotlinx.coroutines.launch(Dispatchers.IO) {
-                    try {
-                        speakElevenLabs(context, text, elevenKey)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "ElevenLabs failed, falling back to Android TTS: ${e.message}")
-                        speakAndroid(text)
-                    }
+            // Fix: GlobalScope.run{launch} is wrong — .run{} is not a coroutine builder
+            GlobalScope.launch(Dispatchers.IO) {
+                try {
+                    speakElevenLabs(context, text, elevenKey)
+                } catch (e: Exception) {
+                    Log.w(TAG, "ElevenLabs failed, falling back to Android TTS: ${e.message}")
+                    speakAndroid(text)
                 }
             }
         } else {
@@ -62,7 +62,7 @@ object CheckmateTTS {
     }
 
     private suspend fun speakElevenLabs(context: Context, text: String, apiKey: String) {
-        val voiceId = "pNInz6obpgDQGcFmaJgB" // Adam — authoritative
+        val voiceId = "pNInz6obpgDQGcFmaJgB"
         val url     = "https://api.elevenlabs.io/v1/text-to-speech/$voiceId"
         val body    = JSONObject().apply {
             put("text", text)
@@ -76,11 +76,10 @@ object CheckmateTTS {
             .post(body)
             .build()
 
-        val response = httpClient.newCall(request).execute()
+        val response = withContext(Dispatchers.IO) { httpClient.newCall(request).execute() }
         if (!response.isSuccessful) throw Exception("EL HTTP ${response.code}")
         val bytes = response.body?.bytes() ?: return
 
-        // Write temp file and play via MediaPlayer
         val tempFile = java.io.File(context.cacheDir, "checkmate_tts.mp3")
         tempFile.writeBytes(bytes)
         val mp = android.media.MediaPlayer()
