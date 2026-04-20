@@ -6,8 +6,6 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
-import com.checkmate.psyche.BehaviorLedger
-import com.checkmate.ui.planner.PlannerState
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.decodeFromString
 import org.json.JSONArray
@@ -20,17 +18,22 @@ object AdaptivePlanner {
     private const val TAG = "AdaptivePlanner"
 
     suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
-        val daysLeft    = daysUntilExam(config.examDate)
-        val behaviorSummary = BehaviorLedger.getSummaryForPlanner()
+        val daysLeft         = daysUntilExam(config.examDate)
+        val behaviorSummary  = getBehaviorSummary()
         val studyWindowHours = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
 
-        // Try LLM first
         val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours)
         if (llmPlan.isNotEmpty()) return llmPlan
 
-        // Rule-based fallback
         return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
     }
+
+    /**
+     * Pull behavior summary from prefs directly to avoid depending on modules:psyche.
+     * PsycheEngine/BehaviorLedger write their summary into CheckmatePrefs under "behavior_summary".
+     */
+    private fun getBehaviorSummary(): String =
+        CheckmatePrefs.getString("behavior_summary", "No behavior data yet") ?: "No behavior data yet"
 
     private suspend fun tryLlmPlan(
         config: PlannerState,
@@ -63,9 +66,9 @@ Generate today's plan.
         return try {
             val raw = LlmGateway.complete(prompt, systemPrompt)
             if (raw.isBlank()) return emptyList()
-            val json   = raw.trim().removePrefix("```json").removeSuffix("```").trim()
-            val arr    = JSONArray(json)
-            val tasks  = mutableListOf<StudyTask>()
+            val json  = raw.trim().removePrefix("```json").removeSuffix("```").trim()
+            val arr   = JSONArray(json)
+            val tasks = mutableListOf<StudyTask>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 tasks.add(StudyTask(
@@ -93,9 +96,10 @@ Generate today's plan.
         val maxTasks     = if (daysLeft < 7) 5 else if (daysLeft < 30) 4 else 3
         val baseDuration = if (daysLeft < 30) 30 else 45
 
-        // Adapt duration from behavior
-        val skipRate = BehaviorLedger.getRecentSkipRate()
-        val duration = when {
+        // Adapt duration from stored skip rate
+        val skipRateStr = CheckmatePrefs.getString("recent_skip_rate", "0") ?: "0"
+        val skipRate    = skipRateStr.toFloatOrNull() ?: 0f
+        val duration    = when {
             skipRate > 0.5f -> (baseDuration - 15).coerceAtLeast(20)
             skipRate < 0.1f -> (baseDuration + 15).coerceAtMost(60)
             else            -> baseDuration
@@ -110,7 +114,7 @@ Generate today's plan.
         )
 
         val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
-        sorted.take(maxTasks).forEachIndexed { idx, subj ->
+        sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
             val topics = topicMap[subj.name] ?: listOf("Chapter ${(dayOfYear + idx) % 10 + 1}")
             val topic  = if (daysLeft < 30) "Revision: ${topics[(dayOfYear + idx) % topics.size]}"
                          else topics[(dayOfYear + idx) % topics.size]

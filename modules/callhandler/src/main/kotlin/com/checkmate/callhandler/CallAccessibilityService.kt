@@ -10,7 +10,10 @@ import android.view.accessibility.AccessibilityEvent
  */
 class CallAccessibilityService : AccessibilityService() {
 
-    private const val TAG = "CallAccessibility"
+    // Fix: const val not allowed in class body — must be in companion object
+    companion object {
+        private const val TAG = "CallAccessibility"
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return

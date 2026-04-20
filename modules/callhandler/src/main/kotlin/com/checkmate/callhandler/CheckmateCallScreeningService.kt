@@ -10,7 +10,10 @@ import android.util.Log
  */
 class CheckmateCallScreeningService : CallScreeningService() {
 
-    private const val TAG = "CheckmateCallScreening"
+    // Fix: const val not allowed in class body — must be in companion object
+    companion object {
+        private const val TAG = "CheckmateCallScreening"
+    }
 
     override fun onScreenCall(callDetails: Call.Details) {
         val response = CallResponse.Builder()
@@ -18,8 +21,8 @@ class CheckmateCallScreeningService : CallScreeningService() {
         if (ModeGuard.isStudyMode()) {
             Log.d(TAG, "Incoming call silenced — Study mode active")
             response
-                .setDisallowCall(false)     // allow call, but silence
-                .setSilenceCall(true)        // vibrate only / silent
+                .setDisallowCall(false)
+                .setSilenceCall(true)
                 .setSkipCallLog(false)
                 .setSkipNotification(false)
         } else {
