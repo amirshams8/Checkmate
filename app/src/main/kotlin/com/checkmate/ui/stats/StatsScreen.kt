@@ -23,29 +23,23 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
     val state by vm.state.collectAsState()
 
     Column(
-        modifier        = Modifier.fillMaxSize().background(BgDark)
-            .verticalScroll(rememberScrollState()),
+        modifier            = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Spacer(Modifier.height(20.dp))
-
-        // Header
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
             Text("Stats", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
             Text("Your performance overview", fontSize = 13.sp, color = White60)
         }
-
-        // ── Summary row ──
         Row(
             modifier              = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            StatTile("Streak", "${state.streakDays}d", Icons.Default.LocalFire, AccentAmber, Modifier.weight(1f))
-            StatTile("Today", "${state.todayCompletion}%", Icons.Default.Today, AccentGreen, Modifier.weight(1f))
-            StatTile("Week", "${state.weekCompletion}%", Icons.Default.DateRange, AccentBlue, Modifier.weight(1f))
+            // Fix: Icons.Default.LocalFire does not exist — correct name is LocalFireDepartment
+            StatTile("Streak", "${state.streakDays}d", Icons.Default.LocalFireDepartment, AccentAmber, Modifier.weight(1f))
+            StatTile("Today",  "${state.todayCompletion}%", Icons.Default.Today,     AccentGreen, Modifier.weight(1f))
+            StatTile("Week",   "${state.weekCompletion}%",  Icons.Default.DateRange,  AccentBlue,  Modifier.weight(1f))
         }
-
-        // ── Weekly bar chart ──
         Surface(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             shape    = RoundedCornerShape(14.dp),
@@ -58,8 +52,6 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
                 WeeklyBarChart(state.weeklyData)
             }
         }
-
-        // ── Subject breakdown ──
         Surface(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             shape    = RoundedCornerShape(14.dp),
@@ -75,8 +67,6 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
                 }
             }
         }
-
-        // ── Attention stats ──
         Surface(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             shape    = RoundedCornerShape(14.dp),
@@ -89,11 +79,10 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
                 Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                     AttentionStat("Checks Passed", "${state.attentionChecksPassed}")
                     AttentionStat("Checks Missed", "${state.attentionChecksMissed}")
-                    AttentionStat("Avg Focus", "${state.avgFocusMinutes}m")
+                    AttentionStat("Avg Focus",     "${state.avgFocusMinutes}m")
                 }
             }
         }
-
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -120,15 +109,12 @@ private fun WeeklyBarChart(data: List<Pair<String, Int>>) {
     ) {
         data.forEach { (day, pct) ->
             Column(
-                modifier              = Modifier.weight(1f),
-                horizontalAlignment   = Alignment.CenterHorizontally,
-                verticalArrangement   = Arrangement.Bottom
+                modifier            = Modifier.weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Bottom
             ) {
                 Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(horizontal = 4.dp),
+                    modifier         = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 4.dp),
                     contentAlignment = Alignment.BottomCenter
                 ) {
                     val barHeight = (pct.toFloat() / maxVal) * 80f
@@ -150,10 +136,7 @@ private fun WeeklyBarChart(data: List<Pair<String, Int>>) {
 @Composable
 private fun SubjectBar(subject: String, pct: Int) {
     Column {
-        Row(
-            modifier             = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(subject, fontSize = 13.sp, color = White90)
             Text("$pct%", fontSize = 13.sp, color = White60, fontFamily = FontFamily.Monospace)
         }

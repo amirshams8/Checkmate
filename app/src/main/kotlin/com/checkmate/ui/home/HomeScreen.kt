@@ -34,17 +34,12 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(BgDark)
-    ) {
+    Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
         LazyColumn(
             modifier            = Modifier.fillMaxSize(),
             contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // ── Header ──
             item {
                 HomeHeader(
                     completedCount = state.completedToday,
@@ -52,39 +47,25 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
                     streakDays     = state.streakDays
                 )
             }
-
-            // ── Progress bar ──
             item {
-                DayProgressBar(
-                    completed = state.completedToday,
-                    total     = state.tasks.size
-                )
+                DayProgressBar(completed = state.completedToday, total = state.tasks.size)
             }
-
-            // ── Psyche message ──
             if (state.psycheMessage.isNotBlank()) {
-                item {
-                    PsycheMessageCard(message = state.psycheMessage)
-                }
+                item { PsycheMessageCard(message = state.psycheMessage) }
             }
-
-            // ── Tasks ──
             if (state.tasks.isEmpty()) {
-                item {
-                    EmptyPlanCard(onPlan = { navController.navigate("planner") })
-                }
+                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }) }
             } else {
                 items(state.tasks, key = { it.id }) { task ->
                     TaskCard(
-                        task      = task,
-                        isActive  = state.activeTaskId == task.id,
-                        onStart   = { vm.startTask(context, task) },
-                        onDone    = { vm.markDone(context, task) },
-                        onSkip    = { vm.markSkip(context, task) }
+                        task     = task,
+                        isActive = state.activeTaskId == task.id,
+                        onStart  = { vm.startTask(context, task) },
+                        onDone   = { vm.markDone(context, task) },
+                        onSkip   = { vm.markSkip(context, task) }
                     )
                 }
             }
-
             item { Spacer(Modifier.height(16.dp)) }
         }
     }
@@ -93,33 +74,22 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
 @Composable
 private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
     Row(
-        modifier             = Modifier.fillMaxWidth(),
-        verticalAlignment    = Alignment.CenterVertically,
+        modifier              = Modifier.fillMaxWidth(),
+        verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Column {
-            Text(
-                text       = "Today",
-                fontSize   = 28.sp,
-                fontWeight = FontWeight.Bold,
-                color      = White90
-            )
-            Text(
-                text     = "$completedCount of $totalCount tasks done",
-                fontSize = 14.sp,
-                color    = White60
-            )
+            Text("Today", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+            Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
         }
         if (streakDays > 0) {
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = AccentGreen.copy(alpha = 0.12f)
-            ) {
+            Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
                 Row(
                     modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.LocalFire, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
+                    // Fix: Icons.Default.LocalFire does not exist — correct name is LocalFireDepartment
+                    Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
                     Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
                 }
@@ -132,23 +102,22 @@ private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
 private fun DayProgressBar(completed: Int, total: Int) {
     val progress = if (total == 0) 0f else completed.toFloat() / total.toFloat()
     val animatedProgress by animateFloatAsState(
-        targetValue  = progress,
+        targetValue   = progress,
         animationSpec = tween(600, easing = FastOutSlowInEasing),
-        label        = "progress"
+        label         = "progress"
     )
-
     Column {
         LinearProgressIndicator(
-            progress          = { animatedProgress },
-            modifier          = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-            color             = AccentGreen,
-            trackColor        = White10,
+            progress   = { animatedProgress },
+            modifier   = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+            color      = AccentGreen,
+            trackColor = White10,
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            text     = "${(progress * 100).toInt()}% complete",
-            fontSize = 11.sp,
-            color    = White30,
+            text       = "${(progress * 100).toInt()}% complete",
+            fontSize   = 11.sp,
+            color      = White30,
             fontFamily = FontFamily.Monospace
         )
     }
@@ -157,22 +126,14 @@ private fun DayProgressBar(completed: Int, total: Int) {
 @Composable
 private fun PsycheMessageCard(message: String) {
     Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = BgCardAlt,
+        shape  = RoundedCornerShape(10.dp),
+        color  = BgCardAlt,
         border = BorderStroke(0.5.dp, AccentBlue.copy(alpha = 0.3f))
     ) {
-        Row(
-            modifier          = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.Psychology, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(10.dp))
-            Text(
-                text       = message,
-                fontSize   = 13.sp,
-                color      = White90,
-                lineHeight = 18.sp
-            )
+            Text(message, fontSize = 13.sp, color = White90, lineHeight = 18.sp)
         }
     }
 }
@@ -186,58 +147,43 @@ private fun TaskCard(
     onSkip: () -> Unit
 ) {
     val borderColor = when {
-        isActive            -> AccentGreen
+        isActive                       -> AccentGreen
         task.state == TaskState.DONE   -> AccentGreen.copy(alpha = 0.3f)
         task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
-        else                -> White10
+        else                           -> White10
     }
-
     Surface(
         shape  = RoundedCornerShape(14.dp),
         color  = if (isActive) BgCardAlt else BgCard,
         border = BorderStroke(1.dp, borderColor)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            // Subject + priority row
             Row(
-                modifier             = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment    = Alignment.CenterVertically
+                verticalAlignment     = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(subjectColor(task.subject))
-                    )
+                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text       = task.subject.uppercase(),
-                        fontSize   = 11.sp,
-                        fontWeight = FontWeight.Bold,
+                        text          = task.subject.uppercase(),
+                        fontSize      = 11.sp,
+                        fontWeight    = FontWeight.Bold,
                         letterSpacing = 2.sp,
-                        color      = subjectColor(task.subject),
-                        fontFamily = FontFamily.Monospace
+                        color         = subjectColor(task.subject),
+                        fontFamily    = FontFamily.Monospace
                     )
                 }
-                Text(
-                    text     = "${task.durationMinutes}m",
-                    fontSize = 12.sp,
-                    color    = White60,
-                    fontFamily = FontFamily.Monospace
-                )
+                Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
             }
-
             Spacer(Modifier.height(8.dp))
-
             Text(
                 text       = task.topic,
                 fontSize   = 17.sp,
                 fontWeight = FontWeight.SemiBold,
                 color      = if (task.state == TaskState.DONE) White60 else White90
             )
-
             if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -247,14 +193,12 @@ private fun TaskCard(
                 )
                 return@Column
             }
-
             Spacer(Modifier.height(12.dp))
-
             if (isActive) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = onDone,
-                        colors  = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                        onClick  = onDone,
+                        colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
@@ -265,9 +209,7 @@ private fun TaskCard(
                         onClick = onSkip,
                         border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
                         colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
-                    ) {
-                        Text("Skip")
-                    }
+                    ) { Text("Skip") }
                 }
             } else {
                 Button(
@@ -287,34 +229,28 @@ private fun TaskCard(
 
 @Composable
 private fun EmptyPlanCard(onPlan: () -> Unit) {
-    Surface(
-        shape  = RoundedCornerShape(14.dp),
-        color  = BgCard,
-        border = BorderStroke(1.dp, White10)
-    ) {
+    Surface(shape = RoundedCornerShape(14.dp), color = BgCard, border = BorderStroke(1.dp, White10)) {
         Column(
-            modifier          = Modifier.fillMaxWidth().padding(24.dp),
+            modifier            = Modifier.fillMaxWidth().padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Icon(Icons.Default.EventNote, null, tint = White30, modifier = Modifier.size(40.dp))
             Spacer(Modifier.height(12.dp))
-            Text("No plan for today", fontSize = 16.sp, color = White60, fontWeight = FontWeight.SemiBold)
-            Text("Set up your exam and subjects to generate a daily plan", fontSize = 13.sp, color = White30, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Text("No plan for today", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(6.dp))
+            Text("Set up your exam and subjects to generate a daily plan", fontSize = 13.sp, color = White60)
             Spacer(Modifier.height(16.dp))
-            Button(
-                onClick = onPlan,
-                colors  = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                Text("Create Plan", fontWeight = FontWeight.Bold)
+            Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
+                Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
             }
         }
     }
 }
 
-private fun subjectColor(subject: String): Color = when (subject.lowercase()) {
-    "physics"   -> Color(0xFF4A9EFF)
-    "chemistry" -> Color(0xFFFFB347)
+private fun subjectColor(subject: String) = when (subject.lowercase()) {
     "biology"   -> Color(0xFF00C896)
-    "math", "maths" -> Color(0xFFBB86FC)
+    "chemistry" -> Color(0xFF4A9EFF)
+    "physics"   -> Color(0xFFFFB347)
+    "math", "maths" -> Color(0xFFFF4757)
     else        -> Color(0xFF9090A8)
 }

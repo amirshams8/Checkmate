@@ -24,13 +24,14 @@ data class AppInfo(val name: String, val packageName: String)
 
 @Composable
 fun AppSelectorScreen(onBack: () -> Unit) {
-    val context    = LocalContext.current
-    val pm         = context.packageManager
+    val context      = LocalContext.current
+    val pm           = context.packageManager
     val savedBlocked = remember {
         (CheckmatePrefs.getString("blocked_apps", "") ?: "")
             .split(",").filter { it.isNotBlank() }.toMutableSet()
     }
-    val blockedApps = remember { mutableStateSetOf<String>().apply { addAll(savedBlocked) } }
+    // Fix: mutableStateSetOf is not available without extra import — use mutableStateOf with a Set instead
+    var blockedApps by remember { mutableStateOf(savedBlocked.toSet()) }
 
     val installedApps = remember {
         pm.getInstalledApplications(PackageManager.GET_META_DATA)
@@ -44,7 +45,6 @@ fun AppSelectorScreen(onBack: () -> Unit) {
     val filtered = installedApps.filter { it.name.contains(search, ignoreCase = true) }
 
     Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
-        // Top bar
         Row(
             modifier          = Modifier.fillMaxWidth().padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -58,7 +58,6 @@ fun AppSelectorScreen(onBack: () -> Unit) {
             Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
         }
 
-        // Search
         OutlinedTextField(
             value         = search,
             onValueChange = { search = it },
@@ -85,8 +84,8 @@ fun AppSelectorScreen(onBack: () -> Unit) {
         Spacer(Modifier.height(8.dp))
 
         LazyColumn(
-            modifier       = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp),
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(filtered, key = { it.packageName }) { app ->
@@ -96,8 +95,10 @@ fun AppSelectorScreen(onBack: () -> Unit) {
                     color  = if (isBlocked) AccentRed.copy(alpha = 0.08f) else BgCard,
                     border = BorderStroke(1.dp, if (isBlocked) AccentRed.copy(alpha = 0.4f) else White10),
                     onClick = {
-                        if (isBlocked) blockedApps.remove(app.packageName)
-                        else blockedApps.add(app.packageName)
+                        blockedApps = if (isBlocked)
+                            blockedApps - app.packageName
+                        else
+                            blockedApps + app.packageName
                     }
                 ) {
                     Row(

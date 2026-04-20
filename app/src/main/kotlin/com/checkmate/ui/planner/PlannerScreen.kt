@@ -61,13 +61,13 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
         item {
             SectionCard(title = "Exam Date") {
                 OutlinedTextField(
-                    value         = state.examDate,
-                    onValueChange = vm::setExamDate,
-                    label         = { Text("DD/MM/YYYY", color = White30) },
-                    singleLine    = true,
-                    modifier      = Modifier.fillMaxWidth(),
+                    value           = state.examDate,
+                    onValueChange   = vm::setExamDate,
+                    label           = { Text("DD/MM/YYYY", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    colors        = plannerFieldColors()
+                    colors          = plannerFieldColors()
                 )
             }
         }
@@ -114,13 +114,13 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
                                 colors        = plannerFieldColors()
                             )
                             OutlinedTextField(
-                                value         = subject.weightage.toString(),
-                                onValueChange = { vm.updateSubjectWeight(index, it.toIntOrNull() ?: 1) },
-                                label         = { Text("Weight", color = White30) },
-                                singleLine    = true,
-                                modifier      = Modifier.weight(1f),
+                                value           = subject.weightage.toString(),
+                                onValueChange   = { vm.updateSubjectWeight(index, it.toIntOrNull() ?: 1) },
+                                label           = { Text("Weight", color = White30) },
+                                singleLine      = true,
+                                modifier        = Modifier.weight(1f),
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                colors        = plannerFieldColors()
+                                colors          = plannerFieldColors()
                             )
                             IconButton(onClick = { vm.removeSubject(index) }) {
                                 Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(18.dp))
@@ -140,14 +140,24 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
         item {
             SectionCard(title = "Guardian WhatsApp") {
                 OutlinedTextField(
-                    value         = state.guardianNumber,
-                    onValueChange = vm::setGuardianNumber,
-                    label         = { Text("+91XXXXXXXXXX", color = White30) },
-                    singleLine    = true,
-                    modifier      = Modifier.fillMaxWidth(),
+                    value           = state.guardianNumber,
+                    onValueChange   = vm::setGuardianNumber,
+                    label           = { Text("+91XXXXXXXXXX", color = White30) },
+                    placeholder     = { Text("Enter guardian phone number", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                    colors        = plannerFieldColors()
+                    leadingIcon     = { Icon(Icons.Default.Phone, null, tint = AccentGreen) },
+                    colors          = plannerFieldColors()
                 )
+                if (state.guardianNumber.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Weekly reports will be sent to this number via WhatsApp",
+                        fontSize = 11.sp,
+                        color    = White60
+                    )
+                }
             }
         }
 
@@ -156,8 +166,8 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             SectionCard(title = "Attention Cycle") {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Focus block: 30 min  →  Short break: 5 min", fontSize = 13.sp, color = White60)
-                    Text("After 2 focus blocks: Long break 10 min", fontSize = 13.sp, color = White60)
-                    Text("✅ button confirms attention every 30 min", fontSize = 13.sp, color = White60)
+                    Text("After 2 focus blocks: Long break 10 min",    fontSize = 13.sp, color = White60)
+                    Text("✅ button confirms attention every 30 min",   fontSize = 13.sp, color = White60)
                     Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Voice reminders", fontSize = 13.sp, color = White90, modifier = Modifier.weight(1f))
@@ -210,8 +220,8 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(task.subject, fontSize = 11.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
-                            Text(task.topic, fontSize = 15.sp, color = White90)
+                            Text(task.subject,  fontSize = 11.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
+                            Text(task.topic,    fontSize = 15.sp, color = White90)
                         }
                         Text("${task.durationMinutes}m", fontSize = 13.sp, color = White60)
                     }

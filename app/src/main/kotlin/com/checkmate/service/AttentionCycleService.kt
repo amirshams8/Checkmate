@@ -14,11 +14,11 @@ import kotlinx.coroutines.*
 class AttentionCycleService : Service() {
 
     companion object {
-        private const val CHANNEL_ID   = "attention_cycle_channel"
-        private const val NOTIF_ID     = 42
-        const val EXTRA_TASK_ID        = "task_id"
-        const val EXTRA_TASK_NAME      = "task_name"
-        const val EXTRA_DURATION_MIN   = "duration_min"
+        private const val CHANNEL_ID = "attention_cycle_channel"
+        private const val NOTIF_ID   = 42
+        const val EXTRA_TASK_ID      = "task_id"
+        const val EXTRA_TASK_NAME    = "task_name"
+        const val EXTRA_DURATION_MIN = "duration_min"
 
         fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
             val intent = Intent(context, AttentionCycleService::class.java).apply {
@@ -46,9 +46,9 @@ class AttentionCycleService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val taskId       = intent?.getStringExtra(EXTRA_TASK_ID)      ?: "task"
-        val taskName     = intent?.getStringExtra(EXTRA_TASK_NAME)    ?: "Task"
-        val durationMin  = intent?.getLongExtra(EXTRA_DURATION_MIN, 60) ?: 60
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)       ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)     ?: "Task"
+        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
 
         startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
         AttentionCycleManager.start(taskId, taskName, durationMin)
@@ -60,21 +60,19 @@ class AttentionCycleService : Service() {
         cycleJob?.cancel()
         cycleJob = scope.launch {
             while (isActive) {
-                val cycleState = AttentionCycleManager.tick()
+                val cs = AttentionCycleManager.tick()
 
-                // Update notification
                 val notif = buildNotification(
-                    phaseLabel(cycleState.phase, cycleState.phaseSecondsLeft),
+                    phaseLabel(cs.phase, cs.phaseSecondsLeft),
                     taskName,
-                    cycleState.totalSessionSeconds,
-                    cycleState.cycleIndex,
-                    cycleState.needsAttentionCheck
+                    cs.totalSessionSeconds,
+                    cs.cycleIndex,
+                    cs.needsAttentionCheck
                 )
                 (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
 
-                // Phase change announcements
-                if (cycleState.phaseJustChanged) {
-                    when (cycleState.phase) {
+                if (cs.phaseJustChanged) {
+                    when (cs.phase) {
                         AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
                         AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
                         AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
@@ -86,8 +84,8 @@ class AttentionCycleService : Service() {
                     }
                 }
 
-                // Attention check pulse
-                if (cycleState.needsAttentionCheck && cycleState.phaseSecondsLeft % 30 == 0) {
+                // Fix: phaseSecondsLeft is Long — compare with 0L, not 0 (Int)
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L) {
                     CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
                 }
 
@@ -97,8 +95,8 @@ class AttentionCycleService : Service() {
     }
 
     private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
-        val m = secondsLeft / 60
-        val s = secondsLeft % 60
+        val m    = secondsLeft / 60
+        val s    = secondsLeft % 60
         val time = String.format("%d:%02d", m, s)
         return when (phase) {
             AttentionPhase.FOCUS       -> "FOCUS — $time"
@@ -111,8 +109,8 @@ class AttentionCycleService : Service() {
     private fun buildNotification(
         phaseText:    String,
         taskName:     String,
-        totalSeconds: Long   = 0,
-        cycleIndex:   Int    = 0,
+        totalSeconds: Long    = 0L,
+        cycleIndex:   Int     = 0,
         needsCheck:   Boolean = false
     ): Notification {
         val totalMin = totalSeconds / 60
