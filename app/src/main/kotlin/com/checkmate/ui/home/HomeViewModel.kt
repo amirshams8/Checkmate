@@ -10,16 +10,18 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.PsycheEngine
 import com.checkmate.service.AttentionCycleService
+import com.checkmate.service.GuardianNotifier
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 data class HomeState(
-    val tasks:          List<StudyTask> = emptyList(),
-    val activeTaskId:   String?         = null,
-    val completedToday: Int             = 0,
-    val streakDays:     Int             = 0,
-    val psycheMessage:  String          = ""
+    val tasks:             List<StudyTask> = emptyList(),
+    val activeTaskId:      String?         = null,
+    val completedToday:    Int             = 0,
+    val streakDays:        Int             = 0,
+    val psycheMessage:     String          = "",
+    val consecutiveSkips:  Int             = 0
 )
 
 class HomeViewModel : ViewModel() {
@@ -27,11 +29,7 @@ class HomeViewModel : ViewModel() {
     private val _state = MutableStateFlow(HomeState())
     val state: StateFlow<HomeState> = _state.asStateFlow()
 
-    init {
-        loadTodayPlan()
-        loadStreak()
-        loadPsycheMessage()
-    }
+    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
 
     private fun loadTodayPlan() {
         viewModelScope.launch {
@@ -39,23 +37,21 @@ class HomeViewModel : ViewModel() {
                 _state.update { it.copy(
                     tasks          = tasks,
                     completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t -> t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED }?.id
+                    activeTaskId   = tasks.firstOrNull { t ->
+                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
+                    }?.id
                 )}
             }
         }
     }
 
     private fun loadStreak() {
-        viewModelScope.launch {
-            val streak = PlanStore.getStreakDays()
-            _state.update { it.copy(streakDays = streak) }
-        }
+        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
     }
 
     private fun loadPsycheMessage() {
         viewModelScope.launch {
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(psycheMessage = msg) }
+            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
         }
     }
 
@@ -64,14 +60,17 @@ class HomeViewModel : ViewModel() {
             WorkModeManager.activate(context)
             val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
             mappedPkg?.let { pkg ->
-                val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
-                launchIntent?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                launchIntent?.let { context.startActivity(it) }
+                context.packageManager.getLaunchIntentForPackage(pkg)
+                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ?.let { context.startActivity(it) }
             }
             AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
             CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
             PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id) }
+            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
+
+            // Auto-trigger 1: notify guardian task started
+            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
         }
     }
 
@@ -83,7 +82,7 @@ class HomeViewModel : ViewModel() {
             PsycheEngine.onTaskCompleted(task)
             CheckmateTTS.speak(context, "Task complete. Well done.")
             val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg) }
+            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
         }
     }
 
@@ -95,25 +94,26 @@ class HomeViewModel : ViewModel() {
             PsycheEngine.onTaskSkipped(task)
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg) }
+            val newSkips = _state.value.consecutiveSkips + 1
+            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
+
+            // Auto-trigger 2: guardian alert after 3 consecutive skips
+            if (newSkips >= 3) {
+                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+            }
         }
     }
 
-    /** Blueprint 2.5: Pause the active task */
     fun pauseTask(context: Context, task: StudyTask) {
         viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            PlanStore.pauseTask(task.id, now)
+            PlanStore.pauseTask(task.id, System.currentTimeMillis())
             AttentionCycleService.sendPause(context)
-            _state.update { it.copy(activeTaskId = task.id) } // keep it active but paused
         }
     }
 
-    /** Blueprint 2.5: Resume a paused task */
     fun resumeTask(context: Context, task: StudyTask) {
         viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            PlanStore.resumeTask(task.id, now)
+            PlanStore.resumeTask(task.id, System.currentTimeMillis())
             AttentionCycleService.sendResume(context)
         }
     }

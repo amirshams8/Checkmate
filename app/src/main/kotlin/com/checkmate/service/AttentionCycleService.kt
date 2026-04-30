@@ -14,14 +14,13 @@ import kotlinx.coroutines.*
 class AttentionCycleService : Service() {
 
     companion object {
-        private const val CHANNEL_ID    = "attention_cycle_channel"
-        private const val NOTIF_ID      = 42
-        const val EXTRA_TASK_ID         = "task_id"
-        const val EXTRA_TASK_NAME       = "task_name"
-        const val EXTRA_DURATION_MIN    = "duration_min"
-        // Pause/Resume broadcast actions
-        const val ACTION_PAUSE          = "com.checkmate.ATTENTION_PAUSE"
-        const val ACTION_RESUME         = "com.checkmate.ATTENTION_RESUME"
+        private const val CHANNEL_ID = "attention_cycle_channel"
+        private const val NOTIF_ID   = 42
+        const val EXTRA_TASK_ID      = "task_id"
+        const val EXTRA_TASK_NAME    = "task_name"
+        const val EXTRA_DURATION_MIN = "duration_min"
+        const val ACTION_PAUSE       = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME      = "com.checkmate.ATTENTION_RESUME"
 
         fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
             val intent = Intent(context, AttentionCycleService::class.java).apply {
@@ -35,9 +34,8 @@ class AttentionCycleService : Service() {
                 context.startService(intent)
         }
 
-        fun stop(context: Context) {
+        fun stop(context: Context) =
             context.stopService(Intent(context, AttentionCycleService::class.java))
-        }
 
         fun sendPause(context: Context) =
             context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
@@ -46,9 +44,9 @@ class AttentionCycleService : Service() {
             context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
     }
 
-    private val scope     = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var cycleJob: Job? = null
-    private var isPaused  = false
+    private var isPaused = false
 
     private val pauseReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -66,14 +64,20 @@ class AttentionCycleService : Service() {
             addAction(ACTION_PAUSE)
             addAction(ACTION_RESUME)
         }
-        registerReceiver(pauseReceiver, filter)
+        // FIX: Android 14 (API 34) requires RECEIVER_NOT_EXPORTED for dynamic receivers
+        // on non-system broadcasts. Without this -> SecurityException -> FATAL at onCreate:69.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(pauseReceiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)       ?: "task"
-        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)     ?: "Task"
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
         val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
-
         startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
         AttentionCycleManager.start(taskId, taskName, durationMin)
         startCycleLoop(taskName)
@@ -85,85 +89,66 @@ class AttentionCycleService : Service() {
         cycleJob = scope.launch {
             while (isActive) {
                 if (isPaused) {
-                    // While paused: update notification to show PAUSED state, don't tick
-                    val paused = AttentionCycleManager.currentState()
-                    val notif = buildNotification("⏸ PAUSED", taskName, paused.totalSessionSeconds, paused.cycleIndex)
-                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
+                    val cs = AttentionCycleManager.currentState()
+                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
                     delay(1_000)
                     continue
                 }
-
                 val cs = AttentionCycleManager.tick()
-
-                val notif = buildNotification(
-                    phaseLabel(cs.phase, cs.phaseSecondsLeft),
-                    taskName,
-                    cs.totalSessionSeconds,
-                    cs.cycleIndex,
-                    cs.needsAttentionCheck
-                )
-                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(NOTIF_ID, buildNotification(
+                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
+                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
 
                 if (cs.phaseJustChanged) {
                     when (cs.phase) {
                         AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
                         AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
                         AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
-                        AttentionPhase.PAUSED      -> CheckmateTTS.speak(this@AttentionCycleService, "Session paused.")
+                        AttentionPhase.PAUSED      -> {}
                         AttentionPhase.DONE        -> {
                             CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
-                            stopSelf()
-                            return@launch
+                            stopSelf(); return@launch
                         }
                     }
                 }
-
-                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L) {
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
                     CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
-                }
-
                 delay(1_000)
             }
         }
     }
 
     private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
-        val m    = secondsLeft / 60
-        val s    = secondsLeft % 60
-        val time = String.format("%d:%02d", m, s)
+        val m = secondsLeft / 60; val s = secondsLeft % 60
+        val t = String.format("%d:%02d", m, s)
         return when (phase) {
-            AttentionPhase.FOCUS       -> "FOCUS — $time"
-            AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $time"
-            AttentionPhase.LONG_BREAK  -> "LONG BREAK — $time"
-            AttentionPhase.PAUSED      -> "⏸ PAUSED — $time"
+            AttentionPhase.FOCUS       -> "FOCUS — $t"
+            AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $t"
+            AttentionPhase.LONG_BREAK  -> "LONG BREAK — $t"
+            AttentionPhase.PAUSED      -> "PAUSED — $t"
             AttentionPhase.DONE        -> "SESSION COMPLETE"
         }
     }
 
     private fun buildNotification(
-        phaseText:    String,
-        taskName:     String,
-        totalSeconds: Long    = 0L,
-        cycleIndex:   Int     = 0,
-        needsCheck:   Boolean = false
+        phaseText: String, taskName: String,
+        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
     ): Notification {
-        val totalMin = totalSeconds / 60
-        val totalSec = totalSeconds % 60
+        val tm = totalSeconds / 60; val ts = totalSeconds % 60
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(if (needsCheck) "⚡ $phaseText — TAP ✅ TO CONFIRM" else phaseText)
-            .setContentText("$taskName  •  Session: ${totalMin}m ${totalSec}s  •  Cycle $cycleIndex")
+            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
+            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
-            .setOngoing(true)
-            .setOnlyAlertOnce(!needsCheck)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
+            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
+            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
     }
 
-    private fun startForegroundCompat(notification: Notification) {
+    private fun startForegroundCompat(n: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        else
-            startForeground(NOTIF_ID, notification)
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        else startForeground(NOTIF_ID, n)
     }
 
     private fun createChannel() {
@@ -174,9 +159,8 @@ class AttentionCycleService : Service() {
     }
 
     override fun onDestroy() {
-        cycleJob?.cancel()
-        scope.cancel()
-        unregisterReceiver(pauseReceiver)
+        cycleJob?.cancel(); scope.cancel()
+        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
         AttentionCycleManager.reset()
         super.onDestroy()
     }
