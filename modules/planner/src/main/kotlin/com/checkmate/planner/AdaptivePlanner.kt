@@ -3,11 +3,14 @@ package com.checkmate.planner
 import android.content.Context
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.DailyCheckIn
+import com.checkmate.core.PYQWeightage
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.decodeFromString
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -18,50 +21,84 @@ object AdaptivePlanner {
     private const val TAG = "AdaptivePlanner"
 
     suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
-        val daysLeft         = daysUntilExam(config.examDate)
-        val behaviorSummary  = getBehaviorSummary()
-        val studyWindowHours = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
+        val daysLeft          = daysUntilExam(config.examDate)
+        val behaviorSummary   = getBehaviorSummary()
+        val studyWindowHours  = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
+        val profile           = ConsultationProfile.load()
+        val checkIn           = DailyCheckIn.loadToday()
+        val coachingContext   = CoachingPlannerEntry.upcomingContext(7)
+        val pyqContext         = buildPyqContext(config.examType, checkIn)
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext)
         if (llmPlan.isNotEmpty()) return llmPlan
 
         return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
     }
 
-    /**
-     * Pull behavior summary from prefs directly to avoid depending on modules:psyche.
-     * PsycheEngine/BehaviorLedger write their summary into CheckmatePrefs under "behavior_summary".
-     */
     private fun getBehaviorSummary(): String =
         CheckmatePrefs.getString("behavior_summary", "No behavior data yet") ?: "No behavior data yet"
+
+    private fun buildPyqContext(exam: String, checkIn: DailyCheckIn?): String {
+        if (checkIn == null) return ""
+        return checkIn.todayTopics.entries.mapNotNull { (subject, topic) ->
+            val weight = PYQWeightage.findTopicWeightage(exam, topic)
+            if (weight > 0f) "$subject/$topic: PYQ weight ${String.format("%.1f", weight)}%"
+            else null
+        }.joinToString("\n")
+    }
 
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
         behaviorSummary: String,
-        studyWindowHours: Float
+        studyWindowHours: Float,
+        profile: com.checkmate.core.ConsultationProfile,
+        checkIn: DailyCheckIn?,
+        coachingContext: String,
+        pyqContext: String
     ): List<StudyTask> {
         val systemPrompt = """
 You are an adaptive study planner for competitive exam students.
 Generate a focused daily study plan. Respond ONLY with a valid JSON array, no markdown, no explanation.
-Format: [{"subject":"Biology","topic":"Cell Division","durationMinutes":45},...]
+Format: [{"subject":"Biology","topic":"Cell Division","subtopic":"Mitosis stages","durationMinutes":45,"sessionType":"LEARN","priority":"HIGH","reason":"PYQ weight 9%, marked weak"}]
 Rules:
 - Max 5 tasks
 - Total time must fit in ${studyWindowHours.toInt()} hours (minus breaks)
-- Weight tasks by subject priority
+- Weight tasks by subject priority and PYQ weightage
 - If exam < 30 days: revision-heavy
 - If exam < 7 days: full revision only
 - Keep durations in multiples of 30
+- sessionType must be one of: LEARN, REVISE, PRACTICE, TEST_PREP
+- reason must be specific: mention PYQ %, coaching test dates, weak topic flags
 """.trimIndent()
 
-        val prompt = """
-Exam: ${config.examType}
-Days until exam: $daysLeft
-Subjects (name:weight): ${config.subjects.joinToString { "${it.name}:${it.weightage}" }}
-Study window: ${config.studyStartTime}–${config.studyEndTime} (${studyWindowHours}h)
-Behavior: $behaviorSummary
-Generate today's plan.
-""".trimIndent()
+        val prompt = buildString {
+            appendLine("Exam: ${config.examType} | Days until exam: $daysLeft")
+            appendLine("Subjects (name:weight): ${config.subjects.joinToString { "${it.name}:${it.weightage}" }}")
+            appendLine("Study window: ${config.studyStartTime}–${config.studyEndTime} (${studyWindowHours}h)")
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            if (checkIn != null) {
+                appendLine("TODAY'S TOPICS SELECTED:")
+                checkIn.todayTopics.forEach { (subj, topic) -> appendLine("  $subj → $topic") }
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING SCHEDULE:")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (pyqContext.isNotBlank()) {
+                appendLine("PYQ WEIGHTAGE FOR TODAY'S TOPICS:")
+                appendLine(pyqContext)
+                appendLine()
+            }
+            appendLine("BEHAVIOR DATA: $behaviorSummary")
+            appendLine()
+            appendLine("Generate today's plan.")
+        }
 
         return try {
             val raw = LlmGateway.complete(prompt, systemPrompt)
@@ -71,9 +108,10 @@ Generate today's plan.
             val tasks = mutableListOf<StudyTask>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
+                val subtopic = if (obj.has("subtopic")) " — ${obj.getString("subtopic")}" else ""
                 tasks.add(StudyTask(
                     subject         = obj.getString("subject"),
-                    topic           = obj.getString("topic"),
+                    topic           = obj.getString("topic") + subtopic,
                     durationMinutes = obj.getInt("durationMinutes")
                 ))
             }
@@ -96,7 +134,6 @@ Generate today's plan.
         val maxTasks     = if (daysLeft < 7) 5 else if (daysLeft < 30) 4 else 3
         val baseDuration = if (daysLeft < 30) 30 else 45
 
-        // Adapt duration from stored skip rate
         val skipRateStr = CheckmatePrefs.getString("recent_skip_rate", "0") ?: "0"
         val skipRate    = skipRateStr.toFloatOrNull() ?: 0f
         val duration    = when {
@@ -105,19 +142,17 @@ Generate today's plan.
             else            -> baseDuration
         }
 
-        val topicMap = mapOf(
-            "Biology"   to listOf("Cell Biology", "Genetics", "Human Physiology", "Plant Physiology", "Ecology", "Evolution"),
-            "Chemistry" to listOf("Physical Chemistry", "Organic Chemistry", "Inorganic Chemistry", "Equilibrium", "Thermodynamics"),
-            "Physics"   to listOf("Mechanics", "Thermodynamics", "Optics", "Electromagnetism", "Modern Physics"),
-            "Math"      to listOf("Algebra", "Calculus", "Trigonometry", "Probability", "Geometry"),
-            "Maths"     to listOf("Algebra", "Calculus", "Trigonometry", "Probability", "Geometry")
-        )
-
+        // Use PYQ weightage to pick top topics per subject
         val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
-            val topics = topicMap[subj.name] ?: listOf("Chapter ${(dayOfYear + idx) % 10 + 1}")
-            val topic  = if (daysLeft < 30) "Revision: ${topics[(dayOfYear + idx) % topics.size]}"
-                         else topics[(dayOfYear + idx) % topics.size]
+            val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
+            val topic = if (topTopics.isNotEmpty()) {
+                val t = topTopics[(dayOfYear + idx) % topTopics.size]
+                if (daysLeft < 30) "Revision: ${t.first}" else t.first
+            } else {
+                if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+            }
             tasks.add(StudyTask(
                 subject         = subj.name,
                 topic           = topic,

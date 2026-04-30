@@ -14,7 +14,9 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Unified LLM gateway supporting OpenRouter, Groq, Claude, Gemini.
- * Falls back gracefully if no key configured.
+ * FIX 1.4: Changed Groq model from deprecated "llama3-8b-8192" to "llama-3.1-8b-instant".
+ * FIX 1.4: Added HTTP status check + response body logging on failure so errors are
+ *           visible in logcat instead of silently returning empty string.
  */
 object LlmGateway {
 
@@ -40,7 +42,9 @@ object LlmGateway {
             "Groq"        -> callOpenAiCompatible(
                 prompt, systemPrompt, apiKey,
                 "https://api.groq.com/openai/v1/chat/completions",
-                "llama3-8b-8192"
+                // FIX: "llama3-8b-8192" was deprecated by Groq → HTTP 400/404 → silent empty return
+                // → AdaptivePlanner always fell back to ruleBasedPlan() → vague tasks
+                "llama-3.1-8b-instant"
             )
             "OpenRouter"  -> callOpenAiCompatible(
                 prompt, systemPrompt, apiKey,
@@ -71,8 +75,14 @@ object LlmGateway {
             .post(body).build()
 
         return try {
-            val resp = client.newCall(req).execute()
-            val json = JSONObject(resp.body?.string() ?: "{}")
+            val resp     = client.newCall(req).execute()
+            val bodyStr  = resp.body?.string() ?: "{}"
+            // FIX: previously body was consumed before status check — error JSON was lost
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "OpenAI-compat HTTP ${resp.code} for model=$model url=$url body=$bodyStr")
+                return ""
+            }
+            val json = JSONObject(bodyStr)
             json.getJSONArray("choices").getJSONObject(0)
                 .getJSONObject("message").getString("content").trim()
         } catch (e: Exception) {
@@ -97,8 +107,13 @@ object LlmGateway {
             .post(body).build()
 
         return try {
-            val resp = client.newCall(req).execute()
-            val json = JSONObject(resp.body?.string() ?: "{}")
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Claude HTTP ${resp.code} body=$bodyStr")
+                return ""
+            }
+            val json = JSONObject(bodyStr)
             json.getJSONArray("content").getJSONObject(0).getString("text").trim()
         } catch (e: Exception) {
             Log.e(TAG, "Claude call failed: ${e.message}")
@@ -120,8 +135,13 @@ object LlmGateway {
             .post(body).build()
 
         return try {
-            val resp = client.newCall(req).execute()
-            val json = JSONObject(resp.body?.string() ?: "{}")
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
+                return ""
+            }
+            val json = JSONObject(bodyStr)
             json.getJSONArray("candidates").getJSONObject(0)
                 .getJSONObject("content")
                 .getJSONArray("parts").getJSONObject(0)

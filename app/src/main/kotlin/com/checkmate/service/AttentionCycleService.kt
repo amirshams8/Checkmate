@@ -14,11 +14,14 @@ import kotlinx.coroutines.*
 class AttentionCycleService : Service() {
 
     companion object {
-        private const val CHANNEL_ID = "attention_cycle_channel"
-        private const val NOTIF_ID   = 42
-        const val EXTRA_TASK_ID      = "task_id"
-        const val EXTRA_TASK_NAME    = "task_name"
-        const val EXTRA_DURATION_MIN = "duration_min"
+        private const val CHANNEL_ID    = "attention_cycle_channel"
+        private const val NOTIF_ID      = 42
+        const val EXTRA_TASK_ID         = "task_id"
+        const val EXTRA_TASK_NAME       = "task_name"
+        const val EXTRA_DURATION_MIN    = "duration_min"
+        // Pause/Resume broadcast actions
+        const val ACTION_PAUSE          = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME         = "com.checkmate.ATTENTION_RESUME"
 
         fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
             val intent = Intent(context, AttentionCycleService::class.java).apply {
@@ -35,14 +38,35 @@ class AttentionCycleService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, AttentionCycleService::class.java))
         }
+
+        fun sendPause(context: Context) =
+            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
+
+        fun sendResume(context: Context) =
+            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val scope     = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var cycleJob: Job? = null
+    private var isPaused  = false
+
+    private val pauseReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
+                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_PAUSE)
+            addAction(ACTION_RESUME)
+        }
+        registerReceiver(pauseReceiver, filter)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -60,6 +84,15 @@ class AttentionCycleService : Service() {
         cycleJob?.cancel()
         cycleJob = scope.launch {
             while (isActive) {
+                if (isPaused) {
+                    // While paused: update notification to show PAUSED state, don't tick
+                    val paused = AttentionCycleManager.currentState()
+                    val notif = buildNotification("⏸ PAUSED", taskName, paused.totalSessionSeconds, paused.cycleIndex)
+                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notif)
+                    delay(1_000)
+                    continue
+                }
+
                 val cs = AttentionCycleManager.tick()
 
                 val notif = buildNotification(
@@ -76,6 +109,7 @@ class AttentionCycleService : Service() {
                         AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
                         AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
                         AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
+                        AttentionPhase.PAUSED      -> CheckmateTTS.speak(this@AttentionCycleService, "Session paused.")
                         AttentionPhase.DONE        -> {
                             CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
                             stopSelf()
@@ -84,7 +118,6 @@ class AttentionCycleService : Service() {
                     }
                 }
 
-                // Fix: phaseSecondsLeft is Long — compare with 0L, not 0 (Int)
                 if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L) {
                     CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
                 }
@@ -102,6 +135,7 @@ class AttentionCycleService : Service() {
             AttentionPhase.FOCUS       -> "FOCUS — $time"
             AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $time"
             AttentionPhase.LONG_BREAK  -> "LONG BREAK — $time"
+            AttentionPhase.PAUSED      -> "⏸ PAUSED — $time"
             AttentionPhase.DONE        -> "SESSION COMPLETE"
         }
     }
@@ -142,6 +176,7 @@ class AttentionCycleService : Service() {
     override fun onDestroy() {
         cycleJob?.cancel()
         scope.cancel()
+        unregisterReceiver(pauseReceiver)
         AttentionCycleManager.reset()
         super.onDestroy()
     }

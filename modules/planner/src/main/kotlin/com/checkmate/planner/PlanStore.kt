@@ -42,6 +42,22 @@ object PlanStore {
         it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
     }
 
+    /** Blueprint 2.5: Pause a task — records pausedAt timestamp */
+    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt)
+    }
+
+    /** Blueprint 2.5: Resume a task — accumulates totalPausedMs, clears pausedAt */
+    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
+        val pausedDuration = if (task.pausedAt != null && task.pausedAt > 0L)
+            resumedAt - task.pausedAt else 0L
+        task.copy(
+            state        = TaskState.ACTIVE,
+            pausedAt     = null,
+            totalPausedMs = task.totalPausedMs + pausedDuration
+        )
+    }
+
     private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
         val updated = _todayTasks.value.map { if (it.id == taskId) block(it) else it }
         _todayTasks.value = updated

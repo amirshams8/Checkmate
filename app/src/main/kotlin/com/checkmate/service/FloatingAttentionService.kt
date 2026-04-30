@@ -14,8 +14,9 @@ import com.checkmate.ui.theme.*
 import kotlinx.coroutines.*
 
 /**
- * Floating overlay showing phase timer + ✅ attention check button.
- * The ✅ button pulses when it's time for a check.
+ * Floating overlay showing phase timer + PAUSE/RESUME/✅ buttons.
+ * Blueprint 2.3: Added PAUSE button alongside existing DONE button.
+ * Bar states: FOCUS ▶ | PAUSED ⏸ (pulsing amber color)
  */
 class FloatingAttentionService : Service() {
 
@@ -42,6 +43,7 @@ class FloatingAttentionService : Service() {
     private var tvSession: TextView? = null
     private var tvCycle: TextView? = null
     private var btnCheck: TextView? = null
+    private var btnPause: TextView? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -71,10 +73,8 @@ class FloatingAttentionService : Service() {
             y = 120
         }
 
-        // Build a simple programmatic view (no XML needed)
         val layout = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
-            setBackgroundColor(0xDD11111C.toInt())
             setPadding(24, 16, 24, 16)
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(0xDD11111C.toInt())
@@ -100,6 +100,29 @@ class FloatingAttentionService : Service() {
             typeface = android.graphics.Typeface.MONOSPACE
             text = "Cycle 1"
         }
+
+        // Button row: PAUSE | ✅
+        val btnRow = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+        }
+        btnPause = TextView(this).apply {
+            setTextColor(0xFFFFB347.toInt()) // amber
+            textSize = 20f
+            text = "⏸"
+            setPadding(0, 8, 16, 0)
+            setOnClickListener {
+                val cs = AttentionCycleManager.currentState()
+                if (cs.phase == AttentionPhase.PAUSED) {
+                    AttentionCycleService.sendResume(this@FloatingAttentionService)
+                    text = "⏸"
+                    setTextColor(0xFFFFB347.toInt())
+                } else {
+                    AttentionCycleService.sendPause(this@FloatingAttentionService)
+                    text = "▶"
+                    setTextColor(0xFF00C896.toInt())
+                }
+            }
+        }
         btnCheck = TextView(this).apply {
             setTextColor(0xFF00C896.toInt())
             textSize = 22f
@@ -110,11 +133,13 @@ class FloatingAttentionService : Service() {
                 visibility = View.GONE
             }
         }
+        btnRow.addView(btnPause)
+        btnRow.addView(btnCheck)
 
         layout.addView(tvPhase)
         layout.addView(tvSession)
         layout.addView(tvCycle)
-        layout.addView(btnCheck)
+        layout.addView(btnRow)
         overlayView = layout
 
         try { windowManager?.addView(overlayView, params) } catch (_: Exception) {}
@@ -124,8 +149,8 @@ class FloatingAttentionService : Service() {
         scope.launch {
             while (isActive) {
                 val cs = AttentionCycleManager.currentState()
-                val m = cs.phaseSecondsLeft / 60
-                val s = cs.phaseSecondsLeft % 60
+                val m  = cs.phaseSecondsLeft / 60
+                val s  = cs.phaseSecondsLeft % 60
                 val tm = cs.totalSessionSeconds / 60
                 val ts = cs.totalSessionSeconds % 60
 
@@ -133,6 +158,7 @@ class FloatingAttentionService : Service() {
                     AttentionPhase.FOCUS       -> 0xFF00C896.toInt()
                     AttentionPhase.SHORT_BREAK -> 0xFF00C896.toInt()
                     AttentionPhase.LONG_BREAK  -> 0xFFFFB347.toInt()
+                    AttentionPhase.PAUSED      -> 0xFFFFB347.toInt() // pulsing amber for paused
                     AttentionPhase.DONE        -> 0xFF9090A8.toInt()
                 }
                 tvPhase?.setTextColor(phaseColor)
@@ -140,11 +166,23 @@ class FloatingAttentionService : Service() {
                     AttentionPhase.FOCUS       -> "FOCUS — $m:${String.format("%02d", s)}"
                     AttentionPhase.SHORT_BREAK -> "BREAK — $m:${String.format("%02d", s)}"
                     AttentionPhase.LONG_BREAK  -> "LONG BREAK — $m:${String.format("%02d", s)}"
+                    AttentionPhase.PAUSED      -> "⏸ PAUSED — $m:${String.format("%02d", s)}"
                     AttentionPhase.DONE        -> "DONE"
                 }
                 tvSession?.text = "Session: ${tm}m ${ts}s"
                 tvCycle?.text   = "Cycle ${cs.cycleIndex}"
                 btnCheck?.visibility = if (cs.needsAttentionCheck) View.VISIBLE else View.GONE
+
+                // Update pause button icon based on current state
+                btnPause?.let { btn ->
+                    if (cs.phase == AttentionPhase.PAUSED) {
+                        btn.text = "▶"
+                        btn.setTextColor(0xFF00C896.toInt())
+                    } else if (cs.phase != AttentionPhase.DONE) {
+                        btn.text = "⏸"
+                        btn.setTextColor(0xFFFFB347.toInt())
+                    }
+                }
 
                 if (cs.phase == AttentionPhase.DONE) stopSelf()
                 delay(1_000)

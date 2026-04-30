@@ -20,12 +20,17 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.DailyCheckIn
 import com.checkmate.ui.theme.*
 
 @Composable
 fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel()) {
     val state   = vm.state.collectAsState().value
     val context = LocalContext.current
+
+    val hasProfile  = ConsultationProfile.hasProfile()
+    val hasCheckIn  = DailyCheckIn.hasDoneCheckInToday()
 
     LazyColumn(
         modifier            = Modifier.fillMaxSize().background(BgDark),
@@ -35,6 +40,61 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
         item {
             Text("Study Plan", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = White90)
             Text("Configure your exam to generate an adaptive daily plan", fontSize = 13.sp, color = White60)
+        }
+
+        // ── Setup shortcuts ──
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                // Consultation profile button
+                OutlinedButton(
+                    onClick  = { navController.navigate("consultation") },
+                    modifier = Modifier.weight(1f),
+                    border   = BorderStroke(1.dp, if (hasProfile) AccentGreen.copy(alpha = 0.5f) else AccentAmber),
+                    colors   = ButtonDefaults.outlinedButtonColors(
+                        contentColor = if (hasProfile) AccentGreen else AccentAmber
+                    )
+                ) {
+                    Icon(
+                        if (hasProfile) Icons.Default.CheckCircle else Icons.Default.PersonAdd,
+                        null, modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (hasProfile) "Profile ✓" else "Setup Profile",
+                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                    )
+                }
+                // Coaching schedule button
+                OutlinedButton(
+                    onClick  = { navController.navigate("coaching_plan") },
+                    modifier = Modifier.weight(1f),
+                    border   = BorderStroke(1.dp, White30),
+                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = White60)
+                ) {
+                    Icon(Icons.Default.School, null, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Coaching", fontSize = 12.sp)
+                }
+                // Daily check-in button
+                OutlinedButton(
+                    onClick  = { navController.navigate("daily_checkin") },
+                    modifier = Modifier.weight(1f),
+                    border   = BorderStroke(1.dp, if (hasCheckIn) AccentGreen.copy(alpha = 0.5f) else AccentAmber),
+                    colors   = ButtonDefaults.outlinedButtonColors(
+                        contentColor = if (hasCheckIn) AccentGreen else AccentAmber
+                    )
+                ) {
+                    Icon(
+                        if (hasCheckIn) Icons.Default.CheckCircle else Icons.Default.Today,
+                        null, modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (hasCheckIn) "Check-In ✓" else "Check-In",
+                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
         }
 
         // ── Exam type ──
@@ -57,7 +117,6 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             }
         }
 
-        // ── Exam date ──
         item {
             SectionCard(title = "Exam Date") {
                 OutlinedTextField(
@@ -72,7 +131,6 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             }
         }
 
-        // ── Study window ──
         item {
             SectionCard(title = "Study Window") {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -96,7 +154,6 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             }
         }
 
-        // ── Subjects + weightage ──
         item {
             SectionCard(title = "Subjects") {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -136,38 +193,28 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             }
         }
 
-        // ── Guardian WhatsApp ──
         item {
             SectionCard(title = "Guardian WhatsApp") {
                 OutlinedTextField(
                     value           = state.guardianNumber,
                     onValueChange   = vm::setGuardianNumber,
                     label           = { Text("+91XXXXXXXXXX", color = White30) },
-                    placeholder     = { Text("Enter guardian phone number", color = White30) },
                     singleLine      = true,
                     modifier        = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                     leadingIcon     = { Icon(Icons.Default.Phone, null, tint = AccentGreen) },
                     colors          = plannerFieldColors()
                 )
-                if (state.guardianNumber.isNotBlank()) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Weekly reports will be sent to this number via WhatsApp",
-                        fontSize = 11.sp,
-                        color    = White60
-                    )
-                }
             }
         }
 
-        // ── Attention cycle settings ──
         item {
             SectionCard(title = "Attention Cycle") {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("Focus block: 30 min  →  Short break: 5 min", fontSize = 13.sp, color = White60)
                     Text("After 2 focus blocks: Long break 10 min",    fontSize = 13.sp, color = White60)
                     Text("✅ button confirms attention every 30 min",   fontSize = 13.sp, color = White60)
+                    Text("⏸ Pause/Resume now available on task cards", fontSize = 13.sp, color = White60)
                     Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Voice reminders", fontSize = 13.sp, color = White90, modifier = Modifier.weight(1f))
@@ -184,7 +231,6 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
             }
         }
 
-        // ── Generate Plan button ──
         item {
             Button(
                 onClick  = { vm.generatePlan(context) },
@@ -206,9 +252,7 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
         }
 
         if (state.generatedTasks.isNotEmpty()) {
-            item {
-                Text("Today's Plan", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            }
+            item { Text("Today's Plan", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = White90) }
             items(state.generatedTasks) { task ->
                 Surface(
                     shape  = RoundedCornerShape(10.dp),
@@ -220,8 +264,8 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(task.subject,  fontSize = 11.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
-                            Text(task.topic,    fontSize = 15.sp, color = White90)
+                            Text(task.subject, fontSize = 11.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
+                            Text(task.topic,   fontSize = 15.sp, color = White90)
                         }
                         Text("${task.durationMinutes}m", fontSize = 13.sp, color = White60)
                     }
@@ -232,9 +276,7 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
                     onClick  = { vm.savePlan(context); navController.navigate("home") },
                     modifier = Modifier.fillMaxWidth(),
                     colors   = ButtonDefaults.buttonColors(containerColor = AccentBlue)
-                ) {
-                    Text("Use This Plan", fontWeight = FontWeight.Bold)
-                }
+                ) { Text("Use This Plan", fontWeight = FontWeight.Bold) }
             }
         }
 

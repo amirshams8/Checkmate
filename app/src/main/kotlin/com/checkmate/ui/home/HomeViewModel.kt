@@ -38,7 +38,8 @@ class HomeViewModel : ViewModel() {
             PlanStore.todayTasks.collect { tasks ->
                 _state.update { it.copy(
                     tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE }
+                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
+                    activeTaskId   = tasks.firstOrNull { t -> t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED }?.id
                 )}
             }
         }
@@ -60,24 +61,15 @@ class HomeViewModel : ViewModel() {
 
     fun startTask(context: Context, task: StudyTask) {
         viewModelScope.launch {
-            // Activate Work Mode
             WorkModeManager.activate(context)
-
-            // Open mapped app if set
             val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
             mappedPkg?.let { pkg ->
                 val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
                 launchIntent?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 launchIntent?.let { context.startActivity(it) }
             }
-
-            // Start attention cycle service
             AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-
-            // TTS
             CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-
-            // Update state
             PlanStore.setTaskActive(task.id)
             _state.update { it.copy(activeTaskId = task.id) }
         }
@@ -104,6 +96,25 @@ class HomeViewModel : ViewModel() {
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
             _state.update { it.copy(activeTaskId = null, psycheMessage = msg) }
+        }
+    }
+
+    /** Blueprint 2.5: Pause the active task */
+    fun pauseTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            PlanStore.pauseTask(task.id, now)
+            AttentionCycleService.sendPause(context)
+            _state.update { it.copy(activeTaskId = task.id) } // keep it active but paused
+        }
+    }
+
+    /** Blueprint 2.5: Resume a paused task */
+    fun resumeTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            PlanStore.resumeTask(task.id, now)
+            AttentionCycleService.sendResume(context)
         }
     }
 }

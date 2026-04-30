@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.AdaptivePlanner
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.PlannerState
@@ -15,24 +16,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-/**
- * UI state for the planner screen — separate from modules:planner PlannerState
- * which is the config passed to AdaptivePlanner.
- */
 data class PlannerUiState(
-    val examType:       String             = "NEET",
-    val examDate:       String             = "",
-    val studyStartTime: String             = "06:00",
-    val studyEndTime:   String             = "22:00",
+    val examType:       String              = "NEET",
+    val examDate:       String              = "",
+    val studyStartTime: String              = "06:00",
+    val studyEndTime:   String              = "22:00",
     val subjects:       List<SubjectConfig> = listOf(
         SubjectConfig("Biology",   3),
         SubjectConfig("Chemistry", 2),
         SubjectConfig("Physics",   2)
     ),
-    val guardianNumber: String             = "",
-    val ttsEnabled:     Boolean            = true,
-    val isGenerating:   Boolean            = false,
-    val generatedTasks: List<StudyTask>    = emptyList()
+    val guardianNumber: String              = "",
+    val ttsEnabled:     Boolean             = true,
+    val isGenerating:   Boolean             = false,
+    val generatedTasks: List<StudyTask>     = emptyList()
 )
 
 class PlannerViewModel : ViewModel() {
@@ -44,12 +41,12 @@ class PlannerViewModel : ViewModel() {
 
     private fun loadSaved() {
         _state.update { s -> s.copy(
-            examType       = CheckmatePrefs.getString("exam_type",        "NEET")  ?: "NEET",
-            examDate       = CheckmatePrefs.getString("exam_date",        "")      ?: "",
-            studyStartTime = CheckmatePrefs.getString("study_start",      "06:00") ?: "06:00",
-            studyEndTime   = CheckmatePrefs.getString("study_end",        "22:00") ?: "22:00",
-            guardianNumber = CheckmatePrefs.getString("guardian_number",  "")      ?: "",
-            ttsEnabled     = CheckmatePrefs.getBoolean("tts_enabled",     true)
+            examType       = CheckmatePrefs.getString("exam_type",       "NEET")  ?: "NEET",
+            examDate       = CheckmatePrefs.getString("exam_date",       "")      ?: "",
+            studyStartTime = CheckmatePrefs.getString("study_start",     "06:00") ?: "06:00",
+            studyEndTime   = CheckmatePrefs.getString("study_end",       "22:00") ?: "22:00",
+            guardianNumber = CheckmatePrefs.getString("guardian_number", "")      ?: "",
+            ttsEnabled     = CheckmatePrefs.getBoolean("tts_enabled",    true)
         )}
         val subjectsRaw = CheckmatePrefs.getString("subjects_config", null)
         if (!subjectsRaw.isNullOrBlank()) {
@@ -140,6 +137,15 @@ class PlannerViewModel : ViewModel() {
                 emptyList()
             }
             _state.update { it.copy(isGenerating = false, generatedTasks = tasks) }
+
+            // FIX 1.5: ttsEnabled existed and was wired to the UI toggle but generatePlan()
+            // never actually called CheckmateTTS.speak() — plan generation was always silent.
+            if (s.ttsEnabled && tasks.isNotEmpty()) {
+                val firstTask = tasks.first()
+                val summary = "Plan ready. ${tasks.size} task${if (tasks.size != 1) "s" else ""}. " +
+                        "Starting with ${firstTask.subject}: ${firstTask.topic}."
+                CheckmateTTS.speak(context, summary)
+            }
         }
     }
 

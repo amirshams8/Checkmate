@@ -29,7 +29,7 @@ import com.checkmate.ui.theme.*
 
 @Composable
 fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
-    val state by vm.state.collectAsState()
+    val state   by vm.state.collectAsState()
     val context = LocalContext.current
 
     Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
@@ -45,9 +45,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
                     streakDays     = state.streakDays
                 )
             }
-            item {
-                DayProgressBar(completed = state.completedToday, total = state.tasks.size)
-            }
+            item { DayProgressBar(completed = state.completedToday, total = state.tasks.size) }
             if (state.psycheMessage.isNotBlank()) {
                 item { PsycheMessageCard(message = state.psycheMessage) }
             }
@@ -60,7 +58,9 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
                         isActive = state.activeTaskId == task.id,
                         onStart  = { vm.startTask(context, task) },
                         onDone   = { vm.markDone(context, task) },
-                        onSkip   = { vm.markSkip(context, task) }
+                        onSkip   = { vm.markSkip(context, task) },
+                        onPause  = { vm.pauseTask(context, task) },
+                        onResume = { vm.resumeTask(context, task) }
                     )
                 }
             }
@@ -137,13 +137,17 @@ private fun PsycheMessageCard(message: String) {
 
 @Composable
 private fun TaskCard(
-    task: StudyTask,
+    task:     StudyTask,
     isActive: Boolean,
-    onStart: () -> Unit,
-    onDone: () -> Unit,
-    onSkip: () -> Unit
+    onStart:  () -> Unit,
+    onDone:   () -> Unit,
+    onSkip:   () -> Unit,
+    onPause:  () -> Unit,
+    onResume: () -> Unit
 ) {
+    val isPaused    = task.state == TaskState.PAUSED
     val borderColor = when {
+        isPaused                        -> AccentAmber
         isActive                        -> AccentGreen
         task.state == TaskState.DONE    -> AccentGreen.copy(alpha = 0.3f)
         task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
@@ -152,12 +156,11 @@ private fun TaskCard(
 
     Surface(
         shape  = RoundedCornerShape(14.dp),
-        color  = if (isActive) BgCardAlt else BgCard,
+        color  = if (isActive || isPaused) BgCardAlt else BgCard,
         border = BorderStroke(1.dp, borderColor)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
 
-            // ── Header row ────────────────────────────────────────────────
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -175,12 +178,27 @@ private fun TaskCard(
                         fontFamily    = FontFamily.Monospace
                     )
                 }
-                Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (isPaused) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AccentAmber.copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                "⏸ PAUSED",
+                                fontSize   = 10.sp,
+                                color      = AccentAmber,
+                                fontWeight = FontWeight.Bold,
+                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                    Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+                }
             }
 
             Spacer(Modifier.height(8.dp))
 
-            // ── Topic ─────────────────────────────────────────────────────
             Text(
                 text       = task.topic,
                 fontSize   = 17.sp,
@@ -188,25 +206,7 @@ private fun TaskCard(
                 color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
             )
 
-            // ── Action area ───────────────────────────────────────────────
-            // FIX: The original code used `return@Column` to bail out early when
-            // a task was DONE or SKIPPED. This caused two crashes confirmed in logcat:
-            //
-            //   PID 29484 @ 02:26:09 — IndexOutOfBoundsException: Index -1 out of
-            //   bounds for length 0 at androidx.compose.runtime.Stack.pop (Stack.kt:26)
-            //   via ComposerImpl.exitGroup → end → endGroup → endRoot
-            //
-            //   PID 15159 @ 02:26:29 — ArrayIndexOutOfBoundsException: length=0;
-            //   index=-5 at SlotReader.groupKey (SlotTable.kt:957) inside LazyList
-            //   measurement (LazyListMeasure.kt:195)
-            //
-            // Root cause: `return@Column` exits the Column lambda early, leaving
-            // Compose's internal slot table with unmatched group push/pop entries.
-            // On the next recomposition or LazyColumn re-measure the runtime tries
-            // to pop a group that was never pushed → crash.
-            //
-            // Fix: replace early-return with if/else so every code path emits the
-            // same number of Compose group open/close pairs.
+            // Action area — fixed with if/else to avoid Compose slot table crash
             if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -217,9 +217,34 @@ private fun TaskCard(
             } else {
                 Spacer(Modifier.height(12.dp))
 
-                if (isActive) {
-                    // Running task → Done + Skip
+                if (isPaused) {
+                    // Paused task → Resume + Skip
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick  = onResume,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentAmber),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp), tint = Color.Black)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Resume", fontWeight = FontWeight.Bold, color = Color.Black)
+                        }
+                        OutlinedButton(
+                            onClick = onSkip,
+                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
+                        ) { Text("Skip") }
+                    }
+                } else if (isActive) {
+                    // Running task → Pause + Done + Skip
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onPause,
+                            border  = BorderStroke(1.dp, AccentAmber.copy(alpha = 0.6f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentAmber)
+                        ) {
+                            Icon(Icons.Default.Pause, null, modifier = Modifier.size(16.dp))
+                        }
                         Button(
                             onClick  = onDone,
                             colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
@@ -236,9 +261,7 @@ private fun TaskCard(
                         ) { Text("Skip") }
                     }
                 } else {
-                    // FIX: Previously Skip was only shown when isActive=true, so tapping
-                    // Skip on a PENDING task did nothing (button wasn't even rendered).
-                    // Now PENDING tasks show Start + Skip side by side.
+                    // Pending task → Start + Skip
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick  = onStart,
