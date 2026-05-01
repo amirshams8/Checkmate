@@ -1,719 +1,251 @@
 // ================================================================
-// CHECKMATE — CRASH FIX + GUARDIAN NOTIFIER SYSTEM
+// CHECKMATE — WHATSAPP AUTOMATION FIX
 // ================================================================
 
-// CRASH ROOT CAUSE (logcat confirmed 4x, PIDs 21830/23361/23438/23736):
-//   AttentionCycleService.onCreate:69
-//   SecurityException: RECEIVER_NOT_EXPORTED not specified
-//   Android 14 (API 34) made this mandatory for dynamic receivers on non-system broadcasts.
-//   Fix: pass Context.RECEIVER_NOT_EXPORTED on API 33+
+// ROOT CAUSE (from logcat):
+//   AutomationEngine: message queued ✓
+//   GuardianNotifier: WhatsApp opened via method A ✓
+//   com.whatsapp/.Conversation visible ✓
+//   CheckmateAutomation: ZERO events — AppAutomationService never fired
+//
+// Two possible reasons (check adb cmd above first):
+//   A) AppAutomationService not enabled in Accessibility Settings
+//      → user must enable it manually, can't be done programmatically
+//   B) accessibility_service.xml missing com.whatsapp package filter
+//      → service receives events but ignores WhatsApp's window
+//
+// Both fixed below.
 
-// GUARDIAN NOTIFIER — 3 auto-triggers:
-//   1. notifyTaskStarted() → called from HomeViewModel.startTask()
-//   2. notifySkipStreak()  → fires when consecutiveSkips >= 3
-//   3. EodSummaryReceiver  → 9 PM daily AlarmManager → full day summary
+//===== FILE: app/src/main/res/xml/accessibility_service.xml =====
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="100"
+    android:packageNames="com.whatsapp,com.checkmate"
+    android:description="@string/service_desc" />
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
-package com.checkmate.service
+//===== FILE: app/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+package com.checkmate.automation
 
-import android.app.*
-import android.content.Context
+import android.accessibilityservice.AccessibilityService
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.os.*
-import androidx.core.app.NotificationCompat
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.AttentionPhase
-import com.checkmate.core.tts.CheckmateTTS
-import kotlinx.coroutines.*
-
-class AttentionCycleService : Service() {
-
-    companion object {
-        private const val CHANNEL_ID = "attention_cycle_channel"
-        private const val NOTIF_ID   = 42
-        const val EXTRA_TASK_ID      = "task_id"
-        const val EXTRA_TASK_NAME    = "task_name"
-        const val EXTRA_DURATION_MIN = "duration_min"
-        const val ACTION_PAUSE       = "com.checkmate.ATTENTION_PAUSE"
-        const val ACTION_RESUME      = "com.checkmate.ATTENTION_RESUME"
-
-        fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
-            val intent = Intent(context, AttentionCycleService::class.java).apply {
-                putExtra(EXTRA_TASK_ID,      taskId)
-                putExtra(EXTRA_TASK_NAME,    taskName)
-                putExtra(EXTRA_DURATION_MIN, durationMinutes)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                context.startForegroundService(intent)
-            else
-                context.startService(intent)
-        }
-
-        fun stop(context: Context) =
-            context.stopService(Intent(context, AttentionCycleService::class.java))
-
-        fun sendPause(context: Context) =
-            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
-
-        fun sendResume(context: Context) =
-            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
-    }
-
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var cycleJob: Job? = null
-    private var isPaused = false
-
-    private val pauseReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(ctx: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
-                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
-            }
-        }
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        createChannel()
-        val filter = android.content.IntentFilter().apply {
-            addAction(ACTION_PAUSE)
-            addAction(ACTION_RESUME)
-        }
-        // FIX: Android 14 (API 34) requires RECEIVER_NOT_EXPORTED for dynamic receivers
-        // on non-system broadcasts. Without this -> SecurityException -> FATAL at onCreate:69.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(pauseReceiver, filter)
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
-        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
-        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
-        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
-        AttentionCycleManager.start(taskId, taskName, durationMin)
-        startCycleLoop(taskName)
-        return START_NOT_STICKY
-    }
-
-    private fun startCycleLoop(taskName: String) {
-        cycleJob?.cancel()
-        cycleJob = scope.launch {
-            while (isActive) {
-                if (isPaused) {
-                    val cs = AttentionCycleManager.currentState()
-                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
-                    delay(1_000)
-                    continue
-                }
-                val cs = AttentionCycleManager.tick()
-                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                    .notify(NOTIF_ID, buildNotification(
-                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
-                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
-
-                if (cs.phaseJustChanged) {
-                    when (cs.phase) {
-                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
-                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
-                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
-                        AttentionPhase.PAUSED      -> {}
-                        AttentionPhase.DONE        -> {
-                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
-                            stopSelf(); return@launch
-                        }
-                    }
-                }
-                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
-                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
-                delay(1_000)
-            }
-        }
-    }
-
-    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
-        val m = secondsLeft / 60; val s = secondsLeft % 60
-        val t = String.format("%d:%02d", m, s)
-        return when (phase) {
-            AttentionPhase.FOCUS       -> "FOCUS — $t"
-            AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $t"
-            AttentionPhase.LONG_BREAK  -> "LONG BREAK — $t"
-            AttentionPhase.PAUSED      -> "PAUSED — $t"
-            AttentionPhase.DONE        -> "SESSION COMPLETE"
-        }
-    }
-
-    private fun buildNotification(
-        phaseText: String, taskName: String,
-        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
-    ): Notification {
-        val tm = totalSeconds / 60; val ts = totalSeconds % 60
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
-            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
-            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
-            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
-            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
-    }
-
-    private fun startForegroundCompat(n: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        else startForeground(NOTIF_ID, n)
-    }
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
-    }
-
-    override fun onDestroy() {
-        cycleJob?.cancel(); scope.cancel()
-        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
-        AttentionCycleManager.reset()
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
-package com.checkmate.service
-
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import com.checkmate.automation.AutomationEngine
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.TaskState
-import java.util.Calendar
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
 
-/**
- * GuardianNotifier — all 3 auto-triggered guardian WhatsApp messages.
- *
- * Delivery flow:
- *   1. AutomationEngine.queueWhatsAppMessage(text) — stores the message
- *   2. openWhatsAppAndSend() — launches WhatsApp to guardian chat via intent
- *   3. AppAutomationService detects WhatsApp open → calls tryTypeAndSend()
- *      → finds input field → sets text → clicks send button
- *
- * Intent method A (whatsapp://send) is tried first — opens directly to chat.
- * Method B (wa.me) is the fallback if A fails on this device.
- */
-object GuardianNotifier {
+class AppAutomationService : AccessibilityService() {
 
-    private const val TAG = "GuardianNotifier"
-    const val ACTION_EOD_SUMMARY = "com.checkmate.EOD_SUMMARY"
+    private val TAG      = "CheckmateAutomation"
+    private val WHATSAPP = "com.whatsapp"
 
-    // ── Trigger 1: Task Started ──────────────────────────────────────────────
+    // Track whether we already attempted to type in this WhatsApp session
+    // so we don't re-fire on every subsequent content-changed event
+    private var typingAttempted = false
+    private var lastWhatsAppPkg = ""
 
-    fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
-        val number = getGuardianNumber() ?: return
-        val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "Guardian notified: task started")
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "Automation service connected — watching: com.whatsapp, com.checkmate")
     }
 
-    // ── Trigger 2: Skip Streak ───────────────────────────────────────────────
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
 
-    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String) {
-        val number = getGuardianNumber() ?: return
-        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic. Time: ${timeNow()}"
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "Guardian notified: skip streak=$skipCount")
-    }
-
-    // ── Trigger 3: End of Day Summary (9 PM alarm) ───────────────────────────
-
-    fun scheduleEndOfDaySummary(context: Context) {
-        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pi = PendingIntent.getBroadcast(
-            context, 9001,
-            Intent(context, EodSummaryReceiver::class.java).apply { action = ACTION_EOD_SUMMARY },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 21)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
-        }
-        am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
-        Log.d(TAG, "EOD summary alarm set for 21:00 daily")
-    }
-
-    fun sendEndOfDaySummary(context: Context) {
-        val number = getGuardianNumber() ?: return
-        val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
-        val done    = tasks.count { it.state == TaskState.DONE }
-        val skipped = tasks.count { it.state == TaskState.SKIPPED }
-        val total   = tasks.size
-        val pct     = if (total > 0) done * 100 / total else 0
-
-        val lines = tasks.joinToString("\n") { t ->
-            val icon = when (t.state) {
-                TaskState.DONE    -> "done"
-                TaskState.SKIPPED -> "skip"
-                else              -> "miss"
+        // ── Work Mode: block distraction apps ──────────────────────────────
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                Log.d(TAG, "Blocking distraction app: $pkg")
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                return
             }
-            "[$icon] ${t.subject}: ${t.topic}"
         }
 
-        val msg = buildString {
-            appendLine("Checkmate Daily Report — ${dateToday()}")
-            appendLine("Completed: $done/$total ($pct%)")
-            if (skipped > 0) appendLine("Skipped: $skipped")
-            appendLine()
-            appendLine(lines)
-        }.trim()
+        // ── WhatsApp: type+send queued message ─────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
 
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "EOD summary sent to guardian")
-    }
+        Log.d(TAG, "WhatsApp event: type=${AccessibilityEvent.eventTypeToString(event.eventType)} class=${event.className}")
 
-    // ── WhatsApp delivery (method A with B fallback) ─────────────────────────
-
-    private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
-        val clean = number.replace(Regex("[^0-9]"), "")
-        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
-
-        // Queue text — AutomationEngine / AppAutomationService will type + send
-        AutomationEngine.queueWhatsAppMessage(message)
-
-        // Method A: whatsapp://send — direct to chat, no browser, no extra tap
-        val intentA = Intent(Intent.ACTION_VIEW,
-            Uri.parse("whatsapp://send?phone=$clean")).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        // Reset typing flag when WhatsApp is freshly opened
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val className = event.className?.toString() ?: ""
+            Log.d(TAG, "WhatsApp window state changed: $className")
+            // Reset on any new WhatsApp window — Conversation is the chat screen
+            if (pkg != lastWhatsAppPkg) {
+                typingAttempted = false
+                lastWhatsAppPkg = pkg
+            }
+            if (className.contains("Conversation", ignoreCase = true) ||
+                className.contains("DeepLink", ignoreCase = true) ||
+                className.contains("Main", ignoreCase = true)) {
+                typingAttempted = false
+            }
         }
-        if (runCatching { context.startActivity(intentA) }.isSuccess) {
-            Log.d(TAG, "WhatsApp opened via method A")
+
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run {
+            Log.w(TAG, "rootInActiveWindow is null — skipping")
             return
         }
 
-        // Method B: wa.me fallback (browser redirect)
-        val intentB = Intent(Intent.ACTION_VIEW,
-            Uri.parse("https://wa.me/$clean")).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        // Try immediately
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            // WhatsApp chat UI sometimes takes ~800ms to fully inflate after DeepLink resolves.
+            // Retry after a short delay if input field wasn't found on first attempt.
+            Log.d(TAG, "Input field not found immediately — retrying in 800ms")
+            Handler(Looper.getMainLooper()).postDelayed({
+                val freshRoot = rootInActiveWindow
+                if (freshRoot != null && AutomationEngine.hasPendingMessage()) {
+                    tryTypeAndSend(freshRoot)
+                }
+            }, 800)
         }
-        runCatching { context.startActivity(intentB) }
-            .onSuccess { Log.d(TAG, "WhatsApp opened via method B fallback") }
-            .onFailure { Log.e(TAG, "Both WhatsApp methods failed: ${it.message}") }
     }
 
-    private fun getGuardianNumber(): String? {
-        val n = CheckmatePrefs.getString("guardian_number", null)
-        if (n.isNullOrBlank()) { Log.w(TAG, "Guardian number not set"); return null }
-        return n
-    }
+    /**
+     * Finds the WhatsApp message input field, sets text, then clicks send.
+     * Returns true if the input field was found (regardless of send success).
+     */
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
 
-    private fun timeNow(): String {
-        val c = Calendar.getInstance()
-        return String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
-    }
+        // 1. Find input field — try resource ID first, fall back to EditText class
+        val inputNode = findNodeById(root, "com.whatsapp:id/entry")
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+            ?: findNodeByClass(root, "android.widget.EditText")
 
-    private fun dateToday(): String {
-        val c = Calendar.getInstance()
-        return String.format("%02d/%02d/%04d",
-            c.get(Calendar.DAY_OF_MONTH), c.get(Calendar.MONTH) + 1, c.get(Calendar.YEAR))
-    }
-}
+        if (inputNode == null) {
+            Log.w(TAG, "Input field not found. Dumping visible nodes:")
+            dumpNodeTree(root, 0)
+            return false
+        }
 
-class EodSummaryReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
-            GuardianNotifier.sendEndOfDaySummary(context)
-    }
-}
+        Log.d(TAG, "Found input field: id=${inputNode.viewIdResourceName} class=${inputNode.className}")
+        typingAttempted = true
 
+        // 2. Focus the field
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
-package com.checkmate.ui.home
+        // 3. Set text
+        val args = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                message
+            )
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "Text set result: $textSet — message: ${message.take(50)}")
 
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.service.AttentionCycleService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.workmode.WorkModeManager
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
+        if (!textSet) {
+            Log.e(TAG, "ACTION_SET_TEXT failed — accessibility permission may be missing or WhatsApp blocked it")
+            return true // field was found, just couldn't set text
+        }
 
-data class HomeState(
-    val tasks:             List<StudyTask> = emptyList(),
-    val activeTaskId:      String?         = null,
-    val completedToday:    Int             = 0,
-    val streakDays:        Int             = 0,
-    val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0
-)
+        // Consume message only after successful text set
+        AutomationEngine.consumePendingWhatsAppMessage()
 
-class HomeViewModel : ViewModel() {
+        // 4. Click send after short delay (WhatsApp needs a tick to enable send button)
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: return@postDelayed
+            val sendNode = findNodeById(freshRoot, "com.whatsapp:id/send")
+                ?: findNodeByDesc(freshRoot, "Send")
+                ?: findNodeByDesc(freshRoot, "send")
 
-    private val _state = MutableStateFlow(HomeState())
-    val state: StateFlow<HomeState> = _state.asStateFlow()
-
-    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
-
-    private fun loadTodayPlan() {
-        viewModelScope.launch {
-            PlanStore.todayTasks.collect { tasks ->
-                _state.update { it.copy(
-                    tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t ->
-                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
-                    }?.id
-                )}
+            if (sendNode != null) {
+                val sent = sendNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                Log.d(TAG, "Send button clicked: $sent — id=${sendNode.viewIdResourceName}")
+            } else {
+                Log.e(TAG, "Send button not found after text set — dumping nodes:")
+                dumpNodeTree(freshRoot, 0)
             }
+        }, 400)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
+        return null
     }
 
-    private fun loadStreak() {
-        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
-    }
-
-    private fun loadPsycheMessage() {
-        viewModelScope.launch {
-            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
+        return null
     }
 
-    fun startTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            WorkModeManager.activate(context)
-            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
-            mappedPkg?.let { pkg ->
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ?.let { context.startActivity(it) }
-            }
-            AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-            PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-
-            // Auto-trigger 1: notify guardian task started
-            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
-        }
+    /** Dumps top 3 levels of the node tree for debugging when field not found */
+    private fun dumpNodeTree(node: AccessibilityNodeInfo, depth: Int) {
+        if (depth > 3) return
+        Log.d(TAG, "  ".repeat(depth) +
+                "id=${node.viewIdResourceName} " +
+                "class=${node.className} " +
+                "desc=${node.contentDescription} " +
+                "editable=${node.isEditable} " +
+                "clickable=${node.isClickable}")
+        for (i in 0 until node.childCount) node.getChild(i)?.let { dumpNodeTree(it, depth + 1) }
     }
 
-    fun markDone(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            WorkModeManager.deactivate(context)
-            PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task)
-            CheckmateTTS.speak(context, "Task complete. Well done.")
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
-        }
-    }
-
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            WorkModeManager.deactivate(context)
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-
-            // Auto-trigger 2: guardian alert after 3 consecutive skips
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
-            }
-        }
-    }
-
-    fun pauseTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
-        }
-    }
-
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
-        }
-    }
+    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
 }
 
 
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
-package com.checkmate.planner
+//===== FILE: app/src/main/kotlin/com/checkmate/automation/AutomationEngine.kt =====
+package com.checkmate.automation
 
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import java.util.Calendar
+import android.util.Log
 
-object PlanStore {
+object AutomationEngine {
 
-    private val json = Json { ignoreUnknownKeys = true }
-    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
-    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
+    private const val TAG = "AutomationEngine"
+    private var pendingWhatsAppMessage: String? = null
 
-    init { reload() }
-
-    private fun reload() {
-        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
-        _todayTasks.value = saved?.let {
-            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
-        } ?: emptyList()
+    fun queueWhatsAppMessage(text: String) {
+        pendingWhatsAppMessage = text
+        Log.d(TAG, "WhatsApp message queued: ${text.take(60)}")
     }
 
-    fun saveTodayTasks(tasks: List<StudyTask>) {
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(tasks))
-        _todayTasks.value = tasks
+    /** Peek without consuming — used to check if message exists before committing */
+    fun peekPendingWhatsAppMessage(): String? = pendingWhatsAppMessage
+
+    /** Consume — call only after successful ACTION_SET_TEXT */
+    fun consumePendingWhatsAppMessage(): String? {
+        val msg = pendingWhatsAppMessage
+        pendingWhatsAppMessage = null
+        Log.d(TAG, "WhatsApp message consumed")
+        return msg
     }
 
-    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
-
-    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
-        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
-    }
-
-    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
-        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt)
-    }
-
-    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
-        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
-        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
-    }
-
-    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
-        val updated = _todayTasks.value.map { if (it.id == taskId) block(it) else it }
-        _todayTasks.value = updated
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
-    }
-
-    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
-
-    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
-    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
-
-    fun getTodayCompletionPercent(): Int {
-        val t = _todayTasks.value
-        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
-    }
-
-    fun getStreakDays(): Int {
-        var streak = 0
-        val cal = Calendar.getInstance()
-        for (i in 0..30) {
-            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
-            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
-            if (tasks.count { it.state == TaskState.DONE } == 0 && tasks.isNotEmpty()) break
-            streak++
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return streak
-    }
-
-    fun getWeekCompletionPercent(): Int {
-        val cal = Calendar.getInstance(); var total = 0; var done = 0
-        repeat(7) {
-            val tasks = loadDay(keyForDay(cal))
-            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return if (total == 0) 0 else done * 100 / total
-    }
-
-    fun getWeeklyData(): List<Pair<String, Int>> {
-        val cal = Calendar.getInstance()
-        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
-        val result = mutableListOf<Pair<String, Int>>()
-        repeat(7) { i ->
-            val tasks = loadDay(keyForDay(cal))
-            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
-            result.add(0, Pair(days[6 - i], pct))
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return result
-    }
-
-    fun getSubjectStats(): List<Pair<String, Int>> =
-        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
-            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
-        }
-
-    private fun loadDay(key: String): List<StudyTask> {
-        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
-        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
-    }
-
-    private fun todayKey() = keyForDay(Calendar.getInstance())
-    private fun keyForDay(cal: Calendar) =
-        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    fun hasPendingMessage(): Boolean = pendingWhatsAppMessage != null
 }
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
-package com.checkmate
-
-import android.app.Application
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CheckmateState
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.service.GuardianNotifier
-
-class CheckmateApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        CheckmatePrefs.init(this)
-        CheckmateState.init(this)
-        CheckmateTTS.init(this)
-        // Schedules 9 PM daily EOD summary alarm. setRepeating with FLAG_UPDATE_CURRENT
-        // is idempotent — safe to call on every launch.
-        GuardianNotifier.scheduleEndOfDaySummary(this)
-    }
-}
-
-
-//===== FILE: app/src/main/AndroidManifest.xml =====
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.checkmate">
-
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
-    <uses-permission android:name="android.permission.CALL_SCREENING" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
-        tools:ignore="ProtectedPermissions" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
-
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
-
-    <queries>
-        <package android:name="com.whatsapp" />
-        <package android:name="com.termux" />
-    </queries>
-
-    <application
-        android:name="com.checkmate.CheckmateApp"
-        android:allowBackup="true"
-        android:label="@string/app_name"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Checkmate"
-        android:usesCleartextTraffic="true"
-        android:networkSecurityConfig="@xml/network_security_config">
-
-        <activity
-            android:name="com.checkmate.MainActivity"
-            android:exported="true"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
-        <service android:name="com.checkmate.service.FloatingAttentionService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.service.AttentionCycleService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.service.ReminderService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.service.WhatsAppReportService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.workmode.WorkModeService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-
-        <service android:name="com.checkmate.callhandler.CheckmateCallScreeningService"
-            android:permission="android.permission.BIND_SCREENING_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.telecom.CallScreeningService" />
-            </intent-filter>
-        </service>
-
-        <service android:name="com.checkmate.callhandler.CallAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data android:name="android.accessibilityservice"
-                android:resource="@xml/call_accessibility_config" />
-        </service>
-
-        <service android:name="com.checkmate.automation.AppAutomationService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service" />
-        </service>
-
-        <service android:name="com.checkmate.automation.WhatsAppNotificationListener"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-            android:exported="true"
-            android:process=":wa_listener">
-            <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
-            </intent-filter>
-        </service>
-
-        <!-- EOD summary receiver — fires at 9 PM daily via AlarmManager -->
-        <receiver android:name="com.checkmate.service.EodSummaryReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.EOD_SUMMARY" />
-            </intent-filter>
-        </receiver>
-
-    </application>
-</manifest>
 
