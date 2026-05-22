@@ -9,8 +9,8 @@
 
 | Version | Link |
 |---|---|
-| Latest APK | **[⬇ Download Checkmate.apk](https://github.com/your-username/checkmate/releases/latest)** |
-| Release Notes | [Changelog](https://github.com/your-username/checkmate/releases) |
+| Latest APK | **[⬇ Download Checkmate.apk](https://github.com/amirshams8/checkmate/releases/latest)** |
+| Release Notes | [Changelog](https://github.com/amirshams8/checkmate/releases) |
 
 > **Android 8.0+** required. Enable "Install from unknown sources" before installing.
 
@@ -122,7 +122,7 @@ checkmate/
 **Prerequisites:** Android Studio Hedgehog+, JDK 17, Android SDK 34
 
 ```bash
-git clone https://github.com/your-username/checkmate.git
+git clone https://github.com/amirshams8/checkmate.git
 cd checkmate
 ./gradlew assembleDebug
 ```
@@ -165,3 +165,9 @@ MIT License — see [LICENSE](LICENSE)
 ---
 
 *Built for JEE / NEET / CUET aspirants who are serious about execution.*
+
+---
+
+## 👥 Credits
+
+Co-created by **Amir Shams** & **Piyush Kumar Paswan**
