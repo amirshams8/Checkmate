@@ -1,26 +1,21 @@
 package com.checkmate.service
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
-import com.checkmate.automation.AutomationEngine
-import com.checkmate.core.CheckmatePrefs
 
+/**
+ * WhatsAppReportService — thin facade over GuardianNotifier.
+ * Prefer calling GuardianNotifier directly in new code.
+ * Kept for back-compat with any call sites using this object name.
+ */
 object WhatsAppReportService {
 
     /**
-     * Opens WhatsApp chat with guardian via wa.me link,
-     * then AutomationEngine types and sends the report.
+     * Sends a text report to the guardian.
+     * Uses method A (whatsapp://send) with method B (wa.me) fallback.
+     * Optionally attach a screenshot Uri from ScreenshotSharer.capture().
      */
-    fun sendReport(context: Context, reportText: String) {
-        val guardianNumber = CheckmatePrefs.getString("guardian_number") ?: return
-        val clean = guardianNumber.replace(Regex("[^0-9]"), "")
-        val uri   = Uri.parse("https://wa.me/$clean")
-        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        // Queue the message into AutomationEngine to type+send once WhatsApp opens
-        AutomationEngine.queueWhatsAppMessage(reportText)
-        context.startActivity(intent)
+    fun sendReport(context: Context, reportText: String, screenshotUri: Uri? = null) {
+        GuardianNotifier.sendReport(context, reportText, screenshotUri)
     }
 }

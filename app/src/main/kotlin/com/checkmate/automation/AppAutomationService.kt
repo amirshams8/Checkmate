@@ -16,10 +16,10 @@ class AppAutomationService : AccessibilityService() {
     private val TAG      = "CheckmateAutomation"
     private val WHATSAPP = "com.whatsapp"
 
-    // Track whether we already attempted to type in this WhatsApp session
-    // so we don't re-fire on every subsequent content-changed event
-    private var typingAttempted = false
-    private var lastWhatsAppPkg = ""
+    // Reset on every new WhatsApp chat session (tracked via message ID + window class)
+    private var typingAttempted    = false
+    private var lastMsgId          = ""       // tracks which queued message we attempted
+    private var lastConvClass      = ""       // tracks which WA window class we last saw
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -46,19 +46,22 @@ class AppAutomationService : AccessibilityService() {
 
         Log.d(TAG, "WhatsApp event: type=${AccessibilityEvent.eventTypeToString(event.eventType)} class=${event.className}")
 
-        // Reset typing flag when WhatsApp is freshly opened
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val className = event.className?.toString() ?: ""
             Log.d(TAG, "WhatsApp window state changed: $className")
-            // Reset on any new WhatsApp window — Conversation is the chat screen
-            if (pkg != lastWhatsAppPkg) {
+
+            // Reset typing flag whenever we land on a chat/conversation screen
+            // or when the pending message changes (new send request came in)
+            val currentMsgId = AutomationEngine.peekPendingWhatsAppMessage()?.take(20) ?: ""
+            val convScreen = className.contains("Conversation", ignoreCase = true)
+                    || className.contains("DeepLink",     ignoreCase = true)
+                    || className.contains("Main",         ignoreCase = true)
+
+            if (convScreen && (className != lastConvClass || currentMsgId != lastMsgId)) {
+                Log.d(TAG, "Resetting typingAttempted — new conv screen or new message")
                 typingAttempted = false
-                lastWhatsAppPkg = pkg
-            }
-            if (className.contains("Conversation", ignoreCase = true) ||
-                className.contains("DeepLink", ignoreCase = true) ||
-                className.contains("Main", ignoreCase = true)) {
-                typingAttempted = false
+                lastConvClass   = className
+                lastMsgId       = currentMsgId
             }
         }
 
@@ -73,7 +76,6 @@ class AppAutomationService : AccessibilityService() {
         val found = tryTypeAndSend(root)
         if (!found) {
             // WhatsApp chat UI sometimes takes ~800ms to fully inflate after DeepLink resolves.
-            // Retry after a short delay if input field wasn't found on first attempt.
             Log.d(TAG, "Input field not found immediately — retrying in 800ms")
             Handler(Looper.getMainLooper()).postDelayed({
                 val freshRoot = rootInActiveWindow

@@ -24,6 +24,12 @@ import java.util.Calendar
  *
  * Intent method A (whatsapp://send) is tried first — opens directly to chat.
  * Method B (wa.me) is the fallback if A fails on this device.
+ *
+ * Screenshot sharing:
+ *   call sendReport(context, reportText, screenshotUri) from any site
+ *   that has a Uri pointing to a cached screenshot in files/screenshots/.
+ *   The Uri MUST come from ScreenshotSharer.capture() which uses
+ *   FileProvider to produce a content:// Uri shareable with WhatsApp.
  */
 object GuardianNotifier {
 
@@ -95,6 +101,39 @@ object GuardianNotifier {
 
         openWhatsAppAndSend(context, number, msg)
         Log.d(TAG, "EOD summary sent to guardian")
+    }
+
+    // ── Manual report with optional screenshot ───────────────────────────────
+
+    /**
+     * Send a text report, optionally attaching a screenshot image.
+     * @param screenshotUri  content:// Uri from ScreenshotSharer.capture(), or null for text-only
+     */
+    fun sendReport(context: Context, reportText: String, screenshotUri: android.net.Uri? = null) {
+        val guardianNumber = getGuardianNumber() ?: return
+        val clean = guardianNumber.replace(Regex("[^0-9]"), "")
+        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
+
+        if (screenshotUri != null) {
+            // Share image + caption directly — WhatsApp handles this via ACTION_SEND
+            // No accessibility typing needed; WA opens share sheet with image pre-filled.
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, screenshotUri)
+                putExtra(Intent.EXTRA_TEXT, reportText)
+                setPackage("com.whatsapp")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            runCatching { context.startActivity(shareIntent) }
+                .onSuccess { Log.d(TAG, "WhatsApp image share launched") }
+                .onFailure {
+                    Log.e(TAG, "WhatsApp image share failed: ${it.message} — falling back to text")
+                    openWhatsAppAndSend(context, clean, reportText)
+                }
+        } else {
+            openWhatsAppAndSend(context, clean, reportText)
+        }
     }
 
     // ── WhatsApp delivery (method A with B fallback) ─────────────────────────

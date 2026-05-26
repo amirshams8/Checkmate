@@ -5,6 +5,7 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ScreenshotSharer
 
 class CheckmateApp : Application() {
     override fun onCreate() {
@@ -12,8 +13,8 @@ class CheckmateApp : Application() {
         CheckmatePrefs.init(this)
         CheckmateState.init(this)
         CheckmateTTS.init(this)
-        // Schedules 9 PM daily EOD summary alarm. setRepeating with FLAG_UPDATE_CURRENT
-        // is idempotent — safe to call on every launch.
         GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Clean up screenshots older than 24h on each cold start
+        ScreenshotSharer.pruneOldScreenshots(this)
     }
 }
