@@ -31,12 +31,14 @@ class HomeViewModel : ViewModel() {
     private val _state = MutableStateFlow(HomeState())
     val state: StateFlow<HomeState> = _state.asStateFlow()
 
-    // MainActivity observes this — when true it launches the MediaProjection dialog.
-    // Resets to false once MainActivity has handled it.
+    // MainActivity observes this to launch the MediaProjection system dialog
     private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
     val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
 
-    // Held temporarily between "request projection" and "projection granted"
+    // MainActivity observes this to call storeProjectionToken() after the FGS is running
+    private val _storeProjectionToken = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val storeProjectionToken: SharedFlow<Unit> = _storeProjectionToken.asSharedFlow()
+
     private var pendingTask: StudyTask? = null
 
     init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
@@ -65,44 +67,38 @@ class HomeViewModel : ViewModel() {
         }
     }
 
-    /**
-     * Called by HomeScreen when student taps Start.
-     * If projection is already ready (token from previous task in same session)
-     * we skip the dialog and start directly. Otherwise we ask MainActivity to
-     * show the system dialog first.
-     */
     fun startTask(context: Context, task: StudyTask) {
         if (ScreenCaptureManager.isReady()) {
-            // Token already held from earlier in this session — start immediately
             launchTask(context, task)
         } else {
-            // Signal MainActivity to request projection, then launchTask will be called
-            // back via onProjectionGranted()
             pendingTask = task
             _requestProjection.tryEmit(task)
         }
     }
 
     /**
-     * Called by MainActivity after the user taps "Start now" in the system dialog.
+     * Called by MainActivity after user approves the MediaProjection dialog.
+     * We start the FGS first (which calls startForeground with mediaProjection type),
+     * then signal MainActivity to call storeProjectionToken() — safe now.
      */
     fun onProjectionGranted(context: Context) {
         val task = pendingTask ?: return
         pendingTask = null
-        launchTask(context, task)
+        // Start the service first so the mediaProjection FGS type is active
+        AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+        // Now tell MainActivity it's safe to call storeProjectionToken()
+        _storeProjectionToken.tryEmit(Unit)
+        // Continue launching the rest of the task (skips AttentionCycleService.start — already done)
+        launchTask(context, task, serviceAlreadyStarted = true)
     }
 
-    /**
-     * Called by MainActivity if the user denied the projection dialog.
-     * We still start the task — just without screenshot capability.
-     */
     fun onProjectionDenied(context: Context) {
         val task = pendingTask ?: return
         pendingTask = null
         launchTask(context, task)
     }
 
-    private fun launchTask(context: Context, task: StudyTask) {
+    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
         viewModelScope.launch {
             WorkModeManager.activate(context)
             val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
@@ -111,7 +107,9 @@ class HomeViewModel : ViewModel() {
                     ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                     ?.let { context.startActivity(it) }
             }
-            AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            if (!serviceAlreadyStarted) {
+                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            }
             FloatingAttentionService.start(context)
             CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
             PlanStore.setTaskActive(task.id)

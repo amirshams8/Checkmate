@@ -20,6 +20,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.stopwatch.NotificationPermissionHelper
+import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.main.MainScreen
@@ -35,11 +36,19 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var homeViewModel: HomeViewModel
 
+    // Holds the raw projection result until the FGS is up and we can safely call getMediaProjection()
+    private var pendingProjectionResultCode: Int = Activity.RESULT_CANCELED
+    private var pendingProjectionData: Intent?   = null
+
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            ScreenCaptureManager.storeProjectionToken(this, result.resultCode, result.data)
+            // Stash the token — DO NOT call getMediaProjection() yet.
+            // storeProjectionToken() will be called from onProjectionGranted()
+            // after AttentionCycleService (type=mediaProjection) is running.
+            pendingProjectionResultCode = result.resultCode
+            pendingProjectionData       = result.data
             homeViewModel.onProjectionGranted(applicationContext)
         } else {
             homeViewModel.onProjectionDenied(applicationContext)
@@ -56,6 +65,18 @@ class MainActivity : ComponentActivity() {
             homeViewModel.requestProjection.collect {
                 val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 projectionLauncher.launch(mgr.createScreenCaptureIntent())
+            }
+        }
+
+        // HomeViewModel signals us when the FGS is up and it's safe to store the token
+        lifecycleScope.launch {
+            homeViewModel.storeProjectionToken.collect {
+                ScreenCaptureManager.storeProjectionToken(
+                    applicationContext,
+                    pendingProjectionResultCode,
+                    pendingProjectionData
+                )
+                pendingProjectionData = null
             }
         }
 
