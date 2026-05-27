@@ -1,14 +1,14 @@
 package com.checkmate.ui.home
 
 import android.content.Context
+import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.StudyTask
+import com.checkmate.core.TaskState
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
 import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
@@ -16,6 +16,7 @@ import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import android.app.Activity
 
 data class HomeState(
     val tasks:             List<StudyTask> = emptyList(),
@@ -34,10 +35,6 @@ class HomeViewModel : ViewModel() {
     // MainActivity observes this to launch the MediaProjection system dialog
     private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
     val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
-
-    // MainActivity observes this to call storeProjectionToken() after the FGS is running
-    private val _storeProjectionToken = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val storeProjectionToken: SharedFlow<Unit> = _storeProjectionToken.asSharedFlow()
 
     private var pendingTask: StudyTask? = null
 
@@ -78,17 +75,26 @@ class HomeViewModel : ViewModel() {
 
     /**
      * Called by MainActivity after user approves the MediaProjection dialog.
-     * We start the FGS first (which calls startForeground with mediaProjection type),
-     * then signal MainActivity to call storeProjectionToken() — safe now.
+     * We forward the raw resultCode + data into AttentionCycleService's start intent,
+     * so getMediaProjection() is called only after startForeground() has run inside the service.
+     * This is the correct fix for:
+     *   SecurityException: Media projections require a foreground service of type
+     *   ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
      */
-    fun onProjectionGranted(context: Context) {
+    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
         val task = pendingTask ?: return
         pendingTask = null
-        // Start the service first so the mediaProjection FGS type is active
-        AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-        // Now tell MainActivity it's safe to call storeProjectionToken()
-        _storeProjectionToken.tryEmit(Unit)
-        // Continue launching the rest of the task (skips AttentionCycleService.start — already done)
+        // Start the FGS with the projection token baked into the intent.
+        // AttentionCycleService.onStartCommand() calls startForeground() first,
+        // then immediately calls ScreenCaptureManager.storeProjectionToken() — safe.
+        AttentionCycleService.start(
+            context,
+            task.id,
+            task.topic,
+            task.durationMinutes.toLong(),
+            projectionResultCode = resultCode,
+            projectionData       = data
+        )
         launchTask(context, task, serviceAlreadyStarted = true)
     }
 
@@ -118,49 +124,23 @@ class HomeViewModel : ViewModel() {
         }
     }
 
-    fun markDone(context: Context, task: StudyTask) {
+    fun skipTask(context: Context, taskId: String) {
         viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task)
-            CheckmateTTS.speak(context, "Task complete. Well done.")
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
-        }
-    }
-
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+            PlanStore.setTaskSkipped(taskId)
+            val skips = (_state.value.consecutiveSkips + 1).also {
+                _state.update { s -> s.copy(consecutiveSkips = it) }
             }
+            GuardianNotifier.notifySkip(context, skips)
+            AttentionCycleService.stop(context)
         }
     }
 
-    fun pauseTask(context: Context, task: StudyTask) {
+    fun completeTask(context: Context, taskId: String) {
         viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
-        }
-    }
-
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
+            PlanStore.setTaskDone(taskId)
+            _state.update { it.copy(activeTaskId = null, consecutiveSkips = 0) }
+            GuardianNotifier.notifyTaskDone(context)
+            AttentionCycleService.stop(context)
         }
     }
 }

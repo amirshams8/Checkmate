@@ -14,19 +14,31 @@ import kotlinx.coroutines.*
 class AttentionCycleService : Service() {
 
     companion object {
-        private const val CHANNEL_ID = "attention_cycle_channel"
-        private const val NOTIF_ID   = 42
-        const val EXTRA_TASK_ID      = "task_id"
-        const val EXTRA_TASK_NAME    = "task_name"
-        const val EXTRA_DURATION_MIN = "duration_min"
-        const val ACTION_PAUSE       = "com.checkmate.ATTENTION_PAUSE"
-        const val ACTION_RESUME      = "com.checkmate.ATTENTION_RESUME"
+        private const val CHANNEL_ID        = "attention_cycle_channel"
+        private const val NOTIF_ID          = 42
+        const val EXTRA_TASK_ID             = "task_id"
+        const val EXTRA_TASK_NAME           = "task_name"
+        const val EXTRA_DURATION_MIN        = "duration_min"
+        // Projection token extras — passed so getMediaProjection() runs AFTER startForeground()
+        const val EXTRA_PROJECTION_CODE     = "projection_result_code"
+        const val EXTRA_PROJECTION_DATA     = "projection_data"
+        const val ACTION_PAUSE              = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME             = "com.checkmate.ATTENTION_RESUME"
 
-        fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
+        fun start(
+            context: Context,
+            taskId: String,
+            taskName: String,
+            durationMinutes: Long,
+            projectionResultCode: Int = Activity.RESULT_CANCELED,
+            projectionData: Intent?   = null
+        ) {
             val intent = Intent(context, AttentionCycleService::class.java).apply {
-                putExtra(EXTRA_TASK_ID,      taskId)
-                putExtra(EXTRA_TASK_NAME,    taskName)
-                putExtra(EXTRA_DURATION_MIN, durationMinutes)
+                putExtra(EXTRA_TASK_ID,          taskId)
+                putExtra(EXTRA_TASK_NAME,         taskName)
+                putExtra(EXTRA_DURATION_MIN,      durationMinutes)
+                putExtra(EXTRA_PROJECTION_CODE,   projectionResultCode)
+                putExtra(EXTRA_PROJECTION_DATA,   projectionData)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 context.startForegroundService(intent)
@@ -76,7 +88,23 @@ class AttentionCycleService : Service() {
         val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
         val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
         val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+
+        // startForeground() MUST be called before getMediaProjection() on Android 14+.
+        // We call it first here, then immediately store the projection token below.
         startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
+
+        // Now it is safe to call getMediaProjection() — the mediaProjection FGS type is active.
+        val projCode = intent?.getIntExtra(EXTRA_PROJECTION_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val projData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            intent?.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+        else
+            @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+
+        if (projCode == Activity.RESULT_OK && projData != null) {
+            ScreenCaptureManager.storeProjectionToken(applicationContext, projCode, projData)
+        }
+
         AttentionCycleManager.start(taskId, taskName, durationMin)
         startCycleLoop(taskName)
         return START_NOT_STICKY
