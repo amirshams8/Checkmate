@@ -1,7 +1,9 @@
 package com.checkmate.ui.settings
 
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -20,7 +22,11 @@ import androidx.compose.ui.unit.sp
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.ui.theme.*
 
-data class AppInfo(val name: String, val packageName: String)
+data class AppInfo(
+    val name:        String,
+    val packageName: String,
+    val isSystem:    Boolean
+)
 
 @Composable
 fun AppSelectorScreen(onBack: () -> Unit) {
@@ -30,21 +36,42 @@ fun AppSelectorScreen(onBack: () -> Unit) {
         (CheckmatePrefs.getString("blocked_apps", "") ?: "")
             .split(",").filter { it.isNotBlank() }.toMutableSet()
     }
-    // Fix: mutableStateSetOf is not available without extra import — use mutableStateOf with a Set instead
-    var blockedApps by remember { mutableStateOf(savedBlocked.toSet()) }
+    var blockedApps  by remember { mutableStateOf(savedBlocked.toSet()) }
+    var search       by remember { mutableStateOf("") }
+    var showSystem   by remember { mutableStateOf(false) }
 
-    val installedApps = remember {
-        pm.getInstalledApplications(PackageManager.GET_META_DATA)
-            .filter { (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 }
+    // Load all apps that have a launcher entry — this includes Google/system apps
+    // (YouTube, Chrome, Gmail, etc.) while excluding headless system internals
+    // (com.android.phone, com.android.providers.* etc.) that have no UI to launch.
+    val allApps = remember {
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        pm.queryIntentActivities(launcherIntent, 0)
+            .map { it.activityInfo.applicationInfo }
+            .distinctBy { it.packageName }
             .filter { it.packageName != context.packageName }
-            .map { AppInfo(pm.getApplicationLabel(it).toString(), it.packageName) }
-            .sortedBy { it.name }
+            .map { info ->
+                AppInfo(
+                    name        = pm.getApplicationLabel(info).toString(),
+                    packageName = info.packageName,
+                    isSystem    = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                )
+            }
+            .sortedWith(compareBy({ it.isSystem }, { it.name }))
     }
 
-    var search by remember { mutableStateOf("") }
-    val filtered = installedApps.filter { it.name.contains(search, ignoreCase = true) }
+    val userApps   = remember(allApps) { allApps.filter { !it.isSystem } }
+    val systemApps = remember(allApps) { allApps.filter {  it.isSystem } }
+
+    val displayList = remember(showSystem, search, allApps) {
+        val base = if (showSystem) allApps else userApps
+        if (search.isBlank()) base
+        else base.filter { it.name.contains(search, ignoreCase = true) ||
+                           it.packageName.contains(search, ignoreCase = true) }
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
+
+        // ── Top bar ──────────────────────────────────────────────────────────
         Row(
             modifier          = Modifier.fillMaxWidth().padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -58,6 +85,7 @@ fun AppSelectorScreen(onBack: () -> Unit) {
             Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
         }
 
+        // ── Search ───────────────────────────────────────────────────────────
         OutlinedTextField(
             value         = search,
             onValueChange = { search = it },
@@ -75,30 +103,87 @@ fun AppSelectorScreen(onBack: () -> Unit) {
         )
 
         Spacer(Modifier.height(8.dp))
-        Text(
-            "  ${blockedApps.size} app(s) blocked during STUDY mode",
-            fontSize = 12.sp,
-            color    = White60,
-            modifier = Modifier.padding(horizontal = 16.dp)
-        )
+
+        // ── Stats + system toggle ────────────────────────────────────────────
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "${blockedApps.size} app(s) blocked · ${systemApps.size} system/Google apps available",
+                fontSize = 11.sp,
+                color    = White60
+            )
+        }
+
+        Spacer(Modifier.height(4.dp))
+
+        // ── Show system apps toggle ──────────────────────────────────────────
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .clickable { showSystem = !showSystem }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(
+                    "Include Google & System Apps",
+                    fontSize   = 13.sp,
+                    color      = White90,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    "YouTube, Chrome, Instagram (pre-installed), etc.",
+                    fontSize = 11.sp,
+                    color    = White60
+                )
+            }
+            Switch(
+                checked         = showSystem,
+                onCheckedChange = { showSystem = it },
+                colors          = SwitchDefaults.colors(
+                    checkedThumbColor       = AccentGreen,
+                    checkedTrackColor       = AccentGreen.copy(alpha = 0.3f),
+                    uncheckedThumbColor     = White60,
+                    uncheckedTrackColor     = White10
+                )
+            )
+        }
+
+        HorizontalDivider(color = White10, modifier = Modifier.padding(horizontal = 16.dp))
         Spacer(Modifier.height(8.dp))
 
+        // ── App list ─────────────────────────────────────────────────────────
         LazyColumn(
             modifier            = Modifier.fillMaxSize(),
             contentPadding      = PaddingValues(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(filtered, key = { it.packageName }) { app ->
+            items(displayList, key = { it.packageName }) { app ->
                 val isBlocked = app.packageName in blockedApps
                 Surface(
                     shape  = RoundedCornerShape(10.dp),
-                    color  = if (isBlocked) AccentRed.copy(alpha = 0.08f) else BgCard,
-                    border = BorderStroke(1.dp, if (isBlocked) AccentRed.copy(alpha = 0.4f) else White10),
+                    color  = when {
+                        isBlocked  -> AccentRed.copy(alpha = 0.08f)
+                        app.isSystem -> BgCardAlt
+                        else       -> BgCard
+                    },
+                    border = BorderStroke(1.dp, when {
+                        isBlocked  -> AccentRed.copy(alpha = 0.4f)
+                        app.isSystem -> AccentBlue.copy(alpha = 0.2f)
+                        else       -> White10
+                    }),
                     onClick = {
                         blockedApps = if (isBlocked)
                             blockedApps - app.packageName
                         else
                             blockedApps + app.packageName
+                        // Persist immediately so the accessibility service sees the update
+                        CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
                     }
                 ) {
                     Row(
@@ -106,7 +191,24 @@ fun AppSelectorScreen(onBack: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text(app.name, fontSize = 14.sp, color = White90)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(app.name, fontSize = 14.sp, color = White90)
+                                if (app.isSystem) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = AccentBlue.copy(alpha = 0.15f)
+                                    ) {
+                                        Text(
+                                            "SYSTEM",
+                                            fontSize = 9.sp,
+                                            color    = AccentBlue,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                        )
+                                    }
+                                }
+                            }
                             Text(app.packageName, fontSize = 10.sp, color = White30)
                         }
                         if (isBlocked) {

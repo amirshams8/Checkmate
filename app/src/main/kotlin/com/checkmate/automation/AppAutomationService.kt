@@ -2,24 +2,69 @@ package com.checkmate.automation
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
 
 class AppAutomationService : AccessibilityService() {
 
-    private val TAG      = "WA_SEND"          // grep this tag in logcat
+    private val TAG      = "WA_SEND"
     private val WHATSAPP = "com.whatsapp"
 
-    // FIX: was resetting only when pkg changed (never, since it's always com.whatsapp)
-    // Now tracks last window class — resets whenever WA shows a new screen
-    private var typingAttempted   = false
-    private var lastWindowClass   = ""
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
+
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
+
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
+
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -30,137 +75,165 @@ class AppAutomationService : AccessibilityService() {
         if (event == null) return
         val pkg = event.packageName?.toString() ?: return
 
-        // Work Mode block
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        if (WorkModeManager.isActive.value &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+
             val blockedApps = WorkModeManager.getBlockedApps()
             if (pkg in blockedApps) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
                 return
             }
         }
 
-        if (pkg != WHATSAPP) return
-
-        val hasPending = AutomationEngine.hasPendingMessage()
-        Log.d(TAG, "WA event pkg=$pkg type=${event.eventType} class=${event.className} hasPending=$hasPending typingAttempted=$typingAttempted")
-
-        if (!hasPending) return
-
-        // ── Reset typingAttempted when WA shows a new window/screen ──────────
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val cls = event.className?.toString() ?: ""
-            Log.d(TAG, "WA window changed: cls='$cls' lastWindowClass='$lastWindowClass'")
-
-            if (cls != lastWindowClass) {
-                Log.d(TAG, ">>> New WA window detected — resetting typingAttempted")
-                typingAttempted = false
-                lastWindowClass = cls
-            } else {
-                Log.d(TAG, "Same window class — typingAttempted stays $typingAttempted")
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isActive.value && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
             }
         }
 
-        if (typingAttempted) {
-            Log.d(TAG, "typingAttempted=true — skipping this event")
-            return
-        }
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
 
-        val root = rootInActiveWindow ?: run {
-            Log.e(TAG, "rootInActiveWindow is NULL — cannot proceed")
-            return
-        }
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
 
-        Log.d(TAG, "Attempting tryTypeAndSend immediately...")
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
         val found = tryTypeAndSend(root)
         if (!found) {
-            Log.w(TAG, "Input field NOT found — scheduling retry in 1200ms")
             Handler(Looper.getMainLooper()).postDelayed({
-                val freshRoot = rootInActiveWindow
-                if (freshRoot == null) {
-                    Log.e(TAG, "RETRY: rootInActiveWindow still null")
-                    return@postDelayed
-                }
-                if (!AutomationEngine.hasPendingMessage()) {
-                    Log.w(TAG, "RETRY: no pending message anymore (was it consumed?)")
-                    return@postDelayed
-                }
-                Log.d(TAG, "RETRY: calling tryTypeAndSend after delay...")
-                tryTypeAndSend(freshRoot)
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
             }, 1200)
         }
     }
 
-    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
-        val message = AutomationEngine.peekPendingWhatsAppMessage()
-        if (message == null) {
-            Log.e(TAG, "tryTypeAndSend: peekPendingWhatsAppMessage() returned null — nothing to send")
-            return false
+    // ── URL scanning ──────────────────────────────────────────────────────────
+
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
+
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
+
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
+
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
+
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
+    }
+
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
         }
-        Log.d(TAG, "tryTypeAndSend: message='${message.take(60)}...'")
 
-        // Dump top-level nodes BEFORE searching so we know what's visible
-        Log.d(TAG, "--- NODE DUMP (depth 3) ---")
-        dumpNodeTree(root, 0)
-        Log.d(TAG, "--- END NODE DUMP ---")
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
 
-        // 1. Find input field
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
+    }
+
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
+
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
+
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
         val inputNode =
             findNodeById(root, "com.whatsapp:id/entry")
-                ?.also { Log.d(TAG, "Found input via id/entry") }
+                ?.also { Log.d(TAG, "input via id/entry") }
             ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
-                ?.also { Log.d(TAG, "Found input via id/conversation_entry") }
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
             ?: findNodeByClass(root, "android.widget.EditText")
-                ?.also { Log.d(TAG, "Found input via EditText class fallback") }
+                ?.also { Log.d(TAG, "input via EditText fallback") }
 
-        if (inputNode == null) {
-            Log.e(TAG, "INPUT FIELD NOT FOUND — WA screen may not be a chat yet")
-            return false
-        }
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
 
-        Log.d(TAG, "Input: id=${inputNode.viewIdResourceName} editable=${inputNode.isEditable} enabled=${inputNode.isEnabled}")
         typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
 
-        // 2. Focus
-        val clicked = inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        Log.d(TAG, "ACTION_CLICK on input: $clicked")
-
-        // 3. Set text
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
         }
         val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        Log.d(TAG, "ACTION_SET_TEXT result: $textSet")
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
 
-        if (!textSet) {
-            Log.e(TAG, "SET_TEXT FAILED — WA may have blocked accessibility input. Node info: class=${inputNode.className} pkg=${inputNode.packageName} editable=${inputNode.isEditable}")
-            // Don't consume — leave message queued so user can retry
-            return true
-        }
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
 
         AutomationEngine.consumePendingWhatsAppMessage()
-        Log.d(TAG, "Message consumed from queue after successful SET_TEXT")
 
-        // 4. Click send after delay
         Handler(Looper.getMainLooper()).postDelayed({
-            val freshRoot = rootInActiveWindow ?: run {
-                Log.e(TAG, "SEND: rootInActiveWindow null — cannot click send")
-                return@postDelayed
-            }
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
             val sendNode =
                 findNodeById(freshRoot, "com.whatsapp:id/send")
-                    ?.also { Log.d(TAG, "Send button found via id/send") }
+                    ?.also { Log.d(TAG, "send btn via id/send") }
                 ?: findNodeByDesc(freshRoot, "Send")
-                    ?.also { Log.d(TAG, "Send button found via contentDesc 'Send'") }
-                ?: findNodeByDesc(freshRoot, "send")
-                    ?.also { Log.d(TAG, "Send button found via contentDesc 'send'") }
-
-            if (sendNode != null) {
-                val sent = sendNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                Log.d(TAG, "SEND BUTTON CLICKED: $sent — id=${sendNode.viewIdResourceName}")
-            } else {
-                Log.e(TAG, "SEND BUTTON NOT FOUND after text set — dumping fresh nodes:")
-                dumpNodeTree(freshRoot, 0)
-            }
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
         }, 500)
 
         return true
@@ -192,19 +265,6 @@ class AppAutomationService : AccessibilityService() {
             for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
         return null
-    }
-
-    private fun dumpNodeTree(node: AccessibilityNodeInfo, depth: Int) {
-        if (depth > 3) return
-        Log.d(TAG, "  ".repeat(depth) +
-            "id=${node.viewIdResourceName} " +
-            "cls=${node.className} " +
-            "desc='${node.contentDescription}' " +
-            "editable=${node.isEditable} " +
-            "clickable=${node.isClickable} " +
-            "enabled=${node.isEnabled} " +
-            "text='${node.text?.take(30)}'")
-        for (i in 0 until node.childCount) node.getChild(i)?.let { dumpNodeTree(it, depth + 1) }
     }
 
     override fun onInterrupt() { Log.d(TAG, "Service interrupted") }

@@ -13,24 +13,6 @@ import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import java.util.Calendar
 
-/**
- * GuardianNotifier — all 3 auto-triggered guardian WhatsApp messages.
- *
- * Delivery flow:
- *   1. AutomationEngine.queueWhatsAppMessage(text) — stores the message
- *   2. openWhatsAppAndSend() — launches WhatsApp to guardian chat via intent
- *   3. AppAutomationService detects WhatsApp open → calls tryTypeAndSend()
- *      → finds input field → sets text → clicks send button
- *
- * Intent method A (whatsapp://send) is tried first — opens directly to chat.
- * Method B (wa.me) is the fallback if A fails on this device.
- *
- * Screenshot sharing:
- *   call sendReport(context, reportText, screenshotUri) from any site
- *   that has a Uri pointing to a cached screenshot in files/screenshots/.
- *   The Uri MUST come from ScreenshotSharer.capture() which uses
- *   FileProvider to produce a content:// Uri shareable with WhatsApp.
- */
 object GuardianNotifier {
 
     private const val TAG = "GuardianNotifier"
@@ -54,7 +36,7 @@ object GuardianNotifier {
         Log.d(TAG, "Guardian notified: skip streak=$skipCount")
     }
 
-    // ── Trigger 3: End of Day Summary (9 PM alarm) ───────────────────────────
+    // ── Trigger 3: End of Day Summary ────────────────────────────────────────
 
     fun scheduleEndOfDaySummary(context: Context) {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -103,20 +85,42 @@ object GuardianNotifier {
         Log.d(TAG, "EOD summary sent to guardian")
     }
 
-    // ── Manual report with optional screenshot ───────────────────────────────
+    // ── Trigger 4: Distraction Alert (3rd attempt on blocked app or site) ────
 
     /**
-     * Send a text report, optionally attaching a screenshot image.
-     * @param screenshotUri  content:// Uri from ScreenshotSharer.capture(), or null for text-only
+     * Called by DistractionGuard when a student hits the attempt threshold.
+     *
+     * @param kind   "app" or "site"
+     * @param target package name or hostname
+     * @param screenshotUri  content:// Uri from ScreenshotCapture, or null
      */
-    fun sendReport(context: Context, reportText: String, screenshotUri: android.net.Uri? = null) {
+    fun notifyDistractionAlert(
+        context: Context,
+        kind: String,
+        target: String,
+        screenshotUri: Uri? = null
+    ) {
+        val number = getGuardianNumber() ?: return
+        val label  = if (kind == "app") "app: $target" else "website: $target"
+        val msg    = "⚠️ Checkmate Alert: Student attempted to open blocked $label " +
+                     "3 times during study session at ${timeNow()}."
+        Log.w(TAG, "Distraction alert: $label")
+
+        if (screenshotUri != null) {
+            sendReport(context, msg, screenshotUri)
+        } else {
+            openWhatsAppAndSend(context, number, msg)
+        }
+    }
+
+    // ── Manual report with optional screenshot ────────────────────────────────
+
+    fun sendReport(context: Context, reportText: String, screenshotUri: Uri? = null) {
         val guardianNumber = getGuardianNumber() ?: return
         val clean = guardianNumber.replace(Regex("[^0-9]"), "")
         if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
 
         if (screenshotUri != null) {
-            // Share image + caption directly — WhatsApp handles this via ACTION_SEND
-            // No accessibility typing needed; WA opens share sheet with image pre-filled.
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "image/png"
                 putExtra(Intent.EXTRA_STREAM, screenshotUri)
@@ -128,7 +132,7 @@ object GuardianNotifier {
             runCatching { context.startActivity(shareIntent) }
                 .onSuccess { Log.d(TAG, "WhatsApp image share launched") }
                 .onFailure {
-                    Log.e(TAG, "WhatsApp image share failed: ${it.message} — falling back to text")
+                    Log.e(TAG, "Image share failed: ${it.message} — falling back to text")
                     openWhatsAppAndSend(context, clean, reportText)
                 }
         } else {
@@ -136,33 +140,29 @@ object GuardianNotifier {
         }
     }
 
-    // ── WhatsApp delivery (method A with B fallback) ─────────────────────────
+    // ── WhatsApp delivery ────────────────────────────────────────────────────
 
     private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
         val clean = number.replace(Regex("[^0-9]"), "")
         if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
 
-        // Queue text — AutomationEngine / AppAutomationService will type + send
         AutomationEngine.queueWhatsAppMessage(message)
 
-        // Method A: whatsapp://send — direct to chat, no browser, no extra tap
         val intentA = Intent(Intent.ACTION_VIEW,
             Uri.parse("whatsapp://send?phone=$clean")).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         if (runCatching { context.startActivity(intentA) }.isSuccess) {
-            Log.d(TAG, "WhatsApp opened via method A")
-            return
+            Log.d(TAG, "WhatsApp opened via method A"); return
         }
 
-        // Method B: wa.me fallback (browser redirect)
         val intentB = Intent(Intent.ACTION_VIEW,
             Uri.parse("https://wa.me/$clean")).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching { context.startActivity(intentB) }
-            .onSuccess { Log.d(TAG, "WhatsApp opened via method B fallback") }
-            .onFailure { Log.e(TAG, "Both WhatsApp methods failed: ${it.message}") }
+            .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
+            .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
     }
 
     private fun getGuardianNumber(): String? {

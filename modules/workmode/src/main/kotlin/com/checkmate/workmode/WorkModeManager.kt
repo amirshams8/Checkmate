@@ -24,6 +24,7 @@ object WorkModeManager {
     fun deactivate(context: Context) {
         CheckmateState.setMode(context, StudyMode.NORMAL)
         _isActive.value = false
+        DistractionGuard.reset()
         context.stopService(Intent(context, WorkModeService::class.java))
     }
 
@@ -31,8 +32,18 @@ object WorkModeManager {
         if (_isActive.value) deactivate(context) else activate(context)
     }
 
+    /** Returns package names of apps to block. */
     fun getBlockedApps(): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    /**
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
+     */
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
         return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
