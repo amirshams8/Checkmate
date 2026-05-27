@@ -4,6 +4,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+// Read local.properties safely
+val localProps = java.util.Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) load(f.inputStream())
+}
+
 android {
     namespace = "com.checkmate"
     compileSdk = 35
@@ -14,6 +20,13 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+
+        // Telegram bot token — set in local.properties, never commit that file
+        buildConfigField(
+            "String",
+            "TELEGRAM_BOT_TOKEN",
+            "\"${localProps.getProperty("telegram_bot_token", "")}\""
+        )
     }
 
     buildFeatures {
@@ -54,7 +67,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     implementation("androidx.appcompat:appcompat:1.6.1")
-    // Fix: Theme.Material3.DayNight.NoActionBar lives in this artifact, not in compose-material3
     implementation("com.google.android.material:material:1.11.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.datastore:datastore-preferences:1.0.0")
