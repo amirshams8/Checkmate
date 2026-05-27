@@ -115,6 +115,194 @@ fun SettingsScreen() {
     }
 }
 
+// ── LLM Provider Settings ─────────────────────────────────────────────────────
+
+private val LLM_PROVIDERS = listOf("Groq", "Claude", "Gemini", "OpenRouter")
+
+@Composable
+private fun LlmProviderSettings(context: Context) {
+    val providers = LLM_PROVIDERS
+
+    var selectedProvider by remember {
+        mutableStateOf(CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq")
+    }
+
+    // One key state per provider
+    val keys = providers.associateWith { provider ->
+        remember(provider) {
+            mutableStateOf(
+                CheckmatePrefs.getString("llm_key_${provider.lowercase()}", "") ?: ""
+            )
+        }
+    }
+
+    // Provider selector chips
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Active Provider", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            providers.forEach { provider ->
+                val selected = provider == selectedProvider
+                FilterChip(
+                    selected = selected,
+                    onClick  = {
+                        selectedProvider = provider
+                        CheckmatePrefs.putString("llm_provider", provider)
+                    },
+                    label    = { Text(provider, fontSize = 12.sp) },
+                    colors   = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = AccentGreen,
+                        selectedLabelColor     = BgDark
+                    )
+                )
+            }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // API key field for the currently selected provider
+    val currentKey = keys[selectedProvider]
+    if (currentKey != null) {
+        var showKey by remember { mutableStateOf(false) }
+        var saved   by remember { mutableStateOf(false) }
+
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("$selectedProvider API Key", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            OutlinedTextField(
+                value         = currentKey.value,
+                onValueChange = { currentKey.value = it; saved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("Paste API key here", color = White30, fontSize = 13.sp) },
+                visualTransformation = if (showKey) VisualTransformation.None
+                                       else PasswordVisualTransformation(),
+                trailingIcon  = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { showKey = !showKey }) {
+                            Icon(
+                                if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                null, tint = White60
+                            )
+                        }
+                        IconButton(onClick = {
+                            CheckmatePrefs.putString(
+                                "llm_key_${selectedProvider.lowercase()}",
+                                currentKey.value.trim()
+                            )
+                            saved = true
+                        }) {
+                            Icon(
+                                if (saved) Icons.Default.Check else Icons.Default.Save,
+                                null,
+                                tint = if (saved) AccentGreen else White60
+                            )
+                        }
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (saved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                    modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Guardian WhatsApp number (used by GuardianNotifier)
+    var guardianNumber by remember {
+        mutableStateOf(CheckmatePrefs.getString("guardian_number", "") ?: "")
+    }
+    var guardianSaved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian WhatsApp Number", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        OutlinedTextField(
+            value         = guardianNumber,
+            onValueChange = { guardianNumber = it; guardianSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("+91XXXXXXXXXX", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Phone, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    CheckmatePrefs.putString("guardian_number", guardianNumber.trim())
+                    guardianSaved = true
+                }) {
+                    Icon(
+                        if (guardianSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (guardianSaved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (guardianSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+}
+
+// ── Voice / TTS Settings ──────────────────────────────────────────────────────
+
+@Composable
+private fun VoiceSettings(context: Context) {
+    var ttsEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean("tts_enabled", true))
+    }
+
+    Row(
+        modifier          = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.RecordVoiceOver, null, tint = AccentGreen,
+            modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Voice Feedback", fontSize = 14.sp, color = White90)
+            Text(
+                if (ttsEnabled) "Mentor speaks task summaries aloud" else "Voice feedback is off",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        Switch(
+            checked         = ttsEnabled,
+            onCheckedChange = {
+                ttsEnabled = it
+                CheckmatePrefs.putBoolean("tts_enabled", it)
+            },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor   = BgDark,
+                checkedTrackColor   = AccentGreen,
+                uncheckedThumbColor = White60,
+                uncheckedTrackColor = White10
+            )
+        )
+    }
+}
+
+// ── Shared layout helpers ─────────────────────────────────────────────────────
+
 @Composable
 private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
@@ -153,7 +341,3 @@ private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onCl
         }
     }
 }
-
-// These composables keep their full implementations from the existing file.
-// Only the shell and WORK MODE section changed — paste your existing
-// LlmProviderSettings() and VoiceSettings() implementations below unchanged.
