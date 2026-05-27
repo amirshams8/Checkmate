@@ -1,125 +1,734 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
-package com.checkmate.ui.home
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/AttentionCycleManager.kt =====
+package com.checkmate.core
 
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.service.AttentionCycleService
-import com.checkmate.service.FloatingAttentionService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.workmode.WorkModeManager
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
-data class HomeState(
-    val tasks:             List<StudyTask> = emptyList(),
-    val activeTaskId:      String?         = null,
-    val completedToday:    Int             = 0,
-    val streakDays:        Int             = 0,
-    val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0
+// PROMPT_DONE: focus block just ended — timer frozen, waiting for user decision
+enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, PROMPT_DONE, DONE }
+
+data class CycleState(
+    val phase:               AttentionPhase = AttentionPhase.FOCUS,
+    val phaseSecondsLeft:    Long           = 30 * 60,
+    val totalSessionSeconds: Long           = 0,
+    val cycleIndex:          Int            = 1,
+    val needsAttentionCheck: Boolean        = false,
+    val phaseJustChanged:    Boolean        = false,
+    val checksPassed:        Int            = 0,
+    val checksMissed:        Int            = 0,
+    val taskId:              String         = "",
+    val taskName:            String         = "",
+    val pausedAt:            Long           = 0L,
+    val totalPausedMs:       Long           = 0L
 )
 
-class HomeViewModel : ViewModel() {
+object AttentionCycleManager {
 
-    private val _state = MutableStateFlow(HomeState())
-    val state: StateFlow<HomeState> = _state.asStateFlow()
+    private const val FOCUS_SECS               = 30 * 60L
+    private const val SHORT_BREAK_SECS         = 5  * 60L
+    private const val LONG_BREAK_SECS          = 10 * 60L
+    private const val FOCUS_BLOCKS_BEFORE_LONG = 2
 
-    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
+    private val _state = MutableStateFlow(CycleState())
+    val stateFlow: StateFlow<CycleState> = _state.asStateFlow()
 
-    private fun loadTodayPlan() {
-        viewModelScope.launch {
-            PlanStore.todayTasks.collect { tasks ->
-                _state.update { it.copy(
-                    tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t ->
-                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
-                    }?.id
-                )}
+    private var focusBlocksDone     = 0
+    private var checkWindowOpen     = false
+    private var checkWindowOpenedAt = 0L
+    private var totalDurationSecs   = 0L
+    private var elapsedTotal        = 0L
+    private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
+    // The break phase queued up while we're showing PROMPT_DONE
+    private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
+
+    fun start(taskId: String, taskName: String, durationMinutes: Long) {
+        totalDurationSecs = durationMinutes * 60
+        elapsedTotal      = 0
+        focusBlocksDone   = 0
+        pendingBreakPhase = AttentionPhase.SHORT_BREAK
+        _state.value = CycleState(
+            phase            = AttentionPhase.FOCUS,
+            phaseSecondsLeft = FOCUS_SECS,
+            taskId           = taskId,
+            taskName         = taskName
+        )
+    }
+
+    /** Called from the floating bar "✅ Mark Done" button during PROMPT_DONE. */
+    fun confirmDone() {
+        val done = _state.value.copy(
+            phase            = AttentionPhase.DONE,
+            phaseJustChanged = true
+        )
+        _state.value = done
+    }
+
+    /**
+     * Called from the floating bar "➡ Continue" button during PROMPT_DONE.
+     * Advances to the queued break phase so the cycle keeps going.
+     */
+    fun dismissPromptAndBreak() {
+        val breakSecs = if (pendingBreakPhase == AttentionPhase.LONG_BREAK)
+            LONG_BREAK_SECS else SHORT_BREAK_SECS
+        _state.value = _state.value.copy(
+            phase               = pendingBreakPhase,
+            phaseSecondsLeft    = breakSecs,
+            needsAttentionCheck = false,
+            phaseJustChanged    = true
+        )
+    }
+
+    /** Blueprint 2.2: Pause — freezes tick loop, records pausedAt timestamp */
+    fun pause() {
+        val current = _state.value
+        if (current.phase == AttentionPhase.PAUSED ||
+            current.phase == AttentionPhase.DONE   ||
+            current.phase == AttentionPhase.PROMPT_DONE) return
+        phaseBeforePause = current.phase
+        _state.value = current.copy(
+            phase            = AttentionPhase.PAUSED,
+            phaseJustChanged = true,
+            pausedAt         = System.currentTimeMillis()
+        )
+    }
+
+    /** Blueprint 2.2: Resume — restarts tick, accumulates totalPausedMs */
+    fun resume() {
+        val current = _state.value
+        if (current.phase != AttentionPhase.PAUSED) return
+        val pauseDuration = if (current.pausedAt > 0L)
+            System.currentTimeMillis() - current.pausedAt else 0L
+        _state.value = current.copy(
+            phase            = phaseBeforePause,
+            phaseJustChanged = true,
+            pausedAt         = 0L,
+            totalPausedMs    = current.totalPausedMs + pauseDuration
+        )
+    }
+
+    fun tick(): CycleState {
+        val current = _state.value
+        // Freeze tick while paused, in prompt, or done
+        if (current.phase == AttentionPhase.PAUSED     ||
+            current.phase == AttentionPhase.PROMPT_DONE ||
+            current.phase == AttentionPhase.DONE)
+            return current
+
+        elapsedTotal++
+
+        if (totalDurationSecs > 0 && elapsedTotal >= totalDurationSecs) {
+            val done = current.copy(phase = AttentionPhase.DONE, phaseJustChanged = true)
+            _state.value = done
+            return done
+        }
+
+        val newSecondsLeft = current.phaseSecondsLeft - 1
+
+        val needsCheck = current.phase == AttentionPhase.FOCUS
+                && newSecondsLeft in 0..120 && !checkWindowOpen
+        if (needsCheck) {
+            checkWindowOpen     = true
+            checkWindowOpenedAt = elapsedTotal
+        }
+
+        var checksMissed = current.checksMissed
+        if (checkWindowOpen && elapsedTotal - checkWindowOpenedAt > 120) {
+            checksMissed++
+            checkWindowOpen = false
+        }
+
+        if (newSecondsLeft <= 0) {
+            return when (current.phase) {
+                AttentionPhase.FOCUS -> {
+                    focusBlocksDone++
+                    // Decide what break comes *after* the prompt
+                    pendingBreakPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
+                        AttentionPhase.LONG_BREAK else AttentionPhase.SHORT_BREAK
+
+                    // Enter PROMPT_DONE — timer frozen, user decides
+                    val next = current.copy(
+                        phase               = AttentionPhase.PROMPT_DONE,
+                        phaseSecondsLeft    = 0,
+                        totalSessionSeconds = elapsedTotal,
+                        cycleIndex          = focusBlocksDone + 1,
+                        needsAttentionCheck = false,
+                        phaseJustChanged    = true,
+                        checksMissed        = checksMissed
+                    )
+                    _state.value = next; next
+                }
+                AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
+                    checkWindowOpen = false
+                    val next = current.copy(
+                        phase               = AttentionPhase.FOCUS,
+                        phaseSecondsLeft    = FOCUS_SECS,
+                        totalSessionSeconds = elapsedTotal,
+                        needsAttentionCheck = false,
+                        phaseJustChanged    = true,
+                        checksMissed        = checksMissed
+                    )
+                    _state.value = next; next
+                }
+                else -> current
+            }
+        }
+
+        val next = current.copy(
+            phaseSecondsLeft    = newSecondsLeft,
+            totalSessionSeconds = elapsedTotal,
+            needsAttentionCheck = checkWindowOpen,
+            phaseJustChanged    = false,
+            checksMissed        = checksMissed
+        )
+        _state.value = next
+        return next
+    }
+
+    fun confirmAttention() {
+        checkWindowOpen = false
+        _state.value = _state.value.copy(
+            checksPassed        = _state.value.checksPassed + 1,
+            needsAttentionCheck = false
+        )
+    }
+
+    fun currentState(): CycleState = _state.value
+
+    fun reset() {
+        focusBlocksDone     = 0
+        checkWindowOpen     = false
+        elapsedTotal        = 0
+        totalDurationSecs   = 0
+        pendingBreakPhase   = AttentionPhase.SHORT_BREAK
+        _state.value        = CycleState()
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
+package com.checkmate.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.*
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.AttentionPhase
+import com.checkmate.core.tts.CheckmateTTS
+import kotlinx.coroutines.*
+
+class AttentionCycleService : Service() {
+
+    companion object {
+        private const val CHANNEL_ID = "attention_cycle_channel"
+        private const val NOTIF_ID   = 42
+        const val EXTRA_TASK_ID      = "task_id"
+        const val EXTRA_TASK_NAME    = "task_name"
+        const val EXTRA_DURATION_MIN = "duration_min"
+        const val ACTION_PAUSE       = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME      = "com.checkmate.ATTENTION_RESUME"
+
+        fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
+            val intent = Intent(context, AttentionCycleService::class.java).apply {
+                putExtra(EXTRA_TASK_ID,      taskId)
+                putExtra(EXTRA_TASK_NAME,    taskName)
+                putExtra(EXTRA_DURATION_MIN, durationMinutes)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(intent)
+            else
+                context.startService(intent)
+        }
+
+        fun stop(context: Context) =
+            context.stopService(Intent(context, AttentionCycleService::class.java))
+
+        fun sendPause(context: Context) =
+            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
+
+        fun sendResume(context: Context) =
+            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
+    }
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var cycleJob: Job? = null
+    private var isPaused = false
+
+    private val pauseReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
+                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
             }
         }
     }
 
-    private fun loadStreak() {
-        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
-    }
-
-    private fun loadPsycheMessage() {
-        viewModelScope.launch {
-            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_PAUSE)
+            addAction(ACTION_RESUME)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(pauseReceiver, filter)
         }
     }
 
-    fun startTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            WorkModeManager.activate(context)
-            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
-            mappedPkg?.let { pkg ->
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ?.let { context.startActivity(it) }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
+        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
+        AttentionCycleManager.start(taskId, taskName, durationMin)
+        startCycleLoop(taskName)
+        return START_NOT_STICKY
+    }
+
+    private fun startCycleLoop(taskName: String) {
+        cycleJob?.cancel()
+        cycleJob = scope.launch {
+            while (isActive) {
+                if (isPaused) {
+                    val cs = AttentionCycleManager.currentState()
+                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
+                    delay(1_000)
+                    continue
+                }
+                val cs = AttentionCycleManager.tick()
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(NOTIF_ID, buildNotification(
+                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
+                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
+
+                if (cs.phaseJustChanged) {
+                    when (cs.phase) {
+                        AttentionPhase.PROMPT_DONE -> CheckmateTTS.speak(
+                            this@AttentionCycleService,
+                            "30 minutes done. Mark task complete or take a break?"
+                        )
+                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Take a 5 minute break."
+                        )
+                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Good work. 10 minute break."
+                        )
+                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Break over. Back to focus."
+                        )
+                        AttentionPhase.PAUSED      -> {}
+                        AttentionPhase.DONE        -> {
+                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
+                            stopSelf(); return@launch
+                        }
+                    }
+                }
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
+                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
+                delay(1_000)
             }
-            AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-            FloatingAttentionService.start(context)  // ← wire in overlay
-            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-            PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-
-            // Auto-trigger 1: notify guardian task started
-            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
         }
     }
 
-    fun markDone(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)   // ← tear down overlay
-            WorkModeManager.deactivate(context)
-            PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task)
-            CheckmateTTS.speak(context, "Task complete. Well done.")
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
+    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
+        val m = secondsLeft / 60; val s = secondsLeft % 60
+        val t = String.format("%d:%02d", m, s)
+        return when (phase) {
+            AttentionPhase.FOCUS        -> "FOCUS — $t"
+            AttentionPhase.SHORT_BREAK  -> "SHORT BREAK — $t"
+            AttentionPhase.LONG_BREAK   -> "LONG BREAK — $t"
+            AttentionPhase.PAUSED       -> "PAUSED — $t"
+            AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+            AttentionPhase.DONE         -> "SESSION COMPLETE"
         }
     }
 
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)   // ← tear down overlay
-            WorkModeManager.deactivate(context)
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
+    private fun buildNotification(
+        phaseText: String, taskName: String,
+        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
+    ): Notification {
+        val tm = totalSeconds / 60; val ts = totalSeconds % 60
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
+            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
+            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
+            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
+            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
+    }
 
-            // Auto-trigger 2: guardian alert after 3 consecutive skips
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+    private fun startForegroundCompat(n: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        else startForeground(NOTIF_ID, n)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() {
+        cycleJob?.cancel(); scope.cancel()
+        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
+        AttentionCycleManager.reset()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/FloatingAttentionService.kt =====
+package com.checkmate.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.IBinder
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.WindowManager
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.lifecycle.*
+import androidx.savedstate.SavedStateRegistry
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.AttentionPhase
+
+class FloatingAttentionService : Service(),
+    LifecycleOwner,
+    ViewModelStoreOwner,
+    SavedStateRegistryOwner {
+
+    private val lifecycleRegistry = LifecycleRegistry(this)
+    override val lifecycle: Lifecycle get() = lifecycleRegistry
+
+    private val vmStore = ViewModelStore()
+    override val viewModelStore: ViewModelStore get() = vmStore
+
+    private val savedStateController = SavedStateRegistryController.create(this)
+    override val savedStateRegistry: SavedStateRegistry
+        get() = savedStateController.savedStateRegistry
+
+    private lateinit var windowManager: WindowManager
+    private var overlayView: ComposeView? = null
+
+    companion object {
+        private const val CHANNEL_ID = "floating_attention_channel"
+        private const val NOTIF_ID   = 99
+
+        fun start(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                !android.provider.Settings.canDrawOverlays(context)) return
+            val intent = Intent(context, FloatingAttentionService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(intent)
+            else
+                context.startService(intent)
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, FloatingAttentionService::class.java))
+        }
+    }
+
+    override fun onCreate() {
+        savedStateController.performAttach()
+        savedStateController.performRestore(null)
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        super.onCreate()
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        createChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIF_ID, buildNotification())
+        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        showOverlay()
+        return START_NOT_STICKY
+    }
+
+    private fun showOverlay() {
+        if (overlayView != null) return
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP }
+
+        val view = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(this@FloatingAttentionService)
+            setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
+            setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
+            setContent { AttentionBar(onDismiss = { stop(this@FloatingAttentionService) }) }
+        }
+        windowManager.addView(view, params)
+        overlayView = view
+    }
+
+    override fun onDestroy() {
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        overlayView?.let { windowManager.removeView(it) }
+        overlayView = null
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun buildNotification(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Attention overlay active")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW).build()
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Floating Attention Bar", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+}
+
+// ── Colors ────────────────────────────────────────────────────────────────────
+
+private val CGreen  = Color(0xFF00C896)
+private val CAmber  = Color(0xFFFFB347)
+private val CGray   = Color(0xFF9090A8)
+private val CRed    = Color(0xFFFF4444)
+private val CPurple = Color(0xFFBB86FC)
+private val CBg     = Color(0xF0111122)
+
+// ── Bar Composable ────────────────────────────────────────────────────────────
+
+@Composable
+private fun AttentionBar(onDismiss: () -> Unit) {
+    val cs by AttentionCycleManager.stateFlow.collectAsState()
+
+    LaunchedEffect(cs.phase) {
+        if (cs.phase == AttentionPhase.DONE) onDismiss()
+    }
+
+    val phaseColor = when (cs.phase) {
+        AttentionPhase.FOCUS        -> CGreen
+        AttentionPhase.SHORT_BREAK  -> CGreen
+        AttentionPhase.LONG_BREAK   -> CAmber
+        AttentionPhase.PAUSED       -> CAmber
+        AttentionPhase.PROMPT_DONE  -> CPurple
+        AttentionPhase.DONE         -> CGray
+    }
+
+    val totalPhaseSecs = when (cs.phase) {
+        AttentionPhase.FOCUS       -> 30 * 60L
+        AttentionPhase.SHORT_BREAK -> 5  * 60L
+        AttentionPhase.LONG_BREAK  -> 10 * 60L
+        else                       -> 1L
+    }
+    val progress = when (cs.phase) {
+        AttentionPhase.PROMPT_DONE -> 1f   // bar full at prompt
+        else -> (1f - cs.phaseSecondsLeft.toFloat() / totalPhaseSecs.toFloat()).coerceIn(0f, 1f)
+    }
+
+    val m = cs.phaseSecondsLeft / 60
+    val s = cs.phaseSecondsLeft % 60
+
+    val phaseLabel = when (cs.phase) {
+        AttentionPhase.FOCUS        -> "FOCUS"
+        AttentionPhase.SHORT_BREAK  -> "BREAK"
+        AttentionPhase.LONG_BREAK   -> "LONG BREAK"
+        AttentionPhase.PAUSED       -> "PAUSED"
+        AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+        AttentionPhase.DONE         -> "DONE"
+    }
+
+    // Pulse color when paused or prompting
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue  = 0.5f,
+        targetValue   = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(700, easing = LinearEasing), RepeatMode.Reverse
+        ),
+        label = "pulseAlpha"
+    )
+    val shouldPulse = cs.phase == AttentionPhase.PAUSED || cs.phase == AttentionPhase.PROMPT_DONE
+    val displayColor = if (shouldPulse) phaseColor.copy(alpha = pulseAlpha) else phaseColor
+
+    Column(Modifier.fillMaxWidth().background(CBg)) {
+
+        if (cs.phase == AttentionPhase.PROMPT_DONE) {
+            // ── Prompt row: task done or take a break? ────────────────────────
+            Row(
+                modifier              = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text       = "30m done!",
+                    fontSize   = 12.sp,
+                    color      = displayColor,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    // ✅ Mark task done
+                    Text(
+                        text       = "✅ Done",
+                        fontSize   = 13.sp,
+                        color      = CGreen,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { AttentionCycleManager.confirmDone() }
+                    )
+                    // ➡ Take break and continue task
+                    Text(
+                        text       = "➡ Break",
+                        fontSize   = 13.sp,
+                        color      = CAmber,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { AttentionCycleManager.dismissPromptAndBreak() }
+                    )
+                }
+            }
+        } else {
+            // ── Normal row: phase label + timer + controls ────────────────────
+            Row(
+                modifier              = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Left: phase + timer + cycle
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text       = phaseLabel,
+                        fontSize   = 11.sp,
+                        color      = displayColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text       = "%02d:%02d".format(m, s),
+                        fontSize   = 13.sp,
+                        color      = displayColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text       = "· C${cs.cycleIndex}",
+                        fontSize   = 10.sp,
+                        color      = CGray,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                // Right: ✅ confirm attention + ⏸/▶ pause + ✕ dismiss
+                Row(verticalAlignment = Alignment.CenterVertically) {
+
+                    if (cs.needsAttentionCheck) {
+                        Text(
+                            text     = "✅",
+                            fontSize = 18.sp,
+                            modifier = Modifier
+                                .padding(end = 12.dp)
+                                .clickable(
+                                    indication        = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { AttentionCycleManager.confirmAttention() }
+                        )
+                    }
+
+                    if (cs.phase != AttentionPhase.DONE) {
+                        val pauseIcon  = if (cs.phase == AttentionPhase.PAUSED) "▶" else "⏸"
+                        val pauseColor = if (cs.phase == AttentionPhase.PAUSED) CGreen else CAmber
+                        Text(
+                            text     = pauseIcon,
+                            fontSize = 16.sp,
+                            color    = pauseColor,
+                            modifier = Modifier
+                                .padding(end = 12.dp)
+                                .clickable(
+                                    indication        = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) {
+                                    if (cs.phase == AttentionPhase.PAUSED) AttentionCycleManager.resume()
+                                    else AttentionCycleManager.pause()
+                                }
+                        )
+                    }
+
+                    Text(
+                        text       = "✕",
+                        fontSize   = 13.sp,
+                        color      = CRed.copy(alpha = 0.85f),
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick           = onDismiss
+                        )
+                    )
+                }
             }
         }
-    }
 
-    fun pauseTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
-        }
-    }
-
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
-        }
+        LinearProgressIndicator(
+            progress   = { progress },
+            modifier   = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .clip(RoundedCornerShape(0.dp)),
+            color      = displayColor,
+            trackColor = displayColor.copy(alpha = 0.12f)
+        )
     }
 }
