@@ -21,14 +21,13 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.ui.theme.*
 
 @Composable
-fun HomeScreen(navController: NavController, vm: HomeViewModel = viewModel()) {
+fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     val state   by vm.state.collectAsState()
     val context = LocalContext.current
 
@@ -206,7 +205,6 @@ private fun TaskCard(
                 color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
             )
 
-            // Action area — fixed with if/else to avoid Compose slot table crash
             if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -218,7 +216,6 @@ private fun TaskCard(
                 Spacer(Modifier.height(12.dp))
 
                 if (isPaused) {
-                    // Paused task → Resume + Skip
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick  = onResume,
@@ -236,7 +233,6 @@ private fun TaskCard(
                         ) { Text("Skip") }
                     }
                 } else if (isActive) {
-                    // Running task → Pause + Done + Skip
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = onPause,
@@ -261,7 +257,6 @@ private fun TaskCard(
                         ) { Text("Skip") }
                     }
                 } else {
-                    // Pending task → Start + Skip
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick  = onStart,

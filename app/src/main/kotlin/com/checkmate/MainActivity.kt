@@ -33,10 +33,8 @@ class MainActivity : ComponentActivity() {
         private const val REQUEST_CODE_MIC     = 1002
     }
 
-    // Shared ViewModel so we can call onProjectionGranted/Denied
     private lateinit var homeViewModel: HomeViewModel
 
-    // ActivityResult launcher for MediaProjection dialog
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -54,7 +52,6 @@ class MainActivity : ComponentActivity() {
 
         homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
 
-        // Observe projection requests from HomeViewModel
         lifecycleScope.launch {
             homeViewModel.requestProjection.collect {
                 val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -71,7 +68,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             CheckmateTheme {
                 Surface {
-                    MainScreen()
+                    MainScreen(homeViewModel = homeViewModel)
                 }
             }
         }

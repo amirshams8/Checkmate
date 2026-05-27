@@ -13,6 +13,7 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import androidx.navigation.compose.*
 import com.checkmate.ui.home.HomeScreen
+import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.mentor.MentorScreen
 import com.checkmate.ui.planner.PlannerScreen
 import com.checkmate.ui.planner.DailyCheckInScreen
@@ -31,14 +32,12 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(homeViewModel: HomeViewModel) {
     val navController = rememberNavController()
-    // Blueprint 6: Today | Plan | Mentor | Stats | Settings
     val items = listOf(Screen.Home, Screen.Planner, Screen.Mentor, Screen.Stats, Screen.Settings)
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
 
-    // Routes that show the bottom nav
     val bottomNavRoutes = items.map { it.route }
     val showBottomNav   = currentRoute in bottomNavRoutes
 
@@ -81,7 +80,7 @@ fun MainScreen() {
             modifier         = Modifier.padding(padding)
         ) {
             // Main tabs
-            composable(Screen.Home.route)     { HomeScreen(navController) }
+            composable(Screen.Home.route)     { HomeScreen(navController, vm = homeViewModel) }
             composable(Screen.Planner.route)  { PlannerScreen(navController) }
             composable(Screen.Mentor.route)   { MentorScreen() }
             composable(Screen.Stats.route)    { StatsScreen() }
