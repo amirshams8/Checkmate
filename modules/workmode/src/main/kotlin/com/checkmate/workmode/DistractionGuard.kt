@@ -1,20 +1,15 @@
 package com.checkmate.workmode
 
 import android.content.Context
-import android.net.Uri
 import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ScreenshotCapture
 
 /**
  * DistractionGuard — tracks how many times the student attempts to open each
  * blocked app or visit each blocked domain during a study session.
  *
- * On the 3rd attempt for any single app or domain:
- *   1. Captures a screenshot via ScreenshotCapture (no Activity needed — uses
- *      the overlay window already owned by FloatingAttentionService).
- *   2. Sends a WhatsApp alert to the guardian with the screenshot attached.
+ * On the 3rd attempt for any single app or domain it fires DistractionListener
+ * (wired in by the app layer) so the :workmode module stays free of any
+ * direct dependency on :app classes like ScreenshotCapture or GuardianNotifier.
  *
  * Counters live in memory only and are wiped when WorkModeManager.deactivate()
  * is called, so each new task starts from zero.
@@ -32,6 +27,12 @@ object DistractionGuard {
     private val appAttempts     = mutableMapOf<String, Int>()
     // hostname (e.g. "youtube.com") → attempt count
     private val domainAttempts  = mutableMapOf<String, Int>()
+
+    /**
+     * Injected by CheckmateApp.onCreate so the :workmode module never
+     * directly references ScreenshotCapture or GuardianNotifier.
+     */
+    var listener: DistractionListener? = null
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -77,8 +78,7 @@ object DistractionGuard {
 
     private fun triggerAlert(context: Context, kind: String, target: String) {
         Log.w(TAG, "ALERT: $kind '$target' attempted $ALERT_THRESHOLD times")
-        // Capture overlay screenshot (no Activity required)
-        val uri: Uri? = ScreenshotCapture.captureOverlay(context)
-        GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+        listener?.onAlertThresholdReached(context, kind, target)
+            ?: Log.w(TAG, "No DistractionListener set — alert suppressed")
     }
 }
