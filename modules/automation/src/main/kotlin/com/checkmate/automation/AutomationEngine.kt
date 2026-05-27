@@ -2,11 +2,6 @@ package com.checkmate.automation
 
 import android.util.Log
 
-/**
- * Central automation coordinator.
- * Queues WhatsApp messages to be typed+sent by AppAutomationService
- * once the target chat is open.
- */
 object AutomationEngine {
 
     private const val TAG = "AutomationEngine"
@@ -16,6 +11,9 @@ object AutomationEngine {
         pendingWhatsAppMessage = text
         Log.d(TAG, "WhatsApp message queued: ${text.take(40)}")
     }
+
+    /** Read without consuming — use before SET_TEXT succeeds */
+    fun peekPendingWhatsAppMessage(): String? = pendingWhatsAppMessage
 
     fun consumePendingWhatsAppMessage(): String? {
         val msg = pendingWhatsAppMessage
