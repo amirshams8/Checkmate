@@ -1,394 +1,470 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
-package com.checkmate.ui.settings
+//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
+package com.checkmate.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.*
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.AttentionPhase
+import com.checkmate.core.tts.CheckmateTTS
+import kotlinx.coroutines.*
+
+class AttentionCycleService : Service() {
+
+    companion object {
+        private const val CHANNEL_ID        = "attention_cycle_channel"
+        private const val NOTIF_ID          = 42
+        const val EXTRA_TASK_ID             = "task_id"
+        const val EXTRA_TASK_NAME           = "task_name"
+        const val EXTRA_DURATION_MIN        = "duration_min"
+        // Projection token extras — passed so getMediaProjection() runs AFTER startForeground()
+        const val EXTRA_PROJECTION_CODE     = "projection_result_code"
+        const val EXTRA_PROJECTION_DATA     = "projection_data"
+        const val ACTION_PAUSE              = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME             = "com.checkmate.ATTENTION_RESUME"
+
+        fun start(
+            context: Context,
+            taskId: String,
+            taskName: String,
+            durationMinutes: Long,
+            projectionResultCode: Int = Activity.RESULT_CANCELED,
+            projectionData: Intent?   = null
+        ) {
+            val intent = Intent(context, AttentionCycleService::class.java).apply {
+                putExtra(EXTRA_TASK_ID,          taskId)
+                putExtra(EXTRA_TASK_NAME,         taskName)
+                putExtra(EXTRA_DURATION_MIN,      durationMinutes)
+                putExtra(EXTRA_PROJECTION_CODE,   projectionResultCode)
+                putExtra(EXTRA_PROJECTION_DATA,   projectionData)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(intent)
+            else
+                context.startService(intent)
+        }
+
+        fun stop(context: Context) =
+            context.stopService(Intent(context, AttentionCycleService::class.java))
+
+        fun sendPause(context: Context) =
+            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
+
+        fun sendResume(context: Context) =
+            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
+    }
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var cycleJob: Job? = null
+    private var isPaused = false
+
+    private val pauseReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
+                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_PAUSE)
+            addAction(ACTION_RESUME)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(pauseReceiver, filter)
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
+        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+
+        // startForeground() MUST be called before getMediaProjection() on Android 14+.
+        // We call it first here, then immediately store the projection token below.
+        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
+
+        // Now it is safe to call getMediaProjection() — the mediaProjection FGS type is active.
+        val projCode = intent?.getIntExtra(EXTRA_PROJECTION_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val projData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            intent?.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+        else
+            @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+
+        if (projCode == Activity.RESULT_OK && projData != null) {
+            ScreenCaptureManager.storeProjectionToken(applicationContext, projCode, projData)
+        }
+
+        AttentionCycleManager.start(taskId, taskName, durationMin)
+        startCycleLoop(taskName)
+        return START_NOT_STICKY
+    }
+
+    private fun startCycleLoop(taskName: String) {
+        cycleJob?.cancel()
+        cycleJob = scope.launch {
+            while (isActive) {
+                if (isPaused) {
+                    val cs = AttentionCycleManager.currentState()
+                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
+                    delay(1_000)
+                    continue
+                }
+                val cs = AttentionCycleManager.tick()
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(NOTIF_ID, buildNotification(
+                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
+                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
+
+                if (cs.phaseJustChanged) {
+                    when (cs.phase) {
+                        AttentionPhase.PROMPT_DONE -> CheckmateTTS.speak(
+                            this@AttentionCycleService,
+                            "30 minutes done. Mark task complete or take a break?"
+                        )
+                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Take a 5 minute break."
+                        )
+                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Good work. 10 minute break."
+                        )
+                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Break over. Back to focus."
+                        )
+                        AttentionPhase.PAUSED      -> {}
+                        AttentionPhase.DONE        -> {
+                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
+                            stopSelf(); return@launch
+                        }
+                    }
+                }
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
+                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
+                delay(1_000)
+            }
+        }
+    }
+
+    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
+        val m = secondsLeft / 60; val s = secondsLeft % 60
+        val t = String.format("%d:%02d", m, s)
+        return when (phase) {
+            AttentionPhase.FOCUS        -> "FOCUS — $t"
+            AttentionPhase.SHORT_BREAK  -> "SHORT BREAK — $t"
+            AttentionPhase.LONG_BREAK   -> "LONG BREAK — $t"
+            AttentionPhase.PAUSED       -> "PAUSED — $t"
+            AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+            AttentionPhase.DONE         -> "SESSION COMPLETE"
+        }
+    }
+
+    private fun buildNotification(
+        phaseText: String, taskName: String,
+        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
+    ): Notification {
+        val tm = totalSeconds / 60; val ts = totalSeconds % 60
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
+            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
+            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
+            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
+            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
+    }
+
+    private fun startForegroundCompat(n: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            startForeground(NOTIF_ID, n,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        else startForeground(NOTIF_ID, n)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() {
+        cycleJob?.cancel(); scope.cancel()
+        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
+        AttentionCycleManager.reset()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/MainActivity.kt =====
+package com.checkmate
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.Surface
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.stopwatch.NotificationPermissionHelper
+import com.checkmate.ui.home.HomeViewModel
+import com.checkmate.ui.main.MainScreen
+import com.checkmate.ui.theme.CheckmateTheme
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+
+    companion object {
+        private const val REQUEST_CODE_OVERLAY = 1001
+        private const val REQUEST_CODE_MIC     = 1002
+    }
+
+    private lateinit var homeViewModel: HomeViewModel
+
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            // Pass the raw resultCode + data directly to the ViewModel.
+            // The ViewModel will forward them into AttentionCycleService's intent,
+            // so getMediaProjection() is called only AFTER startForeground() runs.
+            homeViewModel.onProjectionGranted(
+                applicationContext,
+                result.resultCode,
+                result.data
+            )
+        } else {
+            homeViewModel.onProjectionDenied(applicationContext)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        CheckmateState.init(applicationContext)
+
+        homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
+
+        lifecycleScope.launch {
+            homeViewModel.requestProjection.collect {
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mgr.createScreenCaptureIntent())
+            }
+        }
+
+        if (NotificationPermissionHelper.shouldRequestPermission(this)) {
+            NotificationPermissionHelper.requestPermission(this)
+        }
+        requestOverlayPermissionIfNeeded()
+        requestMicPermissionIfNeeded()
+
+        setContent {
+            CheckmateTheme {
+                Surface {
+                    MainScreen(homeViewModel = homeViewModel)
+                }
+            }
+        }
+    }
+
+    private fun requestMicPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE_MIC
+            )
+        }
+    }
+
+    private fun requestOverlayPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Grant overlay permission for attention timer", Toast.LENGTH_LONG).show()
+            startActivityForResult(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                REQUEST_CODE_OVERLAY
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == NotificationPermissionHelper.REQUEST_CODE_POST_NOTIFICATIONS) {
+            if (!NotificationPermissionHelper.isPermissionGranted(this)) {
+                Toast.makeText(this, "Notification permission needed for reminders", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
+package com.checkmate.ui.home
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
-import android.provider.Settings
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import com.checkmate.core.CheckmatePrefs
-import com.checkmate.ui.theme.*
+import com.checkmate.core.StudyTask
+import com.checkmate.core.TaskState
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.service.AttentionCycleService
+import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.workmode.WorkModeManager
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import android.app.Activity
 
-@Composable
-fun SettingsScreen() {
-    val context = LocalContext.current
-    var showAppSelector     by remember { mutableStateOf(false) }
-    var showWebsiteBlocker  by remember { mutableStateOf(false) }
+data class HomeState(
+    val tasks:             List<StudyTask> = emptyList(),
+    val activeTaskId:      String?         = null,
+    val completedToday:    Int             = 0,
+    val streakDays:        Int             = 0,
+    val psycheMessage:     String          = "",
+    val consecutiveSkips:  Int             = 0
+)
 
-    if (showAppSelector) {
-        AppSelectorScreen(onBack = { showAppSelector = false })
-        return
-    }
-    if (showWebsiteBlocker) {
-        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
-        return
-    }
+class HomeViewModel : ViewModel() {
 
-    Column(
-        modifier        = Modifier.fillMaxSize().background(BgDark)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        Spacer(Modifier.height(20.dp))
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
-        }
-        Spacer(Modifier.height(8.dp))
+    private val _state = MutableStateFlow(HomeState())
+    val state: StateFlow<HomeState> = _state.asStateFlow()
 
-        // ── LLM API Keys ──
-        SettingSection("AI PROVIDERS") {
-            LlmProviderSettings(context)
-        }
+    // MainActivity observes this to launch the MediaProjection system dialog
+    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
+    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
 
-        // ── Voice / TTS ──
-        SettingSection("VOICE") {
-            VoiceSettings(context)
-        }
+    private var pendingTask: StudyTask? = null
 
-        // ── Work Mode ──
-        SettingSection("WORK MODE") {
-            SettingTile(
-                title    = "Blocked Apps",
-                subtitle = "Block distraction apps incl. Google & system apps",
-                icon     = Icons.Default.Block
-            ) { showAppSelector = true }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Blocked Websites",
-                subtitle = "Block distracting domains in any browser",
-                icon     = Icons.Default.Language
-            ) { showWebsiteBlocker = true }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Accessibility Service",
-                subtitle = "Required for app/site blocking and WhatsApp automation",
-                icon     = Icons.Default.Accessibility
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-        }
+    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
 
-        // ── Permissions ──
-        SettingSection("PERMISSIONS") {
-            SettingTile(
-                title    = "Notification Listener",
-                subtitle = "Required for WhatsApp message detection",
-                icon     = Icons.Default.Notifications
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Overlay Permission",
-                subtitle = "Required for floating attention timer",
-                icon     = Icons.Default.Layers
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:${context.packageName}"))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(32.dp))
-    }
-}
-
-// ── LLM Provider Settings ─────────────────────────────────────────────────────
-
-private val LLM_PROVIDERS = listOf("Groq", "Claude", "Gemini", "OpenRouter")
-
-@Composable
-private fun LlmProviderSettings(context: Context) {
-    val providers = LLM_PROVIDERS
-
-    var selectedProvider by remember {
-        mutableStateOf(CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq")
-    }
-
-    // One key state per provider
-    val keys = providers.associateWith { provider ->
-        remember(provider) {
-            mutableStateOf(
-                CheckmatePrefs.getString("llm_key_${provider.lowercase()}", "") ?: ""
-            )
-        }
-    }
-
-    // Provider selector chips
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Active Provider", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            providers.forEach { provider ->
-                val selected = provider == selectedProvider
-                FilterChip(
-                    selected = selected,
-                    onClick  = {
-                        selectedProvider = provider
-                        CheckmatePrefs.putString("llm_provider", provider)
-                    },
-                    label    = { Text(provider, fontSize = 12.sp) },
-                    colors   = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = AccentGreen,
-                        selectedLabelColor     = BgDark
-                    )
-                )
+    private fun loadTodayPlan() {
+        viewModelScope.launch {
+            PlanStore.todayTasks.collect { tasks ->
+                _state.update { it.copy(
+                    tasks          = tasks,
+                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
+                    activeTaskId   = tasks.firstOrNull { t ->
+                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
+                    }?.id
+                )}
             }
         }
     }
 
-    HorizontalDivider(color = White10)
+    private fun loadStreak() {
+        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
+    }
 
-    // API key field for the currently selected provider
-    val currentKey = keys[selectedProvider]
-    if (currentKey != null) {
-        var showKey by remember { mutableStateOf(false) }
-        var saved   by remember { mutableStateOf(false) }
-
-        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Text("$selectedProvider API Key", fontSize = 12.sp, color = White60,
-                modifier = Modifier.padding(bottom = 6.dp))
-            OutlinedTextField(
-                value         = currentKey.value,
-                onValueChange = { currentKey.value = it; saved = false },
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                placeholder   = { Text("Paste API key here", color = White30, fontSize = 13.sp) },
-                visualTransformation = if (showKey) VisualTransformation.None
-                                       else PasswordVisualTransformation(),
-                trailingIcon  = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { showKey = !showKey }) {
-                            Icon(
-                                if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                null, tint = White60
-                            )
-                        }
-                        IconButton(onClick = {
-                            CheckmatePrefs.putString(
-                                "llm_key_${selectedProvider.lowercase()}",
-                                currentKey.value.trim()
-                            )
-                            saved = true
-                        }) {
-                            Icon(
-                                if (saved) Icons.Default.Check else Icons.Default.Save,
-                                null,
-                                tint = if (saved) AccentGreen else White60
-                            )
-                        }
-                    }
-                },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-            if (saved) {
-                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                    modifier = Modifier.padding(top = 4.dp))
-            }
+    private fun loadPsycheMessage() {
+        viewModelScope.launch {
+            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
         }
     }
 
-    HorizontalDivider(color = White10)
-
-    // ── Guardian WhatsApp number ──────────────────────────────────────────────
-    var guardianNumber by remember {
-        mutableStateOf(CheckmatePrefs.getString("guardian_number", "") ?: "")
+    fun startTask(context: Context, task: StudyTask) {
+        if (ScreenCaptureManager.isReady()) {
+            launchTask(context, task)
+        } else {
+            pendingTask = task
+            _requestProjection.tryEmit(task)
+        }
     }
-    var guardianSaved by remember { mutableStateOf(false) }
 
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Guardian WhatsApp Number", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        OutlinedTextField(
-            value         = guardianNumber,
-            onValueChange = { guardianNumber = it; guardianSaved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("+91XXXXXXXXXX", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Phone, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    CheckmatePrefs.putString("guardian_number", guardianNumber.trim())
-                    guardianSaved = true
-                }) {
-                    Icon(
-                        if (guardianSaved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (guardianSaved) AccentGreen else White60
-                    )
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
+    /**
+     * Called by MainActivity after user approves the MediaProjection dialog.
+     * We forward the raw resultCode + data into AttentionCycleService's start intent,
+     * so getMediaProjection() is called only after startForeground() has run inside the service.
+     * This is the correct fix for:
+     *   SecurityException: Media projections require a foreground service of type
+     *   ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+     */
+    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        // Start the FGS with the projection token baked into the intent.
+        // AttentionCycleService.onStartCommand() calls startForeground() first,
+        // then immediately calls ScreenCaptureManager.storeProjectionToken() — safe.
+        AttentionCycleService.start(
+            context,
+            task.id,
+            task.topic,
+            task.durationMinutes.toLong(),
+            projectionResultCode = resultCode,
+            projectionData       = data
         )
-        if (guardianSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                modifier = Modifier.padding(top = 4.dp))
-        }
+        launchTask(context, task, serviceAlreadyStarted = true)
     }
 
-    HorizontalDivider(color = White10)
-
-    // ── Guardian Telegram Chat ID ─────────────────────────────────────────────
-    var telegramChatId by remember {
-        mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
-    }
-    var telegramSaved by remember { mutableStateOf(false) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            "Guardian: open Telegram → message @userinfobot → copy the id: number here",
-            fontSize = 11.sp,
-            color    = White30,
-            modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = telegramChatId,
-            onValueChange = { telegramChatId = it; telegramSaved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
-                    telegramSaved = true
-                }) {
-                    Icon(
-                        if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (telegramSaved) AccentGreen else White60
-                    )
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        if (telegramSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                modifier = Modifier.padding(top = 4.dp))
-        }
-    }
-}
-
-// ── Voice / TTS Settings ──────────────────────────────────────────────────────
-
-@Composable
-private fun VoiceSettings(context: Context) {
-    var ttsEnabled by remember {
-        mutableStateOf(CheckmatePrefs.getBoolean("tts_enabled", true))
+    fun onProjectionDenied(context: Context) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        launchTask(context, task)
     }
 
-    Row(
-        modifier          = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(Icons.Default.RecordVoiceOver, null, tint = AccentGreen,
-            modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text("Voice Feedback", fontSize = 14.sp, color = White90)
-            Text(
-                if (ttsEnabled) "Mentor speaks task summaries aloud" else "Voice feedback is off",
-                fontSize = 11.sp, color = White60
-            )
-        }
-        Switch(
-            checked         = ttsEnabled,
-            onCheckedChange = {
-                ttsEnabled = it
-                CheckmatePrefs.putBoolean("tts_enabled", it)
-            },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor   = BgDark,
-                checkedTrackColor   = AccentGreen,
-                uncheckedThumbColor = White60,
-                uncheckedTrackColor = White10
-            )
-        )
-    }
-}
-
-// ── Shared layout helpers ─────────────────────────────────────────────────────
-
-@Composable
-private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-        Text(
-            title,
-            fontSize      = 11.sp,
-            fontWeight    = FontWeight.Bold,
-            letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
-            color         = White60,
-            modifier      = Modifier.padding(top = 16.dp, bottom = 8.dp)
-        )
-        Surface(
-            shape  = RoundedCornerShape(12.dp),
-            color  = BgCard,
-            border = BorderStroke(0.5.dp, White10)
-        ) {
-            Column(content = content)
-        }
-    }
-}
-
-@Composable
-private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
-    Surface(onClick = onClick, color = androidx.compose.ui.graphics.Color.Transparent) {
-        Row(
-            modifier          = Modifier.fillMaxWidth().padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(icon, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 14.sp, color = White90)
-                Text(subtitle, fontSize = 11.sp, color = White60)
+    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
+        viewModelScope.launch {
+            WorkModeManager.activate(context)
+            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
+            mappedPkg?.let { pkg ->
+                context.packageManager.getLaunchIntentForPackage(pkg)
+                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ?.let { context.startActivity(it) }
             }
-            Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(16.dp))
+            if (!serviceAlreadyStarted) {
+                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            }
+            FloatingAttentionService.start(context)
+            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
+            PlanStore.setTaskActive(task.id)
+            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
+            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
+        }
+    }
+
+    fun skipTask(context: Context, taskId: String) {
+        viewModelScope.launch {
+            PlanStore.setTaskSkipped(taskId)
+            val skips = (_state.value.consecutiveSkips + 1).also {
+                _state.update { s -> s.copy(consecutiveSkips = it) }
+            }
+            GuardianNotifier.notifySkip(context, skips)
+            AttentionCycleService.stop(context)
+        }
+    }
+
+    fun completeTask(context: Context, taskId: String) {
+        viewModelScope.launch {
+            PlanStore.setTaskDone(taskId)
+            _state.update { it.copy(activeTaskId = null, consecutiveSkips = 0) }
+            GuardianNotifier.notifyTaskDone(context)
+            AttentionCycleService.stop(context)
         }
     }
 }
