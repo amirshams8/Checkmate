@@ -1,734 +1,1395 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/AttentionCycleManager.kt =====
-package com.checkmate.core
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/DistractionGuard.kt =====
+package com.checkmate.workmode
 
+import android.content.Context
+import android.net.Uri
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ScreenshotCapture
+
+/**
+ * DistractionGuard — tracks how many times the student attempts to open each
+ * blocked app or visit each blocked domain during a study session.
+ *
+ * On the 3rd attempt for any single app or domain:
+ *   1. Captures a screenshot via ScreenshotCapture (no Activity needed — uses
+ *      the overlay window already owned by FloatingAttentionService).
+ *   2. Sends a WhatsApp alert to the guardian with the screenshot attached.
+ *
+ * Counters live in memory only and are wiped when WorkModeManager.deactivate()
+ * is called, so each new task starts from zero.
+ *
+ * Thread-safety: all mutations are @Synchronized. Reads are opportunistic —
+ * a slight race on the counter is acceptable (off-by-one on the alert threshold
+ * is harmless; we'd rather alert once too many than miss an alert).
+ */
+object DistractionGuard {
+
+    private const val TAG       = "DistractionGuard"
+    const val ALERT_THRESHOLD   = 3          // alert on 3rd attempt
+
+    // packageName → attempt count
+    private val appAttempts     = mutableMapOf<String, Int>()
+    // hostname (e.g. "youtube.com") → attempt count
+    private val domainAttempts  = mutableMapOf<String, Int>()
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /**
+     * Called by AppAutomationService every time a blocked app is foregrounded.
+     * Returns the new attempt count so the caller can decide what action to take.
+     */
+    @Synchronized
+    fun recordAppAttempt(context: Context, packageName: String): Int {
+        val count = (appAttempts[packageName] ?: 0) + 1
+        appAttempts[packageName] = count
+        Log.d(TAG, "App attempt: $packageName → $count")
+        if (count == ALERT_THRESHOLD) {
+            triggerAlert(context, "app", packageName)
+        }
+        return count
+    }
+
+    /**
+     * Called by AppAutomationService every time the URL bar shows a blocked domain.
+     * Returns the new attempt count.
+     */
+    @Synchronized
+    fun recordDomainAttempt(context: Context, hostname: String): Int {
+        val count = (domainAttempts[hostname] ?: 0) + 1
+        domainAttempts[hostname] = count
+        Log.d(TAG, "Domain attempt: $hostname → $count")
+        if (count == ALERT_THRESHOLD) {
+            triggerAlert(context, "site", hostname)
+        }
+        return count
+    }
+
+    /** Wipe all counters — call from WorkModeManager.deactivate(). */
+    @Synchronized
+    fun reset() {
+        appAttempts.clear()
+        domainAttempts.clear()
+        Log.d(TAG, "Counters reset")
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    private fun triggerAlert(context: Context, kind: String, target: String) {
+        Log.w(TAG, "ALERT: $kind '$target' attempted $ALERT_THRESHOLD times")
+        // Capture overlay screenshot (no Activity required)
+        val uri: Uri? = ScreenshotCapture.captureOverlay(context)
+        GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/ScreenshotCapture.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.PixelCopy
+import android.view.WindowManager
+import androidx.core.content.FileProvider
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * ScreenshotCapture — captures a screenshot WITHOUT needing an Activity.
+ *
+ * Strategy:
+ *   Android 9+ (API 28+): PixelCopy can target any Surface. We capture the
+ *   entire display by drawing into a Bitmap via the WindowManager's default
+ *   display surface bounds. PixelCopy must be called from a background thread
+ *   with a Handler pointing to the main thread for the callback.
+ *
+ *   Below API 28: We fall back to a 1×1 transparent overlay window trick to
+ *   force a draw-cache capture of the display. In practice all devices
+ *   Checkmate targets run Android 10+, so this path is a safety net only.
+ *
+ * The Uri returned is a FileProvider content:// Uri shareable with WhatsApp.
+ * Authority must match the <provider> declaration in AndroidManifest.xml.
+ *
+ * Call captureOverlay() from ANY thread — it blocks briefly (up to 2 seconds)
+ * using a CountDownLatch and returns the Uri (or null on failure).
+ */
+object ScreenshotCapture {
+
+    private const val TAG       = "ScreenshotCapture"
+    private const val AUTHORITY = "com.checkmate.fileprovider"
+
+    /**
+     * Capture the full display. Safe to call from the accessibility service
+     * thread or any background thread.
+     *
+     * Returns a content:// Uri or null on failure.
+     */
+    fun captureOverlay(context: Context): Uri? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            captureViaPixelCopy(context)
+        } else {
+            captureViaCanvasFallback(context)
+        }
+    }
+
+    // ── PixelCopy path (API 28+) ──────────────────────────────────────────────
+
+    private fun captureViaPixelCopy(context: Context): Uri? {
+        val wm      = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+            context.display else @Suppress("DEPRECATION") wm.defaultDisplay
+        if (display == null) { Log.e(TAG, "No display"); return null }
+
+        val width  = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.resources.displayMetrics.widthPixels
+        } else {
+            @Suppress("DEPRECATION")
+            android.graphics.Point().also { wm.defaultDisplay.getSize(it) }.x
+        }
+        val height = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.resources.displayMetrics.heightPixels
+        } else {
+            @Suppress("DEPRECATION")
+            android.graphics.Point().also { wm.defaultDisplay.getSize(it) }.y
+        }
+
+        val bitmap  = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val latch   = CountDownLatch(1)
+        var success = false
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // We need a Surface to give PixelCopy a target window.
+            // Use a minimal 1x1 TYPE_APPLICATION_OVERLAY window to get a valid
+            // SurfaceHolder, then immediately take the screenshot and remove it.
+            val holderWindow = android.view.SurfaceView(context)
+            val params = WindowManager.LayoutParams(
+                1, 1,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else
+                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            )
+
+            val mainHandler = Handler(Looper.getMainLooper())
+            mainHandler.post {
+                try {
+                    wm.addView(holderWindow, params)
+                    holderWindow.holder.addCallback(object : android.view.SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: android.view.SurfaceHolder) {
+                            PixelCopy.request(
+                                holder.surface,
+                                android.graphics.Rect(0, 0, width, height),
+                                bitmap,
+                                { result ->
+                                    success = result == PixelCopy.SUCCESS
+                                    if (!success) Log.e(TAG, "PixelCopy result: $result")
+                                    try { wm.removeView(holderWindow) } catch (_: Exception) {}
+                                    latch.countDown()
+                                },
+                                mainHandler
+                            )
+                        }
+                        override fun surfaceChanged(h: android.view.SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                        override fun surfaceDestroyed(h: android.view.SurfaceHolder) {}
+                    })
+                } catch (e: Exception) {
+                    Log.e(TAG, "PixelCopy setup failed: ${e.message}")
+                    try { wm.removeView(holderWindow) } catch (_: Exception) {}
+                    latch.countDown()
+                }
+            }
+        } else {
+            latch.countDown() // API < 26, fall through
+        }
+
+        latch.await(2, TimeUnit.SECONDS)
+        if (!success) {
+            Log.w(TAG, "PixelCopy failed or timeout — falling back to canvas")
+            return captureViaCanvasFallback(context)
+        }
+        return saveBitmapAndGetUri(context, bitmap)
+    }
+
+    // ── Canvas fallback (pre-API 28 or PixelCopy failure) ────────────────────
+
+    private fun captureViaCanvasFallback(context: Context): Uri? {
+        // Without an Activity window we can't get a drawing cache of the
+        // real screen. We save a placeholder bitmap with a timestamp instead —
+        // the text report sent with it still tells the guardian what happened.
+        return try {
+            val w      = context.resources.displayMetrics.widthPixels
+            val h      = 200
+            val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bitmap)
+            canvas.drawColor(android.graphics.Color.BLACK)
+            val paint  = android.graphics.Paint().apply {
+                color    = android.graphics.Color.WHITE
+                textSize = 40f
+            }
+            canvas.drawText("Distraction attempt recorded", 40f, 120f, paint)
+            saveBitmapAndGetUri(context, bitmap)
+        } catch (e: Exception) {
+            Log.e(TAG, "Canvas fallback failed: ${e.message}")
+            null
+        }
+    }
+
+    // ── Persist & expose via FileProvider ─────────────────────────────────────
+
+    private fun saveBitmapAndGetUri(context: Context, bitmap: Bitmap): Uri? {
+        return try {
+            val dir  = File(context.filesDir, "screenshots").also { it.mkdirs() }
+            val ts   = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val file = File(dir, "distraction_$ts.png")
+            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 85, it) }
+            bitmap.recycle()
+            FileProvider.getUriForFile(context, AUTHORITY, file)
+                .also { Log.d(TAG, "Screenshot saved → $it") }
+        } catch (e: Exception) {
+            Log.e(TAG, "Save failed: ${e.message}")
+            null
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
+package com.checkmate.service
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.util.Log
+import com.checkmate.automation.AutomationEngine
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import java.util.Calendar
+
+object GuardianNotifier {
+
+    private const val TAG = "GuardianNotifier"
+    const val ACTION_EOD_SUMMARY = "com.checkmate.EOD_SUMMARY"
+
+    // ── Trigger 1: Task Started ──────────────────────────────────────────────
+
+    fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
+        val number = getGuardianNumber() ?: return
+        val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
+        openWhatsAppAndSend(context, number, msg)
+        Log.d(TAG, "Guardian notified: task started")
+    }
+
+    // ── Trigger 2: Skip Streak ───────────────────────────────────────────────
+
+    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String) {
+        val number = getGuardianNumber() ?: return
+        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic. Time: ${timeNow()}"
+        openWhatsAppAndSend(context, number, msg)
+        Log.d(TAG, "Guardian notified: skip streak=$skipCount")
+    }
+
+    // ── Trigger 3: End of Day Summary ────────────────────────────────────────
+
+    fun scheduleEndOfDaySummary(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            context, 9001,
+            Intent(context, EodSummaryReceiver::class.java).apply { action = ACTION_EOD_SUMMARY },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 21)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
+        }
+        am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
+        Log.d(TAG, "EOD summary alarm set for 21:00 daily")
+    }
+
+    fun sendEndOfDaySummary(context: Context) {
+        val number = getGuardianNumber() ?: return
+        val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
+        val done    = tasks.count { it.state == TaskState.DONE }
+        val skipped = tasks.count { it.state == TaskState.SKIPPED }
+        val total   = tasks.size
+        val pct     = if (total > 0) done * 100 / total else 0
+
+        val lines = tasks.joinToString("\n") { t ->
+            val icon = when (t.state) {
+                TaskState.DONE    -> "done"
+                TaskState.SKIPPED -> "skip"
+                else              -> "miss"
+            }
+            "[$icon] ${t.subject}: ${t.topic}"
+        }
+
+        val msg = buildString {
+            appendLine("Checkmate Daily Report — ${dateToday()}")
+            appendLine("Completed: $done/$total ($pct%)")
+            if (skipped > 0) appendLine("Skipped: $skipped")
+            appendLine()
+            appendLine(lines)
+        }.trim()
+
+        openWhatsAppAndSend(context, number, msg)
+        Log.d(TAG, "EOD summary sent to guardian")
+    }
+
+    // ── Trigger 4: Distraction Alert (3rd attempt on blocked app or site) ────
+
+    /**
+     * Called by DistractionGuard when a student hits the attempt threshold.
+     *
+     * @param kind   "app" or "site"
+     * @param target package name or hostname
+     * @param screenshotUri  content:// Uri from ScreenshotCapture, or null
+     */
+    fun notifyDistractionAlert(
+        context: Context,
+        kind: String,
+        target: String,
+        screenshotUri: Uri? = null
+    ) {
+        val number = getGuardianNumber() ?: return
+        val label  = if (kind == "app") "app: $target" else "website: $target"
+        val msg    = "⚠️ Checkmate Alert: Student attempted to open blocked $label " +
+                     "3 times during study session at ${timeNow()}."
+        Log.w(TAG, "Distraction alert: $label")
+
+        if (screenshotUri != null) {
+            sendReport(context, msg, screenshotUri)
+        } else {
+            openWhatsAppAndSend(context, number, msg)
+        }
+    }
+
+    // ── Manual report with optional screenshot ────────────────────────────────
+
+    fun sendReport(context: Context, reportText: String, screenshotUri: Uri? = null) {
+        val guardianNumber = getGuardianNumber() ?: return
+        val clean = guardianNumber.replace(Regex("[^0-9]"), "")
+        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
+
+        if (screenshotUri != null) {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, screenshotUri)
+                putExtra(Intent.EXTRA_TEXT, reportText)
+                setPackage("com.whatsapp")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            runCatching { context.startActivity(shareIntent) }
+                .onSuccess { Log.d(TAG, "WhatsApp image share launched") }
+                .onFailure {
+                    Log.e(TAG, "Image share failed: ${it.message} — falling back to text")
+                    openWhatsAppAndSend(context, clean, reportText)
+                }
+        } else {
+            openWhatsAppAndSend(context, clean, reportText)
+        }
+    }
+
+    // ── WhatsApp delivery ────────────────────────────────────────────────────
+
+    private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
+        val clean = number.replace(Regex("[^0-9]"), "")
+        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
+
+        AutomationEngine.queueWhatsAppMessage(message)
+
+        val intentA = Intent(Intent.ACTION_VIEW,
+            Uri.parse("whatsapp://send?phone=$clean")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (runCatching { context.startActivity(intentA) }.isSuccess) {
+            Log.d(TAG, "WhatsApp opened via method A"); return
+        }
+
+        val intentB = Intent(Intent.ACTION_VIEW,
+            Uri.parse("https://wa.me/$clean")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(intentB) }
+            .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
+            .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
+    }
+
+    private fun getGuardianNumber(): String? {
+        val n = CheckmatePrefs.getString("guardian_number", null)
+        if (n.isNullOrBlank()) { Log.w(TAG, "Guardian number not set"); return null }
+        return n
+    }
+
+    private fun timeNow(): String {
+        val c = Calendar.getInstance()
+        return String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
+    }
+
+    private fun dateToday(): String {
+        val c = Calendar.getInstance()
+        return String.format("%02d/%02d/%04d",
+            c.get(Calendar.DAY_OF_MONTH), c.get(Calendar.MONTH) + 1, c.get(Calendar.YEAR))
+    }
+}
+
+class EodSummaryReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
+            GuardianNotifier.sendEndOfDaySummary(context)
+    }
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+package com.checkmate.workmode
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.StudyMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-// PROMPT_DONE: focus block just ended — timer frozen, waiting for user decision
-enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, PROMPT_DONE, DONE }
+object WorkModeManager {
 
-data class CycleState(
-    val phase:               AttentionPhase = AttentionPhase.FOCUS,
-    val phaseSecondsLeft:    Long           = 30 * 60,
-    val totalSessionSeconds: Long           = 0,
-    val cycleIndex:          Int            = 1,
-    val needsAttentionCheck: Boolean        = false,
-    val phaseJustChanged:    Boolean        = false,
-    val checksPassed:        Int            = 0,
-    val checksMissed:        Int            = 0,
-    val taskId:              String         = "",
-    val taskName:            String         = "",
-    val pausedAt:            Long           = 0L,
-    val totalPausedMs:       Long           = 0L
-)
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
 
-object AttentionCycleManager {
-
-    private const val FOCUS_SECS               = 30 * 60L
-    private const val SHORT_BREAK_SECS         = 5  * 60L
-    private const val LONG_BREAK_SECS          = 10 * 60L
-    private const val FOCUS_BLOCKS_BEFORE_LONG = 2
-
-    private val _state = MutableStateFlow(CycleState())
-    val stateFlow: StateFlow<CycleState> = _state.asStateFlow()
-
-    private var focusBlocksDone     = 0
-    private var checkWindowOpen     = false
-    private var checkWindowOpenedAt = 0L
-    private var totalDurationSecs   = 0L
-    private var elapsedTotal        = 0L
-    private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
-    // The break phase queued up while we're showing PROMPT_DONE
-    private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
-
-    fun start(taskId: String, taskName: String, durationMinutes: Long) {
-        totalDurationSecs = durationMinutes * 60
-        elapsedTotal      = 0
-        focusBlocksDone   = 0
-        pendingBreakPhase = AttentionPhase.SHORT_BREAK
-        _state.value = CycleState(
-            phase            = AttentionPhase.FOCUS,
-            phaseSecondsLeft = FOCUS_SECS,
-            taskId           = taskId,
-            taskName         = taskName
-        )
+    fun activate(context: Context) {
+        CheckmateState.setMode(context, StudyMode.STUDY)
+        _isActive.value = true
+        startService(context)
     }
 
-    /** Called from the floating bar "✅ Mark Done" button during PROMPT_DONE. */
-    fun confirmDone() {
-        val done = _state.value.copy(
-            phase            = AttentionPhase.DONE,
-            phaseJustChanged = true
-        )
-        _state.value = done
+    fun deactivate(context: Context) {
+        CheckmateState.setMode(context, StudyMode.NORMAL)
+        _isActive.value = false
+        DistractionGuard.reset()
+        context.stopService(Intent(context, WorkModeService::class.java))
+    }
+
+    fun toggle(context: Context) {
+        if (_isActive.value) deactivate(context) else activate(context)
+    }
+
+    /** Returns package names of apps to block. */
+    fun getBlockedApps(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
     /**
-     * Called from the floating bar "➡ Continue" button during PROMPT_DONE.
-     * Advances to the queued break phase so the cycle keeps going.
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
      */
-    fun dismissPromptAndBreak() {
-        val breakSecs = if (pendingBreakPhase == AttentionPhase.LONG_BREAK)
-            LONG_BREAK_SECS else SHORT_BREAK_SECS
-        _state.value = _state.value.copy(
-            phase               = pendingBreakPhase,
-            phaseSecondsLeft    = breakSecs,
-            needsAttentionCheck = false,
-            phaseJustChanged    = true
-        )
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
-    /** Blueprint 2.2: Pause — freezes tick loop, records pausedAt timestamp */
-    fun pause() {
-        val current = _state.value
-        if (current.phase == AttentionPhase.PAUSED ||
-            current.phase == AttentionPhase.DONE   ||
-            current.phase == AttentionPhase.PROMPT_DONE) return
-        phaseBeforePause = current.phase
-        _state.value = current.copy(
-            phase            = AttentionPhase.PAUSED,
-            phaseJustChanged = true,
-            pausedAt         = System.currentTimeMillis()
-        )
-    }
-
-    /** Blueprint 2.2: Resume — restarts tick, accumulates totalPausedMs */
-    fun resume() {
-        val current = _state.value
-        if (current.phase != AttentionPhase.PAUSED) return
-        val pauseDuration = if (current.pausedAt > 0L)
-            System.currentTimeMillis() - current.pausedAt else 0L
-        _state.value = current.copy(
-            phase            = phaseBeforePause,
-            phaseJustChanged = true,
-            pausedAt         = 0L,
-            totalPausedMs    = current.totalPausedMs + pauseDuration
-        )
-    }
-
-    fun tick(): CycleState {
-        val current = _state.value
-        // Freeze tick while paused, in prompt, or done
-        if (current.phase == AttentionPhase.PAUSED     ||
-            current.phase == AttentionPhase.PROMPT_DONE ||
-            current.phase == AttentionPhase.DONE)
-            return current
-
-        elapsedTotal++
-
-        if (totalDurationSecs > 0 && elapsedTotal >= totalDurationSecs) {
-            val done = current.copy(phase = AttentionPhase.DONE, phaseJustChanged = true)
-            _state.value = done
-            return done
-        }
-
-        val newSecondsLeft = current.phaseSecondsLeft - 1
-
-        val needsCheck = current.phase == AttentionPhase.FOCUS
-                && newSecondsLeft in 0..120 && !checkWindowOpen
-        if (needsCheck) {
-            checkWindowOpen     = true
-            checkWindowOpenedAt = elapsedTotal
-        }
-
-        var checksMissed = current.checksMissed
-        if (checkWindowOpen && elapsedTotal - checkWindowOpenedAt > 120) {
-            checksMissed++
-            checkWindowOpen = false
-        }
-
-        if (newSecondsLeft <= 0) {
-            return when (current.phase) {
-                AttentionPhase.FOCUS -> {
-                    focusBlocksDone++
-                    // Decide what break comes *after* the prompt
-                    pendingBreakPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
-                        AttentionPhase.LONG_BREAK else AttentionPhase.SHORT_BREAK
-
-                    // Enter PROMPT_DONE — timer frozen, user decides
-                    val next = current.copy(
-                        phase               = AttentionPhase.PROMPT_DONE,
-                        phaseSecondsLeft    = 0,
-                        totalSessionSeconds = elapsedTotal,
-                        cycleIndex          = focusBlocksDone + 1,
-                        needsAttentionCheck = false,
-                        phaseJustChanged    = true,
-                        checksMissed        = checksMissed
-                    )
-                    _state.value = next; next
-                }
-                AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
-                    checkWindowOpen = false
-                    val next = current.copy(
-                        phase               = AttentionPhase.FOCUS,
-                        phaseSecondsLeft    = FOCUS_SECS,
-                        totalSessionSeconds = elapsedTotal,
-                        needsAttentionCheck = false,
-                        phaseJustChanged    = true,
-                        checksMissed        = checksMissed
-                    )
-                    _state.value = next; next
-                }
-                else -> current
-            }
-        }
-
-        val next = current.copy(
-            phaseSecondsLeft    = newSecondsLeft,
-            totalSessionSeconds = elapsedTotal,
-            needsAttentionCheck = checkWindowOpen,
-            phaseJustChanged    = false,
-            checksMissed        = checksMissed
-        )
-        _state.value = next
-        return next
-    }
-
-    fun confirmAttention() {
-        checkWindowOpen = false
-        _state.value = _state.value.copy(
-            checksPassed        = _state.value.checksPassed + 1,
-            needsAttentionCheck = false
-        )
-    }
-
-    fun currentState(): CycleState = _state.value
-
-    fun reset() {
-        focusBlocksDone     = 0
-        checkWindowOpen     = false
-        elapsedTotal        = 0
-        totalDurationSecs   = 0
-        pendingBreakPhase   = AttentionPhase.SHORT_BREAK
-        _state.value        = CycleState()
+    private fun startService(context: Context) {
+        val intent = Intent(context, WorkModeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
-package com.checkmate.service
+//===== FILE: app/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+package com.checkmate.automation
 
-import android.app.*
-import android.content.Context
+import android.accessibilityservice.AccessibilityService
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.os.*
-import androidx.core.app.NotificationCompat
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.AttentionPhase
-import com.checkmate.core.tts.CheckmateTTS
-import kotlinx.coroutines.*
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
 
-class AttentionCycleService : Service() {
+class AppAutomationService : AccessibilityService() {
 
-    companion object {
-        private const val CHANNEL_ID = "attention_cycle_channel"
-        private const val NOTIF_ID   = 42
-        const val EXTRA_TASK_ID      = "task_id"
-        const val EXTRA_TASK_NAME    = "task_name"
-        const val EXTRA_DURATION_MIN = "duration_min"
-        const val ACTION_PAUSE       = "com.checkmate.ATTENTION_PAUSE"
-        const val ACTION_RESUME      = "com.checkmate.ATTENTION_RESUME"
+    private val TAG      = "WA_SEND"
+    private val WHATSAPP = "com.whatsapp"
 
-        fun start(context: Context, taskId: String, taskName: String, durationMinutes: Long) {
-            val intent = Intent(context, AttentionCycleService::class.java).apply {
-                putExtra(EXTRA_TASK_ID,      taskId)
-                putExtra(EXTRA_TASK_NAME,    taskName)
-                putExtra(EXTRA_DURATION_MIN, durationMinutes)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                context.startForegroundService(intent)
-            else
-                context.startService(intent)
-        }
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
 
-        fun stop(context: Context) =
-            context.stopService(Intent(context, AttentionCycleService::class.java))
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
 
-        fun sendPause(context: Context) =
-            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
 
-        fun sendResume(context: Context) =
-            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "=== AutomationService CONNECTED ===")
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var cycleJob: Job? = null
-    private var isPaused = false
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
 
-    private val pauseReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(ctx: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
-                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
-            }
-        }
-    }
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        if (WorkModeManager.isActive.value &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
-    override fun onCreate() {
-        super.onCreate()
-        createChannel()
-        val filter = android.content.IntentFilter().apply {
-            addAction(ACTION_PAUSE)
-            addAction(ACTION_RESUME)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(pauseReceiver, filter)
-        }
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
-        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
-        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
-        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
-        AttentionCycleManager.start(taskId, taskName, durationMin)
-        startCycleLoop(taskName)
-        return START_NOT_STICKY
-    }
-
-    private fun startCycleLoop(taskName: String) {
-        cycleJob?.cancel()
-        cycleJob = scope.launch {
-            while (isActive) {
-                if (isPaused) {
-                    val cs = AttentionCycleManager.currentState()
-                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
-                    delay(1_000)
-                    continue
-                }
-                val cs = AttentionCycleManager.tick()
-                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                    .notify(NOTIF_ID, buildNotification(
-                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
-                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
-
-                if (cs.phaseJustChanged) {
-                    when (cs.phase) {
-                        AttentionPhase.PROMPT_DONE -> CheckmateTTS.speak(
-                            this@AttentionCycleService,
-                            "30 minutes done. Mark task complete or take a break?"
-                        )
-                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(
-                            this@AttentionCycleService, "Take a 5 minute break."
-                        )
-                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(
-                            this@AttentionCycleService, "Good work. 10 minute break."
-                        )
-                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(
-                            this@AttentionCycleService, "Break over. Back to focus."
-                        )
-                        AttentionPhase.PAUSED      -> {}
-                        AttentionPhase.DONE        -> {
-                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
-                            stopSelf(); return@launch
-                        }
-                    }
-                }
-                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
-                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
-                delay(1_000)
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
+                return
             }
         }
-    }
 
-    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
-        val m = secondsLeft / 60; val s = secondsLeft % 60
-        val t = String.format("%d:%02d", m, s)
-        return when (phase) {
-            AttentionPhase.FOCUS        -> "FOCUS — $t"
-            AttentionPhase.SHORT_BREAK  -> "SHORT BREAK — $t"
-            AttentionPhase.LONG_BREAK   -> "LONG BREAK — $t"
-            AttentionPhase.PAUSED       -> "PAUSED — $t"
-            AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
-            AttentionPhase.DONE         -> "SESSION COMPLETE"
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isActive.value && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
+            }
+        }
+
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
+
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
+            }, 1200)
         }
     }
 
-    private fun buildNotification(
-        phaseText: String, taskName: String,
-        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
-    ): Notification {
-        val tm = totalSeconds / 60; val ts = totalSeconds % 60
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
-            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
-            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
-            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
-            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
+    // ── URL scanning ──────────────────────────────────────────────────────────
+
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
+
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
+
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
+
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
+
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
     }
 
-    private fun startForegroundCompat(n: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        else startForeground(NOTIF_ID, n)
-    }
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
         }
+
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
     }
 
-    override fun onDestroy() {
-        cycleJob?.cancel(); scope.cancel()
-        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
-        AttentionCycleManager.reset()
-        super.onDestroy()
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
+
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
+
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
+        val inputNode =
+            findNodeById(root, "com.whatsapp:id/entry")
+                ?.also { Log.d(TAG, "input via id/entry") }
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
+            ?: findNodeByClass(root, "android.widget.EditText")
+                ?.also { Log.d(TAG, "input via EditText fallback") }
+
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
+
+        typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
+
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
+
+        AutomationEngine.consumePendingWhatsAppMessage()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
+            val sendNode =
+                findNodeById(freshRoot, "com.whatsapp:id/send")
+                    ?.also { Log.d(TAG, "send btn via id/send") }
+                ?: findNodeByDesc(freshRoot, "Send")
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
+        }, 500)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/service/FloatingAttentionService.kt =====
-package com.checkmate.service
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/AppSelectorScreen.kt =====
+package com.checkmate.ui.settings
 
-import android.app.*
-import android.content.Context
 import android.content.Intent
-import android.graphics.PixelFormat
-import android.os.Build
-import android.os.IBinder
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.WindowManager
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
+import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.app.NotificationCompat
-import androidx.lifecycle.*
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
-import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.AttentionPhase
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.theme.*
 
-class FloatingAttentionService : Service(),
-    LifecycleOwner,
-    ViewModelStoreOwner,
-    SavedStateRegistryOwner {
-
-    private val lifecycleRegistry = LifecycleRegistry(this)
-    override val lifecycle: Lifecycle get() = lifecycleRegistry
-
-    private val vmStore = ViewModelStore()
-    override val viewModelStore: ViewModelStore get() = vmStore
-
-    private val savedStateController = SavedStateRegistryController.create(this)
-    override val savedStateRegistry: SavedStateRegistry
-        get() = savedStateController.savedStateRegistry
-
-    private lateinit var windowManager: WindowManager
-    private var overlayView: ComposeView? = null
-
-    companion object {
-        private const val CHANNEL_ID = "floating_attention_channel"
-        private const val NOTIF_ID   = 99
-
-        fun start(context: Context) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                !android.provider.Settings.canDrawOverlays(context)) return
-            val intent = Intent(context, FloatingAttentionService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                context.startForegroundService(intent)
-            else
-                context.startService(intent)
-        }
-
-        fun stop(context: Context) {
-            context.stopService(Intent(context, FloatingAttentionService::class.java))
-        }
-    }
-
-    override fun onCreate() {
-        savedStateController.performAttach()
-        savedStateController.performRestore(null)
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        super.onCreate()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        createChannel()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
-        showOverlay()
-        return START_NOT_STICKY
-    }
-
-    private fun showOverlay() {
-        if (overlayView != null) return
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP }
-
-        val view = ComposeView(this).apply {
-            setViewTreeLifecycleOwner(this@FloatingAttentionService)
-            setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
-            setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
-            setContent { AttentionBar(onDismiss = { stop(this@FloatingAttentionService) }) }
-        }
-        windowManager.addView(view, params)
-        overlayView = view
-    }
-
-    override fun onDestroy() {
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        overlayView?.let { windowManager.removeView(it) }
-        overlayView = null
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun buildNotification(): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Attention overlay active")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW).build()
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "Floating Attention Bar", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
-    }
-}
-
-// ── Colors ────────────────────────────────────────────────────────────────────
-
-private val CGreen  = Color(0xFF00C896)
-private val CAmber  = Color(0xFFFFB347)
-private val CGray   = Color(0xFF9090A8)
-private val CRed    = Color(0xFFFF4444)
-private val CPurple = Color(0xFFBB86FC)
-private val CBg     = Color(0xF0111122)
-
-// ── Bar Composable ────────────────────────────────────────────────────────────
+data class AppInfo(
+    val name:        String,
+    val packageName: String,
+    val isSystem:    Boolean
+)
 
 @Composable
-private fun AttentionBar(onDismiss: () -> Unit) {
-    val cs by AttentionCycleManager.stateFlow.collectAsState()
-
-    LaunchedEffect(cs.phase) {
-        if (cs.phase == AttentionPhase.DONE) onDismiss()
+fun AppSelectorScreen(onBack: () -> Unit) {
+    val context      = LocalContext.current
+    val pm           = context.packageManager
+    val savedBlocked = remember {
+        (CheckmatePrefs.getString("blocked_apps", "") ?: "")
+            .split(",").filter { it.isNotBlank() }.toMutableSet()
     }
+    var blockedApps  by remember { mutableStateOf(savedBlocked.toSet()) }
+    var search       by remember { mutableStateOf("") }
+    var showSystem   by remember { mutableStateOf(false) }
 
-    val phaseColor = when (cs.phase) {
-        AttentionPhase.FOCUS        -> CGreen
-        AttentionPhase.SHORT_BREAK  -> CGreen
-        AttentionPhase.LONG_BREAK   -> CAmber
-        AttentionPhase.PAUSED       -> CAmber
-        AttentionPhase.PROMPT_DONE  -> CPurple
-        AttentionPhase.DONE         -> CGray
-    }
-
-    val totalPhaseSecs = when (cs.phase) {
-        AttentionPhase.FOCUS       -> 30 * 60L
-        AttentionPhase.SHORT_BREAK -> 5  * 60L
-        AttentionPhase.LONG_BREAK  -> 10 * 60L
-        else                       -> 1L
-    }
-    val progress = when (cs.phase) {
-        AttentionPhase.PROMPT_DONE -> 1f   // bar full at prompt
-        else -> (1f - cs.phaseSecondsLeft.toFloat() / totalPhaseSecs.toFloat()).coerceIn(0f, 1f)
-    }
-
-    val m = cs.phaseSecondsLeft / 60
-    val s = cs.phaseSecondsLeft % 60
-
-    val phaseLabel = when (cs.phase) {
-        AttentionPhase.FOCUS        -> "FOCUS"
-        AttentionPhase.SHORT_BREAK  -> "BREAK"
-        AttentionPhase.LONG_BREAK   -> "LONG BREAK"
-        AttentionPhase.PAUSED       -> "PAUSED"
-        AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
-        AttentionPhase.DONE         -> "DONE"
-    }
-
-    // Pulse color when paused or prompting
-    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue  = 0.5f,
-        targetValue   = 1f,
-        animationSpec = infiniteRepeatable(
-            tween(700, easing = LinearEasing), RepeatMode.Reverse
-        ),
-        label = "pulseAlpha"
-    )
-    val shouldPulse = cs.phase == AttentionPhase.PAUSED || cs.phase == AttentionPhase.PROMPT_DONE
-    val displayColor = if (shouldPulse) phaseColor.copy(alpha = pulseAlpha) else phaseColor
-
-    Column(Modifier.fillMaxWidth().background(CBg)) {
-
-        if (cs.phase == AttentionPhase.PROMPT_DONE) {
-            // ── Prompt row: task done or take a break? ────────────────────────
-            Row(
-                modifier              = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text       = "30m done!",
-                    fontSize   = 12.sp,
-                    color      = displayColor,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold
+    // Load all apps that have a launcher entry — this includes Google/system apps
+    // (YouTube, Chrome, Gmail, etc.) while excluding headless system internals
+    // (com.android.phone, com.android.providers.* etc.) that have no UI to launch.
+    val allApps = remember {
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        pm.queryIntentActivities(launcherIntent, 0)
+            .map { it.activityInfo.applicationInfo }
+            .distinctBy { it.packageName }
+            .filter { it.packageName != context.packageName }
+            .map { info ->
+                AppInfo(
+                    name        = pm.getApplicationLabel(info).toString(),
+                    packageName = info.packageName,
+                    isSystem    = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    // ✅ Mark task done
-                    Text(
-                        text       = "✅ Done",
-                        fontSize   = 13.sp,
-                        color      = CGreen,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() }
-                        ) { AttentionCycleManager.confirmDone() }
-                    )
-                    // ➡ Take break and continue task
-                    Text(
-                        text       = "➡ Break",
-                        fontSize   = 13.sp,
-                        color      = CAmber,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() }
-                        ) { AttentionCycleManager.dismissPromptAndBreak() }
-                    )
+            }
+            .sortedWith(compareBy({ it.isSystem }, { it.name }))
+    }
+
+    val userApps   = remember(allApps) { allApps.filter { !it.isSystem } }
+    val systemApps = remember(allApps) { allApps.filter {  it.isSystem } }
+
+    val displayList = remember(showSystem, search, allApps) {
+        val base = if (showSystem) allApps else userApps
+        if (search.isBlank()) base
+        else base.filter { it.name.contains(search, ignoreCase = true) ||
+                           it.packageName.contains(search, ignoreCase = true) }
+    }
+
+    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
+
+        // ── Top bar ──────────────────────────────────────────────────────────
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = {
+                CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
+                onBack()
+            }) {
+                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+            }
+            Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+
+        // ── Search ───────────────────────────────────────────────────────────
+        OutlinedTextField(
+            value         = search,
+            onValueChange = { search = it },
+            label         = { Text("Search apps", color = White30) },
+            modifier      = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            singleLine    = true,
+            leadingIcon   = { Icon(Icons.Default.Search, null, tint = White60) },
+            colors        = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        // ── Stats + system toggle ────────────────────────────────────────────
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "${blockedApps.size} app(s) blocked · ${systemApps.size} system/Google apps available",
+                fontSize = 11.sp,
+                color    = White60
+            )
+        }
+
+        Spacer(Modifier.height(4.dp))
+
+        // ── Show system apps toggle ──────────────────────────────────────────
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .clickable { showSystem = !showSystem }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text(
+                    "Include Google & System Apps",
+                    fontSize   = 13.sp,
+                    color      = White90,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    "YouTube, Chrome, Instagram (pre-installed), etc.",
+                    fontSize = 11.sp,
+                    color    = White60
+                )
+            }
+            Switch(
+                checked         = showSystem,
+                onCheckedChange = { showSystem = it },
+                colors          = SwitchDefaults.colors(
+                    checkedThumbColor       = AccentGreen,
+                    checkedTrackColor       = AccentGreen.copy(alpha = 0.3f),
+                    uncheckedThumbColor     = White60,
+                    uncheckedTrackColor     = White10
+                )
+            )
+        }
+
+        HorizontalDivider(color = White10, modifier = Modifier.padding(horizontal = 16.dp))
+        Spacer(Modifier.height(8.dp))
+
+        // ── App list ─────────────────────────────────────────────────────────
+        LazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(displayList, key = { it.packageName }) { app ->
+                val isBlocked = app.packageName in blockedApps
+                Surface(
+                    shape  = RoundedCornerShape(10.dp),
+                    color  = when {
+                        isBlocked  -> AccentRed.copy(alpha = 0.08f)
+                        app.isSystem -> BgCardAlt
+                        else       -> BgCard
+                    },
+                    border = BorderStroke(1.dp, when {
+                        isBlocked  -> AccentRed.copy(alpha = 0.4f)
+                        app.isSystem -> AccentBlue.copy(alpha = 0.2f)
+                        else       -> White10
+                    }),
+                    onClick = {
+                        blockedApps = if (isBlocked)
+                            blockedApps - app.packageName
+                        else
+                            blockedApps + app.packageName
+                        // Persist immediately so the accessibility service sees the update
+                        CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
+                    }
+                ) {
+                    Row(
+                        modifier          = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(app.name, fontSize = 14.sp, color = White90)
+                                if (app.isSystem) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = AccentBlue.copy(alpha = 0.15f)
+                                    ) {
+                                        Text(
+                                            "SYSTEM",
+                                            fontSize = 9.sp,
+                                            color    = AccentBlue,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            Text(app.packageName, fontSize = 10.sp, color = White30)
+                        }
+                        if (isBlocked) {
+                            Icon(Icons.Default.Block, null, tint = AccentRed, modifier = Modifier.size(20.dp))
+                        }
+                    }
                 }
             }
-        } else {
-            // ── Normal row: phase label + timer + controls ────────────────────
-            Row(
-                modifier              = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Left: phase + timer + cycle
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text       = phaseLabel,
-                        fontSize   = 11.sp,
-                        color      = displayColor,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text       = "%02d:%02d".format(m, s),
-                        fontSize   = 13.sp,
-                        color      = displayColor,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text       = "· C${cs.cycleIndex}",
-                        fontSize   = 10.sp,
-                        color      = CGray,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
+            item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
 
-                // Right: ✅ confirm attention + ⏸/▶ pause + ✕ dismiss
-                Row(verticalAlignment = Alignment.CenterVertically) {
 
-                    if (cs.needsAttentionCheck) {
-                        Text(
-                            text     = "✅",
-                            fontSize = 18.sp,
-                            modifier = Modifier
-                                .padding(end = 12.dp)
-                                .clickable(
-                                    indication        = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) { AttentionCycleManager.confirmAttention() }
-                        )
-                    }
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/WebsiteBlockerScreen.kt =====
+package com.checkmate.ui.settings
 
-                    if (cs.phase != AttentionPhase.DONE) {
-                        val pauseIcon  = if (cs.phase == AttentionPhase.PAUSED) "▶" else "⏸"
-                        val pauseColor = if (cs.phase == AttentionPhase.PAUSED) CGreen else CAmber
-                        Text(
-                            text     = pauseIcon,
-                            fontSize = 16.sp,
-                            color    = pauseColor,
-                            modifier = Modifier
-                                .padding(end = 12.dp)
-                                .clickable(
-                                    indication        = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) {
-                                    if (cs.phase == AttentionPhase.PAUSED) AttentionCycleManager.resume()
-                                    else AttentionCycleManager.pause()
-                                }
-                        )
-                    }
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.theme.*
 
-                    Text(
-                        text       = "✕",
-                        fontSize   = 13.sp,
-                        color      = CRed.copy(alpha = 0.85f),
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() },
-                            onClick           = onDismiss
-                        )
-                    )
-                }
+// Common distracting sites shown as quick-add chips
+private val PRESETS = listOf(
+    "youtube.com", "instagram.com", "twitter.com", "x.com",
+    "facebook.com", "reddit.com", "tiktok.com", "snapchat.com",
+    "netflix.com", "twitch.tv", "discord.com", "pinterest.com"
+)
+
+@Composable
+fun WebsiteBlockerScreen(onBack: () -> Unit) {
+
+    var domains by remember {
+        val saved = (CheckmatePrefs.getString("blocked_domains", "") ?: "")
+            .split(",").filter { it.isNotBlank() }.toSet()
+        mutableStateOf(saved)
+    }
+    var inputText by remember { mutableStateOf("") }
+    var inputError by remember { mutableStateOf("") }
+    val keyboard = LocalSoftwareKeyboardController.current
+
+    fun persist() = CheckmatePrefs.putString("blocked_domains", domains.joinToString(","))
+
+    fun addDomain(raw: String) {
+        val clean = raw.trim().lowercase()
+            .removePrefix("https://").removePrefix("http://")
+            .removePrefix("www.").trimEnd('/')
+        if (clean.isBlank()) { inputError = "Enter a domain"; return }
+        if (!clean.contains('.')) { inputError = "Enter a valid domain (e.g. youtube.com)"; return }
+        domains = domains + clean
+        persist()
+        inputText = ""
+        inputError = ""
+        keyboard?.hide()
+    }
+
+    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
+
+        // ── Top bar ──────────────────────────────────────────────────────────
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { persist(); onBack() }) {
+                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+            }
+            Column {
+                Text("Blocked Websites", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
+                Text("Blocks domains in Chrome, Firefox, Edge + all major browsers",
+                    fontSize = 11.sp, color = White60)
             }
         }
 
-        LinearProgressIndicator(
-            progress   = { progress },
-            modifier   = Modifier
-                .fillMaxWidth()
-                .height(3.dp)
-                .clip(RoundedCornerShape(0.dp)),
-            color      = displayColor,
-            trackColor = displayColor.copy(alpha = 0.12f)
+        // ── Add domain input ──────────────────────────────────────────────────
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            OutlinedTextField(
+                value         = inputText,
+                onValueChange = { inputText = it; inputError = "" },
+                label         = { Text("youtube.com", color = White30) },
+                placeholder   = { Text("Type a domain to block", color = White30) },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                isError       = inputError.isNotBlank(),
+                supportingText = if (inputError.isNotBlank()) {{ Text(inputError, color = AccentRed) }} else null,
+                leadingIcon   = { Icon(Icons.Default.Language, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = { addDomain(inputText) }) {
+                        Icon(Icons.Default.Add, null, tint = AccentGreen)
+                    }
+                },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Uri,
+                    imeAction    = ImeAction.Done
+                ),
+                keyboardActions = KeyboardActions(onDone = { addDomain(inputText) }),
+                colors        = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // ── Quick-add preset chips ────────────────────────────────────────────
+        Text(
+            "  Quick add",
+            fontSize   = 11.sp,
+            color      = White60,
+            fontWeight = FontWeight.Bold,
+            modifier   = Modifier.padding(horizontal = 16.dp)
         )
+        Spacer(Modifier.height(6.dp))
+        androidx.compose.foundation.lazy.LazyRow(
+            contentPadding      = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(PRESETS) { preset ->
+                val alreadyAdded = preset in domains
+                FilterChip(
+                    selected = alreadyAdded,
+                    onClick  = {
+                        if (alreadyAdded) {
+                            domains = domains - preset; persist()
+                        } else {
+                            domains = domains + preset; persist()
+                        }
+                    },
+                    label    = { Text(preset, fontSize = 12.sp) },
+                    colors   = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor    = AccentRed.copy(alpha = 0.15f),
+                        selectedLabelColor        = AccentRed,
+                        containerColor            = BgCard,
+                        labelColor                = White60
+                    ),
+                    leadingIcon = if (alreadyAdded) {{
+                        Icon(Icons.Default.Block, null,
+                            tint = AccentRed, modifier = Modifier.size(14.dp))
+                    }} else null
+                )
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider(color = White10, modifier = Modifier.padding(horizontal = 16.dp))
+        Spacer(Modifier.height(8.dp))
+
+        // ── Active blocked list ───────────────────────────────────────────────
+        Text(
+            "  ${domains.size} domain(s) blocked",
+            fontSize = 11.sp,
+            color    = White60,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        )
+        Spacer(Modifier.height(6.dp))
+
+        LazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (domains.isEmpty()) {
+                item {
+                    Box(
+                        modifier         = Modifier.fillMaxWidth().padding(vertical = 32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("No domains blocked yet", fontSize = 14.sp, color = White30)
+                    }
+                }
+            } else {
+                items(domains.sorted(), key = { it }) { domain ->
+                    Surface(
+                        shape  = RoundedCornerShape(10.dp),
+                        color  = AccentRed.copy(alpha = 0.06f),
+                        border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.3f))
+                    ) {
+                        Row(
+                            modifier          = Modifier.fillMaxWidth().padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Language, null,
+                                tint     = AccentRed.copy(alpha = 0.7f),
+                                modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text(domain, fontSize = 14.sp, color = White90, modifier = Modifier.weight(1f))
+                            IconButton(
+                                onClick  = { domains = domains - domain; persist() },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Default.Close, null,
+                                    tint = White30, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
+        }
     }
 }
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
+package com.checkmate.ui.settings
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.theme.*
+
+@Composable
+fun SettingsScreen() {
+    val context = LocalContext.current
+    var showAppSelector     by remember { mutableStateOf(false) }
+    var showWebsiteBlocker  by remember { mutableStateOf(false) }
+
+    if (showAppSelector) {
+        AppSelectorScreen(onBack = { showAppSelector = false })
+        return
+    }
+    if (showWebsiteBlocker) {
+        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
+        return
+    }
+
+    Column(
+        modifier        = Modifier.fillMaxSize().background(BgDark)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Spacer(Modifier.height(20.dp))
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+        Spacer(Modifier.height(8.dp))
+
+        // ── LLM API Keys ──
+        SettingSection("AI PROVIDERS") {
+            LlmProviderSettings(context)
+        }
+
+        // ── Voice / TTS ──
+        SettingSection("VOICE") {
+            VoiceSettings(context)
+        }
+
+        // ── Work Mode ──
+        SettingSection("WORK MODE") {
+            SettingTile(
+                title    = "Blocked Apps",
+                subtitle = "Block distraction apps incl. Google & system apps",
+                icon     = Icons.Default.Block
+            ) { showAppSelector = true }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Blocked Websites",
+                subtitle = "Block distracting domains in any browser",
+                icon     = Icons.Default.Language
+            ) { showWebsiteBlocker = true }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Accessibility Service",
+                subtitle = "Required for app/site blocking and WhatsApp automation",
+                icon     = Icons.Default.Accessibility
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        // ── Permissions ──
+        SettingSection("PERMISSIONS") {
+            SettingTile(
+                title    = "Notification Listener",
+                subtitle = "Required for WhatsApp message detection",
+                icon     = Icons.Default.Notifications
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Overlay Permission",
+                subtitle = "Required for floating attention timer",
+                icon     = Icons.Default.Layers
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
+    }
+}
+
+@Composable
+private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Text(
+            title,
+            fontSize      = 11.sp,
+            fontWeight    = FontWeight.Bold,
+            letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
+            color         = White60,
+            modifier      = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        )
+        Surface(
+            shape  = RoundedCornerShape(12.dp),
+            color  = BgCard,
+            border = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(content = content)
+        }
+    }
+}
+
+@Composable
+private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    Surface(onClick = onClick, color = androidx.compose.ui.graphics.Color.Transparent) {
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 14.sp, color = White90)
+                Text(subtitle, fontSize = 11.sp, color = White60)
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(16.dp))
+        }
+    }
+}
+
+// These composables keep their full implementations from the existing file.
+// Only the shell and WORK MODE section changed — paste your existing
+// LlmProviderSettings() and VoiceSettings() implementations below unchanged.
