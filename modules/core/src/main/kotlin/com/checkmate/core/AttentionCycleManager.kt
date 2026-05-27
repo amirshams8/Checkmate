@@ -4,8 +4,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-// Added PAUSED phase for Blueprint 2.2
-enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, DONE }
+// PROMPT_DONE: focus block just ended — timer frozen, waiting for user decision
+enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, PROMPT_DONE, DONE }
 
 data class CycleState(
     val phase:               AttentionPhase = AttentionPhase.FOCUS,
@@ -38,11 +38,14 @@ object AttentionCycleManager {
     private var totalDurationSecs   = 0L
     private var elapsedTotal        = 0L
     private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
+    // The break phase queued up while we're showing PROMPT_DONE
+    private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
 
     fun start(taskId: String, taskName: String, durationMinutes: Long) {
         totalDurationSecs = durationMinutes * 60
         elapsedTotal      = 0
         focusBlocksDone   = 0
+        pendingBreakPhase = AttentionPhase.SHORT_BREAK
         _state.value = CycleState(
             phase            = AttentionPhase.FOCUS,
             phaseSecondsLeft = FOCUS_SECS,
@@ -51,15 +54,41 @@ object AttentionCycleManager {
         )
     }
 
+    /** Called from the floating bar "✅ Mark Done" button during PROMPT_DONE. */
+    fun confirmDone() {
+        val done = _state.value.copy(
+            phase            = AttentionPhase.DONE,
+            phaseJustChanged = true
+        )
+        _state.value = done
+    }
+
+    /**
+     * Called from the floating bar "➡ Continue" button during PROMPT_DONE.
+     * Advances to the queued break phase so the cycle keeps going.
+     */
+    fun dismissPromptAndBreak() {
+        val breakSecs = if (pendingBreakPhase == AttentionPhase.LONG_BREAK)
+            LONG_BREAK_SECS else SHORT_BREAK_SECS
+        _state.value = _state.value.copy(
+            phase               = pendingBreakPhase,
+            phaseSecondsLeft    = breakSecs,
+            needsAttentionCheck = false,
+            phaseJustChanged    = true
+        )
+    }
+
     /** Blueprint 2.2: Pause — freezes tick loop, records pausedAt timestamp */
     fun pause() {
         val current = _state.value
-        if (current.phase == AttentionPhase.PAUSED || current.phase == AttentionPhase.DONE) return
+        if (current.phase == AttentionPhase.PAUSED ||
+            current.phase == AttentionPhase.DONE   ||
+            current.phase == AttentionPhase.PROMPT_DONE) return
         phaseBeforePause = current.phase
         _state.value = current.copy(
-            phase          = AttentionPhase.PAUSED,
+            phase            = AttentionPhase.PAUSED,
             phaseJustChanged = true,
-            pausedAt       = System.currentTimeMillis()
+            pausedAt         = System.currentTimeMillis()
         )
     }
 
@@ -79,8 +108,10 @@ object AttentionCycleManager {
 
     fun tick(): CycleState {
         val current = _state.value
-        // Don't tick while paused or done
-        if (current.phase == AttentionPhase.PAUSED || current.phase == AttentionPhase.DONE)
+        // Freeze tick while paused, in prompt, or done
+        if (current.phase == AttentionPhase.PAUSED     ||
+            current.phase == AttentionPhase.PROMPT_DONE ||
+            current.phase == AttentionPhase.DONE)
             return current
 
         elapsedTotal++
@@ -110,12 +141,14 @@ object AttentionCycleManager {
             return when (current.phase) {
                 AttentionPhase.FOCUS -> {
                     focusBlocksDone++
-                    val nextPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
+                    // Decide what break comes *after* the prompt
+                    pendingBreakPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
                         AttentionPhase.LONG_BREAK else AttentionPhase.SHORT_BREAK
-                    val nextSecs = if (nextPhase == AttentionPhase.LONG_BREAK) LONG_BREAK_SECS else SHORT_BREAK_SECS
+
+                    // Enter PROMPT_DONE — timer frozen, user decides
                     val next = current.copy(
-                        phase               = nextPhase,
-                        phaseSecondsLeft    = nextSecs,
+                        phase               = AttentionPhase.PROMPT_DONE,
+                        phaseSecondsLeft    = 0,
                         totalSessionSeconds = elapsedTotal,
                         cycleIndex          = focusBlocksDone + 1,
                         needsAttentionCheck = false,
@@ -153,7 +186,10 @@ object AttentionCycleManager {
 
     fun confirmAttention() {
         checkWindowOpen = false
-        _state.value = _state.value.copy(checksPassed = _state.value.checksPassed + 1, needsAttentionCheck = false)
+        _state.value = _state.value.copy(
+            checksPassed        = _state.value.checksPassed + 1,
+            needsAttentionCheck = false
+        )
     }
 
     fun currentState(): CycleState = _state.value
@@ -163,6 +199,7 @@ object AttentionCycleManager {
         checkWindowOpen     = false
         elapsedTotal        = 0
         totalDurationSecs   = 0
+        pendingBreakPhase   = AttentionPhase.SHORT_BREAK
         _state.value        = CycleState()
     }
 }

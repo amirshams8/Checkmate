@@ -90,98 +90,61 @@ class FloatingAttentionService : Service(),
         return START_NOT_STICKY
     }
 
+    private fun showOverlay() {
+        if (overlayView != null) return
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP }
+
+        val view = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(this@FloatingAttentionService)
+            setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
+            setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
+            setContent { AttentionBar(onDismiss = { stop(this@FloatingAttentionService) }) }
+        }
+        windowManager.addView(view, params)
+        overlayView = view
+    }
+
     override fun onDestroy() {
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        removeOverlay()
-        vmStore.clear()
+        overlayView?.let { windowManager.removeView(it) }
+        overlayView = null
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun showOverlay() {
-        removeOverlay()
-
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.START
-            x = 0
-            y = 120
-        }
-
-        val composeView = ComposeView(this).apply {
-            setViewTreeLifecycleOwner(this@FloatingAttentionService)
-            setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
-            setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
-            setContent {
-                AttentionBar(onDismiss = { stopSelf() })
-            }
-        }
-
-        // Drag to reposition vertically
-        var initY = 0; var rawY = 0f
-        composeView.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> { initY = params.y; rawY = event.rawY; true }
-                MotionEvent.ACTION_MOVE -> {
-                    params.y = initY + (rawY - event.rawY).toInt()
-                    runCatching { windowManager.updateViewLayout(composeView, params) }
-                    true
-                }
-                else -> false
-            }
-        }
-
-        overlayView = composeView
-        runCatching { windowManager.addView(composeView, params) }
-    }
-
-    private fun removeOverlay() {
-        overlayView?.let { runCatching { windowManager.removeView(it) } }
-        overlayView = null
-    }
-
-    private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setContentTitle("Checkmate — Session Active")
-        .setSmallIcon(android.R.drawable.ic_menu_recent_history)
-        .setOngoing(true)
-        .setSilent(true)
-        .setPriority(NotificationCompat.PRIORITY_MIN)
-        .build()
+    private fun buildNotification(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Attention overlay active")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW).build()
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                CHANNEL_ID, "Floating Timer", NotificationManager.IMPORTANCE_MIN
-            ).apply {
-                setShowBadge(false)
-                enableLights(false)
-                enableVibration(false)
-            }
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(ch)
+            val ch = NotificationChannel(CHANNEL_ID, "Floating Attention Bar", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
         }
     }
 }
 
 // ── Colors ────────────────────────────────────────────────────────────────────
 
-private val CGreen = Color(0xFF00C896)
-private val CAmber = Color(0xFFFFB347)
-private val CGray  = Color(0xFF9090A8)
-private val CRed   = Color(0xFFFF4444)
-private val CBg    = Color(0xF0111122)
+private val CGreen  = Color(0xFF00C896)
+private val CAmber  = Color(0xFFFFB347)
+private val CGray   = Color(0xFF9090A8)
+private val CRed    = Color(0xFFFF4444)
+private val CPurple = Color(0xFFBB86FC)
+private val CBg     = Color(0xF0111122)
 
 // ── Bar Composable ────────────────────────────────────────────────────────────
 
@@ -194,11 +157,12 @@ private fun AttentionBar(onDismiss: () -> Unit) {
     }
 
     val phaseColor = when (cs.phase) {
-        AttentionPhase.FOCUS       -> CGreen
-        AttentionPhase.SHORT_BREAK -> CGreen
-        AttentionPhase.LONG_BREAK  -> CAmber
-        AttentionPhase.PAUSED      -> CAmber
-        AttentionPhase.DONE        -> CGray
+        AttentionPhase.FOCUS        -> CGreen
+        AttentionPhase.SHORT_BREAK  -> CGreen
+        AttentionPhase.LONG_BREAK   -> CAmber
+        AttentionPhase.PAUSED       -> CAmber
+        AttentionPhase.PROMPT_DONE  -> CPurple
+        AttentionPhase.DONE         -> CGray
     }
 
     val totalPhaseSecs = when (cs.phase) {
@@ -207,20 +171,24 @@ private fun AttentionBar(onDismiss: () -> Unit) {
         AttentionPhase.LONG_BREAK  -> 10 * 60L
         else                       -> 1L
     }
-    val progress = (1f - cs.phaseSecondsLeft.toFloat() / totalPhaseSecs.toFloat()).coerceIn(0f, 1f)
+    val progress = when (cs.phase) {
+        AttentionPhase.PROMPT_DONE -> 1f   // bar full at prompt
+        else -> (1f - cs.phaseSecondsLeft.toFloat() / totalPhaseSecs.toFloat()).coerceIn(0f, 1f)
+    }
 
     val m = cs.phaseSecondsLeft / 60
     val s = cs.phaseSecondsLeft % 60
 
     val phaseLabel = when (cs.phase) {
-        AttentionPhase.FOCUS       -> "FOCUS"
-        AttentionPhase.SHORT_BREAK -> "BREAK"
-        AttentionPhase.LONG_BREAK  -> "LONG BREAK"
-        AttentionPhase.PAUSED      -> "PAUSED"
-        AttentionPhase.DONE        -> "DONE"
+        AttentionPhase.FOCUS        -> "FOCUS"
+        AttentionPhase.SHORT_BREAK  -> "BREAK"
+        AttentionPhase.LONG_BREAK   -> "LONG BREAK"
+        AttentionPhase.PAUSED       -> "PAUSED"
+        AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+        AttentionPhase.DONE         -> "DONE"
     }
 
-    // Pulse color when paused
+    // Pulse color when paused or prompting
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val pulseAlpha by infiniteTransition.animateFloat(
         initialValue  = 0.5f,
@@ -230,88 +198,136 @@ private fun AttentionBar(onDismiss: () -> Unit) {
         ),
         label = "pulseAlpha"
     )
-    val displayColor = if (cs.phase == AttentionPhase.PAUSED)
-        phaseColor.copy(alpha = pulseAlpha) else phaseColor
+    val shouldPulse = cs.phase == AttentionPhase.PAUSED || cs.phase == AttentionPhase.PROMPT_DONE
+    val displayColor = if (shouldPulse) phaseColor.copy(alpha = pulseAlpha) else phaseColor
 
     Column(Modifier.fillMaxWidth().background(CBg)) {
 
-        Row(
-            modifier              = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
-            verticalAlignment     = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            // Left: phase + timer + cycle
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        if (cs.phase == AttentionPhase.PROMPT_DONE) {
+            // ── Prompt row: task done or take a break? ────────────────────────
+            Row(
+                modifier              = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
                 Text(
-                    text       = phaseLabel,
-                    fontSize   = 11.sp,
+                    text       = "30m done!",
+                    fontSize   = 12.sp,
                     color      = displayColor,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold
                 )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text       = "%02d:%02d".format(m, s),
-                    fontSize   = 13.sp,
-                    color      = displayColor,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text       = "· C${cs.cycleIndex}",
-                    fontSize   = 10.sp,
-                    color      = CGray,
-                    fontFamily = FontFamily.Monospace
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    // ✅ Mark task done
+                    Text(
+                        text       = "✅ Done",
+                        fontSize   = 13.sp,
+                        color      = CGreen,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { AttentionCycleManager.confirmDone() }
+                    )
+                    // ➡ Take break and continue task
+                    Text(
+                        text       = "➡ Break",
+                        fontSize   = 13.sp,
+                        color      = CAmber,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { AttentionCycleManager.dismissPromptAndBreak() }
+                    )
+                }
             }
-
-            // Right: ✅ confirm + ⏸/▶ pause + ✕ dismiss
-            Row(verticalAlignment = Alignment.CenterVertically) {
-
-                if (cs.needsAttentionCheck) {
+        } else {
+            // ── Normal row: phase label + timer + controls ────────────────────
+            Row(
+                modifier              = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Left: phase + timer + cycle
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text     = "✅",
-                        fontSize = 18.sp,
-                        modifier = Modifier
-                            .padding(end = 12.dp)
-                            .clickable(
-                                indication        = null,
-                                interactionSource = remember { MutableInteractionSource() }
-                            ) { AttentionCycleManager.confirmAttention() }
+                        text       = phaseLabel,
+                        fontSize   = 11.sp,
+                        color      = displayColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text       = "%02d:%02d".format(m, s),
+                        fontSize   = 13.sp,
+                        color      = displayColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text       = "· C${cs.cycleIndex}",
+                        fontSize   = 10.sp,
+                        color      = CGray,
+                        fontFamily = FontFamily.Monospace
                     )
                 }
 
-                if (cs.phase != AttentionPhase.DONE) {
-                    val pauseIcon  = if (cs.phase == AttentionPhase.PAUSED) "▶" else "⏸"
-                    val pauseColor = if (cs.phase == AttentionPhase.PAUSED) CGreen else CAmber
+                // Right: ✅ confirm attention + ⏸/▶ pause + ✕ dismiss
+                Row(verticalAlignment = Alignment.CenterVertically) {
+
+                    if (cs.needsAttentionCheck) {
+                        Text(
+                            text     = "✅",
+                            fontSize = 18.sp,
+                            modifier = Modifier
+                                .padding(end = 12.dp)
+                                .clickable(
+                                    indication        = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { AttentionCycleManager.confirmAttention() }
+                        )
+                    }
+
+                    if (cs.phase != AttentionPhase.DONE) {
+                        val pauseIcon  = if (cs.phase == AttentionPhase.PAUSED) "▶" else "⏸"
+                        val pauseColor = if (cs.phase == AttentionPhase.PAUSED) CGreen else CAmber
+                        Text(
+                            text     = pauseIcon,
+                            fontSize = 16.sp,
+                            color    = pauseColor,
+                            modifier = Modifier
+                                .padding(end = 12.dp)
+                                .clickable(
+                                    indication        = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) {
+                                    if (cs.phase == AttentionPhase.PAUSED) AttentionCycleManager.resume()
+                                    else AttentionCycleManager.pause()
+                                }
+                        )
+                    }
+
                     Text(
-                        text     = pauseIcon,
-                        fontSize = 16.sp,
-                        color    = pauseColor,
-                        modifier = Modifier
-                            .padding(end = 12.dp)
-                            .clickable(
-                                indication        = null,
-                                interactionSource = remember { MutableInteractionSource() }
-                            ) {
-                                if (cs.phase == AttentionPhase.PAUSED) AttentionCycleManager.resume()
-                                else AttentionCycleManager.pause()
-                            }
+                        text       = "✕",
+                        fontSize   = 13.sp,
+                        color      = CRed.copy(alpha = 0.85f),
+                        fontFamily = FontFamily.Monospace,
+                        modifier   = Modifier.clickable(
+                            indication        = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick           = onDismiss
+                        )
                     )
                 }
-
-                Text(
-                    text      = "✕",
-                    fontSize  = 13.sp,
-                    color     = CRed.copy(alpha = 0.85f),
-                    fontFamily = FontFamily.Monospace,
-                    modifier  = Modifier.clickable(
-                        indication        = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                        onClick           = onDismiss
-                    )
-                )
             }
         }
 

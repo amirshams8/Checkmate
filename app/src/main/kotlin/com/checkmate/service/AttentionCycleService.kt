@@ -64,8 +64,6 @@ class AttentionCycleService : Service() {
             addAction(ACTION_PAUSE)
             addAction(ACTION_RESUME)
         }
-        // FIX: Android 14 (API 34) requires RECEIVER_NOT_EXPORTED for dynamic receivers
-        // on non-system broadcasts. Without this -> SecurityException -> FATAL at onCreate:69.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -103,9 +101,19 @@ class AttentionCycleService : Service() {
 
                 if (cs.phaseJustChanged) {
                     when (cs.phase) {
-                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(this@AttentionCycleService, "Take a 5 minute break.")
-                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(this@AttentionCycleService, "Good work. 10 minute break.")
-                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(this@AttentionCycleService, "Break over. Back to focus.")
+                        AttentionPhase.PROMPT_DONE -> CheckmateTTS.speak(
+                            this@AttentionCycleService,
+                            "30 minutes done. Mark task complete or take a break?"
+                        )
+                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Take a 5 minute break."
+                        )
+                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Good work. 10 minute break."
+                        )
+                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Break over. Back to focus."
+                        )
                         AttentionPhase.PAUSED      -> {}
                         AttentionPhase.DONE        -> {
                             CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
@@ -124,11 +132,12 @@ class AttentionCycleService : Service() {
         val m = secondsLeft / 60; val s = secondsLeft % 60
         val t = String.format("%d:%02d", m, s)
         return when (phase) {
-            AttentionPhase.FOCUS       -> "FOCUS — $t"
-            AttentionPhase.SHORT_BREAK -> "SHORT BREAK — $t"
-            AttentionPhase.LONG_BREAK  -> "LONG BREAK — $t"
-            AttentionPhase.PAUSED      -> "PAUSED — $t"
-            AttentionPhase.DONE        -> "SESSION COMPLETE"
+            AttentionPhase.FOCUS        -> "FOCUS — $t"
+            AttentionPhase.SHORT_BREAK  -> "SHORT BREAK — $t"
+            AttentionPhase.LONG_BREAK   -> "LONG BREAK — $t"
+            AttentionPhase.PAUSED       -> "PAUSED — $t"
+            AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+            AttentionPhase.DONE         -> "SESSION COMPLETE"
         }
     }
 
