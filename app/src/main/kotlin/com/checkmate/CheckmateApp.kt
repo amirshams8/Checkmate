@@ -2,12 +2,11 @@ package com.checkmate
 
 import android.app.Application
 import android.content.Context
-import android.net.Uri
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ScreenshotCapture
+import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.ScreenshotSharer
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
@@ -19,14 +18,17 @@ class CheckmateApp : Application() {
         CheckmateState.init(this)
         CheckmateTTS.init(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Clean up screenshots older than 24h on each cold start
         ScreenshotSharer.pruneOldScreenshots(this)
 
-        // Wire the distraction alert callback — keeps :workmode free of :app imports
+        // Wire real screenshot capture via MediaProjection into DistractionGuard
         DistractionGuard.listener = object : DistractionListener {
             override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                val uri: Uri? = ScreenshotCapture.captureOverlay(context)
-                GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                // capture() is non-blocking internally (uses VirtualDisplay + ImageReader)
+                // but we call it on the accessibility service thread via a bg thread to avoid ANR
+                Thread {
+                    val uri = ScreenCaptureManager.capture(context)
+                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
             }
         }
     }

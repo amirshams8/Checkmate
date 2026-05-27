@@ -1,8 +1,10 @@
 package com.checkmate
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,14 +12,19 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.material3.MaterialTheme
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.stopwatch.NotificationPermissionHelper
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.main.MainScreen
 import com.checkmate.ui.theme.CheckmateTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -26,9 +33,34 @@ class MainActivity : ComponentActivity() {
         private const val REQUEST_CODE_MIC     = 1002
     }
 
+    // Shared ViewModel so we can call onProjectionGranted/Denied
+    private lateinit var homeViewModel: HomeViewModel
+
+    // ActivityResult launcher for MediaProjection dialog
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            ScreenCaptureManager.storeProjectionToken(this, result.resultCode, result.data)
+            homeViewModel.onProjectionGranted(applicationContext)
+        } else {
+            homeViewModel.onProjectionDenied(applicationContext)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CheckmateState.init(applicationContext)
+
+        homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
+
+        // Observe projection requests from HomeViewModel
+        lifecycleScope.launch {
+            homeViewModel.requestProjection.collect {
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mgr.createScreenCaptureIntent())
+            }
+        }
 
         if (NotificationPermissionHelper.shouldRequestPermission(this)) {
             NotificationPermissionHelper.requestPermission(this)
