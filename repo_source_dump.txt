@@ -26,6 +26,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── FloatingAttentionService.kt
 │   │   │   │   │   │   │   ├── GuardianNotifier.kt
 │   │   │   │   │   │   │   ├── ReminderService.kt
+│   │   │   │   │   │   │   ├── ScreenCaptureManager.kt
 │   │   │   │   │   │   │   ├── ScreenshotCapture.kt
 │   │   │   │   │   │   │   ├── ScreenshotSharer.kt
 │   │   │   │   │   │   │   ├── WhatsAppReportService.kt
@@ -283,6 +284,7 @@ class ExampleInstrumentedTest {
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.CALL_SCREENING" />
@@ -346,10 +348,6 @@ class ExampleInstrumentedTest {
             </intent-filter>
         </service>
 
-        <!--
-            Accessibility services — exported="true" + foregroundServiceType="dataSync"
-            required for ColorOS to bind (mirrored from working DevTools AutoBuildService).
-        -->
         <service
             android:name="com.checkmate.callhandler.CallAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
@@ -376,7 +374,6 @@ class ExampleInstrumentedTest {
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
-        <!-- Notification listener — separate process so it survives app kill -->
         <service android:name="com.checkmate.automation.WhatsAppNotificationListener"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true"
@@ -386,7 +383,6 @@ class ExampleInstrumentedTest {
             </intent-filter>
         </service>
 
-        <!-- EOD summary receiver -->
         <receiver android:name="com.checkmate.service.EodSummaryReceiver"
             android:exported="false">
             <intent-filter>
@@ -413,12 +409,11 @@ package com.checkmate
 
 import android.app.Application
 import android.content.Context
-import android.net.Uri
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ScreenshotCapture
+import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.ScreenshotSharer
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
@@ -430,14 +425,17 @@ class CheckmateApp : Application() {
         CheckmateState.init(this)
         CheckmateTTS.init(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Clean up screenshots older than 24h on each cold start
         ScreenshotSharer.pruneOldScreenshots(this)
 
-        // Wire the distraction alert callback — keeps :workmode free of :app imports
+        // Wire real screenshot capture via MediaProjection into DistractionGuard
         DistractionGuard.listener = object : DistractionListener {
             override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                val uri: Uri? = ScreenshotCapture.captureOverlay(context)
-                GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                // capture() is non-blocking internally (uses VirtualDisplay + ImageReader)
+                // but we call it on the accessibility service thread via a bg thread to avoid ANR
+                Thread {
+                    val uri = ScreenCaptureManager.capture(context)
+                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
             }
         }
     }
@@ -448,8 +446,10 @@ class CheckmateApp : Application() {
 package com.checkmate
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -457,14 +457,19 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.material3.MaterialTheme
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.stopwatch.NotificationPermissionHelper
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.main.MainScreen
 import com.checkmate.ui.theme.CheckmateTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -473,9 +478,34 @@ class MainActivity : ComponentActivity() {
         private const val REQUEST_CODE_MIC     = 1002
     }
 
+    // Shared ViewModel so we can call onProjectionGranted/Denied
+    private lateinit var homeViewModel: HomeViewModel
+
+    // ActivityResult launcher for MediaProjection dialog
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            ScreenCaptureManager.storeProjectionToken(this, result.resultCode, result.data)
+            homeViewModel.onProjectionGranted(applicationContext)
+        } else {
+            homeViewModel.onProjectionDenied(applicationContext)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CheckmateState.init(applicationContext)
+
+        homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
+
+        // Observe projection requests from HomeViewModel
+        lifecycleScope.launch {
+            homeViewModel.requestProjection.collect {
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mgr.createScreenCaptureIntent())
+            }
+        }
 
         if (NotificationPermissionHelper.shouldRequestPermission(this)) {
             NotificationPermissionHelper.requestPermission(this)
@@ -1618,6 +1648,159 @@ class ReminderService : Service() {
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/service/ScreenCaptureManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import androidx.core.content.FileProvider
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * ScreenCaptureManager — real screen capture via MediaProjection.
+ *
+ * Usage:
+ *   1. Call createCaptureIntent(context) and launch it with startActivityForResult.
+ *   2. In onActivityResult pass the resultCode + data to storeProjectionToken().
+ *   3. Call capture(context) from any thread — blocks up to 2s, returns Uri or null.
+ *   4. Call release() on Work Mode end to free the projection.
+ */
+object ScreenCaptureManager {
+
+    private const val TAG       = "ScreenCaptureManager"
+    private const val AUTHORITY = "com.checkmate.fileprovider"
+
+    private var mediaProjection: MediaProjection? = null
+
+    // ── Setup ─────────────────────────────────────────────────────────────────
+
+    fun createCaptureIntent(context: Context): Intent {
+        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        return mgr.createScreenCaptureIntent()
+    }
+
+    fun storeProjectionToken(context: Context, resultCode: Int, data: Intent?) {
+        if (data == null) { Log.w(TAG, "Projection data null — user denied"); return }
+        release()
+        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mgr.getMediaProjection(resultCode, data)
+        Log.d(TAG, "MediaProjection token stored")
+    }
+
+    fun isReady(): Boolean = mediaProjection != null
+
+    fun release() {
+        mediaProjection?.stop()
+        mediaProjection = null
+        Log.d(TAG, "MediaProjection released")
+    }
+
+    // ── Capture ───────────────────────────────────────────────────────────────
+
+    /**
+     * Captures the real screen. Safe to call from any thread.
+     * Returns a FileProvider content:// Uri or null on failure.
+     */
+    fun capture(context: Context): Uri? {
+        val projection = mediaProjection ?: run {
+            Log.w(TAG, "No MediaProjection token — skipping screenshot")
+            return null
+        }
+
+        val metrics = context.resources.displayMetrics
+        val width   = metrics.widthPixels
+        val height  = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        val latch   = CountDownLatch(1)
+        var bitmap: Bitmap? = null
+
+        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        var virtualDisplay: VirtualDisplay? = null
+
+        val handler = Handler(Looper.getMainLooper())
+
+        imageReader.setOnImageAvailableListener({ reader ->
+            try {
+                val image  = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val planes = image.planes
+                val buffer = planes[0].buffer
+                val pixelStride  = planes[0].pixelStride
+                val rowStride    = planes[0].rowStride
+                val rowPadding   = rowStride - pixelStride * width
+
+                val bmp = Bitmap.createBitmap(
+                    width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888
+                )
+                bmp.copyPixelsFromBuffer(buffer)
+                // Crop to exact screen width (remove row padding)
+                bitmap = Bitmap.createBitmap(bmp, 0, 0, width, height)
+                bmp.recycle()
+                image.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Image read failed: ${e.message}")
+            } finally {
+                latch.countDown()
+            }
+        }, handler)
+
+        virtualDisplay = projection.createVirtualDisplay(
+            "CheckmateCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader.surface,
+            null, handler
+        )
+
+        latch.await(3, TimeUnit.SECONDS)
+
+        virtualDisplay?.release()
+        imageReader.close()
+
+        val bmp = bitmap ?: run {
+            Log.w(TAG, "Bitmap null after capture")
+            return null
+        }
+
+        return saveBitmapAndGetUri(context, bmp)
+    }
+
+    // ── Persist ───────────────────────────────────────────────────────────────
+
+    private fun saveBitmapAndGetUri(context: Context, bitmap: Bitmap): Uri? {
+        return try {
+            val dir  = File(context.filesDir, "screenshots").also { it.mkdirs() }
+            val ts   = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val file = File(dir, "distraction_$ts.png")
+            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 85, it) }
+            bitmap.recycle()
+            FileProvider.getUriForFile(context, AUTHORITY, file)
+                .also { Log.d(TAG, "Screenshot saved → $it") }
+        } catch (e: Exception) {
+            Log.e(TAG, "Save failed: ${e.message}")
+            null
+        }
+    }
+}
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/service/ScreenshotCapture.kt =====
 package com.checkmate.service
 
@@ -2615,6 +2798,7 @@ import com.checkmate.psyche.PsycheEngine
 import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -2632,6 +2816,14 @@ class HomeViewModel : ViewModel() {
 
     private val _state = MutableStateFlow(HomeState())
     val state: StateFlow<HomeState> = _state.asStateFlow()
+
+    // MainActivity observes this — when true it launches the MediaProjection dialog.
+    // Resets to false once MainActivity has handled it.
+    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
+    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
+
+    // Held temporarily between "request projection" and "projection granted"
+    private var pendingTask: StudyTask? = null
 
     init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
 
@@ -2659,7 +2851,44 @@ class HomeViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Called by HomeScreen when student taps Start.
+     * If projection is already ready (token from previous task in same session)
+     * we skip the dialog and start directly. Otherwise we ask MainActivity to
+     * show the system dialog first.
+     */
     fun startTask(context: Context, task: StudyTask) {
+        if (ScreenCaptureManager.isReady()) {
+            // Token already held from earlier in this session — start immediately
+            launchTask(context, task)
+        } else {
+            // Signal MainActivity to request projection, then launchTask will be called
+            // back via onProjectionGranted()
+            pendingTask = task
+            _requestProjection.tryEmit(task)
+        }
+    }
+
+    /**
+     * Called by MainActivity after the user taps "Start now" in the system dialog.
+     */
+    fun onProjectionGranted(context: Context) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        launchTask(context, task)
+    }
+
+    /**
+     * Called by MainActivity if the user denied the projection dialog.
+     * We still start the task — just without screenshot capability.
+     */
+    fun onProjectionDenied(context: Context) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        launchTask(context, task)
+    }
+
+    private fun launchTask(context: Context, task: StudyTask) {
         viewModelScope.launch {
             WorkModeManager.activate(context)
             val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
@@ -2669,12 +2898,10 @@ class HomeViewModel : ViewModel() {
                     ?.let { context.startActivity(it) }
             }
             AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-            FloatingAttentionService.start(context)  // ← wire in overlay
+            FloatingAttentionService.start(context)
             CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
             PlanStore.setTaskActive(task.id)
             _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-
-            // Auto-trigger 1: notify guardian task started
             GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
         }
     }
@@ -2682,8 +2909,9 @@ class HomeViewModel : ViewModel() {
     fun markDone(context: Context, task: StudyTask) {
         viewModelScope.launch {
             AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)   // ← tear down overlay
+            FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.DONE)
             PsycheEngine.onTaskCompleted(task)
             CheckmateTTS.speak(context, "Task complete. Well done.")
@@ -2695,16 +2923,15 @@ class HomeViewModel : ViewModel() {
     fun markSkip(context: Context, task: StudyTask) {
         viewModelScope.launch {
             AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)   // ← tear down overlay
+            FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
             PsycheEngine.onTaskSkipped(task)
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
             val newSkips = _state.value.consecutiveSkips + 1
             _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-
-            // Auto-trigger 2: guardian alert after 3 consecutive skips
             if (newSkips >= 3) {
                 GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
             }
