@@ -60,6 +60,10 @@ class AttentionCycleService : Service() {
     private var cycleJob: Job? = null
     private var isPaused = false
 
+    // Tracks the last elapsed-second mark at which we pushed a status+screenshot update,
+    // so we fire roughly every StatusReporter.STATUS_INTERVAL_SECONDS regardless of pauses.
+    private var lastStatusPushAt = 0L
+
     private val pauseReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             when (intent?.action) {
@@ -106,6 +110,7 @@ class AttentionCycleService : Service() {
         }
 
         AttentionCycleManager.start(taskId, taskName, durationMin)
+        lastStatusPushAt = 0L
         startCycleLoop(taskName)
         return START_NOT_STICKY
     }
@@ -151,6 +156,16 @@ class AttentionCycleService : Service() {
                 }
                 if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
                     CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
+
+                // ── Periodic status + screenshot push to guardian bot ──────────────
+                if (cs.totalSessionSeconds - lastStatusPushAt >= StatusReporter.STATUS_INTERVAL_SECONDS) {
+                    lastStatusPushAt = cs.totalSessionSeconds
+                    val snapshot = cs
+                    launch(Dispatchers.IO) {
+                        StatusReporter.pushStatus(this@AttentionCycleService, snapshot)
+                    }
+                }
+
                 delay(1_000)
             }
         }

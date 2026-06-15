@@ -10,6 +10,7 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
@@ -25,7 +26,7 @@ import java.util.concurrent.TimeUnit
  *   2. Guardian messages @userinfobot to get their chat_id
  *   3. Student enters that chat_id in Settings → Guardian Telegram Chat ID
  *
- * Call sendAlert() from a background thread — blocks on network.
+ * Call sendAlert() / uploadPhotoAndGetFileId() from a background thread — both block on network.
  */
 object TelegramAlertBot {
 
@@ -69,6 +70,33 @@ object TelegramAlertBot {
         sendText(chatId, caption)
     }
 
+    /**
+     * Uploads a screenshot to the guardian's chat with the given caption and
+     * returns Telegram's file_id for the largest photo size, or null on failure.
+     *
+     * The returned file_id can be reused later (e.g. by the Cloudflare worker)
+     * to re-send the same image via sendPhoto without re-uploading bytes.
+     *
+     * Must be called from a background thread.
+     */
+    fun uploadPhotoAndGetFileId(context: Context, caption: String, screenshotUri: Uri): String? {
+        if (BOT_TOKEN.isBlank()) {
+            Log.e(TAG, "BOT_TOKEN not set in local.properties — skipping status photo upload")
+            return null
+        }
+        val chatId = getChatId() ?: run {
+            Log.w(TAG, "telegram_chat_id not set — skipping status photo upload")
+            return null
+        }
+
+        val tmp = copyUriToTempFile(context, screenshotUri) ?: return null
+        return try {
+            sendPhotoForFileId(chatId, caption, tmp)
+        } finally {
+            tmp.delete()
+        }
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     private fun sendPhoto(chatId: String, caption: String, photo: File): Boolean {
@@ -93,6 +121,46 @@ object TelegramAlertBot {
         } catch (e: Exception) {
             Log.e(TAG, "sendPhoto exception: ${e.message}")
             false
+        }
+    }
+
+    /**
+     * Same as sendPhoto, but parses the response and returns the file_id of the
+     * largest photo size (last entry in the "photo" array), or null on failure.
+     */
+    private fun sendPhotoForFileId(chatId: String, caption: String, photo: File): String? {
+        return try {
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("chat_id", chatId)
+                .addFormDataPart("caption", caption)
+                .addFormDataPart(
+                    "photo", photo.name,
+                    photo.asRequestBody("image/png".toMediaType())
+                )
+                .build()
+
+            val response = client.newCall(
+                Request.Builder().url("$BASE_URL/sendPhoto").post(body).build()
+            ).execute()
+
+            val bodyStr = response.body?.string()
+            Log.d(TAG, "sendPhotoForFileId: ${response.code}")
+            response.close()
+
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
+
+            val json = JSONObject(bodyStr)
+            if (!json.optBoolean("ok", false)) return null
+
+            val photoArray = json.getJSONObject("result").optJSONArray("photo") ?: return null
+            if (photoArray.length() == 0) return null
+
+            // Last entry = largest resolution
+            photoArray.getJSONObject(photoArray.length() - 1).optString("file_id", null)
+        } catch (e: Exception) {
+            Log.e(TAG, "sendPhotoForFileId exception: ${e.message}")
+            null
         }
     }
 
@@ -127,7 +195,7 @@ object TelegramAlertBot {
         }
     }
 
-    private fun getChatId(): String? {
+    fun getChatId(): String? {
         val id = CheckmatePrefs.getString("telegram_chat_id", null)
         return if (id.isNullOrBlank()) null else id.trim()
     }
