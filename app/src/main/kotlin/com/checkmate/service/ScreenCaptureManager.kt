@@ -25,11 +25,22 @@ import java.util.concurrent.TimeUnit
 /**
  * ScreenCaptureManager — real screen capture via MediaProjection.
  *
+ * IMPORTANT (Android 14+ constraint): MediaProjection.createVirtualDisplay()
+ * may only be called ONCE per MediaProjection instance. Calling it a second
+ * time on the same token throws and triggers onStop(), permanently killing
+ * the projection for the rest of the session. To support repeated captures
+ * (distraction alerts + periodic status pushes), we now create the
+ * VirtualDisplay + ImageReader ONCE when the token is stored, and reuse that
+ * same surface for every subsequent capture() call. We only tear it down in
+ * release().
+ *
  * Usage:
  *   1. Call createCaptureIntent(context) and launch it with startActivityForResult.
  *   2. In onActivityResult pass the resultCode + data to storeProjectionToken().
+ *      This also sets up the reusable VirtualDisplay/ImageReader.
  *   3. Call capture(context) from any thread — blocks up to 3s, returns Uri or null.
- *   4. Call release() on Work Mode end to free the projection.
+ *      Safe to call multiple times on the same token.
+ *   4. Call release() on Work Mode end to free the projection and surfaces.
  */
 object ScreenCaptureManager {
 
@@ -37,13 +48,27 @@ object ScreenCaptureManager {
     private const val AUTHORITY = "com.checkmate.fileprovider"
 
     private var mediaProjection: MediaProjection? = null
+    private var imageReader: ImageReader? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var captureWidth = 0
+    private var captureHeight = 0
+
+    // Guards setup/teardown/capture against concurrent calls — StatusReporter's
+    // periodic push and a distraction-alert capture can both fire from different
+    // threads around the same time.
+    private val lock = Any()
+
+    private val handler = Handler(Looper.getMainLooper())
 
     // Android 14+ requires a registered callback before createVirtualDisplay().
     // We keep one callback registered for the lifetime of the projection token.
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             Log.d(TAG, "MediaProjection stopped by system")
-            mediaProjection = null
+            synchronized(lock) {
+                tearDownSurfaceLocked()
+                mediaProjection = null
+            }
         }
     }
 
@@ -56,56 +81,104 @@ object ScreenCaptureManager {
 
     fun storeProjectionToken(context: Context, resultCode: Int, data: android.content.Intent?) {
         if (data == null) { Log.w(TAG, "Projection data null — user denied"); return }
-        release()
-        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection = mgr.getMediaProjection(resultCode, data)
-        // Must register callback before any createVirtualDisplay() call (Android 14+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            projection.registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
+        synchronized(lock) {
+            releaseLocked()
+
+            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = mgr.getMediaProjection(resultCode, data)
+            // Must register callback before any createVirtualDisplay() call (Android 14+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                projection.registerCallback(projectionCallback, handler)
+            }
+            mediaProjection = projection
+            Log.d(TAG, "MediaProjection token stored")
+
+            setUpSurfaceLocked(context, projection)
         }
-        mediaProjection = projection
-        Log.d(TAG, "MediaProjection token stored")
     }
 
-    fun isReady(): Boolean = mediaProjection != null
+    fun isReady(): Boolean = synchronized(lock) { mediaProjection != null && virtualDisplay != null }
 
     fun release() {
+        synchronized(lock) { releaseLocked() }
+    }
+
+    private fun releaseLocked() {
+        tearDownSurfaceLocked()
         mediaProjection?.let { proj ->
             try { proj.unregisterCallback(projectionCallback) } catch (_: Exception) {}
-            proj.stop()
+            try { proj.stop() } catch (_: Exception) {}
         }
         mediaProjection = null
         Log.d(TAG, "MediaProjection released")
     }
 
-    // ── Capture ───────────────────────────────────────────────────────────────
+    // ── Surface setup/teardown (done ONCE per token) ────────────────────────────
 
-    /**
-     * Captures the real screen. Safe to call from any thread.
-     * Returns a FileProvider content:// Uri or null on failure.
-     */
-    fun capture(context: Context): Uri? {
-        val projection = mediaProjection ?: run {
-            Log.w(TAG, "No MediaProjection token — skipping screenshot")
-            return null
-        }
-
+    private fun setUpSurfaceLocked(context: Context, projection: MediaProjection) {
         val metrics = context.resources.displayMetrics
         val width   = metrics.widthPixels
         val height  = metrics.heightPixels
         val density = metrics.densityDpi
 
-        val latch   = CountDownLatch(1)
+        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+
+        val display = try {
+            projection.createVirtualDisplay(
+                "CheckmateCapture",
+                width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                null, handler
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createVirtualDisplay failed: ${e.message}")
+            reader.close()
+            return
+        }
+
+        imageReader    = reader
+        virtualDisplay = display
+        captureWidth   = width
+        captureHeight  = height
+        Log.d(TAG, "VirtualDisplay + ImageReader created (reused for all captures)")
+    }
+
+    private fun tearDownSurfaceLocked() {
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        virtualDisplay = null
+        imageReader = null
+    }
+
+    // ── Capture ───────────────────────────────────────────────────────────────
+
+    /**
+     * Captures the real screen using the existing reusable VirtualDisplay/ImageReader.
+     * Safe to call from any thread, and safe to call repeatedly on the same token.
+     * Returns a FileProvider content:// Uri or null on failure.
+     */
+    fun capture(context: Context): Uri? {
+        val reader: ImageReader
+        val width: Int
+        val height: Int
+
+        synchronized(lock) {
+            if (mediaProjection == null || virtualDisplay == null || imageReader == null) {
+                Log.w(TAG, "No MediaProjection surface ready — skipping screenshot")
+                return null
+            }
+            reader = imageReader!!
+            width  = captureWidth
+            height = captureHeight
+        }
+
+        val latch = CountDownLatch(1)
         var bitmap: Bitmap? = null
 
-        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        var virtualDisplay: VirtualDisplay? = null
-
-        val handler = Handler(Looper.getMainLooper())
-
-        imageReader.setOnImageAvailableListener({ reader ->
+        val listener = ImageReader.OnImageAvailableListener { r ->
             try {
-                val image  = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val image  = r.acquireLatestImage() ?: return@OnImageAvailableListener
                 val planes = image.planes
                 val buffer = planes[0].buffer
                 val pixelStride  = planes[0].pixelStride
@@ -124,20 +197,12 @@ object ScreenCaptureManager {
             } finally {
                 latch.countDown()
             }
-        }, handler)
+        }
 
-        virtualDisplay = projection.createVirtualDisplay(
-            "CheckmateCapture",
-            width, height, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader.surface,
-            null, handler
-        )
-
+        reader.setOnImageAvailableListener(listener, handler)
         latch.await(3, TimeUnit.SECONDS)
-
-        virtualDisplay?.release()
-        imageReader.close()
+        // Detach listener so it doesn't fire for unrelated frames between captures.
+        reader.setOnImageAvailableListener(null, null)
 
         val bmp = bitmap ?: run {
             Log.w(TAG, "Bitmap null after capture")
