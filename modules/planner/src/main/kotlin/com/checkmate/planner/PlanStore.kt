@@ -31,6 +31,28 @@ object PlanStore {
         _todayTasks.value = tasks
     }
 
+    /**
+     * Appends a single manually-created task to today's plan WITHOUT touching any
+     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
+     * the whole list, this is additive — safe to call any time, any number of times.
+     * The new task goes through the exact same StudyTask model as AdaptivePlanner
+     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
+     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
+     * code path needed anywhere downstream.
+     */
+    fun addCustomTask(task: StudyTask) {
+        val updated = _todayTasks.value + task
+        _todayTasks.value = updated
+        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
+    }
+
+    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
+    fun removeTask(taskId: String) {
+        val updated = _todayTasks.value.filterNot { it.id == taskId }
+        _todayTasks.value = updated
+        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
+    }
+
     fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
 
     fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {

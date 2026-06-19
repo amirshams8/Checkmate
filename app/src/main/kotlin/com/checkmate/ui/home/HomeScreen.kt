@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -19,6 +20,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
@@ -30,6 +32,8 @@ import com.checkmate.ui.theme.*
 fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     val state   by vm.state.collectAsState()
     val context = LocalContext.current
+
+    var showAddTaskDialog by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
         LazyColumn(
@@ -49,7 +53,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                 item { PsycheMessageCard(message = state.psycheMessage) }
             }
             if (state.tasks.isEmpty()) {
-                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }) }
+                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }, onAddCustom = { showAddTaskDialog = true }) }
             } else {
                 items(state.tasks, key = { it.id }) { task ->
                     TaskCard(
@@ -59,14 +63,118 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                         onDone   = { vm.markDone(context, task) },
                         onSkip   = { vm.markSkip(context, task) },
                         onPause  = { vm.pauseTask(context, task) },
-                        onResume = { vm.resumeTask(context, task) }
+                        onResume = { vm.resumeTask(context, task) },
+                        onRemove = { vm.removeTask(task) }
                     )
                 }
+                item {
+                    TextButton(onClick = { showAddTaskDialog = true }) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = AccentGreen)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Add Custom Task", color = AccentGreen, fontWeight = FontWeight.SemiBold)
+                    }
+                }
             }
-            item { Spacer(Modifier.height(16.dp)) }
+            item { Spacer(Modifier.height(72.dp)) }
+        }
+
+        FloatingActionButton(
+            onClick     = { showAddTaskDialog = true },
+            containerColor = AccentGreen,
+            modifier    = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(20.dp)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = "Add custom task", tint = Color.Black)
         }
     }
+
+    if (showAddTaskDialog) {
+        AddCustomTaskDialog(
+            onDismiss = { showAddTaskDialog = false },
+            onConfirm = { subject, topic, duration ->
+                vm.addCustomTask(context, subject, topic, duration)
+                showAddTaskDialog = false
+            }
+        )
+    }
 }
+
+@Composable
+private fun AddCustomTaskDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (subject: String, topic: String, durationMinutes: Int) -> Unit
+) {
+    var subject  by remember { mutableStateOf("") }
+    var topic    by remember { mutableStateOf("") }
+    var duration by remember { mutableStateOf("30") }
+
+    val durationInt = duration.toIntOrNull()
+    val isValid = subject.isNotBlank() && topic.isNotBlank() && durationInt != null && durationInt > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Add Custom Task", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Slots in alongside today's plan — nothing else is removed.",
+                    fontSize = 12.sp, color = White60
+                )
+                OutlinedTextField(
+                    value           = subject,
+                    onValueChange   = { subject = it },
+                    label           = { Text("Subject", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                OutlinedTextField(
+                    value           = topic,
+                    onValueChange   = { topic = it },
+                    label           = { Text("Topic", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                OutlinedTextField(
+                    value           = duration,
+                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
+                    label           = { Text("Duration (minutes)", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors          = dialogFieldColors()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { durationInt?.let { onConfirm(subject.trim(), topic.trim(), it) } },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Add Task", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+@Composable
+private fun dialogFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor   = AccentGreen,
+    unfocusedBorderColor = White30,
+    cursorColor          = AccentGreen,
+    focusedLabelColor    = AccentGreen,
+    focusedTextColor     = White90,
+    unfocusedTextColor   = White90
+)
 
 @Composable
 private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
@@ -142,7 +250,8 @@ private fun TaskCard(
     onDone:   () -> Unit,
     onSkip:   () -> Unit,
     onPause:  () -> Unit,
-    onResume: () -> Unit
+    onResume: () -> Unit,
+    onRemove: () -> Unit
 ) {
     val isPaused    = task.state == TaskState.PAUSED
     val borderColor = when {
@@ -193,6 +302,11 @@ private fun TaskCard(
                         }
                     }
                     Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+                    if (task.state == TaskState.PENDING) {
+                        IconButton(onClick = onRemove, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Close, null, tint = White30, modifier = Modifier.size(14.dp))
+                        }
+                    }
                 }
             }
 
@@ -282,7 +396,7 @@ private fun TaskCard(
 }
 
 @Composable
-private fun EmptyPlanCard(onPlan: () -> Unit) {
+private fun EmptyPlanCard(onPlan: () -> Unit, onAddCustom: () -> Unit) {
     Surface(shape = RoundedCornerShape(14.dp), color = BgCard, border = BorderStroke(1.dp, White10)) {
         Column(
             modifier            = Modifier.fillMaxWidth().padding(24.dp),
@@ -292,10 +406,19 @@ private fun EmptyPlanCard(onPlan: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             Text("No plan for today", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
             Spacer(Modifier.height(6.dp))
-            Text("Set up your exam and subjects to generate a daily plan", fontSize = 13.sp, color = White60)
+            Text("Set up your exam and subjects to generate a daily plan, or add a one-off task", fontSize = 13.sp, color = White60)
             Spacer(Modifier.height(16.dp))
-            Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
-                Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
+                    Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+                OutlinedButton(
+                    onClick = onAddCustom,
+                    border  = BorderStroke(1.dp, White30),
+                    colors  = ButtonDefaults.outlinedButtonColors(contentColor = White90)
+                ) {
+                    Text("Add Custom Task")
+                }
             }
         }
     }

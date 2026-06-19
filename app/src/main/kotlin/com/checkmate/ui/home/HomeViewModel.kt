@@ -65,6 +65,37 @@ class HomeViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Adds a manually-created task to today's plan.
+     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
+     * whatever is already in today's list (AI-generated or previously added custom
+     * tasks) and never overwrites/clears them. The new StudyTask is identical in
+     * shape to a generated one, so it automatically renders in the same TaskCard,
+     * drives AttentionCycleService/WorkModeManager the same way via startTask(),
+     * and triggers the same GuardianNotifier WhatsApp "task started" ping plus the
+     * same end-of-day WhatsApp/Telegram report — no extra wiring required.
+     */
+    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int) {
+        val cleanSubject  = subject.trim()
+        val cleanTopic    = topic.trim()
+        val cleanDuration = durationMinutes.coerceIn(5, 240)
+        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
+
+        val task = StudyTask(
+            subject         = cleanSubject,
+            topic           = cleanTopic,
+            durationMinutes = cleanDuration
+        )
+        PlanStore.addCustomTask(task)
+        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
+    }
+
+    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
+    fun removeTask(task: StudyTask) {
+        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
+        PlanStore.removeTask(task.id)
+    }
+
     fun startTask(context: Context, task: StudyTask) {
         if (ScreenCaptureManager.isReady()) {
             launchTask(context, task)
