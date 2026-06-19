@@ -1,9 +1,10 @@
 package com.checkmate.core
 
 /**
- * PYQ (Previous Year Question) topic-level weightage for JEE / NEET.
- * Based on NTA official analysis + last 10 year data.
- * Values represent approximate % of total paper for that topic.
+ * PYQ (Previous Year Question) topic-level weightage for JEE / NEET / SSC CGL.
+ * Based on NTA official analysis (JEE/NEET) and SSC's last several years' Tier 1
+ * question pattern (SSC CGL). Values represent approximate % of that subject's
+ * questions coming from each chapter — not % of the whole paper.
  */
 object PYQWeightage {
 
@@ -129,6 +130,57 @@ object PYQWeightage {
                 "Alcohol Phenols" to 3.5f,
                 "Amines" to 3.0f,
                 "Biomolecules" to 3.0f
+            )
+        ),
+
+        "SSC CGL" to mapOf(
+            "Quantitative Aptitude" to mapOf(
+                "Arithmetic — Percentage Profit Loss Interest" to 16.0f,
+                "Data Interpretation" to 10.0f,
+                "Geometry" to 10.0f,
+                "Time Speed and Distance" to 9.0f,
+                "Algebra" to 9.0f,
+                "Trigonometry" to 9.0f,
+                "Mensuration" to 9.0f,
+                "Time and Work" to 8.0f,
+                "Number System" to 8.0f,
+                "Average and Ratio" to 7.0f,
+                "Mixture and Alligation" to 5.0f
+            ),
+            "General Intelligence & Reasoning" to mapOf(
+                "Puzzles and Seating Arrangement" to 14.0f,
+                "Analogies and Classification" to 13.0f,
+                "Series Completion" to 12.0f,
+                "Coding-Decoding" to 10.0f,
+                "Syllogism" to 10.0f,
+                "Non-Verbal Reasoning — Mirror and Water Images" to 9.0f,
+                "Blood Relations" to 8.0f,
+                "Matrix Based Reasoning" to 8.0f,
+                "Direction Sense" to 7.0f,
+                "Statement and Conclusion" to 6.0f,
+                "Paper Folding and Cutting" to 3.0f
+            ),
+            "English Language" to mapOf(
+                "Reading Comprehension" to 18.0f,
+                "Spotting Errors" to 14.0f,
+                "Cloze Test" to 12.0f,
+                "Sentence Improvement" to 12.0f,
+                "Para Jumbles" to 10.0f,
+                "Synonyms and Antonyms" to 10.0f,
+                "One Word Substitution" to 8.0f,
+                "Idioms and Phrases" to 8.0f,
+                "Fill in the Blanks" to 8.0f
+            ),
+            "General Awareness" to mapOf(
+                "Current Affairs — National and International" to 20.0f,
+                "Science and Technology" to 14.0f,
+                "Indian History" to 12.0f,
+                "Indian Polity and Constitution" to 12.0f,
+                "Indian Geography" to 10.0f,
+                "Indian Economy" to 10.0f,
+                "Static Awareness — Books Awards Days" to 8.0f,
+                "Government Schemes" to 8.0f,
+                "Sports and Honours" to 6.0f
             )
         )
     )

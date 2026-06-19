@@ -1,7 +1,10 @@
 package com.checkmate.core
 
 /**
- * NTA-official full syllabus for JEE / NEET / CUET.
+ * Official full syllabus for JEE / NEET / CUET (NTA) and SSC CGL (Staff Selection Commission).
+ * SSC CGL block reflects the 2026 notification syllabus — Tier 1 (Quantitative Aptitude,
+ * General Intelligence & Reasoning, English Language, General Awareness) plus the
+ * Tier 2 Paper 1 additions (Computer Knowledge, Statistics for JSO posts).
  * Structure: Exam → Subject → Chapter → List<Topic>
  */
 object ExamSyllabus {
@@ -204,6 +207,114 @@ object ExamSyllabus {
                 "Class 12 Physics" to listOf(
                     "Electrostatics", "Current Electricity", "Magnetism",
                     "EMI", "AC", "EM Waves", "Optics", "Modern Physics", "Semiconductors"
+                )
+            )
+        ),
+
+        // SSC CGL 2026 — Tier 1 (qualifying) + Tier 2 Paper 1 (final merit) syllabus.
+        // Tier 2 Paper 2 (Statistics) is JSO-specific; Paper 3 (Finance & Economics) is AAO-specific —
+        // both are folded in as subjects so students targeting those posts can track them separately.
+        "SSC CGL" to mapOf(
+            "Quantitative Aptitude" to mapOf(
+                "Number System" to listOf(
+                    "LCM and HCF", "Simplification", "Number Series",
+                    "Surds and Indices", "Divisibility Rules", "Decimal and Fractions"
+                ),
+                "Arithmetic" to listOf(
+                    "Percentage", "Profit and Loss", "Simple Interest", "Compound Interest",
+                    "Ratio and Proportion", "Average", "Time and Work",
+                    "Time Speed and Distance", "Partnership", "Mixture and Alligation",
+                    "Boats and Streams", "Pipes and Cisterns"
+                ),
+                "Algebra" to listOf(
+                    "Linear Equations", "Quadratic Equations", "Algebraic Identities", "Polynomials"
+                ),
+                "Geometry" to listOf(
+                    "Triangles", "Circles and Chords and Tangents", "Quadrilaterals",
+                    "Lines and Angles", "Congruence and Similarity", "Coordinate Geometry Basics"
+                ),
+                "Trigonometry" to listOf(
+                    "Trigonometric Ratios", "Heights and Distances", "Trigonometric Identities",
+                    "Maxima and Minima in Trigonometry"
+                ),
+                "Mensuration" to listOf(
+                    "2D Mensuration — Area and Perimeter", "3D Mensuration — Volume and Surface Area",
+                    "Mensuration of Combined Solids"
+                ),
+                "Data Interpretation" to listOf(
+                    "Bar Graphs", "Pie Charts", "Line Graphs", "Tabulation", "Caselet DI"
+                )
+            ),
+            "General Intelligence & Reasoning" to mapOf(
+                "Verbal Reasoning" to listOf(
+                    "Analogies", "Classification", "Coding-Decoding", "Blood Relations",
+                    "Direction Sense", "Series Completion", "Syllogism",
+                    "Statement and Conclusion", "Word Formation", "Alphabet and Number Test"
+                ),
+                "Non-Verbal Reasoning" to listOf(
+                    "Mirror Images", "Water Images", "Paper Folding and Cutting",
+                    "Embedded Figures", "Figure Series", "Pattern Completion", "Figure Counting"
+                ),
+                "Analytical Reasoning" to listOf(
+                    "Puzzles", "Seating Arrangement", "Logical Venn Diagrams",
+                    "Matrix Based Reasoning", "Input-Output", "Critical Thinking"
+                )
+            ),
+            "English Language" to mapOf(
+                "Grammar" to listOf(
+                    "Spotting Errors", "Sentence Improvement", "Active and Passive Voice",
+                    "Direct and Indirect Speech", "Parts of Speech", "Tenses",
+                    "Subject-Verb Agreement"
+                ),
+                "Vocabulary" to listOf(
+                    "Synonyms and Antonyms", "One Word Substitution",
+                    "Idioms and Phrases", "Spelling Correction", "Homonyms"
+                ),
+                "Reading Comprehension" to listOf(
+                    "Passage Based Questions", "Cloze Test", "Para Jumbles",
+                    "Fill in the Blanks", "Sentence Rearrangement"
+                )
+            ),
+            "General Awareness" to mapOf(
+                "Static GK" to listOf(
+                    "Indian History", "Indian Geography", "Indian Polity and Constitution",
+                    "Indian Economy", "Books Awards and Important Days", "Art and Culture"
+                ),
+                "Current Affairs" to listOf(
+                    "National and International Current Affairs", "Government Schemes",
+                    "Sports", "Awards and Honours", "Appointments and Obituaries"
+                ),
+                "Science" to listOf(
+                    "Physics Basics", "Chemistry Basics", "Biology Basics",
+                    "Science and Technology Current Developments"
+                )
+            ),
+            "Computer Knowledge" to mapOf(
+                "Computer Fundamentals" to listOf(
+                    "Computer Basics and Generations", "MS Office — Word Excel PowerPoint",
+                    "Internet and Networking Basics", "Computer Security and Viruses",
+                    "Operating Systems Basics"
+                )
+            ),
+            "Statistics (JSO Paper 2)" to mapOf(
+                "Descriptive Statistics" to listOf(
+                    "Collection and Classification of Data", "Tabulation and Presentation",
+                    "Measures of Central Tendency", "Measures of Dispersion",
+                    "Correlation and Regression"
+                ),
+                "Probability and Sampling" to listOf(
+                    "Probability Theory", "Random Variables and Distributions",
+                    "Sampling Theory", "Statistical Inference"
+                )
+            ),
+            "Finance & Economics (AAO Paper 3)" to mapOf(
+                "Finance" to listOf(
+                    "Financial Accounting", "Basic Concepts of Accounting",
+                    "Self-Balancing Ledgers", "Depreciation Accounting"
+                ),
+                "Economics and Governance" to listOf(
+                    "Comptroller and Auditor General of India", "Finance Commission",
+                    "Theory of Demand and Supply", "Indian Economy Basics", "Government Budgeting"
                 )
             )
         )

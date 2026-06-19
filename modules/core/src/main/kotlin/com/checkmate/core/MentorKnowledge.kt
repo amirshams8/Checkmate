@@ -17,6 +17,11 @@ object MentorKnowledge {
             "Mathematics" to listOf("Calculus", "3D Geometry", "Probability", "Coordinate Geometry", "Vectors"),
             "Physics"     to listOf("Rotational Dynamics", "Electrostatics", "EMI", "Modern Physics", "Waves"),
             "Chemistry"   to listOf("Organic Mechanisms", "Coordination", "p-Block", "Thermodynamics", "Electrochemistry")
+        ),
+        "SSC CGL" to mapOf(
+            "Quantitative Aptitude"           to listOf("Mensuration", "Algebra", "Trigonometry", "Data Interpretation", "Geometry"),
+            "General Intelligence & Reasoning" to listOf("Non-Verbal Reasoning", "Analytical Reasoning", "Syllogism", "Coding-Decoding", "Blood Relations"),
+            "English Language"                to listOf("Cloze Test", "Para Jumbles", "Sentence Improvement", "Idioms and Phrases", "Spotting Errors")
         )
     )
 
@@ -69,11 +74,24 @@ object MentorKnowledge {
             "Not checking domain restrictions when differentiating inverse functions",
             "Applying L'Hôpital without verifying 0/0 or ∞/∞ form",
             "Forgetting that integration by parts choice matters — LIATE rule"
+        ),
+        "Data Interpretation" to listOf(
+            "Spending too long reading the caselet instead of jumping to the asked values",
+            "Misreading pie-chart percentages as absolute values",
+            "Forgetting to check the base/total before computing a percentage change",
+            "Not rounding intermediate steps consistently, causing answer mismatches",
+            "Ignoring units (lakhs vs crores, % vs absolute) printed in the graph legend"
+        ),
+        "Syllogism" to listOf(
+            "Assuming a converse statement is automatically true (e.g. 'Some A are B' ⇏ 'Some B are A' reversal errors)",
+            "Forgetting to check both possible Venn diagram cases before concluding 'cannot be determined'",
+            "Mixing up 'All', 'Some', and 'No' statement rules under negation",
+            "Treating 'Some are not' as the same as 'No'"
         )
     )
 
     val revisionStrategies = """
-PROVEN REVISION STRATEGIES FOR JEE/NEET:
+PROVEN REVISION STRATEGIES FOR JEE/NEET/SSC CGL:
 
 1. PYQ-First Method:
    - For each topic, solve last 10 years PYQs before reading theory.
@@ -104,6 +122,12 @@ PROVEN REVISION STRATEGIES FOR JEE/NEET:
    - Full mocks: weekly. 1 subject mocks: 2-3x per week.
    - Analyze wrong answers the same day — never skip post-mock analysis.
    - Track: Was it conceptual gap? Silly mistake? Time pressure? Each needs different fix.
+
+7. Subject Sequencing for SSC CGL:
+   - Quant and Reasoning are speed-and-accuracy sections — sectional 15-min timers reward drilling, not depth.
+   - English compounds slowly — build vocabulary daily rather than cramming before Tier 1.
+   - General Awareness rewards a steady daily current-affairs habit over last-month cramming.
+   - Tier 1 and Tier 2 share most subjects, so a single topic pass prepares for both stages.
 """.trim()
 
     val burnoutDetectionPatterns = """
@@ -136,6 +160,12 @@ FASTEST MARKS PER EFFORT:
    = ~30 marks. All formula-based, predictable question patterns.
 3. Physics: 3 chapters (Electrostatics, Current Electricity, Optics) = ~25 marks combined.
    PYQ-heavy: same question types repeat every year with number changes.
+
+SSC CGL SCORE GAP:
+- Tier 1 is qualifying only (200 marks) — clear the cutoff, don't over-optimize it.
+- Final merit is 100% Tier 2 (450 marks across papers) — shift serious prep there post-Tier 1.
+- Reasoning and Quant are the fastest marks per effort: formula/pattern-based, low ambiguity.
+- English needs the longest runway (vocabulary, grammar) — start it earliest, never last.
 """.trim()
 
     /** Returns relevant knowledge blocks for a given query topic */

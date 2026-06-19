@@ -100,8 +100,8 @@ fun PlannerScreen(navController: NavController, vm: PlannerViewModel = viewModel
         // ── Exam type ──
         item {
             SectionCard(title = "Exam") {
-                val exams = listOf("NEET", "JEE", "UPSC", "CA", "GATE", "Custom")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val exams = listOf("NEET", "JEE", "SSC CGL", "UPSC", "CA", "GATE", "Custom")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
                     exams.forEach { exam ->
                         FilterChip(
                             selected = state.examType == exam,

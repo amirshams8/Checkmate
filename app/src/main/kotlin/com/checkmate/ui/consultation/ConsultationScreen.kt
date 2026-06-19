@@ -58,8 +58,8 @@ fun ConsultationScreen(navController: NavController, vm: ConsultationViewModel =
             // Exam target chips
             Text("Exam Target", fontSize = 12.sp, color = White60)
             Spacer(Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("NEET", "JEE", "CUET").forEach { exam ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                listOf("NEET", "JEE", "CUET", "SSC CGL").forEach { exam ->
                     FilterChip(
                         selected = profile.examTarget == exam,
                         onClick  = { vm.update { it.copy(examTarget = exam) } },
