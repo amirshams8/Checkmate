@@ -34,6 +34,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     val context = LocalContext.current
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
+    var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
 
     Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
         LazyColumn(
@@ -57,14 +58,15 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
             } else {
                 items(state.tasks, key = { it.id }) { task ->
                     TaskCard(
-                        task     = task,
-                        isActive = state.activeTaskId == task.id,
-                        onStart  = { vm.startTask(context, task) },
-                        onDone   = { vm.markDone(context, task) },
-                        onSkip   = { vm.markSkip(context, task) },
-                        onPause  = { vm.pauseTask(context, task) },
-                        onResume = { vm.resumeTask(context, task) },
-                        onRemove = { vm.removeTask(task) }
+                        task           = task,
+                        isActive       = state.activeTaskId == task.id,
+                        onStart        = { vm.startTask(context, task) },
+                        onDone         = { vm.markDone(context, task) },
+                        onSkip         = { vm.markSkip(context, task) },
+                        onPause        = { vm.pauseTask(context, task) },
+                        onResume       = { vm.resumeTask(context, task) },
+                        onRemove       = { vm.removeTask(task) },
+                        onEditDuration = { editingTask = task }
                     )
                 }
                 item {
@@ -79,9 +81,9 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
         }
 
         FloatingActionButton(
-            onClick     = { showAddTaskDialog = true },
+            onClick        = { showAddTaskDialog = true },
             containerColor = AccentGreen,
-            modifier    = Modifier
+            modifier       = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(20.dp)
         ) {
@@ -95,6 +97,17 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
             onConfirm = { subject, topic, duration ->
                 vm.addCustomTask(context, subject, topic, duration)
                 showAddTaskDialog = false
+            }
+        )
+    }
+
+    editingTask?.let { task ->
+        EditDurationDialog(
+            task      = task,
+            onDismiss = { editingTask = null },
+            onConfirm = { newDuration ->
+                vm.editTaskDuration(task, newDuration)
+                editingTask = null
             }
         )
     }
@@ -121,7 +134,7 @@ private fun AddCustomTaskDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Slots in alongside today's plan — nothing else is removed.",
+                    "Slots in alongside today's plan — nothing else is removed. Duration stays editable later.",
                     fontSize = 12.sp, color = White60
                 )
                 OutlinedTextField(
@@ -158,6 +171,51 @@ private fun AddCustomTaskDialog(
                 colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
             ) {
                 Text("Add Task", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+@Composable
+private fun EditDurationDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (durationMinutes: Int) -> Unit
+) {
+    var duration by remember { mutableStateOf(task.durationMinutes.toString()) }
+    val durationInt = duration.toIntOrNull()
+    val isValid = durationInt != null && durationInt > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Edit Duration", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                OutlinedTextField(
+                    value           = duration,
+                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
+                    label           = { Text("Duration (minutes)", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors          = dialogFieldColors()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { durationInt?.let(onConfirm) },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
             }
         },
         dismissButton = {
@@ -244,14 +302,15 @@ private fun PsycheMessageCard(message: String) {
 
 @Composable
 private fun TaskCard(
-    task:     StudyTask,
-    isActive: Boolean,
-    onStart:  () -> Unit,
-    onDone:   () -> Unit,
-    onSkip:   () -> Unit,
-    onPause:  () -> Unit,
-    onResume: () -> Unit,
-    onRemove: () -> Unit
+    task:           StudyTask,
+    isActive:       Boolean,
+    onStart:        () -> Unit,
+    onDone:         () -> Unit,
+    onSkip:         () -> Unit,
+    onPause:        () -> Unit,
+    onResume:       () -> Unit,
+    onRemove:       () -> Unit,
+    onEditDuration: () -> Unit
 ) {
     val isPaused    = task.state == TaskState.PAUSED
     val borderColor = when {
@@ -301,7 +360,26 @@ private fun TaskCard(
                             )
                         }
                     }
+                    if (task.isCustom) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AccentBlue.copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                "CUSTOM",
+                                fontSize   = 10.sp,
+                                color      = AccentBlue,
+                                fontWeight = FontWeight.Bold,
+                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                     Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+                    if (task.isCustom && task.state == TaskState.PENDING) {
+                        IconButton(onClick = onEditDuration, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
+                        }
+                    }
                     if (task.state == TaskState.PENDING) {
                         IconButton(onClick = onRemove, modifier = Modifier.size(20.dp)) {
                             Icon(Icons.Default.Close, null, tint = White30, modifier = Modifier.size(14.dp))

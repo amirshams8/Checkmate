@@ -20,7 +20,10 @@ data class StudyTask(
     // ── Pause/Resume fields (Blueprint 2.1) ──
     val pausedAt:        Long?      = null,   // epoch ms when task was paused
     val totalPausedMs:   Long       = 0L,     // accumulated pause time across all pauses
-    val actualMinutes:   Int        = 0       // real focus time excluding paused periods
+    val actualMinutes:   Int        = 0,      // real focus time excluding paused periods
+    // ── Manual task tracking ──
+    val isCustom:        Boolean    = false   // true only for tasks added via HomeViewModel.addCustomTask;
+                                               // gates the duration-edit affordance in HomeScreen
 )
 
 @Serializable

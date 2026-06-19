@@ -53,6 +53,11 @@ object PlanStore {
         CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
     }
 
+    /** Edits the planned duration of a single task — used for custom-task duration editing. */
+    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(durationMinutes = durationMinutes)
+    }
+
     fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
 
     fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {

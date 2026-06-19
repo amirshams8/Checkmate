@@ -69,11 +69,13 @@ class HomeViewModel : ViewModel() {
      * Adds a manually-created task to today's plan.
      * Uses PlanStore.addCustomTask() which is additive only — it appends onto
      * whatever is already in today's list (AI-generated or previously added custom
-     * tasks) and never overwrites/clears them. The new StudyTask is identical in
-     * shape to a generated one, so it automatically renders in the same TaskCard,
-     * drives AttentionCycleService/WorkModeManager the same way via startTask(),
-     * and triggers the same GuardianNotifier WhatsApp "task started" ping plus the
-     * same end-of-day WhatsApp/Telegram report — no extra wiring required.
+     * tasks) and never overwrites/clears them. isCustom = true is what later lets
+     * HomeScreen show the duration-edit affordance only for tasks added this way.
+     * The StudyTask is otherwise identical in shape to a generated one, so it
+     * automatically renders in the same TaskCard, drives AttentionCycleService/
+     * WorkModeManager the same way via startTask(), and triggers the same
+     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
+     * WhatsApp/Telegram report — no extra wiring required.
      */
     fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int) {
         val cleanSubject  = subject.trim()
@@ -84,10 +86,25 @@ class HomeViewModel : ViewModel() {
         val task = StudyTask(
             subject         = cleanSubject,
             topic           = cleanTopic,
-            durationMinutes = cleanDuration
+            durationMinutes = cleanDuration,
+            isCustom        = true
         )
         PlanStore.addCustomTask(task)
         CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
+    }
+
+    /**
+     * Edits the duration of a custom task. Only allowed for tasks created via
+     * addCustomTask (isCustom = true) and only while still PENDING — once a task
+     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
+     * so changing durationMinutes underneath it would desync the running countdown.
+     * Generated (AI-planned) tasks are intentionally left untouched here — their
+     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
+     */
+    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
+        if (!task.isCustom || task.state != TaskState.PENDING) return
+        val clamped = newDurationMinutes.coerceIn(5, 240)
+        PlanStore.updateTaskDuration(task.id, clamped)
     }
 
     /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
