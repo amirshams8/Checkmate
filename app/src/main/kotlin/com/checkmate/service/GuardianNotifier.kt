@@ -9,6 +9,7 @@ import android.net.Uri
 import android.util.Log
 import com.checkmate.automation.AutomationEngine
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import java.util.Calendar
@@ -18,8 +19,6 @@ object GuardianNotifier {
     private const val TAG = "GuardianNotifier"
     const val ACTION_EOD_SUMMARY = "com.checkmate.EOD_SUMMARY"
 
-    // ── Trigger 1: Task Started ──────────────────────────────────────────────
-
     fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
         val number = getGuardianNumber() ?: return
         val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
@@ -27,16 +26,12 @@ object GuardianNotifier {
         Log.d(TAG, "Guardian notified: task started")
     }
 
-    // ── Trigger 2: Skip Streak ───────────────────────────────────────────────
-
     fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String) {
         val number = getGuardianNumber() ?: return
         val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic. Time: ${timeNow()}"
         openWhatsAppAndSend(context, number, msg)
         Log.d(TAG, "Guardian notified: skip streak=$skipCount")
     }
-
-    // ── Trigger 3: End of Day Summary ────────────────────────────────────────
 
     fun scheduleEndOfDaySummary(context: Context) {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -64,7 +59,7 @@ object GuardianNotifier {
         val total   = tasks.size
         val pct     = if (total > 0) done * 100 / total else 0
 
-        val lines = tasks.joinToString("\n") { t ->
+        val taskLines = tasks.joinToString("\n") { t ->
             val icon = when (t.state) {
                 TaskState.DONE    -> "done"
                 TaskState.SKIPPED -> "skip"
@@ -73,30 +68,24 @@ object GuardianNotifier {
             "[$icon] ${t.subject}: ${t.topic}"
         }
 
+        val checklistSummary = DailyChecklist.getTodaySummaryText()
+
         val msg = buildString {
             appendLine("Checkmate Daily Report — ${dateToday()}")
-            appendLine("Completed: $done/$total ($pct%)")
+            appendLine("Tasks: $done/$total ($pct%)")
             if (skipped > 0) appendLine("Skipped: $skipped")
             appendLine()
-            appendLine(lines)
+            appendLine(taskLines)
+            if (checklistSummary.isNotBlank()) {
+                appendLine()
+                appendLine(checklistSummary)
+            }
         }.trim()
 
         openWhatsAppAndSend(context, number, msg)
         Log.d(TAG, "EOD summary sent to guardian")
     }
 
-    // ── Trigger 4: Distraction Alert ─────────────────────────────────────────
-
-    /**
-     * Called by DistractionGuard when a student hits the attempt threshold.
-     *
-     * Two completely separate paths:
-     *   - WhatsApp → text alert only (via AutomationEngine, no image)
-     *   - Telegram → screenshot + caption (via TelegramAlertBot, background thread)
-     *
-     * They are independent — if Telegram chat_id is not set, only WhatsApp fires.
-     * If guardian_number is not set, only Telegram fires. Both can fire together.
-     */
     fun notifyDistractionAlert(
         context: Context,
         kind: String,
@@ -108,22 +97,17 @@ object GuardianNotifier {
                     "3 times during study session at ${timeNow()}."
         Log.w(TAG, "Distraction alert: $label")
 
-        // Path 1 — WhatsApp: text only, always attempted if number is set
         val number = getGuardianNumber()
         if (number != null) {
             openWhatsAppAndSend(context, number, msg)
             Log.d(TAG, "Distraction alert sent via WhatsApp (text)")
         }
 
-        // Path 2 — Telegram: screenshot + caption, fired on bg thread
-        // Completely separate from WhatsApp — no fallback into WA image share
         Thread {
             TelegramAlertBot.sendAlert(context, msg, screenshotUri)
             Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
         }.start()
     }
-
-    // ── WhatsApp delivery ────────────────────────────────────────────────────
 
     private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
         val clean = number.replace(Regex("[^0-9]"), "")
@@ -147,8 +131,6 @@ object GuardianNotifier {
             .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
             .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun getGuardianNumber(): String? {
         val n = CheckmatePrefs.getString("guardian_number", null)

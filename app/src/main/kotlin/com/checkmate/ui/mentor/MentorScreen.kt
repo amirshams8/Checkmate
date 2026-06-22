@@ -22,46 +22,52 @@ import com.checkmate.ui.theme.*
 
 @Composable
 fun MentorScreen(vm: MentorViewModel = viewModel()) {
-    val state   by vm.state.collectAsState()
-    val context = LocalContext.current
+    val state     by vm.state.collectAsState()
+    val context   = LocalContext.current
     val listState = rememberLazyListState()
+    var showClearDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty())
             listState.animateScrollToItem(state.messages.size - 1)
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
-        // Header
+    // imePadding() pushes the input row above the keyboard when it opens
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgDark)
+            .imePadding()
+    ) {
         Row(
             modifier          = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(Icons.Default.Psychology, null, tint = AccentGreen, modifier = Modifier.size(22.dp))
             Spacer(Modifier.width(8.dp))
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text("Mentor AI", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = White90)
                 Text("Knows your full situation. No fluff.", fontSize = 11.sp, color = White60)
+            }
+            IconButton(onClick = { showClearDialog = true }) {
+                Icon(Icons.Default.DeleteSweep, null, tint = White30, modifier = Modifier.size(20.dp))
             }
         }
         HorizontalDivider(color = White10, thickness = 0.5.dp)
 
-        // Message list
         LazyColumn(
-            state           = listState,
-            modifier        = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding  = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            state               = listState,
+            modifier            = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            items(state.messages) { msg ->
-                MentorBubble(msg)
-            }
+            items(state.messages) { msg -> MentorBubble(msg) }
             if (state.isLoading) {
                 item {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
                         Surface(
-                            shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
-                            color = BgCard,
+                            shape  = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
+                            color  = BgCard,
                             border = BorderStroke(0.5.dp, White10)
                         ) {
                             Row(
@@ -79,11 +85,10 @@ fun MentorScreen(vm: MentorViewModel = viewModel()) {
             item { Spacer(Modifier.height(8.dp)) }
         }
 
-        // Input row
         HorizontalDivider(color = White10, thickness = 0.5.dp)
         Row(
-            modifier          = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            modifier              = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment     = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             OutlinedTextField(
@@ -103,14 +108,32 @@ fun MentorScreen(vm: MentorViewModel = viewModel()) {
                 )
             )
             FloatingActionButton(
-                onClick           = { vm.send(context) },
-                containerColor    = AccentGreen,
-                contentColor      = Color.Black,
-                modifier          = Modifier.size(46.dp)
+                onClick        = { vm.send(context) },
+                containerColor = AccentGreen,
+                contentColor   = Color.Black,
+                modifier       = Modifier.size(46.dp)
             ) {
                 Icon(Icons.Default.Send, null, modifier = Modifier.size(20.dp))
             }
         }
+    }
+
+    if (showClearDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDialog = false },
+            containerColor   = BgCard,
+            title = { Text("Clear chat history?", fontWeight = FontWeight.Bold, color = White90) },
+            text  = { Text("Removes all messages. Your consultation profile and behavior data are kept.", fontSize = 13.sp, color = White60) },
+            confirmButton = {
+                Button(
+                    onClick = { vm.clearHistory(); showClearDialog = false },
+                    colors  = ButtonDefaults.buttonColors(containerColor = AccentRed)
+                ) { Text("Clear", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDialog = false }) { Text("Cancel", color = White60) }
+            }
+        )
     }
 }
 
@@ -133,11 +156,11 @@ private fun MentorBubble(msg: MentorMessage) {
             modifier = Modifier.widthIn(max = 300.dp)
         ) {
             Text(
-                text     = msg.content,
-                fontSize = 14.sp,
-                color    = White90,
+                text       = msg.content,
+                fontSize   = 14.sp,
+                color      = White90,
                 lineHeight = 20.sp,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                modifier   = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
             )
         }
     }
