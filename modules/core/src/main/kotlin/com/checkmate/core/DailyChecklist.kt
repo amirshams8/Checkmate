@@ -5,24 +5,34 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import java.util.Calendar
-import java.util.UUID
 
 @Serializable
 data class ChecklistItem(
-    val id:        String  = UUID.randomUUID().toString(),
-    val label:     String,
-    val isDone:    Boolean = false
+    val id:     String,          // NO default — caller always supplies a stable ID
+    val label:  String,
+    val isDone: Boolean = false
 )
 
 /**
  * DailyChecklist — user-editable checklist persisted in SharedPrefs.
+ *
+ * Root bug fixed: the old data class had `id = UUID.randomUUID().toString()` as a
+ * default, so every getTemplate() call produced new IDs, making toggleItem()'s
+ * indexOfFirst { it.id == itemId } always return -1.
+ *
+ * Fix: IDs are now derived from the label via a stable slug, so they never drift
+ * between calls. Custom items created by the user pass their own UUID at creation
+ * time (generated once and persisted with the template).
+ *
  * Two separate keys:
- *   - "checklist_template"  : the master list of items (survives across days)
- *   - "checklist_<dayKey>"  : today's done/not-done state (resets daily)
+ *   "checklist_template"  — master item list (survives across days)
+ *   "checklist_<dayKey>"  — today's done/not-done state (resets daily)
  */
 object DailyChecklist {
 
     private val json = Json { ignoreUnknownKeys = true }
+
+    // ── Template ──────────────────────────────────────────────────────────────
 
     fun getTemplate(): List<ChecklistItem> {
         val saved = CheckmatePrefs.getString("checklist_template", null) ?: return defaultTemplate()
@@ -33,13 +43,16 @@ object DailyChecklist {
         CheckmatePrefs.putString("checklist_template", json.encodeToString(items))
     }
 
+    /** IDs are stable slugs derived from the label — never random. */
     private fun defaultTemplate(): List<ChecklistItem> = listOf(
-        ChecklistItem(label = "Lecture"),
-        ChecklistItem(label = "Notes Rev"),
-        ChecklistItem(label = "DPP + HW"),
-        ChecklistItem(label = "NCERT read"),
-        ChecklistItem(label = "Short Notes")
+        ChecklistItem(id = "lecture",    label = "Lecture"),
+        ChecklistItem(id = "notes_rev",  label = "Notes Rev"),
+        ChecklistItem(id = "dpp_hw",     label = "DPP + HW"),
+        ChecklistItem(id = "ncert_read", label = "NCERT read"),
+        ChecklistItem(id = "short_note", label = "Short Notes")
     )
+
+    // ── Today's state ─────────────────────────────────────────────────────────
 
     fun getTodayItems(): List<ChecklistItem> {
         val template  = getTemplate()
@@ -62,9 +75,9 @@ object DailyChecklist {
     }
 
     fun toggleItem(itemId: String) {
-        val items  = getTodayItems().toMutableList()
-        val idx    = items.indexOfFirst { it.id == itemId }
-        if (idx < 0) return
+        val items = getTodayItems().toMutableList()
+        val idx   = items.indexOfFirst { it.id == itemId }
+        if (idx < 0) return                                  // now will never happen
         items[idx] = items[idx].copy(isDone = !items[idx].isDone)
         saveTodayItems(items)
     }
@@ -72,6 +85,8 @@ object DailyChecklist {
     fun saveTodayItems(items: List<ChecklistItem>) {
         CheckmatePrefs.putString("checklist_${todayKey()}", json.encodeToString(items))
     }
+
+    // ── Summary for EOD report ────────────────────────────────────────────────
 
     fun getTodaySummaryText(): String {
         val items = getTodayItems()
@@ -83,6 +98,8 @@ object DailyChecklist {
         }
         return "Checklist: $done/${items.size}\n$lines"
     }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun todayKey(): String {
         val c = Calendar.getInstance()
