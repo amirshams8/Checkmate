@@ -8,6 +8,7 @@ import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import com.checkmate.automation.AutomationEngine
+import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
@@ -51,8 +52,15 @@ object GuardianNotifier {
         Log.d(TAG, "EOD summary alarm set for 21:00 daily")
     }
 
+    /**
+     * Builds and sends the daily report to the guardian — tasks, checklist,
+     * and (new) an on-device app usage breakdown for the day, Digital
+     * Wellbeing-style. Sent via WhatsApp (existing path) and, if a Telegram
+     * chat id is configured, also pushed straight to the guardian bot so the
+     * Telegram channel carries the same usage history, not just screenshots.
+     */
     fun sendEndOfDaySummary(context: Context) {
-        val number = getGuardianNumber() ?: return
+        val number = getGuardianNumber()
         val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
         val done    = tasks.count { it.state == TaskState.DONE }
         val skipped = tasks.count { it.state == TaskState.SKIPPED }
@@ -69,6 +77,7 @@ object GuardianNotifier {
         }
 
         val checklistSummary = DailyChecklist.getTodaySummaryText()
+        val usageSummary = AppUsageTracker.buildUsageReportText(context)
 
         val msg = buildString {
             appendLine("Checkmate Daily Report — ${dateToday()}")
@@ -80,10 +89,40 @@ object GuardianNotifier {
                 appendLine()
                 appendLine(checklistSummary)
             }
+            appendLine()
+            appendLine(usageSummary)
         }.trim()
 
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "EOD summary sent to guardian")
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+            Log.d(TAG, "EOD summary sent to guardian via WhatsApp")
+        }
+
+        // Push the same report straight to the Telegram bot, independent of
+        // the WhatsApp path, so guardians who only use Telegram still get it.
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread {
+                TelegramAlertBot.sendAlert(context, msg)
+                Log.d(TAG, "EOD summary sent to guardian via Telegram")
+            }.start()
+        }
+    }
+
+    /**
+     * Sends just the app usage breakdown to the guardian via Telegram —
+     * useful as an on-demand "usage" report independent of the once-a-day
+     * EOD summary. Call from a background thread or let it spin its own.
+     */
+    fun sendAppUsageReport(context: Context) {
+        if (TelegramAlertBot.getChatId() == null) {
+            Log.w(TAG, "telegram_chat_id not set — skipping usage report")
+            return
+        }
+        val text = "Checkmate — ${dateToday()}\n${AppUsageTracker.buildUsageReportText(context)}"
+        Thread {
+            TelegramAlertBot.sendAlert(context, text)
+            Log.d(TAG, "Usage report sent to guardian via Telegram")
+        }.start()
     }
 
     fun notifyDistractionAlert(

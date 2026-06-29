@@ -19,7 +19,13 @@ data class CycleState(
     val taskId:              String         = "",
     val taskName:            String         = "",
     val pausedAt:            Long           = 0L,
-    val totalPausedMs:       Long           = 0L
+    val totalPausedMs:       Long           = 0L,
+    // Total length of the active task in seconds — used by the floating bar
+    // to scale its progress indicator correctly in both Pomodoro and plain mode.
+    val totalDurationSecs:   Long           = 0L,
+    // Snapshot (taken at start()) of whether Pomodoro-style breaks/checks are
+    // active for this session. Exposed on state so UI doesn't need prefs access.
+    val pomodoroEnabled:     Boolean        = true
 )
 
 object AttentionCycleManager {
@@ -28,6 +34,11 @@ object AttentionCycleManager {
     private const val SHORT_BREAK_SECS         = 5  * 60L
     private const val LONG_BREAK_SECS          = 10 * 60L
     private const val FOCUS_BLOCKS_BEFORE_LONG = 2
+
+    // Pref key — read once per session in start() and snapshotted onto CycleState
+    // and into the private var below so mid-session toggling in Settings never
+    // changes the rules of an already-running session.
+    const val PREF_POMODORO_ENABLED = "pomodoro_enabled"
 
     private val _state = MutableStateFlow(CycleState())
     val stateFlow: StateFlow<CycleState> = _state.asStateFlow()
@@ -40,21 +51,32 @@ object AttentionCycleManager {
     private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
     // The break phase queued up while we're showing PROMPT_DONE
     private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
+    // When false: no 30-min blocks, no breaks, no PROMPT_DONE prompts, no
+    // forced attention-check taps — just one continuous focus timer for the
+    // whole task duration. Toggled via Settings → Work Mode → Pomodoro Breaks.
+    private var pomodoroEnabled     = true
 
     fun start(taskId: String, taskName: String, durationMinutes: Long) {
+        pomodoroEnabled   = CheckmatePrefs.getBoolean(PREF_POMODORO_ENABLED, true)
         totalDurationSecs = durationMinutes * 60
         elapsedTotal      = 0
         focusBlocksDone   = 0
+        checkWindowOpen   = false
         pendingBreakPhase = AttentionPhase.SHORT_BREAK
+
+        val initialSecondsLeft = if (pomodoroEnabled) FOCUS_SECS else totalDurationSecs
+
         _state.value = CycleState(
-            phase            = AttentionPhase.FOCUS,
-            phaseSecondsLeft = FOCUS_SECS,
-            taskId           = taskId,
-            taskName         = taskName
+            phase             = AttentionPhase.FOCUS,
+            phaseSecondsLeft  = initialSecondsLeft,
+            taskId            = taskId,
+            taskName          = taskName,
+            totalDurationSecs = totalDurationSecs,
+            pomodoroEnabled   = pomodoroEnabled
         )
     }
 
-    /** Called from the floating bar "✅ Mark Done" button during PROMPT_DONE. */
+    /** Called from the floating bar \"✅ Mark Done\" button during PROMPT_DONE. */
     fun confirmDone() {
         val done = _state.value.copy(
             phase            = AttentionPhase.DONE,
@@ -64,7 +86,7 @@ object AttentionCycleManager {
     }
 
     /**
-     * Called from the floating bar "➡ Continue" button during PROMPT_DONE.
+     * Called from the floating bar \"➡ Continue\" button during PROMPT_DONE.
      * Advances to the queued break phase so the cycle keeps going.
      */
     fun dismissPromptAndBreak() {
@@ -117,13 +139,31 @@ object AttentionCycleManager {
         elapsedTotal++
 
         if (totalDurationSecs > 0 && elapsedTotal >= totalDurationSecs) {
-            val done = current.copy(phase = AttentionPhase.DONE, phaseJustChanged = true)
+            val done = current.copy(
+                phase               = AttentionPhase.DONE,
+                phaseJustChanged    = true,
+                phaseSecondsLeft    = 0,
+                totalSessionSeconds = elapsedTotal
+            )
             _state.value = done
             return done
         }
 
         val newSecondsLeft = current.phaseSecondsLeft - 1
 
+        // ── Plain continuous timer: no breaks, no PROMPT_DONE, no forced checks ──
+        if (!pomodoroEnabled) {
+            val next = current.copy(
+                phaseSecondsLeft    = newSecondsLeft.coerceAtLeast(0),
+                totalSessionSeconds = elapsedTotal,
+                needsAttentionCheck = false,
+                phaseJustChanged    = false
+            )
+            _state.value = next
+            return next
+        }
+
+        // ── Pomodoro mode: 30-min focus blocks with breaks + attention checks ──
         val needsCheck = current.phase == AttentionPhase.FOCUS
                 && newSecondsLeft in 0..120 && !checkWindowOpen
         if (needsCheck) {
@@ -200,6 +240,7 @@ object AttentionCycleManager {
         elapsedTotal        = 0
         totalDurationSecs   = 0
         pendingBreakPhase   = AttentionPhase.SHORT_BREAK
+        pomodoroEnabled     = true
         _state.value        = CycleState()
     }
 }

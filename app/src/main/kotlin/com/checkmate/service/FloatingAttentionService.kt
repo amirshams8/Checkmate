@@ -35,6 +35,7 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.AttentionPhase
+import com.checkmate.core.CheckmatePrefs
 
 class FloatingAttentionService : Service(),
     LifecycleOwner,
@@ -58,7 +59,14 @@ class FloatingAttentionService : Service(),
         private const val CHANNEL_ID = "floating_attention_channel"
         private const val NOTIF_ID   = 99
 
+        // Pref key for the Settings → Work Mode → "Floating Focus Bar" toggle.
+        // When off, the overlay never shows; the student still gets the same
+        // controls (Done / Break / Confirm / Pause) via notification buttons
+        // added in AttentionCycleService, so nothing becomes un-controllable.
+        const val PREF_FOCUS_BAR_ENABLED = "focus_bar_enabled"
+
         fun start(context: Context) {
+            if (!CheckmatePrefs.getBoolean(PREF_FOCUS_BAR_ENABLED, true)) return
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                 !android.provider.Settings.canDrawOverlays(context)) return
             val intent = Intent(context, FloatingAttentionService::class.java)
@@ -165,8 +173,11 @@ private fun AttentionBar(onDismiss: () -> Unit) {
         AttentionPhase.DONE         -> CGray
     }
 
+    // FOCUS phase length depends on mode: a fixed 30-min block in Pomodoro
+    // mode, or the whole task duration in plain continuous-timer mode.
     val totalPhaseSecs = when (cs.phase) {
-        AttentionPhase.FOCUS       -> 30 * 60L
+        AttentionPhase.FOCUS       -> if (cs.pomodoroEnabled) 30 * 60L
+                                       else cs.totalDurationSecs.coerceAtLeast(1L)
         AttentionPhase.SHORT_BREAK -> 5  * 60L
         AttentionPhase.LONG_BREAK  -> 10 * 60L
         else                       -> 1L
@@ -272,13 +283,15 @@ private fun AttentionBar(onDismiss: () -> Unit) {
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text       = "· C${cs.cycleIndex}",
-                        fontSize   = 10.sp,
-                        color      = CGray,
-                        fontFamily = FontFamily.Monospace
-                    )
+                    if (cs.pomodoroEnabled) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text       = "· C${cs.cycleIndex}",
+                            fontSize   = 10.sp,
+                            color      = CGray,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
 
                 // Right: ✅ confirm attention + ⏸/▶ pause + ✕ dismiss

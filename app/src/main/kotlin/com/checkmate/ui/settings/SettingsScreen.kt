@@ -20,7 +20,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.service.FloatingAttentionService
 import com.checkmate.ui.theme.*
 
 @Composable
@@ -61,6 +63,8 @@ fun SettingsScreen() {
 
         // ── Work Mode ──
         SettingSection("WORK MODE") {
+            FocusCycleSettings(context)
+            HorizontalDivider(color = White10)
             SettingTile(
                 title    = "Blocked Apps",
                 subtitle = "Block distraction apps incl. Google & system apps",
@@ -109,9 +113,112 @@ fun SettingsScreen() {
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Usage Access",
+                subtitle = "Required for app usage history (Digital Wellbeing-style stats)",
+                icon     = Icons.Default.History
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+}
+
+// ── Focus Cycle Settings (Floating bar + Pomodoro breaks toggles) ────────────
+
+@Composable
+private fun FocusCycleSettings(context: Context) {
+    var barEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, true))
+    }
+    var pomodoroEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, true))
+    }
+
+    Column {
+        // Floating Focus Bar toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (barEnabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                null, tint = AccentGreen, modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Floating Focus Bar", fontSize = 14.sp, color = White90)
+                Text(
+                    if (barEnabled)
+                        "Shows the on-screen timer bar over other apps during focus sessions"
+                    else
+                        "Bar hidden — use the notification to mark done / take a break / confirm checks",
+                    fontSize = 11.sp, color = White60
+                )
+            }
+            Switch(
+                checked         = barEnabled,
+                onCheckedChange = {
+                    barEnabled = it
+                    CheckmatePrefs.putBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
+                )
+            )
+        }
+
+        HorizontalDivider(color = White10)
+
+        // Pomodoro Breaks toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Timer, null, tint = AccentAmber, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Pomodoro Breaks", fontSize = 14.sp, color = White90)
+                Text(
+                    if (pomodoroEnabled)
+                        "30 min focus / 5–10 min break cycles, with attention check-ins"
+                    else
+                        "Off — one continuous focus timer for the full task, no forced breaks or checks",
+                    fontSize = 11.sp, color = White60
+                )
+            }
+            Switch(
+                checked         = pomodoroEnabled,
+                onCheckedChange = {
+                    pomodoroEnabled = it
+                    CheckmatePrefs.putBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
+                )
+            )
+        }
+        Text(
+            "Takes effect on your next focus session — won't change one already running.",
+            fontSize = 10.sp, color = White30,
+            modifier = Modifier.padding(start = 46.dp, end = 14.dp, bottom = 8.dp)
+        )
     }
 }
 

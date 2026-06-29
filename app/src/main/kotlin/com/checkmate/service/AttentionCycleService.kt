@@ -24,6 +24,12 @@ class AttentionCycleService : Service() {
         const val EXTRA_PROJECTION_DATA     = "projection_data"
         const val ACTION_PAUSE              = "com.checkmate.ATTENTION_PAUSE"
         const val ACTION_RESUME             = "com.checkmate.ATTENTION_RESUME"
+        // Notification action buttons — these mirror what the floating attention
+        // bar offers, so a student who turns the bar off in Settings can still
+        // confirm attention / mark done / take a break from the notification.
+        const val ACTION_MARK_DONE          = "com.checkmate.ATTENTION_MARK_DONE"
+        const val ACTION_TAKE_BREAK         = "com.checkmate.ATTENTION_TAKE_BREAK"
+        const val ACTION_CONFIRM_ATTENTION  = "com.checkmate.ATTENTION_CONFIRM"
 
         fun start(
             context: Context,
@@ -59,16 +65,20 @@ class AttentionCycleService : Service() {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var cycleJob: Job? = null
     private var isPaused = false
+    private var lastTaskName = "Task"
 
     // Tracks the last elapsed-second mark at which we pushed a status+screenshot update,
     // so we fire roughly every StatusReporter.STATUS_INTERVAL_SECONDS regardless of pauses.
     private var lastStatusPushAt = 0L
 
-    private val pauseReceiver = object : android.content.BroadcastReceiver() {
+    private val controlReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             when (intent?.action) {
-                ACTION_PAUSE  -> { isPaused = true;  AttentionCycleManager.pause() }
-                ACTION_RESUME -> { isPaused = false; AttentionCycleManager.resume() }
+                ACTION_PAUSE             -> { isPaused = true;  AttentionCycleManager.pause() }
+                ACTION_RESUME            -> { isPaused = false; AttentionCycleManager.resume() }
+                ACTION_MARK_DONE         -> AttentionCycleManager.confirmDone()
+                ACTION_TAKE_BREAK        -> AttentionCycleManager.dismissPromptAndBreak()
+                ACTION_CONFIRM_ATTENTION -> AttentionCycleManager.confirmAttention()
             }
         }
     }
@@ -79,12 +89,15 @@ class AttentionCycleService : Service() {
         val filter = android.content.IntentFilter().apply {
             addAction(ACTION_PAUSE)
             addAction(ACTION_RESUME)
+            addAction(ACTION_MARK_DONE)
+            addAction(ACTION_TAKE_BREAK)
+            addAction(ACTION_CONFIRM_ATTENTION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(pauseReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(controlReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(pauseReceiver, filter)
+            registerReceiver(controlReceiver, filter)
         }
     }
 
@@ -92,10 +105,11 @@ class AttentionCycleService : Service() {
         val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
         val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
         val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+        lastTaskName = taskName
 
         // startForeground() MUST be called before getMediaProjection() on Android 14+.
         // We call it first here, then immediately store the projection token below.
-        startForegroundCompat(buildNotification("FOCUS — 30:00", taskName))
+        startForegroundCompat(buildNotification(initialPhaseLabel(durationMin), taskName))
 
         // Now it is safe to call getMediaProjection() — the mediaProjection FGS type is active.
         val projCode = intent?.getIntExtra(EXTRA_PROJECTION_CODE, Activity.RESULT_CANCELED)
@@ -115,6 +129,11 @@ class AttentionCycleService : Service() {
         return START_NOT_STICKY
     }
 
+    private fun initialPhaseLabel(durationMin: Long): String {
+        val pomodoro = AttentionCycleManager.currentState().pomodoroEnabled
+        return if (pomodoro) "FOCUS — 30:00" else "FOCUS — ${durationMin}:00"
+    }
+
     private fun startCycleLoop(taskName: String) {
         cycleJob?.cancel()
         cycleJob = scope.launch {
@@ -130,7 +149,7 @@ class AttentionCycleService : Service() {
                 (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
                     .notify(NOTIF_ID, buildNotification(
                         phaseLabel(cs.phase, cs.phaseSecondsLeft),
-                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck))
+                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck, cs.phase))
 
                 if (cs.phaseJustChanged) {
                     when (cs.phase) {
@@ -186,15 +205,40 @@ class AttentionCycleService : Service() {
 
     private fun buildNotification(
         phaseText: String, taskName: String,
-        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false
+        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false,
+        phase: AttentionPhase = AttentionPhase.FOCUS
     ): Notification {
         val tm = totalSeconds / 60; val ts = totalSeconds % 60
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
             .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
             .setSmallIcon(android.R.drawable.ic_menu_recent_history)
             .setOngoing(true).setOnlyAlertOnce(!needsCheck)
-            .setPriority(NotificationCompat.PRIORITY_HIGH).build()
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+
+        // Action buttons mirror the floating attention bar so the same controls
+        // are available from the notification when the overlay bar is off.
+        if (phase == AttentionPhase.PROMPT_DONE) {
+            builder.addAction(0, "✅ Mark Done", actionPendingIntent(ACTION_MARK_DONE, 1))
+            builder.addAction(0, "➡ Break",      actionPendingIntent(ACTION_TAKE_BREAK, 2))
+        } else if (needsCheck) {
+            builder.addAction(0, "✅ I'm here", actionPendingIntent(ACTION_CONFIRM_ATTENTION, 3))
+        }
+        if (phase != AttentionPhase.DONE && phase != AttentionPhase.PROMPT_DONE) {
+            val pauseLabel = if (isPaused) "▶ Resume" else "⏸ Pause"
+            val pauseAction = if (isPaused) ACTION_RESUME else ACTION_PAUSE
+            builder.addAction(0, pauseLabel, actionPendingIntent(pauseAction, 4))
+        }
+
+        return builder.build()
+    }
+
+    private fun actionPendingIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(action).setPackage(packageName)
+        return PendingIntent.getBroadcast(
+            this, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     private fun startForegroundCompat(n: Notification) {
@@ -214,7 +258,7 @@ class AttentionCycleService : Service() {
 
     override fun onDestroy() {
         cycleJob?.cancel(); scope.cancel()
-        try { unregisterReceiver(pauseReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(controlReceiver) } catch (_: Exception) {}
         AttentionCycleManager.reset()
         super.onDestroy()
     }
