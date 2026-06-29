@@ -41,6 +41,10 @@ object StatusReporter {
 
     // Your Cloudflare Worker URL
     private const val WORKER_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/status"
+    // Same worker, /usage route — caches the latest app-usage report so the
+    // guardian can text "usage" any time and get an instant reply (up to
+    // ~30 min stale) without needing to wake the phone.
+    private const val USAGE_URL  = "https://steep-band-1bd0.amirshamse8.workers.dev/usage"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -104,6 +108,36 @@ object StatusReporter {
             response.close()
         } catch (e: Exception) {
             Log.e(TAG, "pushStatus exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Caches the latest app-usage report text in the worker's KV under
+     * usage:<chatId>. Call this alongside (or instead of) a direct Telegram
+     * push so a guardian texting "usage" between scheduled pushes still gets
+     * an instant reply from the worker, rather than nothing.
+     * Must be called from a background thread.
+     */
+    fun pushUsageReport(context: Context, report: String) {
+        try {
+            val chatId = TelegramAlertBot.getChatId()
+            if (chatId.isNullOrBlank()) {
+                Log.w(TAG, "telegram_chat_id not set — skipping usage cache push")
+                return
+            }
+            val payload = JSONObject().apply {
+                put("chatId", chatId)
+                put("report", report)
+                put("timestamp", System.currentTimeMillis())
+            }
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(
+                Request.Builder().url(USAGE_URL).post(body).build()
+            ).execute()
+            Log.d(TAG, "pushUsageReport: ${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "pushUsageReport exception: ${e.message}")
         }
     }
 }

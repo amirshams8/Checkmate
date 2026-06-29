@@ -17,6 +17,9 @@ class CheckmateApp : Application() {
         CheckmateState.init(this)
         CheckmateTTS.init(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
+        // worker's KV for the on-demand "usage" command (see worker.js).
+        GuardianNotifier.scheduleUsageReports(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
