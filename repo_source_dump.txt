@@ -407,6 +407,15 @@ class ExampleInstrumentedTest {
             </intent-filter>
         </receiver>
 
+        <!-- Fires every 30 min: pushes app-usage Telegram alert + caches it
+             in the worker's KV for the on-demand "usage" command -->
+        <receiver android:name="com.checkmate.service.UsageReportReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.checkmate.USAGE_REPORT" />
+            </intent-filter>
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.checkmate.fileprovider"
@@ -441,6 +450,9 @@ class CheckmateApp : Application() {
         CheckmateState.init(this)
         CheckmateTTS.init(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
+        // worker's KV for the on-demand "usage" command (see worker.js).
+        GuardianNotifier.scheduleUsageReports(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
@@ -1523,7 +1535,11 @@ import java.util.Calendar
 object GuardianNotifier {
 
     private const val TAG = "GuardianNotifier"
-    const val ACTION_EOD_SUMMARY = "com.checkmate.EOD_SUMMARY"
+    const val ACTION_EOD_SUMMARY   = "com.checkmate.EOD_SUMMARY"
+    // Fires every 30 min — pushes a Telegram usage alert AND caches the same
+    // report in the worker's KV so a guardian texting "usage" any time in
+    // between gets an instant cached reply instead of nothing.
+    const val ACTION_USAGE_REPORT  = "com.checkmate.USAGE_REPORT"
 
     fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
         val number = getGuardianNumber() ?: return
@@ -1555,6 +1571,28 @@ object GuardianNotifier {
         }
         am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
         Log.d(TAG, "EOD summary alarm set for 21:00 daily")
+    }
+
+    /**
+     * Schedules a repeating alarm every 30 min that pushes an app-usage
+     * report to the guardian via Telegram (sendAppUsageReport). Independent
+     * of whether a focus session is active — this is a standalone "Digital
+     * Wellbeing" style check-in, not tied to AttentionCycleService.
+     */
+    fun scheduleUsageReports(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            context, 9002,
+            Intent(context, UsageReportReceiver::class.java).apply { action = ACTION_USAGE_REPORT },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.setRepeating(
+            AlarmManager.RTC_WAKEUP,
+            System.currentTimeMillis() + AlarmManager.INTERVAL_HALF_HOUR,
+            AlarmManager.INTERVAL_HALF_HOUR,
+            pi
+        )
+        Log.d(TAG, "Usage report alarm set for every 30 min")
     }
 
     /**
@@ -1614,19 +1652,25 @@ object GuardianNotifier {
     }
 
     /**
-     * Sends just the app usage breakdown to the guardian via Telegram —
-     * useful as an on-demand "usage" report independent of the once-a-day
-     * EOD summary. Call from a background thread or let it spin its own.
+     * Sends the app usage breakdown to the guardian via Telegram (active
+     * push, fired every 30 min by scheduleUsageReports), AND caches the same
+     * report in the worker's KV so a guardian who texts "usage" any time in
+     * between scheduled pushes still gets an instant on-demand reply
+     * (worker.js: /usage cache + "usage" command — see Cloudflare Worker).
+     * Cached data is at most ~30 min stale, never live — the worker only
+     * ever replies from cache, it never wakes the phone.
      */
     fun sendAppUsageReport(context: Context) {
         if (TelegramAlertBot.getChatId() == null) {
             Log.w(TAG, "telegram_chat_id not set — skipping usage report")
             return
         }
-        val text = "Checkmate — ${dateToday()}\n${AppUsageTracker.buildUsageReportText(context)}"
+        val report = AppUsageTracker.buildUsageReportText(context)
+        val text   = "Checkmate — ${dateToday()}\n$report"
         Thread {
             TelegramAlertBot.sendAlert(context, text)
-            Log.d(TAG, "Usage report sent to guardian via Telegram")
+            StatusReporter.pushUsageReport(context, report)
+            Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
         }.start()
     }
 
@@ -1698,6 +1742,13 @@ class EodSummaryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
             GuardianNotifier.sendEndOfDaySummary(context)
+    }
+}
+
+class UsageReportReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == GuardianNotifier.ACTION_USAGE_REPORT)
+            GuardianNotifier.sendAppUsageReport(context)
     }
 }
 
@@ -2058,6 +2109,10 @@ object StatusReporter {
 
     // Your Cloudflare Worker URL
     private const val WORKER_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/status"
+    // Same worker, /usage route — caches the latest app-usage report so the
+    // guardian can text "usage" any time and get an instant reply (up to
+    // ~30 min stale) without needing to wake the phone.
+    private const val USAGE_URL  = "https://steep-band-1bd0.amirshamse8.workers.dev/usage"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -2121,6 +2176,36 @@ object StatusReporter {
             response.close()
         } catch (e: Exception) {
             Log.e(TAG, "pushStatus exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Caches the latest app-usage report text in the worker's KV under
+     * usage:<chatId>. Call this alongside (or instead of) a direct Telegram
+     * push so a guardian texting "usage" between scheduled pushes still gets
+     * an instant reply from the worker, rather than nothing.
+     * Must be called from a background thread.
+     */
+    fun pushUsageReport(context: Context, report: String) {
+        try {
+            val chatId = TelegramAlertBot.getChatId()
+            if (chatId.isNullOrBlank()) {
+                Log.w(TAG, "telegram_chat_id not set — skipping usage cache push")
+                return
+            }
+            val payload = JSONObject().apply {
+                put("chatId", chatId)
+                put("report", report)
+                put("timestamp", System.currentTimeMillis())
+            }
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(
+                Request.Builder().url(USAGE_URL).post(body).build()
+            ).execute()
+            Log.d(TAG, "pushUsageReport: ${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "pushUsageReport exception: ${e.message}")
         }
     }
 }
