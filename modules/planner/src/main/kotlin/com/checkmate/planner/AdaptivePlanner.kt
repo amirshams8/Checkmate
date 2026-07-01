@@ -7,6 +7,7 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
 import com.checkmate.core.CoachingPlannerEntry
 import com.checkmate.core.DailyCheckIn
+import com.checkmate.core.DailyChecklist
 import com.checkmate.core.PYQWeightage
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
@@ -28,8 +29,12 @@ object AdaptivePlanner {
         val checkIn           = DailyCheckIn.loadToday()
         val coachingContext   = CoachingPlannerEntry.upcomingContext(7)
         val pyqContext         = buildPyqContext(config.examType, checkIn)
+        // FEATURE: Checklist → Planner — same-day lecture/DPP/notes completion
+        // feeds tomorrow's plan so an incomplete checklist skews the next plan
+        // toward catching up on fundamentals rather than piling on new PYQ topics.
+        val checklistContext  = buildChecklistContext()
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext)
         if (llmPlan.isNotEmpty()) return llmPlan
 
         return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
@@ -47,6 +52,38 @@ object AdaptivePlanner {
         }.joinToString("\n")
     }
 
+    /**
+     * Reads today's checklist completion (lecture/notes/DPP/etc.) so the LLM
+     * planner can react to same-day execution gaps, not just multi-day behavior
+     * trends. Returns "" when the checklist was never touched today — an
+     * untouched checklist means "not used," not "0% complete," and treating it
+     * as a crisis would produce false catch-up plans. Mirrors the same
+     * empty-guard pattern used in buildPyqContext().
+     */
+    private fun buildChecklistContext(): String {
+        val summary = DailyChecklist.getTodaySummaryText()
+        if (summary.isBlank()) return ""
+
+        val items = DailyChecklist.getTodayItems()
+        if (items.isEmpty()) return ""
+
+        val touched = items.any { it.isDone }
+        // Checklist exists but nothing has been checked off yet today (e.g. it's
+        // early morning) — not a signal of falling behind, so skip it.
+        if (!touched) return ""
+
+        val doneCount = items.count { it.isDone }
+        val totalCount = items.size
+        val incomplete = items.filter { !it.isDone }.map { it.label }
+
+        return buildString {
+            appendLine("Today's checklist: $doneCount/$totalCount complete")
+            if (incomplete.isNotEmpty()) {
+                appendLine("Not done yet: ${incomplete.joinToString()}")
+            }
+        }.trim()
+    }
+
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
@@ -55,7 +92,8 @@ object AdaptivePlanner {
         profile: com.checkmate.core.ConsultationProfile,
         checkIn: DailyCheckIn?,
         coachingContext: String,
-        pyqContext: String
+        pyqContext: String,
+        checklistContext: String
     ): List<StudyTask> {
         val systemPrompt = """
 You are an adaptive study planner for competitive exam students.
@@ -70,6 +108,9 @@ Rules:
 - Keep durations in multiples of 30
 - sessionType must be one of: LEARN, REVISE, PRACTICE, TEST_PREP
 - reason must be specific: mention PYQ %, coaching test dates, weak topic flags
+- If TODAY'S CHECKLIST STATUS shows incomplete fundamentals (lecture notes, DPP, NCERT reading)
+  from earlier today, prioritize catching those up over introducing new topics — an unfinished
+  checklist means the student is behind on today's baseline, not ready for additional load
 """.trimIndent()
 
         val prompt = buildString {
@@ -93,6 +134,11 @@ Rules:
             if (pyqContext.isNotBlank()) {
                 appendLine("PYQ WEIGHTAGE FOR TODAY'S TOPICS:")
                 appendLine(pyqContext)
+                appendLine()
+            }
+            if (checklistContext.isNotBlank()) {
+                appendLine("TODAY'S CHECKLIST STATUS:")
+                appendLine(checklistContext)
                 appendLine()
             }
             appendLine("BEHAVIOR DATA: $behaviorSummary")
