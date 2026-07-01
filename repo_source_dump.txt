@@ -8740,6 +8740,7 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
 import com.checkmate.core.CoachingPlannerEntry
 import com.checkmate.core.DailyCheckIn
+import com.checkmate.core.DailyChecklist
 import com.checkmate.core.PYQWeightage
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
@@ -8761,8 +8762,12 @@ object AdaptivePlanner {
         val checkIn           = DailyCheckIn.loadToday()
         val coachingContext   = CoachingPlannerEntry.upcomingContext(7)
         val pyqContext         = buildPyqContext(config.examType, checkIn)
+        // FEATURE: Checklist → Planner — same-day lecture/DPP/notes completion
+        // feeds tomorrow's plan so an incomplete checklist skews the next plan
+        // toward catching up on fundamentals rather than piling on new PYQ topics.
+        val checklistContext  = buildChecklistContext()
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext)
         if (llmPlan.isNotEmpty()) return llmPlan
 
         return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
@@ -8780,6 +8785,38 @@ object AdaptivePlanner {
         }.joinToString("\n")
     }
 
+    /**
+     * Reads today's checklist completion (lecture/notes/DPP/etc.) so the LLM
+     * planner can react to same-day execution gaps, not just multi-day behavior
+     * trends. Returns "" when the checklist was never touched today — an
+     * untouched checklist means "not used," not "0% complete," and treating it
+     * as a crisis would produce false catch-up plans. Mirrors the same
+     * empty-guard pattern used in buildPyqContext().
+     */
+    private fun buildChecklistContext(): String {
+        val summary = DailyChecklist.getTodaySummaryText()
+        if (summary.isBlank()) return ""
+
+        val items = DailyChecklist.getTodayItems()
+        if (items.isEmpty()) return ""
+
+        val touched = items.any { it.isDone }
+        // Checklist exists but nothing has been checked off yet today (e.g. it's
+        // early morning) — not a signal of falling behind, so skip it.
+        if (!touched) return ""
+
+        val doneCount = items.count { it.isDone }
+        val totalCount = items.size
+        val incomplete = items.filter { !it.isDone }.map { it.label }
+
+        return buildString {
+            appendLine("Today's checklist: $doneCount/$totalCount complete")
+            if (incomplete.isNotEmpty()) {
+                appendLine("Not done yet: ${incomplete.joinToString()}")
+            }
+        }.trim()
+    }
+
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
@@ -8788,7 +8825,8 @@ object AdaptivePlanner {
         profile: com.checkmate.core.ConsultationProfile,
         checkIn: DailyCheckIn?,
         coachingContext: String,
-        pyqContext: String
+        pyqContext: String,
+        checklistContext: String
     ): List<StudyTask> {
         val systemPrompt = """
 You are an adaptive study planner for competitive exam students.
@@ -8803,6 +8841,9 @@ Rules:
 - Keep durations in multiples of 30
 - sessionType must be one of: LEARN, REVISE, PRACTICE, TEST_PREP
 - reason must be specific: mention PYQ %, coaching test dates, weak topic flags
+- If TODAY'S CHECKLIST STATUS shows incomplete fundamentals (lecture notes, DPP, NCERT reading)
+  from earlier today, prioritize catching those up over introducing new topics — an unfinished
+  checklist means the student is behind on today's baseline, not ready for additional load
 """.trimIndent()
 
         val prompt = buildString {
@@ -8826,6 +8867,11 @@ Rules:
             if (pyqContext.isNotBlank()) {
                 appendLine("PYQ WEIGHTAGE FOR TODAY'S TOPICS:")
                 appendLine(pyqContext)
+                appendLine()
+            }
+            if (checklistContext.isNotBlank()) {
+                appendLine("TODAY'S CHECKLIST STATUS:")
+                appendLine(checklistContext)
                 appendLine()
             }
             appendLine("BEHAVIOR DATA: $behaviorSummary")
@@ -9275,13 +9321,34 @@ object BehaviorLedger {
 package com.checkmate.psyche
 
 import android.util.Log
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+
+// FEATURE: Weekly Report Delta — snapshots each week's numbers so the next
+// report can show trend direction (e.g. "Consistency dropped from Good to
+// Moderate") instead of an isolated snapshot. First week has no baseline
+// and falls back to the original non-delta format.
+@Serializable
+data class WeeklySnapshot(
+    val skipTotal:    Int    = 0,
+    val streak:       Int    = 0,
+    val checksPassed: Int    = 0,
+    val checksMissed: Int    = 0,
+    val consistency:  String = "",
+    val timestamp:    Long   = 0L
+)
 
 object PsycheEngine {
 
     private const val TAG = "PsycheEngine"
+    private const val KEY_LAST_SNAPSHOT = "psyche_last_week_snapshot"
+    private val json = Json { ignoreUnknownKeys = true }
 
     private val SYSTEM_PROMPT = """
 You are a strict but adaptive study coach. Your job is to enforce behavior, not motivate with fluff.
@@ -9346,6 +9413,10 @@ Rules:
             else            -> "Poor"
         }
 
+        // ── Load last week's snapshot (if any) before we overwrite it ──────────
+        val previous = loadLastSnapshot()
+        val deltaBlock = buildDeltaBlock(previous, consistency, attnStats, skipTotal)
+
         val ruleReport = """
 *Checkmate Weekly Report*
 
@@ -9355,17 +9426,82 @@ Consistency: $consistency
 Attention checks passed: ${attnStats.checksPassed}
 Attention checks missed: ${attnStats.checksMissed}
 Avg focus per session: ${attnStats.avgFocusMinutes} min
-
+${deltaBlock}
 ${if (skipRate > 0.4f) "⚠ Needs better discipline. Evening sessions are being skipped frequently." else "Performance is on track."}
 """.trimIndent()
 
-        return try {
+        val report = try {
             val llm = LlmGateway.complete(
                 "Generate a short parent WhatsApp report. Data: $ruleReport",
-                "You write brief, factual parent reports about student study performance. 5-6 lines max. No fluff."
+                "You write brief, factual parent reports about student study performance. 5-6 lines max. No fluff. " +
+                "If a WEEK-OVER-WEEK CHANGE line is present in the data, include that trend — it matters more to the parent than the raw snapshot."
             )
             if (llm.isBlank()) ruleReport else llm
         } catch (_: Exception) { ruleReport }
+
+        // ── Persist this week's numbers as next week's baseline ────────────────
+        saveSnapshot(WeeklySnapshot(
+            skipTotal    = skipTotal,
+            streak       = streak,
+            checksPassed = attnStats.checksPassed,
+            checksMissed = attnStats.checksMissed,
+            consistency  = consistency,
+            timestamp    = System.currentTimeMillis()
+        ))
+
+        return report
+    }
+
+    // ── Delta helpers ────────────────────────────────────────────────────────
+
+    private fun buildDeltaBlock(
+        previous: WeeklySnapshot?,
+        consistency: String,
+        attnStats: AttentionStats,
+        skipTotal: Int
+    ): String {
+        if (previous == null) return "" // first week — nothing to diff against yet
+
+        val consistencyLine = if (previous.consistency.isNotBlank() && previous.consistency != consistency) {
+            "Consistency ${trendWord(previous.consistency, consistency)} from ${previous.consistency} to $consistency."
+        } else null
+
+        val missedDelta = attnStats.checksMissed - previous.checksMissed
+        val missedLine = when {
+            missedDelta > 0 -> "Focus checks missed rose from ${previous.checksMissed} to ${attnStats.checksMissed}."
+            missedDelta < 0 -> "Focus checks missed fell from ${previous.checksMissed} to ${attnStats.checksMissed}."
+            else            -> null
+        }
+
+        val skipDelta = skipTotal - previous.skipTotal
+        val skipLine = when {
+            skipDelta > 0 -> "Tasks missed rose from ${previous.skipTotal} to $skipTotal this week."
+            skipDelta < 0 -> "Tasks missed dropped from ${previous.skipTotal} to $skipTotal this week."
+            else          -> null
+        }
+
+        val lines = listOfNotNull(consistencyLine, missedLine, skipLine)
+        if (lines.isEmpty()) return ""
+
+        return "\nWEEK-OVER-WEEK CHANGE:\n" + lines.joinToString("\n") { "• $it" } + "\n"
+    }
+
+    /** Simple ordinal comparison so we say "improved" vs "dropped" correctly. */
+    private fun trendWord(prev: String, current: String): String {
+        val order = listOf("Poor", "Moderate", "Good", "Excellent")
+        val prevIdx = order.indexOf(prev)
+        val currIdx = order.indexOf(current)
+        if (prevIdx < 0 || currIdx < 0) return "changed"
+        return if (currIdx > prevIdx) "improved" else "dropped"
+    }
+
+    private fun loadLastSnapshot(): WeeklySnapshot? {
+        val raw = CheckmatePrefs.getString(KEY_LAST_SNAPSHOT, null) ?: return null
+        return try { json.decodeFromString(raw) } catch (_: Exception) { null }
+    }
+
+    private fun saveSnapshot(snapshot: WeeklySnapshot) {
+        CheckmatePrefs.putString(KEY_LAST_SNAPSHOT, json.encodeToString(snapshot))
     }
 }
 
