@@ -2,6 +2,7 @@ package com.checkmate.psyche
 
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -71,12 +72,34 @@ Rules:
         BehaviorLedger.record(task, TaskState.SKIPPED)
     }
 
+    // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
+    // in that subject reads with real urgency instead of generic streak
+    // language. Deliberately conservative: only fires within COACHING_TEST_URGENT_DAYS,
+    // only for type=="test" (not lectures), and any lookup failure (bad date,
+    // no entry, subject mismatch) falls straight through to the existing
+    // skip-count logic unchanged — a stale or empty coaching calendar can
+    // only under-trigger this, never fabricate false urgency.
+    private const val COACHING_TEST_URGENT_DAYS = 3
+
     fun getSkipReaction(task: StudyTask): String {
         val skipCount = BehaviorLedger.getSkipCountForSubject(task.subject, withinDays = 7)
+
+        val upcomingTest = try {
+            CoachingPlannerEntry.nearestUpcomingTest(task.subject, withinDays = COACHING_TEST_URGENT_DAYS)
+        } catch (_: Exception) { null }
+
+        val urgencyClause = upcomingTest?.let { test ->
+            when (test.daysAway) {
+                0    -> " Your ${test.subject} test is today."
+                1    -> " Your ${test.subject} test is tomorrow."
+                else -> " Your ${test.subject} test is in ${test.daysAway} days."
+            }
+        } ?: ""
+
         return when {
-            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified."
-            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you."
-            else           -> "You skipped ${task.subject}. Stay consistent."
+            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified.$urgencyClause"
+            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you.$urgencyClause"
+            else           -> "You skipped ${task.subject}. Stay consistent.$urgencyClause"
         }
     }
 
