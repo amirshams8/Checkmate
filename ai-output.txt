@@ -1,101 +1,261 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/CoachingPlannerEntry.kt =====
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/AttentionCycleManager.kt =====
 package com.checkmate.core
 
-import com.checkmate.core.CheckmatePrefs
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
-// FEATURE: Coaching-Test Countdown — structured (not string) lookup so
-// PsycheEngine.getSkipReaction() can branch on "is there a test in this
-// subject within N days" without re-parsing dates itself or string-matching
-// upcomingContext()'s flattened output.
-data class UpcomingTest(
-    val subject:    String,
-    val chapter:    String,
-    val date:       String,
-    val daysAway:   Int
+// PROMPT_DONE: focus block just ended — timer frozen, waiting for user decision
+enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, PROMPT_DONE, DONE }
+
+data class CycleState(
+    val phase:               AttentionPhase = AttentionPhase.FOCUS,
+    val phaseSecondsLeft:    Long           = 30 * 60,
+    val totalSessionSeconds: Long           = 0,
+    val cycleIndex:          Int            = 1,
+    val needsAttentionCheck: Boolean        = false,
+    val phaseJustChanged:    Boolean        = false,
+    val checksPassed:        Int            = 0,
+    val checksMissed:        Int            = 0,
+    val taskId:              String         = "",
+    val taskName:            String         = "",
+    val pausedAt:            Long           = 0L,
+    val totalPausedMs:       Long           = 0L,
+    // Total length of the active task in seconds — used by the floating bar
+    // to scale its progress indicator correctly in both Pomodoro and plain mode.
+    val totalDurationSecs:   Long           = 0L,
+    // Snapshot (taken at start()) of whether Pomodoro-style breaks/checks are
+    // active for this session. Exposed on state so UI doesn't need prefs access.
+    val pomodoroEnabled:     Boolean        = true
 )
 
-@Serializable
-data class CoachingPlannerEntry(
-    val id:       String = java.util.UUID.randomUUID().toString(),
-    val subject:  String,
-    val chapter:  String,
-    val type:     String,  // "test" | "lecture"
-    val date:     String,  // "dd/MM/yyyy"
-    val notes:    String   = ""
-) {
-    companion object {
-        private const val KEY = "coaching_planner_entries"
-        private val json = Json { ignoreUnknownKeys = true }
+object AttentionCycleManager {
 
-        fun loadAll(): List<CoachingPlannerEntry> {
-            val raw = CheckmatePrefs.getString(KEY, null) ?: return emptyList()
-            return try { json.decodeFromString(raw) } catch (_: Exception) { emptyList() }
+    private const val FOCUS_SECS               = 30 * 60L
+    private const val SHORT_BREAK_SECS         = 5  * 60L
+    private const val LONG_BREAK_SECS          = 10 * 60L
+    private const val FOCUS_BLOCKS_BEFORE_LONG = 2
+
+    // Pref key — read once per session in start() and snapshotted onto CycleState
+    // and into the private var below so mid-session toggling in Settings never
+    // changes the rules of an already-running session.
+    const val PREF_POMODORO_ENABLED = "pomodoro_enabled"
+
+    private val _state = MutableStateFlow(CycleState())
+    val stateFlow: StateFlow<CycleState> = _state.asStateFlow()
+
+    private var focusBlocksDone     = 0
+    private var checkWindowOpen     = false
+    private var checkWindowOpenedAt = 0L
+    private var totalDurationSecs   = 0L
+    private var elapsedTotal        = 0L
+    private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
+    // The break phase queued up while we're showing PROMPT_DONE
+    private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
+    // When false: no 30-min blocks, no breaks, no PROMPT_DONE prompts, no
+    // forced attention-check taps — just one continuous focus timer for the
+    // whole task duration. Toggled via Settings → Work Mode → Pomodoro Breaks.
+    private var pomodoroEnabled     = true
+    // BUGFIX: tracks whether the attention check for the CURRENT focus block has
+    // already been confirmed. Without this, tick()'s needsCheck condition
+    // (`!checkWindowOpen`) re-opens the check window on the very next tick after
+    // confirmAttention() sets checkWindowOpen=false — because phaseSecondsLeft is
+    // still inside the 0..120s trigger range. That caused the ✅ button and the
+    // "Still focused?" TTS prompt to reappear ~1 second after being tapped,
+    // making it look like the tap did nothing. Reset only when a new FOCUS
+    // block actually begins (start() or break->FOCUS transition).
+    private var checkConfirmedThisBlock = false
+
+    fun start(taskId: String, taskName: String, durationMinutes: Long) {
+        pomodoroEnabled   = CheckmatePrefs.getBoolean(PREF_POMODORO_ENABLED, true)
+        totalDurationSecs = durationMinutes * 60
+        elapsedTotal      = 0
+        focusBlocksDone   = 0
+        checkWindowOpen   = false
+        checkConfirmedThisBlock = false
+        pendingBreakPhase = AttentionPhase.SHORT_BREAK
+
+        val initialSecondsLeft = if (pomodoroEnabled) FOCUS_SECS else totalDurationSecs
+
+        _state.value = CycleState(
+            phase             = AttentionPhase.FOCUS,
+            phaseSecondsLeft  = initialSecondsLeft,
+            taskId            = taskId,
+            taskName          = taskName,
+            totalDurationSecs = totalDurationSecs,
+            pomodoroEnabled   = pomodoroEnabled
+        )
+    }
+
+    /** Called from the floating bar \"✅ Mark Done\" button during PROMPT_DONE. */
+    fun confirmDone() {
+        val done = _state.value.copy(
+            phase            = AttentionPhase.DONE,
+            phaseJustChanged = true
+        )
+        _state.value = done
+    }
+
+    /**
+     * Called from the floating bar \"➡ Continue\" button during PROMPT_DONE.
+     * Advances to the queued break phase so the cycle keeps going.
+     */
+    fun dismissPromptAndBreak() {
+        val breakSecs = if (pendingBreakPhase == AttentionPhase.LONG_BREAK)
+            LONG_BREAK_SECS else SHORT_BREAK_SECS
+        _state.value = _state.value.copy(
+            phase               = pendingBreakPhase,
+            phaseSecondsLeft    = breakSecs,
+            needsAttentionCheck = false,
+            phaseJustChanged    = true
+        )
+    }
+
+    /** Blueprint 2.2: Pause — freezes tick loop, records pausedAt timestamp */
+    fun pause() {
+        val current = _state.value
+        if (current.phase == AttentionPhase.PAUSED ||
+            current.phase == AttentionPhase.DONE   ||
+            current.phase == AttentionPhase.PROMPT_DONE) return
+        phaseBeforePause = current.phase
+        _state.value = current.copy(
+            phase            = AttentionPhase.PAUSED,
+            phaseJustChanged = true,
+            pausedAt         = System.currentTimeMillis()
+        )
+    }
+
+    /** Blueprint 2.2: Resume — restarts tick, accumulates totalPausedMs */
+    fun resume() {
+        val current = _state.value
+        if (current.phase != AttentionPhase.PAUSED) return
+        val pauseDuration = if (current.pausedAt > 0L)
+            System.currentTimeMillis() - current.pausedAt else 0L
+        _state.value = current.copy(
+            phase            = phaseBeforePause,
+            phaseJustChanged = true,
+            pausedAt         = 0L,
+            totalPausedMs    = current.totalPausedMs + pauseDuration
+        )
+    }
+
+    fun tick(): CycleState {
+        val current = _state.value
+        // Freeze tick while paused, in prompt, or done
+        if (current.phase == AttentionPhase.PAUSED     ||
+            current.phase == AttentionPhase.PROMPT_DONE ||
+            current.phase == AttentionPhase.DONE)
+            return current
+
+        elapsedTotal++
+
+        if (totalDurationSecs > 0 && elapsedTotal >= totalDurationSecs) {
+            val done = current.copy(
+                phase               = AttentionPhase.DONE,
+                phaseJustChanged    = true,
+                phaseSecondsLeft    = 0,
+                totalSessionSeconds = elapsedTotal
+            )
+            _state.value = done
+            return done
         }
 
-        fun saveAll(entries: List<CoachingPlannerEntry>) {
-            CheckmatePrefs.putString(KEY, json.encodeToString(entries))
+        val newSecondsLeft = current.phaseSecondsLeft - 1
+
+        // ── Plain continuous timer: no breaks, no PROMPT_DONE, no forced checks ──
+        if (!pomodoroEnabled) {
+            val next = current.copy(
+                phaseSecondsLeft    = newSecondsLeft.coerceAtLeast(0),
+                totalSessionSeconds = elapsedTotal,
+                needsAttentionCheck = false,
+                phaseJustChanged    = false
+            )
+            _state.value = next
+            return next
         }
 
-        fun addEntry(entry: CoachingPlannerEntry) {
-            saveAll(loadAll() + entry)
+        // ── Pomodoro mode: 30-min focus blocks with breaks + attention checks ──
+        val needsCheck = current.phase == AttentionPhase.FOCUS
+                && newSecondsLeft in 0..120 && !checkWindowOpen && !checkConfirmedThisBlock
+        if (needsCheck) {
+            checkWindowOpen     = true
+            checkWindowOpenedAt = elapsedTotal
         }
 
-        /** Returns coaching events in the next N days as a prompt-ready string */
-        fun upcomingContext(withinDays: Int = 7): String {
-            val entries = loadAll().filter { entry ->
-                try {
-                    val parts = entry.date.split("/")
-                    val cal = java.util.Calendar.getInstance()
-                    val now = cal.clone() as java.util.Calendar
-                    cal.set(parts[2].toInt(), parts[1].toInt() - 1, parts[0].toInt())
-                    val diffDays = ((cal.timeInMillis - now.timeInMillis) / (1000 * 60 * 60 * 24)).toInt()
-                    diffDays in 0..withinDays
-                } catch (_: Exception) { false }
-            }
-            if (entries.isEmpty()) return "No upcoming coaching tests/lectures in $withinDays days"
-            return entries.joinToString("\n") {
-                "${it.date}: ${it.subject} ${it.chapter} (${it.type})"
-            }
+        var checksMissed = current.checksMissed
+        if (checkWindowOpen && elapsedTotal - checkWindowOpenedAt > 120) {
+            checksMissed++
+            checkWindowOpen = false
         }
 
-        /**
-         * Returns the nearest upcoming TEST (not lecture) for a given subject
-         * within withinDays, or null if none exists / date can't be parsed.
-         * Subject match is case-insensitive to tolerate manual entry drift
-         * (e.g. "biology" vs "Biology") without silently missing a real test.
-         *
-         * Returning null is the safe default for every failure path here —
-         * callers (PsycheEngine) treat null as "no urgency signal" and fall
-         * back to their existing behavior, so a stale/malformed coaching
-         * entry can only ever under-trigger urgency, never fabricate it.
-         */
-        fun nearestUpcomingTest(subject: String, withinDays: Int = 7): UpcomingTest? {
-            return loadAll()
-                .filter { it.type.equals("test", ignoreCase = true) }
-                .filter { it.subject.equals(subject, ignoreCase = true) }
-                .mapNotNull { entry ->
-                    try {
-                        val parts = entry.date.split("/")
-                        val cal = java.util.Calendar.getInstance()
-                        val now = cal.clone() as java.util.Calendar
-                        cal.set(parts[2].toInt(), parts[1].toInt() - 1, parts[0].toInt())
-                        val diffDays = ((cal.timeInMillis - now.timeInMillis) / (1000 * 60 * 60 * 24)).toInt()
-                        if (diffDays in 0..withinDays) {
-                            UpcomingTest(
-                                subject  = entry.subject,
-                                chapter  = entry.chapter,
-                                date     = entry.date,
-                                daysAway = diffDays
-                            )
-                        } else null
-                    } catch (_: Exception) { null }
+        if (newSecondsLeft <= 0) {
+            return when (current.phase) {
+                AttentionPhase.FOCUS -> {
+                    focusBlocksDone++
+                    // Decide what break comes *after* the prompt
+                    pendingBreakPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
+                        AttentionPhase.LONG_BREAK else AttentionPhase.SHORT_BREAK
+
+                    // Enter PROMPT_DONE — timer frozen, user decides
+                    val next = current.copy(
+                        phase               = AttentionPhase.PROMPT_DONE,
+                        phaseSecondsLeft    = 0,
+                        totalSessionSeconds = elapsedTotal,
+                        cycleIndex          = focusBlocksDone + 1,
+                        needsAttentionCheck = false,
+                        phaseJustChanged    = true,
+                        checksMissed        = checksMissed
+                    )
+                    _state.value = next; next
                 }
-                .minByOrNull { it.daysAway }
+                AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
+                    checkWindowOpen = false
+                    checkConfirmedThisBlock = false
+                    val next = current.copy(
+                        phase               = AttentionPhase.FOCUS,
+                        phaseSecondsLeft    = FOCUS_SECS,
+                        totalSessionSeconds = elapsedTotal,
+                        needsAttentionCheck = false,
+                        phaseJustChanged    = true,
+                        checksMissed        = checksMissed
+                    )
+                    _state.value = next; next
+                }
+                else -> current
+            }
         }
+
+        val next = current.copy(
+            phaseSecondsLeft    = newSecondsLeft,
+            totalSessionSeconds = elapsedTotal,
+            needsAttentionCheck = checkWindowOpen,
+            phaseJustChanged    = false,
+            checksMissed        = checksMissed
+        )
+        _state.value = next
+        return next
+    }
+
+    fun confirmAttention() {
+        checkWindowOpen = false
+        checkConfirmedThisBlock = true
+        _state.value = _state.value.copy(
+            checksPassed        = _state.value.checksPassed + 1,
+            needsAttentionCheck = false
+        )
+    }
+
+    fun currentState(): CycleState = _state.value
+
+    fun reset() {
+        focusBlocksDone     = 0
+        checkWindowOpen     = false
+        checkConfirmedThisBlock = false
+        elapsedTotal        = 0
+        totalDurationSecs   = 0
+        pendingBreakPhase   = AttentionPhase.SHORT_BREAK
+        pomodoroEnabled     = true
+        _state.value        = CycleState()
     }
 }
 
@@ -167,12 +327,19 @@ Rules:
         } catch (_: Exception) { ruleMsg }
     }
 
-    fun onTaskCompleted(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.DONE)
+    // BUGFIX: previously these two took no checksPassed/checksMissed args and
+    // always recorded 0/0 into BehaviorLedger, so attention-check counts never
+    // reached the dashboard or the weekly guardian report even though
+    // AttentionCycleManager was tracking them correctly during the session.
+    // Callers (HomeViewModel.markDone/markSkip) now read
+    // AttentionCycleManager.currentState() BEFORE stopping the service and
+    // pass the real counts through here.
+    fun onTaskCompleted(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
     }
 
-    fun onTaskSkipped(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.SKIPPED)
+    fun onTaskSkipped(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed)
     }
 
     // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
@@ -310,3 +477,234 @@ ${if (skipRate > 0.4f) "⚠ Needs better discipline. Evening sessions are being 
         CheckmatePrefs.putString(KEY_LAST_SNAPSHOT, json.encodeToString(snapshot))
     }
 }
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
+package com.checkmate.ui.home
+
+import android.content.Context
+import android.content.Intent
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import android.app.Activity
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.PsycheEngine
+import com.checkmate.service.AttentionCycleService
+import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.workmode.WorkModeManager
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+data class HomeState(
+    val tasks:             List<StudyTask> = emptyList(),
+    val activeTaskId:      String?         = null,
+    val completedToday:    Int             = 0,
+    val streakDays:        Int             = 0,
+    val psycheMessage:     String          = "",
+    val consecutiveSkips:  Int             = 0
+)
+
+class HomeViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(HomeState())
+    val state: StateFlow<HomeState> = _state.asStateFlow()
+
+    // MainActivity observes this to launch the MediaProjection system dialog
+    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
+    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
+
+    private var pendingTask: StudyTask? = null
+
+    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
+
+    private fun loadTodayPlan() {
+        viewModelScope.launch {
+            PlanStore.todayTasks.collect { tasks ->
+                _state.update { it.copy(
+                    tasks          = tasks,
+                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
+                    activeTaskId   = tasks.firstOrNull { t ->
+                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
+                    }?.id
+                )}
+            }
+        }
+    }
+
+    private fun loadStreak() {
+        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
+    }
+
+    private fun loadPsycheMessage() {
+        viewModelScope.launch {
+            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
+        }
+    }
+
+    /**
+     * Adds a manually-created task to today's plan.
+     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
+     * whatever is already in today's list (AI-generated or previously added custom
+     * tasks) and never overwrites/clears them. isCustom = true is what later lets
+     * HomeScreen show the duration-edit affordance only for tasks added this way.
+     * The StudyTask is otherwise identical in shape to a generated one, so it
+     * automatically renders in the same TaskCard, drives AttentionCycleService/
+     * WorkModeManager the same way via startTask(), and triggers the same
+     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
+     * WhatsApp/Telegram report — no extra wiring required.
+     */
+    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int) {
+        val cleanSubject  = subject.trim()
+        val cleanTopic    = topic.trim()
+        val cleanDuration = durationMinutes.coerceIn(5, 240)
+        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
+
+        val task = StudyTask(
+            subject         = cleanSubject,
+            topic           = cleanTopic,
+            durationMinutes = cleanDuration,
+            isCustom        = true
+        )
+        PlanStore.addCustomTask(task)
+        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
+    }
+
+    /**
+     * Edits the duration of a custom task. Only allowed for tasks created via
+     * addCustomTask (isCustom = true) and only while still PENDING — once a task
+     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
+     * so changing durationMinutes underneath it would desync the running countdown.
+     * Generated (AI-planned) tasks are intentionally left untouched here — their
+     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
+     */
+    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
+        if (!task.isCustom || task.state != TaskState.PENDING) return
+        val clamped = newDurationMinutes.coerceIn(5, 240)
+        PlanStore.updateTaskDuration(task.id, clamped)
+    }
+
+    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
+    fun removeTask(task: StudyTask) {
+        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
+        PlanStore.removeTask(task.id)
+    }
+
+    fun startTask(context: Context, task: StudyTask) {
+        if (ScreenCaptureManager.isReady()) {
+            launchTask(context, task)
+        } else {
+            pendingTask = task
+            _requestProjection.tryEmit(task)
+        }
+    }
+
+    /**
+     * Called by MainActivity after user approves the MediaProjection dialog.
+     * resultCode + data are forwarded into AttentionCycleService's start intent so that
+     * getMediaProjection() is called only AFTER startForeground() runs inside the service.
+     * Fix for: SecurityException: Media projections require a foreground service of type
+     *          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+     */
+    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        AttentionCycleService.start(
+            context,
+            task.id,
+            task.topic,
+            task.durationMinutes.toLong(),
+            projectionResultCode = resultCode,
+            projectionData       = data
+        )
+        launchTask(context, task, serviceAlreadyStarted = true)
+    }
+
+    fun onProjectionDenied(context: Context) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        launchTask(context, task)
+    }
+
+    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
+        viewModelScope.launch {
+            WorkModeManager.activate(context)
+            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
+            mappedPkg?.let { pkg ->
+                context.packageManager.getLaunchIntentForPackage(pkg)
+                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ?.let { context.startActivity(it) }
+            }
+            if (!serviceAlreadyStarted) {
+                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            }
+            FloatingAttentionService.start(context)
+            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
+            PlanStore.setTaskActive(task.id)
+            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
+            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
+        }
+    }
+
+    fun markDone(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            // BUGFIX: read attention-check counts BEFORE stopping the service —
+            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
+            // which zeroes checksPassed/checksMissed. Previously this was read too late (or not
+            // at all), so PsycheEngine.onTaskCompleted() always recorded 0/0 into BehaviorLedger
+            // regardless of how many attention checks the student actually confirmed.
+            val cycleState = AttentionCycleManager.currentState()
+            AttentionCycleService.stop(context)
+            FloatingAttentionService.stop(context)
+            WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
+            PlanStore.markTask(task.id, TaskState.DONE)
+            PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
+            CheckmateTTS.speak(context, "Task complete. Well done.")
+            val msg = PsycheEngine.getDailyMorningMessage()
+            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
+        }
+    }
+
+    fun markSkip(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            // Same fix as markDone() — capture before stop()/reset() wipes the counts.
+            val cycleState = AttentionCycleManager.currentState()
+            AttentionCycleService.stop(context)
+            FloatingAttentionService.stop(context)
+            WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
+            PlanStore.markTask(task.id, TaskState.SKIPPED)
+            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
+            val msg = PsycheEngine.getSkipReaction(task)
+            CheckmateTTS.speak(context, msg)
+            val newSkips = _state.value.consecutiveSkips + 1
+            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
+            if (newSkips >= 3) {
+                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+            }
+        }
+    }
+
+    fun pauseTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            PlanStore.pauseTask(task.id, System.currentTimeMillis())
+            AttentionCycleService.sendPause(context)
+        }
+    }
+
+    fun resumeTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            PlanStore.resumeTask(task.id, System.currentTimeMillis())
+            AttentionCycleService.sendResume(context)
+        }
+    }
+}
+
+
