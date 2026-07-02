@@ -55,6 +55,15 @@ object AttentionCycleManager {
     // forced attention-check taps — just one continuous focus timer for the
     // whole task duration. Toggled via Settings → Work Mode → Pomodoro Breaks.
     private var pomodoroEnabled     = true
+    // BUGFIX: tracks whether the attention check for the CURRENT focus block has
+    // already been confirmed. Without this, tick()'s needsCheck condition
+    // (`!checkWindowOpen`) re-opens the check window on the very next tick after
+    // confirmAttention() sets checkWindowOpen=false — because phaseSecondsLeft is
+    // still inside the 0..120s trigger range. That caused the ✅ button and the
+    // "Still focused?" TTS prompt to reappear ~1 second after being tapped,
+    // making it look like the tap did nothing. Reset only when a new FOCUS
+    // block actually begins (start() or break->FOCUS transition).
+    private var checkConfirmedThisBlock = false
 
     fun start(taskId: String, taskName: String, durationMinutes: Long) {
         pomodoroEnabled   = CheckmatePrefs.getBoolean(PREF_POMODORO_ENABLED, true)
@@ -62,6 +71,7 @@ object AttentionCycleManager {
         elapsedTotal      = 0
         focusBlocksDone   = 0
         checkWindowOpen   = false
+        checkConfirmedThisBlock = false
         pendingBreakPhase = AttentionPhase.SHORT_BREAK
 
         val initialSecondsLeft = if (pomodoroEnabled) FOCUS_SECS else totalDurationSecs
@@ -165,7 +175,7 @@ object AttentionCycleManager {
 
         // ── Pomodoro mode: 30-min focus blocks with breaks + attention checks ──
         val needsCheck = current.phase == AttentionPhase.FOCUS
-                && newSecondsLeft in 0..120 && !checkWindowOpen
+                && newSecondsLeft in 0..120 && !checkWindowOpen && !checkConfirmedThisBlock
         if (needsCheck) {
             checkWindowOpen     = true
             checkWindowOpenedAt = elapsedTotal
@@ -199,6 +209,7 @@ object AttentionCycleManager {
                 }
                 AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
                     checkWindowOpen = false
+                    checkConfirmedThisBlock = false
                     val next = current.copy(
                         phase               = AttentionPhase.FOCUS,
                         phaseSecondsLeft    = FOCUS_SECS,
@@ -226,6 +237,7 @@ object AttentionCycleManager {
 
     fun confirmAttention() {
         checkWindowOpen = false
+        checkConfirmedThisBlock = true
         _state.value = _state.value.copy(
             checksPassed        = _state.value.checksPassed + 1,
             needsAttentionCheck = false
@@ -237,6 +249,7 @@ object AttentionCycleManager {
     fun reset() {
         focusBlocksDone     = 0
         checkWindowOpen     = false
+        checkConfirmedThisBlock = false
         elapsedTotal        = 0
         totalDurationSecs   = 0
         pendingBreakPhase   = AttentionPhase.SHORT_BREAK

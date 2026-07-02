@@ -64,12 +64,19 @@ Rules:
         } catch (_: Exception) { ruleMsg }
     }
 
-    fun onTaskCompleted(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.DONE)
+    // BUGFIX: previously these two took no checksPassed/checksMissed args and
+    // always recorded 0/0 into BehaviorLedger, so attention-check counts never
+    // reached the dashboard or the weekly guardian report even though
+    // AttentionCycleManager was tracking them correctly during the session.
+    // Callers (HomeViewModel.markDone/markSkip) now read
+    // AttentionCycleManager.currentState() BEFORE stopping the service and
+    // pass the real counts through here.
+    fun onTaskCompleted(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
     }
 
-    fun onTaskSkipped(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.SKIPPED)
+    fun onTaskSkipped(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed)
     }
 
     // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test

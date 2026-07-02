@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import android.app.Activity
+import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
@@ -171,12 +172,18 @@ class HomeViewModel : ViewModel() {
 
     fun markDone(context: Context, task: StudyTask) {
         viewModelScope.launch {
+            // BUGFIX: read attention-check counts BEFORE stopping the service —
+            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
+            // which zeroes checksPassed/checksMissed. Previously this was read too late (or not
+            // at all), so PsycheEngine.onTaskCompleted() always recorded 0/0 into BehaviorLedger
+            // regardless of how many attention checks the student actually confirmed.
+            val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task)
+            PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
             CheckmateTTS.speak(context, "Task complete. Well done.")
             val msg = PsycheEngine.getDailyMorningMessage()
             _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
@@ -185,12 +192,14 @@ class HomeViewModel : ViewModel() {
 
     fun markSkip(context: Context, task: StudyTask) {
         viewModelScope.launch {
+            // Same fix as markDone() — capture before stop()/reset() wipes the counts.
+            val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task)
+            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
             val newSkips = _state.value.consecutiveSkips + 1
