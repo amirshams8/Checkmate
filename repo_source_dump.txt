@@ -3379,6 +3379,7 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import android.app.Activity
+import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
@@ -3545,12 +3546,18 @@ class HomeViewModel : ViewModel() {
 
     fun markDone(context: Context, task: StudyTask) {
         viewModelScope.launch {
+            // BUGFIX: read attention-check counts BEFORE stopping the service —
+            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
+            // which zeroes checksPassed/checksMissed. Previously this was read too late (or not
+            // at all), so PsycheEngine.onTaskCompleted() always recorded 0/0 into BehaviorLedger
+            // regardless of how many attention checks the student actually confirmed.
+            val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task)
+            PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
             CheckmateTTS.speak(context, "Task complete. Well done.")
             val msg = PsycheEngine.getDailyMorningMessage()
             _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
@@ -3559,12 +3566,14 @@ class HomeViewModel : ViewModel() {
 
     fun markSkip(context: Context, task: StudyTask) {
         viewModelScope.launch {
+            // Same fix as markDone() — capture before stop()/reset() wipes the counts.
+            val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task)
+            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
             val newSkips = _state.value.consecutiveSkips + 1
@@ -7132,6 +7141,15 @@ object AttentionCycleManager {
     // forced attention-check taps — just one continuous focus timer for the
     // whole task duration. Toggled via Settings → Work Mode → Pomodoro Breaks.
     private var pomodoroEnabled     = true
+    // BUGFIX: tracks whether the attention check for the CURRENT focus block has
+    // already been confirmed. Without this, tick()'s needsCheck condition
+    // (`!checkWindowOpen`) re-opens the check window on the very next tick after
+    // confirmAttention() sets checkWindowOpen=false — because phaseSecondsLeft is
+    // still inside the 0..120s trigger range. That caused the ✅ button and the
+    // "Still focused?" TTS prompt to reappear ~1 second after being tapped,
+    // making it look like the tap did nothing. Reset only when a new FOCUS
+    // block actually begins (start() or break->FOCUS transition).
+    private var checkConfirmedThisBlock = false
 
     fun start(taskId: String, taskName: String, durationMinutes: Long) {
         pomodoroEnabled   = CheckmatePrefs.getBoolean(PREF_POMODORO_ENABLED, true)
@@ -7139,6 +7157,7 @@ object AttentionCycleManager {
         elapsedTotal      = 0
         focusBlocksDone   = 0
         checkWindowOpen   = false
+        checkConfirmedThisBlock = false
         pendingBreakPhase = AttentionPhase.SHORT_BREAK
 
         val initialSecondsLeft = if (pomodoroEnabled) FOCUS_SECS else totalDurationSecs
@@ -7242,7 +7261,7 @@ object AttentionCycleManager {
 
         // ── Pomodoro mode: 30-min focus blocks with breaks + attention checks ──
         val needsCheck = current.phase == AttentionPhase.FOCUS
-                && newSecondsLeft in 0..120 && !checkWindowOpen
+                && newSecondsLeft in 0..120 && !checkWindowOpen && !checkConfirmedThisBlock
         if (needsCheck) {
             checkWindowOpen     = true
             checkWindowOpenedAt = elapsedTotal
@@ -7276,6 +7295,7 @@ object AttentionCycleManager {
                 }
                 AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
                     checkWindowOpen = false
+                    checkConfirmedThisBlock = false
                     val next = current.copy(
                         phase               = AttentionPhase.FOCUS,
                         phaseSecondsLeft    = FOCUS_SECS,
@@ -7303,6 +7323,7 @@ object AttentionCycleManager {
 
     fun confirmAttention() {
         checkWindowOpen = false
+        checkConfirmedThisBlock = true
         _state.value = _state.value.copy(
             checksPassed        = _state.value.checksPassed + 1,
             needsAttentionCheck = false
@@ -7314,6 +7335,7 @@ object AttentionCycleManager {
     fun reset() {
         focusBlocksDone     = 0
         checkWindowOpen     = false
+        checkConfirmedThisBlock = false
         elapsedTotal        = 0
         totalDurationSecs   = 0
         pendingBreakPhase   = AttentionPhase.SHORT_BREAK
@@ -9430,12 +9452,19 @@ Rules:
         } catch (_: Exception) { ruleMsg }
     }
 
-    fun onTaskCompleted(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.DONE)
+    // BUGFIX: previously these two took no checksPassed/checksMissed args and
+    // always recorded 0/0 into BehaviorLedger, so attention-check counts never
+    // reached the dashboard or the weekly guardian report even though
+    // AttentionCycleManager was tracking them correctly during the session.
+    // Callers (HomeViewModel.markDone/markSkip) now read
+    // AttentionCycleManager.currentState() BEFORE stopping the service and
+    // pass the real counts through here.
+    fun onTaskCompleted(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
     }
 
-    fun onTaskSkipped(task: StudyTask) {
-        BehaviorLedger.record(task, TaskState.SKIPPED)
+    fun onTaskSkipped(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed)
     }
 
     // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
