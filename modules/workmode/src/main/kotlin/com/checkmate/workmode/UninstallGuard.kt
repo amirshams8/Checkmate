@@ -75,6 +75,12 @@ object UninstallGuard {
         "com.samsung.android.settings"
     )
 
+    /**
+     * Injected by CheckmateApp.onCreate so :workmode (and :automation, which
+     * calls this object) never directly references GuardianNotifier.
+     */
+    var listener: UninstallAlertListener? = null
+
     // ── Result types ─────────────────────────────────────────────────────────
 
     sealed class UnlockResult {

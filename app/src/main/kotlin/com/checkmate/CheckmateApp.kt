@@ -9,6 +9,8 @@ import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.UninstallAlertListener
+import com.checkmate.workmode.UninstallGuard
 
 class CheckmateApp : Application() {
     override fun onCreate() {
@@ -28,6 +30,16 @@ class CheckmateApp : Application() {
                 Thread {
                     val uri = ScreenCaptureManager.capture(context)
                     GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
+            }
+        }
+
+        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
+        // (via :workmode's UninstallGuard) into GuardianNotifier.
+        UninstallGuard.listener = object : UninstallAlertListener {
+            override fun onGuardedScreenBlocked(context: Context, reason: String) {
+                Thread {
+                    GuardianNotifier.notifyUninstallAttempt(context, reason)
                 }.start()
             }
         }

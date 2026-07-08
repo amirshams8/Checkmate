@@ -153,11 +153,7 @@ class AppAutomationService : AccessibilityService() {
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
-            Thread {
-                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
-                    applicationContext, "settings_screen_blocked"
-                )
-            }.start()
+            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, "settings_screen_blocked")
         }
     }
 
