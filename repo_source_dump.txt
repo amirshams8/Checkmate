@@ -16,8 +16,11 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   ├── kotlin
 │   │   │   │   ├── com
 │   │   │   │   │   ├── checkmate
+│   │   │   │   │   │   ├── BootReceiver.kt
 │   │   │   │   │   │   ├── CheckmateApp.kt
 │   │   │   │   │   │   ├── MainActivity.kt
+│   │   │   │   │   │   ├── admin
+│   │   │   │   │   │   │   ├── CheckmateDeviceAdminReceiver.kt
 │   │   │   │   │   │   ├── automation
 │   │   │   │   │   │   │   ├── AppAutomationService.kt
 │   │   │   │   │   │   │   ├── AutomationEngine.kt
@@ -71,6 +74,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   ├── accessibility_service.xml
 │   │   │   │   │   ├── accessibility_service_config.xml
 │   │   │   │   │   ├── call_accessibility_config.xml
+│   │   │   │   │   ├── device_admin.xml
 │   │   │   │   │   ├── file_paths.xml
 │   │   │   │   │   ├── network_security_config.xml
 │   │   ├── test
@@ -166,6 +170,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── workmode
 │   │   │   │   │   │   │   │   ├── DistractionGuard.kt
 │   │   │   │   │   │   │   │   ├── DistractionListener.kt
+│   │   │   │   │   │   │   │   ├── UninstallGuard.kt
 │   │   │   │   │   │   │   │   ├── WorkModeManager.kt
 │   │   │   │   │   │   │   │   ├── WorkModeService.kt
 ├── gradle/wrapper
@@ -400,6 +405,32 @@ class ExampleInstrumentedTest {
             </intent-filter>
         </service>
 
+        <!-- Device Admin — hides the plain Uninstall button on Checkmate's App Info
+             screen once activated. Activation is a user action from Settings →
+             Security tile (SettingsScreen.kt), not forced at install time. -->
+        <receiver
+            android:name="com.checkmate.admin.CheckmateDeviceAdminReceiver"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Reschedules guardian alarms (EOD summary, 30-min usage report) after
+             reboot, since AlarmManager repeating alarms don't survive a restart.
+             Also fires a one-time Safe Mode notice to the guardian if relevant. -->
+        <receiver
+            android:name="com.checkmate.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
         <receiver android:name="com.checkmate.service.EodSummaryReceiver"
             android:exported="false">
             <intent-filter>
@@ -428,6 +459,48 @@ class ExampleInstrumentedTest {
 
     </application>
 </manifest>
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/BootReceiver.kt =====
+package com.checkmate
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.TelegramAlertBot
+
+/**
+ * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
+ * reports) are cancelled on reboot; this puts them back so guardian
+ * reporting survives a restart instead of silently going quiet.
+ *
+ * Also fires a one-time "device rebooted" note to the guardian when the
+ * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
+ * watchdog and (on some OEMs) the device admin lock entirely, which is the
+ * one uninstall path this app genuinely cannot block. Surfacing it is the
+ * next best thing: the guardian at least finds out it happened.
+ */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        CheckmatePrefs.init(context)
+        GuardianNotifier.scheduleEndOfDaySummary(context)
+        GuardianNotifier.scheduleUsageReports(context)
+        Log.d("BootReceiver", "Guardian alarms rescheduled after boot")
+
+        val inSafeMode = context.packageManager.isSafeMode
+        if (inSafeMode && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifySafeModeBoot(context)
+            }.start()
+        }
+    }
+}
 
 
 //===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
@@ -580,6 +653,68 @@ class MainActivity : ComponentActivity() {
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/admin/CheckmateDeviceAdminReceiver.kt =====
+package com.checkmate.admin
+
+import android.app.admin.DeviceAdminReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.checkmate.service.GuardianNotifier
+
+/**
+ * CheckmateDeviceAdminReceiver — makes Checkmate a Device Admin app.
+ *
+ * Effect: once activated (Settings → Security → Device admin apps → Checkmate),
+ * Android hides the plain "Uninstall" button on Checkmate's App Info page —
+ * the user must first deactivate device admin, which routes back through
+ * Android's own "Deactivate this device admin app?" screen. AppAutomationService
+ * watches for that screen (and the App Info uninstall screen) via UninstallGuard
+ * and kicks back to home unless a guardian PIN was entered first — see
+ * UninstallGuard.kt in :modules:workmode.
+ *
+ * This receiver itself just reacts to the two admin lifecycle events that
+ * matter for guardian visibility: someone requesting deactivation, and
+ * deactivation actually completing (e.g. via `adb shell dpm remove-active-admin`,
+ * which UninstallGuard's accessibility watchdog cannot intercept).
+ */
+class CheckmateDeviceAdminReceiver : DeviceAdminReceiver() {
+
+    companion object {
+        private const val TAG = "DeviceAdminReceiver"
+
+        fun componentName(context: Context): ComponentName =
+            ComponentName(context.applicationContext, CheckmateDeviceAdminReceiver::class.java)
+    }
+
+    override fun onEnabled(context: Context, intent: Intent) {
+        super.onEnabled(context, intent)
+        Log.d(TAG, "Device admin enabled")
+    }
+
+    /**
+     * Called when the user reaches Android's built-in disable-confirmation
+     * screen. We cannot block this screen (it's owned by the OS), but we can
+     * make sure the guardian knows immediately — the accessibility watchdog
+     * in UninstallGuard fires the same alert the moment it detects the screen,
+     * so this is a second, guaranteed-delivery signal in case the watchdog
+     * was killed by an OEM battery optimizer.
+     */
+    override fun onDisableRequested(context: Context, intent: Intent): CharSequence {
+        Log.w(TAG, "Device admin disable REQUESTED")
+        Thread { GuardianNotifier.notifyUninstallAttempt(context, "device_admin_disable_requested") }.start()
+        return "Deactivating this will allow Checkmate to be uninstalled. Your guardian will be notified."
+    }
+
+    override fun onDisabled(context: Context, intent: Intent) {
+        super.onDisabled(context, intent)
+        Log.w(TAG, "Device admin DISABLED")
+        Thread { GuardianNotifier.notifyUninstallAttempt(context, "device_admin_disabled") }.start()
+    }
+}
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
 package com.checkmate.automation
 
@@ -593,13 +728,16 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
 
 class AppAutomationService : AccessibilityService() {
 
     private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
     private val WHATSAPP = "com.whatsapp"
+    private val SELF_PKG get() = packageName // "com.checkmate"
 
     // ── Browser packages whose URL bar we scan for blocked domains ────────────
     // All major browsers expose their address bar as an accessible text node.
@@ -679,6 +817,14 @@ class AppAutomationService : AccessibilityService() {
             }
         }
 
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            checkGuardedScreen()
+        }
+
         // ── WhatsApp automation ───────────────────────────────────────────────
         if (pkg != WHATSAPP) return
         if (!AutomationEngine.hasPendingMessage()) return
@@ -700,6 +846,53 @@ class AppAutomationService : AccessibilityService() {
                 rootInActiveWindow?.let { tryTypeAndSend(it) }
             }, 1200)
         }
+    }
+
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for a combination of "this is
+     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert. Deliberately conservative: requires
+     * BOTH signals so we never interfere with unrelated Settings browsing.
+     */
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) return
+
+        val root = rootInActiveWindow ?: return
+        val text = collectAllText(root)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        if (!UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)) return
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            Thread {
+                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
+                    applicationContext, "settings_screen_blocked"
+                )
+            }.start()
+        }
+    }
+
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
     }
 
     // ── URL scanning ──────────────────────────────────────────────────────────
@@ -1527,6 +1720,7 @@ import android.util.Log
 import com.checkmate.automation.AutomationEngine
 import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
@@ -1621,9 +1815,11 @@ object GuardianNotifier {
 
         val checklistSummary = DailyChecklist.getTodaySummaryText()
         val usageSummary = AppUsageTracker.buildUsageReportText(context)
+        val candidateName = ConsultationProfile.candidateDisplayName()
 
         val msg = buildString {
             appendLine("Checkmate Daily Report — ${dateToday()}")
+            appendLine("Candidate: $candidateName")
             appendLine("Tasks: $done/$total ($pct%)")
             if (skipped > 0) appendLine("Skipped: $skipped")
             appendLine()
@@ -1666,10 +1862,13 @@ object GuardianNotifier {
             return
         }
         val report = AppUsageTracker.buildUsageReportText(context)
-        val text   = "Checkmate — ${dateToday()}\n$report"
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val text = "Checkmate — ${dateToday()}\nCandidate: $candidateName\n$report"
         Thread {
             TelegramAlertBot.sendAlert(context, text)
-            StatusReporter.pushUsageReport(context, report)
+            // Cache carries the candidate line too, since the worker's "usage"
+            // command replies with exactly this cached string.
+            StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
             Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
         }.start()
     }
@@ -1695,6 +1894,46 @@ object GuardianNotifier {
             TelegramAlertBot.sendAlert(context, msg, screenshotUri)
             Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
         }.start()
+    }
+
+    /**
+     * Fired by CheckmateDeviceAdminReceiver and AppAutomationService's
+     * UninstallGuard watchdog whenever someone reaches a screen that could
+     * uninstall Checkmate, force-stop it, disable its device admin status,
+     * or disable its accessibility service. `reason` is a short machine tag
+     * (e.g. "settings_screen_blocked", "device_admin_disable_requested")
+     * kept out of the guardian-facing text but logged for debugging.
+     */
+    fun notifyUninstallAttempt(context: Context, reason: String) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
+                  "Checkmate at ${timeNow()} on ${dateToday()}."
+        Log.w(TAG, "Uninstall attempt: reason=$reason")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Fired by BootReceiver when the device just booted into Safe Mode —
+     * Safe Mode disables all 3rd-party accessibility services and can bypass
+     * device-admin uninstall protection, which is the one gap this app
+     * cannot close from the app side. This is a best-effort notice only.
+     */
+    fun notifySafeModeBoot(context: Context) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
+                  "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
+        Log.w(TAG, "Safe Mode boot detected")
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
     }
 
     private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
@@ -2470,6 +2709,21 @@ fun ConsultationScreen(navController: NavController, vm: ConsultationViewModel =
             modifier = Modifier.padding(horizontal = 20.dp)
         )
         Spacer(Modifier.height(12.dp))
+
+        // ── IDENTITY SECTION ──
+        SectionHeader("CANDIDATE")
+        ConsultCard {
+            ConsultField(
+                value         = profile.candidateName,
+                onValueChange = { vm.update { p -> p.copy(candidateName = it) } },
+                label         = "Candidate Name"
+            )
+            Text(
+                "Shown to your guardian on every usage report and daily summary.",
+                fontSize = 11.sp, color = White30,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
 
         // ── ACADEMIC SECTION ──
         SectionHeader("ACADEMIC")
@@ -5154,6 +5408,7 @@ fun AppSelectorScreen(onBack: () -> Unit) {
 //===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
 package com.checkmate.ui.settings
 
+import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -5174,10 +5429,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.ui.theme.*
+import com.checkmate.workmode.UninstallGuard
 
 @Composable
 fun SettingsScreen() {
@@ -5243,6 +5500,11 @@ fun SettingsScreen() {
             }
         }
 
+        // ── Security / Uninstall Protection ──
+        SettingSection("SECURITY") {
+            UninstallProtectionSettings(context)
+        }
+
         // ── Permissions ──
         SettingSection("PERMISSIONS") {
             SettingTile(
@@ -5281,6 +5543,122 @@ fun SettingsScreen() {
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+}
+
+// ── Security: Device Admin activation + Guardian PIN (uninstall protection) ──
+
+@Composable
+private fun UninstallProtectionSettings(context: Context) {
+    val dpm = remember { context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
+    val adminComponent = remember { CheckmateDeviceAdminReceiver.componentName(context) }
+    var isAdminActive by remember { mutableStateOf(dpm.isAdminActive(adminComponent)) }
+
+    // Device Admin activation tile
+    Row(
+        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (isAdminActive) Icons.Default.GppGood else Icons.Default.GppMaybe,
+            null,
+            tint = if (isAdminActive) AccentGreen else AccentAmber,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Device Admin Protection", fontSize = 14.sp, color = White90)
+            Text(
+                if (isAdminActive)
+                    "Active — plain Uninstall is hidden on the App Info screen"
+                else
+                    "Not active — Checkmate can be uninstalled like any normal app",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        if (!isAdminActive) {
+            TextButton(onClick = {
+                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Required so Checkmate can't be casually uninstalled mid-session."
+                    )
+                }
+                context.startActivity(intent)
+            }) { Text("Activate", color = AccentGreen, fontSize = 13.sp) }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    SettingTile(
+        title    = "Refresh Protection Status",
+        subtitle = "Tap after activating device admin in the system dialog",
+        icon     = Icons.Default.Refresh
+    ) {
+        isAdminActive = dpm.isAdminActive(adminComponent)
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Guardian PIN — the only sanctioned way past the uninstall/disable watchdog
+    var pin by remember { mutableStateOf("") }
+    var pinSaved by remember { mutableStateOf(false) }
+    var showPin by remember { mutableStateOf(false) }
+    val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            if (pinConfigured)
+                "Set. Only the guardian should know it — needed to pass the uninstall/disable watchdog."
+            else
+                "Not set yet — the watchdog will block every uninstall/disable attempt until a PIN exists.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = pin,
+            onValueChange = { pin = it; pinSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("New guardian PIN", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Lock, null, tint = White60) },
+            visualTransformation = if (showPin) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon  = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showPin = !showPin }) {
+                        Icon(
+                            if (showPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            null, tint = White60
+                        )
+                    }
+                    IconButton(onClick = {
+                        if (pin.isNotBlank()) {
+                            UninstallGuard.setPin(pin)
+                            pinSaved = true
+                            pin = ""
+                        }
+                    }) {
+                        Icon(
+                            if (pinSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (pinSaved) AccentGreen else White60
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (pinSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
     }
 }
 
@@ -6324,6 +6702,7 @@ fun CheckmateTheme(content: @Composable () -> Unit) {
     <string name="app_name">Checkmate</string>
     <string name="service_desc">Checkmate automation service for guardian notifications.</string>
     <string name="accessibility_call_desc">Checkmate call screening service.</string>
+    <string name="device_admin_desc">Prevents Checkmate from being casually uninstalled during a study session. Your guardian is notified if deactivation is attempted.</string>
 </resources>
 
 
@@ -6380,6 +6759,20 @@ fun CheckmateTheme(content: @Composable () -> Unit) {
     android:canRetrieveWindowContent="true"
     android:accessibilityFlags="flagReportViewIds"
     android:description="@string/accessibility_call_desc" />
+
+
+//===== FILE: app/src/main/res/xml/device_admin.xml =====
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Minimal device-admin policy set. We don't need password/camera/wipe
+    policies — activation alone is what hides the plain Uninstall button
+    on Checkmate's App Info screen. Keeping this list empty avoids scary
+    permission text in the activation dialog ("can erase your data", etc).
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+    </uses-policies>
+</device-admin>
 
 
 //===== FILE: app/src/main/res/xml/file_paths.xml =====
@@ -7522,6 +7915,7 @@ data class TimeSlot(
 
 @Serializable
 data class ConsultationProfile(
+    val candidateName:    String         = "",
     val examTarget:       String         = "NEET",
     val examDate:         String         = "",
     val currentClass:     String         = "Dropper",
@@ -7550,6 +7944,12 @@ data class ConsultationProfile(
 
         fun hasProfile(): Boolean = !CheckmatePrefs.getString(KEY, null).isNullOrBlank()
 
+        /** Candidate's display name for guardian reports, falling back to a neutral label. */
+        fun candidateDisplayName(): String {
+            val name = load().candidateName.trim()
+            return name.ifBlank { "Candidate" }
+        }
+
         /** Returns a flat string for injection into the LLM planner prompt */
         fun ConsultationProfile.toPromptContext(): String {
             val score = if (currentMockScore > 0)
@@ -7559,6 +7959,7 @@ data class ConsultationProfile(
             else blockedSlots.joinToString { "${it.label} ${it.startTime}–${it.endTime}" }
             val weak = if (weakTopics.isEmpty()) weakSubjects.joinToString() else weakTopics.joinToString()
             return buildString {
+                appendLine("Candidate: ${candidateName.ifBlank { "Not set" }}")
                 appendLine("Exam: $examTarget | Date: $examDate | Class: $currentClass")
                 appendLine("Coaching: ${coachingName.ifBlank { "None" }}")
                 appendLine("Target: $targetScore | $score")
@@ -9738,6 +10139,105 @@ interface DistractionListener {
      * @param target   package name or hostname
      */
     fun onAlertThresholdReached(context: Context, kind: String, target: String)
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/UninstallGuard.kt =====
+package com.checkmate.workmode
+
+import com.checkmate.core.CheckmatePrefs
+
+/**
+ * UninstallGuard — the shared brain behind Checkmate's uninstall protection.
+ *
+ * Three cooperating pieces close the loop:
+ *  1. Device Admin activation (CheckmateDeviceAdminReceiver) hides the plain
+ *     "Uninstall" button on the App Info screen.
+ *  2. This object holds the guardian-PIN-gated "temporary unlock" window —
+ *     the only sanctioned way past the watchdog below.
+ *  3. AppAutomationService (accessibility service) watches for navigation
+ *     into the screens that could remove/disable Checkmate and, unless
+ *     currently unlocked, bounces the user back to Home and alerts the
+ *     guardian via GuardianNotifier.notifyUninstallAttempt().
+ *
+ * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
+ * those are OS-level and no on-device app can intercept them. What this
+ * closes is the everyday loophole: a single tap on "Uninstall" or "Turn off"
+ * from a normal running session.
+ */
+object UninstallGuard {
+
+    private const val KEY_PIN         = "guardian_pin"
+    private const val KEY_UNLOCK_UNTIL = "uninstall_unlock_until"
+    private const val KEY_LAST_ALERT   = "uninstall_last_alert_at"
+
+    // How long a correct PIN entry keeps the watchdog from bouncing the user,
+    // so a guardian can actually walk through the uninstall/disable flow.
+    private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
+
+    // Don't fire a fresh Telegram alert more than once per this window even
+    // if the watchdog keeps re-triggering while the user sits on the screen.
+    private const val ALERT_THROTTLE_MS = 20 * 1000L
+
+    /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
+    val GUARD_KEYWORDS = listOf(
+        "uninstall",
+        "force stop",
+        "disable device admin app",
+        "deactivate this device admin app",
+        "deactivate",
+        "remove admin",
+        "turn off",          // accessibility-service disable toggle wording on many OEMs
+        "app info"
+    )
+
+    // Package names whose screens we watch. Settings itself, plus common
+    // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
+    val WATCHED_PACKAGES = setOf(
+        "com.android.settings",
+        "com.android.permissioncontroller",
+        "com.miui.securitycenter",
+        "com.coloros.securepay",
+        "com.oppo.securepay",
+        "com.samsung.android.settings"
+    )
+
+    fun hasPinConfigured(): Boolean = !CheckmatePrefs.getString(KEY_PIN, null).isNullOrBlank()
+
+    fun setPin(pin: String) = CheckmatePrefs.putString(KEY_PIN, pin.trim())
+
+    /**
+     * Guardian enters the PIN inside the app (Settings → Security) before
+     * going to uninstall/disable Checkmate. Correct PIN opens a short window
+     * during which the watchdog stands down.
+     */
+    fun unlockWithPin(pin: String): Boolean {
+        val stored = CheckmatePrefs.getString(KEY_PIN, null)
+        if (stored.isNullOrBlank() || pin.trim() != stored) return false
+        CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
+        return true
+    }
+
+    fun isUnlocked(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L)
+
+    fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
+
+    /** True if this window's visible text suggests an uninstall/disable screen for Checkmate. */
+    fun looksLikeGuardedScreen(visibleText: String, targetsCheckmate: Boolean): Boolean {
+        if (!targetsCheckmate) return false
+        val lower = visibleText.lowercase()
+        return GUARD_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */
+    fun shouldAlert(): Boolean {
+        val last = CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L)
+        val now = System.currentTimeMillis()
+        if (now - last < ALERT_THROTTLE_MS) return false
+        CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
+        return true
+    }
 }
 
 
