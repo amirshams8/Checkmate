@@ -14,6 +14,7 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
+import com.checkmate.workmode.UninstallGuard
 import java.util.Calendar
 
 object GuardianNotifier {
@@ -221,6 +222,50 @@ object GuardianNotifier {
         val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
                   "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
         Log.w(TAG, "Safe Mode boot detected")
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Generates a fresh 6-digit guardian PIN, stores only its hash on-device
+     * (UninstallGuard.storeNewPinHash), and sends the plaintext PIN to the
+     * guardian's Telegram chat — the only place it's ever visible. Whoever
+     * taps "Generate" on the phone (student or guardian) never sees the PIN
+     * itself, so generating a new one can't be used to self-authorize.
+     *
+     * Returns a short status string suitable for showing directly in the UI.
+     */
+    fun generateAndSendGuardianPin(context: Context, onResult: (success: Boolean, message: String) -> Unit) {
+        if (TelegramAlertBot.getChatId() == null) {
+            onResult(false, "Set Guardian Telegram Chat ID first")
+            return
+        }
+        if (!UninstallGuard.canRegeneratePin()) {
+            onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingSeconds()}s before generating another")
+            return
+        }
+        val pin = UninstallGuard.generateRandomPin()
+        UninstallGuard.storeNewPinHash(pin)
+        Thread {
+            TelegramAlertBot.sendAlert(
+                context,
+                "🔑 Checkmate Guardian PIN: $pin\n" +
+                "Enter this in the app to pass the uninstall-protection watchdog for 2 minutes. " +
+                "Keep it private from the student — anyone can request a new one from the phone, " +
+                "but only you ever see the code."
+            )
+            Log.d(TAG, "Guardian PIN generated and sent via Telegram")
+        }.start()
+        onResult(true, "New PIN sent to guardian via Telegram")
+    }
+
+    /** Fired by the unlock screen when UninstallGuard reports a brute-force lockout. */
+    fun notifyPinBruteForce(context: Context) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🚨 Checkmate Alert: $candidateName entered the wrong guardian PIN too many times " +
+                  "at ${timeNow()} on ${dateToday()}. Unlock is locked for 10 minutes."
+        Log.w(TAG, "Guardian PIN brute-force lockout triggered")
         if (TelegramAlertBot.getChatId() != null) {
             Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
         }

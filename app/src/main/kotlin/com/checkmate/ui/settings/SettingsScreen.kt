@@ -25,6 +25,7 @@ import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GuardianNotifier
 import com.checkmate.ui.theme.*
 import com.checkmate.workmode.UninstallGuard
 
@@ -194,50 +195,92 @@ private fun UninstallProtectionSettings(context: Context) {
 
     HorizontalDivider(color = White10)
 
-    // Guardian PIN — the only sanctioned way past the uninstall/disable watchdog
-    var pin by remember { mutableStateOf("") }
-    var pinSaved by remember { mutableStateOf(false) }
-    var showPin by remember { mutableStateOf(false) }
+    // Guardian PIN — generated device-side, hashed on-device, plaintext sent
+    // ONLY to the guardian's Telegram. Whoever taps "Generate" never sees it,
+    // so tapping it from the student's side can't self-authorize anything.
     val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
+    var genStatus by remember { mutableStateOf<String?>(null) }
+    var genInFlight by remember { mutableStateOf(false) }
 
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
         Text(
             if (pinConfigured)
-                "Set. Only the guardian should know it — needed to pass the uninstall/disable watchdog."
+                "A PIN is set. It was sent only to the guardian's Telegram — nobody on this screen can see it."
             else
-                "Not set yet — the watchdog will block every uninstall/disable attempt until a PIN exists.",
+                "No PIN yet — the watchdog will block every uninstall/disable attempt until one is generated.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
+        )
+        Button(
+            onClick = {
+                genInFlight = true
+                GuardianNotifier.generateAndSendGuardianPin(context) { success, message ->
+                    genStatus = message
+                    genInFlight = false
+                }
+            },
+            enabled  = !genInFlight,
+            modifier = Modifier.fillMaxWidth(),
+            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+        ) {
+            Icon(Icons.Default.Send, null, modifier = Modifier.size(18.dp), tint = androidx.compose.ui.graphics.Color.Black)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (pinConfigured) "Generate New PIN → Guardian's Telegram" else "Generate PIN → Guardian's Telegram",
+                color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp
+            )
+        }
+        genStatus?.let {
+            Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Unlock — only the person who has the PIN from Telegram (the guardian)
+    // can pass this. Wrong-PIN attempts are counted; 5 failures locks the
+    // unlock field for 10 minutes and alerts the guardian.
+    var unlockPin by remember { mutableStateOf("") }
+    var unlockStatus by remember { mutableStateOf<String?>(null) }
+    var unlockStatusColor by remember { mutableStateOf(White60) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Unlock Protection", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Guardian enters the PIN they received on Telegram to pass the watchdog for 2 minutes.",
             fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
         )
         OutlinedTextField(
-            value         = pin,
-            onValueChange = { pin = it; pinSaved = false },
+            value         = unlockPin,
+            onValueChange = { if (it.length <= 6) unlockPin = it },
             modifier      = Modifier.fillMaxWidth(),
             singleLine    = true,
-            placeholder   = { Text("New guardian PIN", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Lock, null, tint = White60) },
-            visualTransformation = if (showPin) VisualTransformation.None else PasswordVisualTransformation(),
+            placeholder   = { Text("6-digit guardian PIN", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
             trailingIcon  = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { showPin = !showPin }) {
-                        Icon(
-                            if (showPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            null, tint = White60
-                        )
-                    }
-                    IconButton(onClick = {
-                        if (pin.isNotBlank()) {
-                            UninstallGuard.setPin(pin)
-                            pinSaved = true
-                            pin = ""
+                IconButton(onClick = {
+                    when (val result = UninstallGuard.unlockWithPin(unlockPin)) {
+                        is UninstallGuard.UnlockResult.Success -> {
+                            unlockStatus = "Unlocked for 2 minutes"
+                            unlockStatusColor = AccentGreen
+                            unlockPin = ""
                         }
-                    }) {
-                        Icon(
-                            if (pinSaved) Icons.Default.Check else Icons.Default.Save,
-                            null,
-                            tint = if (pinSaved) AccentGreen else White60
-                        )
+                        is UninstallGuard.UnlockResult.WrongPin -> {
+                            unlockStatus = "Incorrect PIN"
+                            unlockStatusColor = AccentRed
+                        }
+                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
+                            unlockStatus = "No PIN generated yet"
+                            unlockStatusColor = AccentAmber
+                        }
+                        is UninstallGuard.UnlockResult.LockedOut -> {
+                            unlockStatus = "Too many wrong attempts — locked for ${result.secondsLeft / 60}m"
+                            unlockStatusColor = AccentRed
+                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
+                        }
                     }
+                }) {
+                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
                 }
             },
             colors = OutlinedTextFieldDefaults.colors(
@@ -248,8 +291,8 @@ private fun UninstallProtectionSettings(context: Context) {
                 unfocusedTextColor   = White90
             )
         )
-        if (pinSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        unlockStatus?.let {
+            Text(it, fontSize = 11.sp, color = unlockStatusColor, modifier = Modifier.padding(top = 4.dp))
         }
     }
 }
