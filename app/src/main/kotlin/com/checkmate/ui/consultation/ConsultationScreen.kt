@@ -52,6 +52,21 @@ fun ConsultationScreen(navController: NavController, vm: ConsultationViewModel =
         )
         Spacer(Modifier.height(12.dp))
 
+        // ── IDENTITY SECTION ──
+        SectionHeader("CANDIDATE")
+        ConsultCard {
+            ConsultField(
+                value         = profile.candidateName,
+                onValueChange = { vm.update { p -> p.copy(candidateName = it) } },
+                label         = "Candidate Name"
+            )
+            Text(
+                "Shown to your guardian on every usage report and daily summary.",
+                fontSize = 11.sp, color = White30,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+
         // ── ACADEMIC SECTION ──
         SectionHeader("ACADEMIC")
         ConsultCard {

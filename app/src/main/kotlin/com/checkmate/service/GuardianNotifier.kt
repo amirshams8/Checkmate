@@ -10,6 +10,7 @@ import android.util.Log
 import com.checkmate.automation.AutomationEngine
 import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
@@ -104,9 +105,11 @@ object GuardianNotifier {
 
         val checklistSummary = DailyChecklist.getTodaySummaryText()
         val usageSummary = AppUsageTracker.buildUsageReportText(context)
+        val candidateName = ConsultationProfile.candidateDisplayName()
 
         val msg = buildString {
             appendLine("Checkmate Daily Report — ${dateToday()}")
+            appendLine("Candidate: $candidateName")
             appendLine("Tasks: $done/$total ($pct%)")
             if (skipped > 0) appendLine("Skipped: $skipped")
             appendLine()
@@ -149,10 +152,13 @@ object GuardianNotifier {
             return
         }
         val report = AppUsageTracker.buildUsageReportText(context)
-        val text   = "Checkmate — ${dateToday()}\n$report"
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val text = "Checkmate — ${dateToday()}\nCandidate: $candidateName\n$report"
         Thread {
             TelegramAlertBot.sendAlert(context, text)
-            StatusReporter.pushUsageReport(context, report)
+            // Cache carries the candidate line too, since the worker's "usage"
+            // command replies with exactly this cached string.
+            StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
             Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
         }.start()
     }
@@ -178,6 +184,46 @@ object GuardianNotifier {
             TelegramAlertBot.sendAlert(context, msg, screenshotUri)
             Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
         }.start()
+    }
+
+    /**
+     * Fired by CheckmateDeviceAdminReceiver and AppAutomationService's
+     * UninstallGuard watchdog whenever someone reaches a screen that could
+     * uninstall Checkmate, force-stop it, disable its device admin status,
+     * or disable its accessibility service. `reason` is a short machine tag
+     * (e.g. "settings_screen_blocked", "device_admin_disable_requested")
+     * kept out of the guardian-facing text but logged for debugging.
+     */
+    fun notifyUninstallAttempt(context: Context, reason: String) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
+                  "Checkmate at ${timeNow()} on ${dateToday()}."
+        Log.w(TAG, "Uninstall attempt: reason=$reason")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Fired by BootReceiver when the device just booted into Safe Mode —
+     * Safe Mode disables all 3rd-party accessibility services and can bypass
+     * device-admin uninstall protection, which is the one gap this app
+     * cannot close from the app side. This is a best-effort notice only.
+     */
+    fun notifySafeModeBoot(context: Context) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
+                  "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
+        Log.w(TAG, "Safe Mode boot detected")
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
     }
 
     private fun openWhatsAppAndSend(context: Context, number: String, message: String) {

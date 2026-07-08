@@ -16,6 +16,7 @@ data class TimeSlot(
 
 @Serializable
 data class ConsultationProfile(
+    val candidateName:    String         = "",
     val examTarget:       String         = "NEET",
     val examDate:         String         = "",
     val currentClass:     String         = "Dropper",
@@ -44,6 +45,12 @@ data class ConsultationProfile(
 
         fun hasProfile(): Boolean = !CheckmatePrefs.getString(KEY, null).isNullOrBlank()
 
+        /** Candidate's display name for guardian reports, falling back to a neutral label. */
+        fun candidateDisplayName(): String {
+            val name = load().candidateName.trim()
+            return name.ifBlank { "Candidate" }
+        }
+
         /** Returns a flat string for injection into the LLM planner prompt */
         fun ConsultationProfile.toPromptContext(): String {
             val score = if (currentMockScore > 0)
@@ -53,6 +60,7 @@ data class ConsultationProfile(
             else blockedSlots.joinToString { "${it.label} ${it.startTime}–${it.endTime}" }
             val weak = if (weakTopics.isEmpty()) weakSubjects.joinToString() else weakTopics.joinToString()
             return buildString {
+                appendLine("Candidate: ${candidateName.ifBlank { "Not set" }}")
                 appendLine("Exam: $examTarget | Date: $examDate | Class: $currentClass")
                 appendLine("Coaching: ${coachingName.ifBlank { "None" }}")
                 appendLine("Target: $targetScore | $score")

@@ -10,13 +10,16 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
 
 class AppAutomationService : AccessibilityService() {
 
     private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
     private val WHATSAPP = "com.whatsapp"
+    private val SELF_PKG get() = packageName // "com.checkmate"
 
     // ── Browser packages whose URL bar we scan for blocked domains ────────────
     // All major browsers expose their address bar as an accessible text node.
@@ -96,6 +99,14 @@ class AppAutomationService : AccessibilityService() {
             }
         }
 
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            checkGuardedScreen()
+        }
+
         // ── WhatsApp automation ───────────────────────────────────────────────
         if (pkg != WHATSAPP) return
         if (!AutomationEngine.hasPendingMessage()) return
@@ -117,6 +128,53 @@ class AppAutomationService : AccessibilityService() {
                 rootInActiveWindow?.let { tryTypeAndSend(it) }
             }, 1200)
         }
+    }
+
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for a combination of "this is
+     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert. Deliberately conservative: requires
+     * BOTH signals so we never interfere with unrelated Settings browsing.
+     */
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) return
+
+        val root = rootInActiveWindow ?: return
+        val text = collectAllText(root)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        if (!UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)) return
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            Thread {
+                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
+                    applicationContext, "settings_screen_blocked"
+                )
+            }.start()
+        }
+    }
+
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
     }
 
     // ── URL scanning ──────────────────────────────────────────────────────────

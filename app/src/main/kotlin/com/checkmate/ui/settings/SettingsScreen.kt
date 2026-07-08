@@ -1,5 +1,6 @@
 package com.checkmate.ui.settings
 
+import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -20,10 +21,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.ui.theme.*
+import com.checkmate.workmode.UninstallGuard
 
 @Composable
 fun SettingsScreen() {
@@ -89,6 +92,11 @@ fun SettingsScreen() {
             }
         }
 
+        // ── Security / Uninstall Protection ──
+        SettingSection("SECURITY") {
+            UninstallProtectionSettings(context)
+        }
+
         // ── Permissions ──
         SettingSection("PERMISSIONS") {
             SettingTile(
@@ -127,6 +135,122 @@ fun SettingsScreen() {
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+}
+
+// ── Security: Device Admin activation + Guardian PIN (uninstall protection) ──
+
+@Composable
+private fun UninstallProtectionSettings(context: Context) {
+    val dpm = remember { context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
+    val adminComponent = remember { CheckmateDeviceAdminReceiver.componentName(context) }
+    var isAdminActive by remember { mutableStateOf(dpm.isAdminActive(adminComponent)) }
+
+    // Device Admin activation tile
+    Row(
+        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (isAdminActive) Icons.Default.GppGood else Icons.Default.GppMaybe,
+            null,
+            tint = if (isAdminActive) AccentGreen else AccentAmber,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Device Admin Protection", fontSize = 14.sp, color = White90)
+            Text(
+                if (isAdminActive)
+                    "Active — plain Uninstall is hidden on the App Info screen"
+                else
+                    "Not active — Checkmate can be uninstalled like any normal app",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        if (!isAdminActive) {
+            TextButton(onClick = {
+                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Required so Checkmate can't be casually uninstalled mid-session."
+                    )
+                }
+                context.startActivity(intent)
+            }) { Text("Activate", color = AccentGreen, fontSize = 13.sp) }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    SettingTile(
+        title    = "Refresh Protection Status",
+        subtitle = "Tap after activating device admin in the system dialog",
+        icon     = Icons.Default.Refresh
+    ) {
+        isAdminActive = dpm.isAdminActive(adminComponent)
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Guardian PIN — the only sanctioned way past the uninstall/disable watchdog
+    var pin by remember { mutableStateOf("") }
+    var pinSaved by remember { mutableStateOf(false) }
+    var showPin by remember { mutableStateOf(false) }
+    val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            if (pinConfigured)
+                "Set. Only the guardian should know it — needed to pass the uninstall/disable watchdog."
+            else
+                "Not set yet — the watchdog will block every uninstall/disable attempt until a PIN exists.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = pin,
+            onValueChange = { pin = it; pinSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("New guardian PIN", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Lock, null, tint = White60) },
+            visualTransformation = if (showPin) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon  = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showPin = !showPin }) {
+                        Icon(
+                            if (showPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            null, tint = White60
+                        )
+                    }
+                    IconButton(onClick = {
+                        if (pin.isNotBlank()) {
+                            UninstallGuard.setPin(pin)
+                            pinSaved = true
+                            pin = ""
+                        }
+                    }) {
+                        Icon(
+                            if (pinSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (pinSaved) AccentGreen else White60
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (pinSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
     }
 }
 
