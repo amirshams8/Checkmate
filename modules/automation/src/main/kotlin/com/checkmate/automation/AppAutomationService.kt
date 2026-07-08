@@ -10,33 +10,40 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
 
 class AppAutomationService : AccessibilityService() {
 
     private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
     private val WHATSAPP = "com.whatsapp"
+    private val SELF_PKG get() = packageName // "com.checkmate"
 
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
     private val BROWSER_PACKAGES = setOf(
-        "com.android.chrome",
+        "com.android.chrome",           // Chrome (system on most devices)
         "com.chrome.beta",
         "com.chrome.dev",
         "com.chrome.canary",
         "org.mozilla.firefox",
         "org.mozilla.firefox_beta",
         "org.mozilla.focus",
-        "com.microsoft.emmx",
+        "com.microsoft.emmx",           // Edge
         "com.brave.browser",
         "com.opera.browser",
         "com.opera.mini.native",
-        "com.sec.android.app.sbrowser",
-        "com.UCMobile.intl",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
         "com.duckduckgo.mobile.android",
-        "mark.via.gp",
+        "mark.via.gp",                  // Via Browser
         "com.kiwibrowser.browser"
     )
 
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
     private val URL_BAR_IDS = mapOf(
         "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
         "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
@@ -49,13 +56,16 @@ class AppAutomationService : AccessibilityService() {
         "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
         "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
         "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
-        "com.sec.android.app.sbrowser"  to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
         "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
     )
-
+    // Generic fallback content-descriptions used across unknown browsers
     private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
-    private val lastSeenUrl           = mutableMapOf<String, String>()
 
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
+
+    // WhatsApp automation state
     private var typingAttempted = false
     private var lastWindowClass = ""
 
@@ -75,6 +85,7 @@ class AppAutomationService : AccessibilityService() {
             val blockedApps = WorkModeManager.getBlockedApps()
             if (pkg in blockedApps) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
                 DistractionGuard.recordAppAttempt(this, pkg)
                 return
             }
@@ -86,6 +97,14 @@ class AppAutomationService : AccessibilityService() {
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 checkAndBlockUrl(pkg)
             }
+        }
+
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            checkGuardedScreen()
         }
 
         // ── WhatsApp automation ───────────────────────────────────────────────
@@ -111,12 +130,60 @@ class AppAutomationService : AccessibilityService() {
         }
     }
 
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for a combination of "this is
+     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert. Deliberately conservative: requires
+     * BOTH signals so we never interfere with unrelated Settings browsing.
+     */
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) return
+
+        val root = rootInActiveWindow ?: return
+        val text = collectAllText(root)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        if (!UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)) return
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            Thread {
+                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
+                    applicationContext, "settings_screen_blocked"
+                )
+            }.start()
+        }
+    }
+
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
+    }
+
     // ── URL scanning ──────────────────────────────────────────────────────────
 
     private fun checkAndBlockUrl(browserPkg: String) {
         val root = rootInActiveWindow ?: return
         val url  = extractUrl(root, browserPkg) ?: return
 
+        // Debounce: only act when URL actually changes
         if (lastSeenUrl[browserPkg] == url) return
         lastSeenUrl[browserPkg] = url
 
@@ -130,16 +197,25 @@ class AppAutomationService : AccessibilityService() {
 
         Log.w(TAG, "Blocked domain matched: $matched — going back")
         performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
         DistractionGuard.recordDomainAttempt(this, matched)
     }
 
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
     private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
         val ids = URL_BAR_IDS[pkg] ?: emptyList()
         for (id in ids) {
             val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
             val text = node?.text?.toString()?.trim()
             if (!text.isNullOrBlank()) return text
         }
+
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
         while (stack.isNotEmpty()) {
@@ -159,10 +235,16 @@ class AppAutomationService : AccessibilityService() {
         if (text.isBlank() || text.length < 4) return false
         return text.contains('.') &&
                !text.contains(' ') &&
-               (text.startsWith("http") || text.startsWith("www.") ||
-                text.matches(Regex(".*\\.[a-z]{2,}.*")))
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
     }
 
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
     private fun parseHostname(raw: String): String? {
         return try {
             val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
