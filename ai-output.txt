@@ -1,708 +1,2019 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/AttentionCycleManager.kt =====
-package com.checkmate.core
+//===== FILE: app/src/main/AndroidManifest.xml =====
 
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-// PROMPT_DONE: focus block just ended — timer frozen, waiting for user decision
-enum class AttentionPhase { FOCUS, SHORT_BREAK, LONG_BREAK, PAUSED, PROMPT_DONE, DONE }
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.CALL_SCREENING" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
-data class CycleState(
-    val phase:               AttentionPhase = AttentionPhase.FOCUS,
-    val phaseSecondsLeft:    Long           = 30 * 60,
-    val totalSessionSeconds: Long           = 0,
-    val cycleIndex:          Int            = 1,
-    val needsAttentionCheck: Boolean        = false,
-    val phaseJustChanged:    Boolean        = false,
-    val checksPassed:        Int            = 0,
-    val checksMissed:        Int            = 0,
-    val taskId:              String         = "",
-    val taskName:            String         = "",
-    val pausedAt:            Long           = 0L,
-    val totalPausedMs:       Long           = 0L,
-    // Total length of the active task in seconds — used by the floating bar
-    // to scale its progress indicator correctly in both Pomodoro and plain mode.
-    val totalDurationSecs:   Long           = 0L,
-    // Snapshot (taken at start()) of whether Pomodoro-style breaks/checks are
-    // active for this session. Exposed on state so UI doesn't need prefs access.
-    val pomodoroEnabled:     Boolean        = true
-)
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
-object AttentionCycleManager {
+    <queries>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.termux" />
+    </queries>
 
-    private const val FOCUS_SECS               = 30 * 60L
-    private const val SHORT_BREAK_SECS         = 5  * 60L
-    private const val LONG_BREAK_SECS          = 10 * 60L
-    private const val FOCUS_BLOCKS_BEFORE_LONG = 2
+    <application
+        android:name="com.checkmate.CheckmateApp"
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Checkmate"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config">
 
-    // Pref key — read once per session in start() and snapshotted onto CycleState
-    // and into the private var below so mid-session toggling in Settings never
-    // changes the rules of an already-running session.
-    const val PREF_POMODORO_ENABLED = "pomodoro_enabled"
+        <activity
+            android:name="com.checkmate.MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
-    private val _state = MutableStateFlow(CycleState())
-    val stateFlow: StateFlow<CycleState> = _state.asStateFlow()
+        <!-- Regular foreground services -->
+        <service android:name="com.checkmate.service.FloatingAttentionService"
+            android:exported="false" android:foregroundServiceType="dataSync" />
+        <!-- mediaProjection type added so Android 14+ allows getMediaProjection() while this service is running -->
+        <service android:name="com.checkmate.service.AttentionCycleService"
+            android:exported="false" android:foregroundServiceType="dataSync|mediaProjection" />
+        <service android:name="com.checkmate.service.ReminderService"
+            android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name="com.checkmate.service.WhatsAppReportService"
+            android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name="com.checkmate.workmode.WorkModeService"
+            android:exported="false" android:foregroundServiceType="dataSync" />
 
-    private var focusBlocksDone     = 0
-    private var checkWindowOpen     = false
-    private var checkWindowOpenedAt = 0L
-    private var totalDurationSecs   = 0L
-    private var elapsedTotal        = 0L
-    private var phaseBeforePause:   AttentionPhase = AttentionPhase.FOCUS
-    // The break phase queued up while we're showing PROMPT_DONE
-    private var pendingBreakPhase:  AttentionPhase = AttentionPhase.SHORT_BREAK
-    // When false: no 30-min blocks, no breaks, no PROMPT_DONE prompts, no
-    // forced attention-check taps — just one continuous focus timer for the
-    // whole task duration. Toggled via Settings → Work Mode → Pomodoro Breaks.
-    private var pomodoroEnabled     = true
-    // BUGFIX: tracks whether the attention check for the CURRENT focus block has
-    // already been confirmed. Without this, tick()'s needsCheck condition
-    // (`!checkWindowOpen`) re-opens the check window on the very next tick after
-    // confirmAttention() sets checkWindowOpen=false — because phaseSecondsLeft is
-    // still inside the 0..120s trigger range. That caused the ✅ button and the
-    // "Still focused?" TTS prompt to reappear ~1 second after being tapped,
-    // making it look like the tap did nothing. Reset only when a new FOCUS
-    // block actually begins (start() or break->FOCUS transition).
-    private var checkConfirmedThisBlock = false
+        <!-- Call screening service -->
+        <service android:name="com.checkmate.callhandler.CheckmateCallScreeningService"
+            android:permission="android.permission.BIND_SCREENING_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.telecom.CallScreeningService" />
+            </intent-filter>
+        </service>
 
-    fun start(taskId: String, taskName: String, durationMinutes: Long) {
-        pomodoroEnabled   = CheckmatePrefs.getBoolean(PREF_POMODORO_ENABLED, true)
-        totalDurationSecs = durationMinutes * 60
-        elapsedTotal      = 0
-        focusBlocksDone   = 0
-        checkWindowOpen   = false
-        checkConfirmedThisBlock = false
-        pendingBreakPhase = AttentionPhase.SHORT_BREAK
+        <service
+            android:name="com.checkmate.callhandler.CallAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/call_accessibility_config" />
+        </service>
 
-        val initialSecondsLeft = if (pomodoroEnabled) FOCUS_SECS else totalDurationSecs
+        <service
+            android:name="com.checkmate.automation.AppAutomationService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
-        _state.value = CycleState(
-            phase             = AttentionPhase.FOCUS,
-            phaseSecondsLeft  = initialSecondsLeft,
-            taskId            = taskId,
-            taskName          = taskName,
-            totalDurationSecs = totalDurationSecs,
-            pomodoroEnabled   = pomodoroEnabled
-        )
+        <service android:name="com.checkmate.automation.WhatsAppNotificationListener"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true"
+            android:process=":wa_listener">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Device Admin — hides the plain Uninstall button on Checkmate's App Info
+             screen once activated. Activation is a user action from Settings →
+             Security tile (SettingsScreen.kt), not forced at install time. -->
+        <receiver
+            android:name="com.checkmate.admin.CheckmateDeviceAdminReceiver"
+            android:permission="android.permission.BIND_DEVICE_ADMIN"
+            android:exported="true">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Reschedules guardian alarms (EOD summary, 30-min usage report) after
+             reboot, since AlarmManager repeating alarms don't survive a restart.
+             Also fires a one-time Safe Mode notice to the guardian if relevant. -->
+        <receiver
+            android:name="com.checkmate.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver android:name="com.checkmate.service.EodSummaryReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.checkmate.EOD_SUMMARY" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Fires every 30 min: pushes app-usage Telegram alert + caches it
+             in the worker's KV for the on-demand "usage" command -->
+        <receiver android:name="com.checkmate.service.UsageReportReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.checkmate.USAGE_REPORT" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.checkmate.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+</manifest>
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/admin/CheckmateDeviceAdminReceiver.kt =====
+
+package com.checkmate.admin
+
+import android.app.admin.DeviceAdminReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.checkmate.service.GuardianNotifier
+
+/**
+ * CheckmateDeviceAdminReceiver — makes Checkmate a Device Admin app.
+ *
+ * Effect: once activated (Settings → Security → Device admin apps → Checkmate),
+ * Android hides the plain "Uninstall" button on Checkmate's App Info page —
+ * the user must first deactivate device admin, which routes back through
+ * Android's own "Deactivate this device admin app?" screen. AppAutomationService
+ * watches for that screen (and the App Info uninstall screen) via UninstallGuard
+ * and kicks back to home unless a guardian PIN was entered first — see
+ * UninstallGuard.kt in :modules:workmode.
+ *
+ * This receiver itself just reacts to the two admin lifecycle events that
+ * matter for guardian visibility: someone requesting deactivation, and
+ * deactivation actually completing (e.g. via `adb shell dpm remove-active-admin`,
+ * which UninstallGuard's accessibility watchdog cannot intercept).
+ */
+class CheckmateDeviceAdminReceiver : DeviceAdminReceiver() {
+
+    companion object {
+        private const val TAG = "DeviceAdminReceiver"
+
+        fun componentName(context: Context): ComponentName =
+            ComponentName(context.applicationContext, CheckmateDeviceAdminReceiver::class.java)
     }
 
-    /** Called from the floating bar \"✅ Mark Done\" button during PROMPT_DONE. */
-    fun confirmDone() {
-        val done = _state.value.copy(
-            phase            = AttentionPhase.DONE,
-            phaseJustChanged = true
-        )
-        _state.value = done
+    override fun onEnabled(context: Context, intent: Intent) {
+        super.onEnabled(context, intent)
+        Log.d(TAG, "Device admin enabled")
     }
 
     /**
-     * Called from the floating bar \"➡ Continue\" button during PROMPT_DONE.
-     * Advances to the queued break phase so the cycle keeps going.
+     * Called when the user reaches Android's built-in disable-confirmation
+     * screen. We cannot block this screen (it's owned by the OS), but we can
+     * make sure the guardian knows immediately — the accessibility watchdog
+     * in UninstallGuard fires the same alert the moment it detects the screen,
+     * so this is a second, guaranteed-delivery signal in case the watchdog
+     * was killed by an OEM battery optimizer.
      */
-    fun dismissPromptAndBreak() {
-        val breakSecs = if (pendingBreakPhase == AttentionPhase.LONG_BREAK)
-            LONG_BREAK_SECS else SHORT_BREAK_SECS
-        _state.value = _state.value.copy(
-            phase               = pendingBreakPhase,
-            phaseSecondsLeft    = breakSecs,
-            needsAttentionCheck = false,
-            phaseJustChanged    = true
-        )
+    override fun onDisableRequested(context: Context, intent: Intent): CharSequence {
+        Log.w(TAG, "Device admin disable REQUESTED")
+        Thread { GuardianNotifier.notifyUninstallAttempt(context, "device_admin_disable_requested") }.start()
+        return "Deactivating this will allow Checkmate to be uninstalled. Your guardian will be notified."
     }
 
-    /** Blueprint 2.2: Pause — freezes tick loop, records pausedAt timestamp */
-    fun pause() {
-        val current = _state.value
-        if (current.phase == AttentionPhase.PAUSED ||
-            current.phase == AttentionPhase.DONE   ||
-            current.phase == AttentionPhase.PROMPT_DONE) return
-        phaseBeforePause = current.phase
-        _state.value = current.copy(
-            phase            = AttentionPhase.PAUSED,
-            phaseJustChanged = true,
-            pausedAt         = System.currentTimeMillis()
-        )
-    }
-
-    /** Blueprint 2.2: Resume — restarts tick, accumulates totalPausedMs */
-    fun resume() {
-        val current = _state.value
-        if (current.phase != AttentionPhase.PAUSED) return
-        val pauseDuration = if (current.pausedAt > 0L)
-            System.currentTimeMillis() - current.pausedAt else 0L
-        _state.value = current.copy(
-            phase            = phaseBeforePause,
-            phaseJustChanged = true,
-            pausedAt         = 0L,
-            totalPausedMs    = current.totalPausedMs + pauseDuration
-        )
-    }
-
-    fun tick(): CycleState {
-        val current = _state.value
-        // Freeze tick while paused, in prompt, or done
-        if (current.phase == AttentionPhase.PAUSED     ||
-            current.phase == AttentionPhase.PROMPT_DONE ||
-            current.phase == AttentionPhase.DONE)
-            return current
-
-        elapsedTotal++
-
-        if (totalDurationSecs > 0 && elapsedTotal >= totalDurationSecs) {
-            val done = current.copy(
-                phase               = AttentionPhase.DONE,
-                phaseJustChanged    = true,
-                phaseSecondsLeft    = 0,
-                totalSessionSeconds = elapsedTotal
-            )
-            _state.value = done
-            return done
-        }
-
-        val newSecondsLeft = current.phaseSecondsLeft - 1
-
-        // ── Plain continuous timer: no breaks, no PROMPT_DONE, no forced checks ──
-        if (!pomodoroEnabled) {
-            val next = current.copy(
-                phaseSecondsLeft    = newSecondsLeft.coerceAtLeast(0),
-                totalSessionSeconds = elapsedTotal,
-                needsAttentionCheck = false,
-                phaseJustChanged    = false
-            )
-            _state.value = next
-            return next
-        }
-
-        // ── Pomodoro mode: 30-min focus blocks with breaks + attention checks ──
-        val needsCheck = current.phase == AttentionPhase.FOCUS
-                && newSecondsLeft in 0..120 && !checkWindowOpen && !checkConfirmedThisBlock
-        if (needsCheck) {
-            checkWindowOpen     = true
-            checkWindowOpenedAt = elapsedTotal
-        }
-
-        var checksMissed = current.checksMissed
-        if (checkWindowOpen && elapsedTotal - checkWindowOpenedAt > 120) {
-            checksMissed++
-            checkWindowOpen = false
-        }
-
-        if (newSecondsLeft <= 0) {
-            return when (current.phase) {
-                AttentionPhase.FOCUS -> {
-                    focusBlocksDone++
-                    // Decide what break comes *after* the prompt
-                    pendingBreakPhase = if (focusBlocksDone % FOCUS_BLOCKS_BEFORE_LONG == 0)
-                        AttentionPhase.LONG_BREAK else AttentionPhase.SHORT_BREAK
-
-                    // Enter PROMPT_DONE — timer frozen, user decides
-                    val next = current.copy(
-                        phase               = AttentionPhase.PROMPT_DONE,
-                        phaseSecondsLeft    = 0,
-                        totalSessionSeconds = elapsedTotal,
-                        cycleIndex          = focusBlocksDone + 1,
-                        needsAttentionCheck = false,
-                        phaseJustChanged    = true,
-                        checksMissed        = checksMissed
-                    )
-                    _state.value = next; next
-                }
-                AttentionPhase.SHORT_BREAK, AttentionPhase.LONG_BREAK -> {
-                    checkWindowOpen = false
-                    checkConfirmedThisBlock = false
-                    val next = current.copy(
-                        phase               = AttentionPhase.FOCUS,
-                        phaseSecondsLeft    = FOCUS_SECS,
-                        totalSessionSeconds = elapsedTotal,
-                        needsAttentionCheck = false,
-                        phaseJustChanged    = true,
-                        checksMissed        = checksMissed
-                    )
-                    _state.value = next; next
-                }
-                else -> current
-            }
-        }
-
-        val next = current.copy(
-            phaseSecondsLeft    = newSecondsLeft,
-            totalSessionSeconds = elapsedTotal,
-            needsAttentionCheck = checkWindowOpen,
-            phaseJustChanged    = false,
-            checksMissed        = checksMissed
-        )
-        _state.value = next
-        return next
-    }
-
-    fun confirmAttention() {
-        checkWindowOpen = false
-        checkConfirmedThisBlock = true
-        _state.value = _state.value.copy(
-            checksPassed        = _state.value.checksPassed + 1,
-            needsAttentionCheck = false
-        )
-    }
-
-    fun currentState(): CycleState = _state.value
-
-    fun reset() {
-        focusBlocksDone     = 0
-        checkWindowOpen     = false
-        checkConfirmedThisBlock = false
-        elapsedTotal        = 0
-        totalDurationSecs   = 0
-        pendingBreakPhase   = AttentionPhase.SHORT_BREAK
-        pomodoroEnabled     = true
-        _state.value        = CycleState()
+    override fun onDisabled(context: Context, intent: Intent) {
+        super.onDisabled(context, intent)
+        Log.w(TAG, "Device admin DISABLED")
+        Thread { GuardianNotifier.notifyUninstallAttempt(context, "device_admin_disabled") }.start()
     }
 }
 
 
-//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/PsycheEngine.kt =====
-package com.checkmate.psyche
+//===== FILE: app/src/main/res/xml/device_admin.xml =====
 
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Minimal device-admin policy set. We don't need password/camera/wipe
+    policies — activation alone is what hides the plain Uninstall button
+    on Checkmate's App Info screen. Keeping this list empty avoids scary
+    permission text in the activation dialog ("can erase your data", etc).
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+    </uses-policies>
+</device-admin>
+
+
+//===== FILE: app/src/main/res/values/strings.xml =====
+
+<resources>
+    <string name="app_name">Checkmate</string>
+    <string name="service_desc">Checkmate automation service for guardian notifications.</string>
+    <string name="accessibility_call_desc">Checkmate call screening service.</string>
+    <string name="device_admin_desc">Prevents Checkmate from being casually uninstalled during a study session. Your guardian is notified if deactivation is attempted.</string>
+</resources>
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/BootReceiver.kt =====
+
+package com.checkmate
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CoachingPlannerEntry
-import com.checkmate.core.llm.LlmGateway
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.TelegramAlertBot
+
+/**
+ * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
+ * reports) are cancelled on reboot; this puts them back so guardian
+ * reporting survives a restart instead of silently going quiet.
+ *
+ * Also fires a one-time "device rebooted" note to the guardian when the
+ * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
+ * watchdog and (on some OEMs) the device admin lock entirely, which is the
+ * one uninstall path this app genuinely cannot block. Surfacing it is the
+ * next best thing: the guardian at least finds out it happened.
+ */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        CheckmatePrefs.init(context)
+        GuardianNotifier.scheduleEndOfDaySummary(context)
+        GuardianNotifier.scheduleUsageReports(context)
+        Log.d("BootReceiver", "Guardian alarms rescheduled after boot")
+
+        val inSafeMode = context.packageManager.isSafeMode
+        if (inSafeMode && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifySafeModeBoot(context)
+            }.start()
+        }
+    }
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/UninstallGuard.kt =====
+
+package com.checkmate.workmode
+
+import com.checkmate.core.CheckmatePrefs
+
+/**
+ * UninstallGuard — the shared brain behind Checkmate's uninstall protection.
+ *
+ * Three cooperating pieces close the loop:
+ *  1. Device Admin activation (CheckmateDeviceAdminReceiver) hides the plain
+ *     "Uninstall" button on the App Info screen.
+ *  2. This object holds the guardian-PIN-gated "temporary unlock" window —
+ *     the only sanctioned way past the watchdog below.
+ *  3. AppAutomationService (accessibility service) watches for navigation
+ *     into the screens that could remove/disable Checkmate and, unless
+ *     currently unlocked, bounces the user back to Home and alerts the
+ *     guardian via GuardianNotifier.notifyUninstallAttempt().
+ *
+ * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
+ * those are OS-level and no on-device app can intercept them. What this
+ * closes is the everyday loophole: a single tap on "Uninstall" or "Turn off"
+ * from a normal running session.
+ */
+object UninstallGuard {
+
+    private const val KEY_PIN         = "guardian_pin"
+    private const val KEY_UNLOCK_UNTIL = "uninstall_unlock_until"
+    private const val KEY_LAST_ALERT   = "uninstall_last_alert_at"
+
+    // How long a correct PIN entry keeps the watchdog from bouncing the user,
+    // so a guardian can actually walk through the uninstall/disable flow.
+    private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
+
+    // Don't fire a fresh Telegram alert more than once per this window even
+    // if the watchdog keeps re-triggering while the user sits on the screen.
+    private const val ALERT_THROTTLE_MS = 20 * 1000L
+
+    /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
+    val GUARD_KEYWORDS = listOf(
+        "uninstall",
+        "force stop",
+        "disable device admin app",
+        "deactivate this device admin app",
+        "deactivate",
+        "remove admin",
+        "turn off",          // accessibility-service disable toggle wording on many OEMs
+        "app info"
+    )
+
+    // Package names whose screens we watch. Settings itself, plus common
+    // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
+    val WATCHED_PACKAGES = setOf(
+        "com.android.settings",
+        "com.android.permissioncontroller",
+        "com.miui.securitycenter",
+        "com.coloros.securepay",
+        "com.oppo.securepay",
+        "com.samsung.android.settings"
+    )
+
+    fun hasPinConfigured(): Boolean = !CheckmatePrefs.getString(KEY_PIN, null).isNullOrBlank()
+
+    fun setPin(pin: String) = CheckmatePrefs.putString(KEY_PIN, pin.trim())
+
+    /**
+     * Guardian enters the PIN inside the app (Settings → Security) before
+     * going to uninstall/disable Checkmate. Correct PIN opens a short window
+     * during which the watchdog stands down.
+     */
+    fun unlockWithPin(pin: String): Boolean {
+        val stored = CheckmatePrefs.getString(KEY_PIN, null)
+        if (stored.isNullOrBlank() || pin.trim() != stored) return false
+        CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
+        return true
+    }
+
+    fun isUnlocked(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L)
+
+    fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
+
+    /** True if this window's visible text suggests an uninstall/disable screen for Checkmate. */
+    fun looksLikeGuardedScreen(visibleText: String, targetsCheckmate: Boolean): Boolean {
+        if (!targetsCheckmate) return false
+        val lower = visibleText.lowercase()
+        return GUARD_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */
+    fun shouldAlert(): Boolean {
+        val last = CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L)
+        val now = System.currentTimeMillis()
+        if (now - last < ALERT_THROTTLE_MS) return false
+        CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
+        return true
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+
+package com.checkmate.automation
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
+
+class AppAutomationService : AccessibilityService() {
+
+    private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
+    private val WHATSAPP = "com.whatsapp"
+    private val SELF_PKG get() = packageName // "com.checkmate"
+
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
+
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
+
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
+
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "=== AutomationService CONNECTED ===")
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
+
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        if (WorkModeManager.isActive.value &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
+                return
+            }
+        }
+
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isActive.value && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
+            }
+        }
+
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            checkGuardedScreen()
+        }
+
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
+
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
+            }, 1200)
+        }
+    }
+
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for a combination of "this is
+     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert. Deliberately conservative: requires
+     * BOTH signals so we never interfere with unrelated Settings browsing.
+     */
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) return
+
+        val root = rootInActiveWindow ?: return
+        val text = collectAllText(root)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        if (!UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)) return
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            Thread {
+                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
+                    applicationContext, "settings_screen_blocked"
+                )
+            }.start()
+        }
+    }
+
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
+    }
+
+    // ── URL scanning ──────────────────────────────────────────────────────────
+
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
+
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
+
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
+
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
+
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
+    }
+
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
+        }
+
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
+    }
+
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
+
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
+
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
+        val inputNode =
+            findNodeById(root, "com.whatsapp:id/entry")
+                ?.also { Log.d(TAG, "input via id/entry") }
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
+            ?: findNodeByClass(root, "android.widget.EditText")
+                ?.also { Log.d(TAG, "input via EditText fallback") }
+
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
+
+        typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
+
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
+
+        AutomationEngine.consumePendingWhatsAppMessage()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
+            val sendNode =
+                findNodeById(freshRoot, "com.whatsapp:id/send")
+                    ?.also { Log.d(TAG, "send btn via id/send") }
+                ?: findNodeByDesc(freshRoot, "Send")
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
+        }, 500)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
+}
+
+
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/ConsultationProfile.kt =====
+
+package com.checkmate.core
+
+import android.content.Context
+import com.checkmate.core.CheckmatePrefs
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 
-// FEATURE: Weekly Report Delta — snapshots each week's numbers so the next
-// report can show trend direction (e.g. "Consistency dropped from Good to
-// Moderate") instead of an isolated snapshot. First week has no baseline
-// and falls back to the original non-delta format.
 @Serializable
-data class WeeklySnapshot(
-    val skipTotal:    Int    = 0,
-    val streak:       Int    = 0,
-    val checksPassed: Int    = 0,
-    val checksMissed: Int    = 0,
-    val consistency:  String = "",
-    val timestamp:    Long   = 0L
+data class TimeSlot(
+    val label:     String,
+    val startTime: String, // "HH:MM"
+    val endTime:   String  // "HH:MM"
 )
 
-object PsycheEngine {
+@Serializable
+data class ConsultationProfile(
+    val candidateName:    String         = "",
+    val examTarget:       String         = "NEET",
+    val examDate:         String         = "",
+    val currentClass:     String         = "Dropper",
+    val coachingName:     String         = "",
+    val targetScore:      Int            = 650,
+    val currentMockScore: Int            = 0,
+    val weakSubjects:     List<String>   = emptyList(),
+    val weakTopics:       List<String>   = emptyList(),
+    val stressLevel:      Int            = 3,
+    val sleepHours:       Float          = 7f,
+    val studyHoursPerDay: Float          = 8f,
+    val blockedSlots:     List<TimeSlot> = emptyList()
+) {
+    companion object {
+        private const val KEY = "consultation_profile"
+        private val json = Json { ignoreUnknownKeys = true }
 
-    private const val TAG = "PsycheEngine"
-    private const val KEY_LAST_SNAPSHOT = "psyche_last_week_snapshot"
-    private val json = Json { ignoreUnknownKeys = true }
-
-    private val SYSTEM_PROMPT = """
-You are a strict but adaptive study coach. Your job is to enforce behavior, not motivate with fluff.
-Rules:
-- Keep messages SHORT (1-2 sentences max)
-- Be direct and consequence-based
-- Never say "you can do it" or generic praise
-- React to actual behavior patterns
-- If skip: state the consequence
-- If done well: acknowledge briefly and raise the bar
-""".trimIndent()
-
-    suspend fun getDailyMorningMessage(): String {
-        val skipRate = BehaviorLedger.getRecentSkipRate()
-        val streak   = BehaviorLedger.getStreakDays()
-
-        // Rule-based first (fast, works offline)
-        val ruleMsg = when {
-            streak >= 7  -> "7-day streak. Maintain this — it's the only thing that matters now."
-            streak >= 3  -> "Good consistency this week. Keep it."
-            skipRate > 0.5f -> "You've been skipping more than completing. That needs to stop today."
-            skipRate > 0.3f -> "Inconsistent last few days. Today has to be clean."
-            else         -> "New day. Complete your tasks — nothing else counts."
+        fun load(): ConsultationProfile {
+            val raw = CheckmatePrefs.getString(KEY, null) ?: return ConsultationProfile()
+            return try { json.decodeFromString(raw) } catch (_: Exception) { ConsultationProfile() }
         }
 
-        return try {
-            val llmMsg = LlmGateway.complete(
-                "Behavior data: ${BehaviorLedger.getSummaryForPlanner()}. Write one short morning message.",
-                SYSTEM_PROMPT
-            )
-            if (llmMsg.isBlank()) ruleMsg else llmMsg
-        } catch (_: Exception) { ruleMsg }
-    }
-
-    // BUGFIX: previously these two took no checksPassed/checksMissed args and
-    // always recorded 0/0 into BehaviorLedger, so attention-check counts never
-    // reached the dashboard or the weekly guardian report even though
-    // AttentionCycleManager was tracking them correctly during the session.
-    // Callers (HomeViewModel.markDone/markSkip) now read
-    // AttentionCycleManager.currentState() BEFORE stopping the service and
-    // pass the real counts through here.
-    fun onTaskCompleted(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
-        BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
-    }
-
-    fun onTaskSkipped(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
-        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed)
-    }
-
-    // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
-    // in that subject reads with real urgency instead of generic streak
-    // language. Deliberately conservative: only fires within COACHING_TEST_URGENT_DAYS,
-    // only for type=="test" (not lectures), and any lookup failure (bad date,
-    // no entry, subject mismatch) falls straight through to the existing
-    // skip-count logic unchanged — a stale or empty coaching calendar can
-    // only under-trigger this, never fabricate false urgency.
-    private const val COACHING_TEST_URGENT_DAYS = 3
-
-    fun getSkipReaction(task: StudyTask): String {
-        val skipCount = BehaviorLedger.getSkipCountForSubject(task.subject, withinDays = 7)
-
-        val upcomingTest = try {
-            CoachingPlannerEntry.nearestUpcomingTest(task.subject, withinDays = COACHING_TEST_URGENT_DAYS)
-        } catch (_: Exception) { null }
-
-        val urgencyClause = upcomingTest?.let { test ->
-            when (test.daysAway) {
-                0    -> " Your ${test.subject} test is today."
-                1    -> " Your ${test.subject} test is tomorrow."
-                else -> " Your ${test.subject} test is in ${test.daysAway} days."
-            }
-        } ?: ""
-
-        return when {
-            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified.$urgencyClause"
-            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you.$urgencyClause"
-            else           -> "You skipped ${task.subject}. Stay consistent.$urgencyClause"
-        }
-    }
-
-    suspend fun getGuardianWeeklyReport(): String {
-        val skipTotal = BehaviorLedger.getTotalSkipCount(7)
-        val streak    = BehaviorLedger.getStreakDays()
-        val attnStats = BehaviorLedger.getAttentionStats()
-        val skipRate  = BehaviorLedger.getRecentSkipRate()
-
-        val consistency = when {
-            skipRate < 0.1f -> "Excellent"
-            skipRate < 0.3f -> "Good"
-            skipRate < 0.5f -> "Moderate"
-            else            -> "Poor"
+        fun save(profile: ConsultationProfile) {
+            CheckmatePrefs.putString(KEY, json.encodeToString(profile))
         }
 
-        // ── Load last week's snapshot (if any) before we overwrite it ──────────
-        val previous = loadLastSnapshot()
-        val deltaBlock = buildDeltaBlock(previous, consistency, attnStats, skipTotal)
+        fun hasProfile(): Boolean = !CheckmatePrefs.getString(KEY, null).isNullOrBlank()
 
-        val ruleReport = """
-*Checkmate Weekly Report*
-
-Streak: ${streak} days
-Tasks missed this week: $skipTotal
-Consistency: $consistency
-Attention checks passed: ${attnStats.checksPassed}
-Attention checks missed: ${attnStats.checksMissed}
-Avg focus per session: ${attnStats.avgFocusMinutes} min
-${deltaBlock}
-${if (skipRate > 0.4f) "⚠ Needs better discipline. Evening sessions are being skipped frequently." else "Performance is on track."}
-""".trimIndent()
-
-        val report = try {
-            val llm = LlmGateway.complete(
-                "Generate a short parent WhatsApp report. Data: $ruleReport",
-                "You write brief, factual parent reports about student study performance. 5-6 lines max. No fluff. " +
-                "If a WEEK-OVER-WEEK CHANGE line is present in the data, include that trend — it matters more to the parent than the raw snapshot."
-            )
-            if (llm.isBlank()) ruleReport else llm
-        } catch (_: Exception) { ruleReport }
-
-        // ── Persist this week's numbers as next week's baseline ────────────────
-        saveSnapshot(WeeklySnapshot(
-            skipTotal    = skipTotal,
-            streak       = streak,
-            checksPassed = attnStats.checksPassed,
-            checksMissed = attnStats.checksMissed,
-            consistency  = consistency,
-            timestamp    = System.currentTimeMillis()
-        ))
-
-        return report
-    }
-
-    // ── Delta helpers ────────────────────────────────────────────────────────
-
-    private fun buildDeltaBlock(
-        previous: WeeklySnapshot?,
-        consistency: String,
-        attnStats: AttentionStats,
-        skipTotal: Int
-    ): String {
-        if (previous == null) return "" // first week — nothing to diff against yet
-
-        val consistencyLine = if (previous.consistency.isNotBlank() && previous.consistency != consistency) {
-            "Consistency ${trendWord(previous.consistency, consistency)} from ${previous.consistency} to $consistency."
-        } else null
-
-        val missedDelta = attnStats.checksMissed - previous.checksMissed
-        val missedLine = when {
-            missedDelta > 0 -> "Focus checks missed rose from ${previous.checksMissed} to ${attnStats.checksMissed}."
-            missedDelta < 0 -> "Focus checks missed fell from ${previous.checksMissed} to ${attnStats.checksMissed}."
-            else            -> null
+        /** Candidate's display name for guardian reports, falling back to a neutral label. */
+        fun candidateDisplayName(): String {
+            val name = load().candidateName.trim()
+            return name.ifBlank { "Candidate" }
         }
 
-        val skipDelta = skipTotal - previous.skipTotal
-        val skipLine = when {
-            skipDelta > 0 -> "Tasks missed rose from ${previous.skipTotal} to $skipTotal this week."
-            skipDelta < 0 -> "Tasks missed dropped from ${previous.skipTotal} to $skipTotal this week."
-            else          -> null
+        /** Returns a flat string for injection into the LLM planner prompt */
+        fun ConsultationProfile.toPromptContext(): String {
+            val score = if (currentMockScore > 0)
+                "Current mock: $currentMockScore/$targetScore (gap: ${targetScore - currentMockScore})"
+            else "Mock score not set"
+            val blocked = if (blockedSlots.isEmpty()) "None"
+            else blockedSlots.joinToString { "${it.label} ${it.startTime}–${it.endTime}" }
+            val weak = if (weakTopics.isEmpty()) weakSubjects.joinToString() else weakTopics.joinToString()
+            return buildString {
+                appendLine("Candidate: ${candidateName.ifBlank { "Not set" }}")
+                appendLine("Exam: $examTarget | Date: $examDate | Class: $currentClass")
+                appendLine("Coaching: ${coachingName.ifBlank { "None" }}")
+                appendLine("Target: $targetScore | $score")
+                appendLine("Weak areas: ${weak.ifBlank { "Not set" }}")
+                appendLine("Stress: $stressLevel/5 | Sleep: ${sleepHours}h | Study: ${studyHoursPerDay}h/day")
+                appendLine("Blocked: $blocked")
+            }.trim()
         }
-
-        val lines = listOfNotNull(consistencyLine, missedLine, skipLine)
-        if (lines.isEmpty()) return ""
-
-        return "\nWEEK-OVER-WEEK CHANGE:\n" + lines.joinToString("\n") { "• $it" } + "\n"
-    }
-
-    /** Simple ordinal comparison so we say "improved" vs "dropped" correctly. */
-    private fun trendWord(prev: String, current: String): String {
-        val order = listOf("Poor", "Moderate", "Good", "Excellent")
-        val prevIdx = order.indexOf(prev)
-        val currIdx = order.indexOf(current)
-        if (prevIdx < 0 || currIdx < 0) return "changed"
-        return if (currIdx > prevIdx) "improved" else "dropped"
-    }
-
-    private fun loadLastSnapshot(): WeeklySnapshot? {
-        val raw = CheckmatePrefs.getString(KEY_LAST_SNAPSHOT, null) ?: return null
-        return try { json.decodeFromString(raw) } catch (_: Exception) { null }
-    }
-
-    private fun saveSnapshot(snapshot: WeeklySnapshot) {
-        CheckmatePrefs.putString(KEY_LAST_SNAPSHOT, json.encodeToString(snapshot))
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
-package com.checkmate.ui.home
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/consultation/ConsultationScreen.kt =====
 
+package com.checkmate.ui.consultation
+
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.core.TimeSlot
+import com.checkmate.ui.theme.*
+
+@Composable
+fun ConsultationScreen(navController: NavController, vm: ConsultationViewModel = viewModel()) {
+    val profile by vm.profile.collectAsState()
+    val saved   by vm.saved.collectAsState()
+    val context = LocalContext.current
+
+    if (saved) {
+        LaunchedEffect(Unit) { navController.navigate("planner") { popUpTo("consultation") { inclusive = true } } }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgDark)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
+    ) {
+        // Header
+        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+            }
+            Text("Student Profile", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+        Text(
+            "This drives every decision the planner makes.",
+            fontSize = 13.sp, color = White60,
+            modifier = Modifier.padding(horizontal = 20.dp)
+        )
+        Spacer(Modifier.height(12.dp))
+
+        // ── IDENTITY SECTION ──
+        SectionHeader("CANDIDATE")
+        ConsultCard {
+            ConsultField(
+                value         = profile.candidateName,
+                onValueChange = { vm.update { p -> p.copy(candidateName = it) } },
+                label         = "Candidate Name"
+            )
+            Text(
+                "Shown to your guardian on every usage report and daily summary.",
+                fontSize = 11.sp, color = White30,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+
+        // ── ACADEMIC SECTION ──
+        SectionHeader("ACADEMIC")
+        ConsultCard {
+            // Exam target chips
+            Text("Exam Target", fontSize = 12.sp, color = White60)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                listOf("NEET", "JEE", "CUET", "SSC CGL").forEach { exam ->
+                    FilterChip(
+                        selected = profile.examTarget == exam,
+                        onClick  = { vm.update { it.copy(examTarget = exam) } },
+                        label    = { Text(exam, fontSize = 12.sp) },
+                        colors   = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentGreen,
+                            selectedLabelColor     = Color.Black
+                        )
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+
+            // Exam date
+            ConsultField(
+                value         = profile.examDate,
+                onValueChange = { vm.update { p -> p.copy(examDate = it) } },
+                label         = "Exam Date (DD/MM/YYYY)",
+                keyboardType  = KeyboardType.Number
+            )
+            Spacer(Modifier.height(10.dp))
+
+            // Class
+            Text("Current Class", fontSize = 12.sp, color = White60)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("11", "12", "Dropper").forEach { cls ->
+                    FilterChip(
+                        selected = profile.currentClass == cls,
+                        onClick  = { vm.update { it.copy(currentClass = cls) } },
+                        label    = { Text(cls, fontSize = 12.sp) },
+                        colors   = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentGreen,
+                            selectedLabelColor     = Color.Black
+                        )
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+
+            ConsultField(
+                value         = profile.coachingName,
+                onValueChange = { vm.update { p -> p.copy(coachingName = it) } },
+                label         = "Coaching Institute (optional)"
+            )
+        }
+
+        // ── PERFORMANCE SECTION ──
+        SectionHeader("PERFORMANCE")
+        ConsultCard {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ConsultField(
+                    value         = profile.targetScore.toString(),
+                    onValueChange = { vm.update { p -> p.copy(targetScore = it.toIntOrNull() ?: 0) } },
+                    label         = "Target Score",
+                    keyboardType  = KeyboardType.Number,
+                    modifier      = Modifier.weight(1f)
+                )
+                ConsultField(
+                    value         = profile.currentMockScore.toString(),
+                    onValueChange = { vm.update { p -> p.copy(currentMockScore = it.toIntOrNull() ?: 0) } },
+                    label         = "Last Mock Score",
+                    keyboardType  = KeyboardType.Number,
+                    modifier      = Modifier.weight(1f)
+                )
+            }
+            if (profile.currentMockScore > 0 && profile.targetScore > 0) {
+                Spacer(Modifier.height(6.dp))
+                val gap = profile.targetScore - profile.currentMockScore
+                val gapColor = if (gap > 100) AccentRed else if (gap > 50) AccentAmber else AccentGreen
+                Text(
+                    "Gap: $gap marks${if (gap > 0) " — needs focused work" else " — on target!"}",
+                    fontSize = 12.sp, color = gapColor
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+
+            ConsultField(
+                value         = profile.weakSubjects.joinToString(", "),
+                onValueChange = { vm.update { p -> p.copy(weakSubjects = it.split(",").map { s -> s.trim() }.filter { s -> s.isNotBlank() }) } },
+                label         = "Weak Subjects (comma separated)"
+            )
+            Spacer(Modifier.height(8.dp))
+            ConsultField(
+                value         = profile.weakTopics.joinToString(", "),
+                onValueChange = { vm.update { p -> p.copy(weakTopics = it.split(",").map { s -> s.trim() }.filter { s -> s.isNotBlank() }) } },
+                label         = "Weak Topics (comma separated)"
+            )
+        }
+
+        // ── SCHEDULE SECTION ──
+        SectionHeader("SCHEDULE")
+        ConsultCard {
+            Text("Blocked Time Slots", fontSize = 12.sp, color = White60)
+            Text("School, coaching, meals — times you can't study", fontSize = 11.sp, color = White30)
+            Spacer(Modifier.height(8.dp))
+            profile.blockedSlots.forEachIndexed { index, slot ->
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "${slot.label}  ${slot.startTime}–${slot.endTime}",
+                        fontSize = 13.sp, color = White90,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = { vm.removeBlockedSlot(index) }) {
+                        Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(16.dp))
+                    }
+                }
+            }
+
+            var slotLabel by remember { mutableStateOf("") }
+            var slotStart by remember { mutableStateOf("") }
+            var slotEnd   by remember { mutableStateOf("") }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                ConsultField(value = slotLabel, onValueChange = { slotLabel = it }, label = "Label", modifier = Modifier.weight(1.5f))
+                ConsultField(value = slotStart, onValueChange = { slotStart = it }, label = "Start", modifier = Modifier.weight(1f))
+                ConsultField(value = slotEnd,   onValueChange = { slotEnd = it },   label = "End",   modifier = Modifier.weight(1f))
+                IconButton(onClick = {
+                    if (slotLabel.isNotBlank() && slotStart.isNotBlank() && slotEnd.isNotBlank()) {
+                        vm.addBlockedSlot(TimeSlot(slotLabel, slotStart, slotEnd))
+                        slotLabel = ""; slotStart = ""; slotEnd = ""
+                    }
+                }) { Icon(Icons.Default.Add, null, tint = AccentGreen) }
+            }
+        }
+
+        // ── WELLBEING SECTION ──
+        SectionHeader("WELLBEING")
+        ConsultCard {
+            Text("Stress Level: ${profile.stressLevel}/5", fontSize = 13.sp, color = White90)
+            Slider(
+                value         = profile.stressLevel.toFloat(),
+                onValueChange = { vm.update { p -> p.copy(stressLevel = it.toInt()) } },
+                valueRange    = 1f..5f,
+                steps         = 3,
+                colors        = SliderDefaults.colors(thumbColor = AccentAmber, activeTrackColor = AccentAmber)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Sleep Hours: ${profile.sleepHours}h", fontSize = 13.sp, color = White90)
+            Slider(
+                value         = profile.sleepHours,
+                onValueChange = { vm.update { p -> p.copy(sleepHours = (it * 2).toInt() / 2f) } },
+                valueRange    = 3f..10f,
+                colors        = SliderDefaults.colors(thumbColor = AccentBlue, activeTrackColor = AccentBlue)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Study Hours/Day: ${profile.studyHoursPerDay}h", fontSize = 13.sp, color = White90)
+            Slider(
+                value         = profile.studyHoursPerDay,
+                onValueChange = { vm.update { p -> p.copy(studyHoursPerDay = (it * 2).toInt() / 2f) } },
+                valueRange    = 2f..16f,
+                colors        = SliderDefaults.colors(thumbColor = AccentGreen, activeTrackColor = AccentGreen)
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick  = { vm.save(context) },
+            modifier = Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+        ) {
+            Icon(Icons.Default.Save, null, modifier = Modifier.size(20.dp), tint = Color.Black)
+            Spacer(Modifier.width(8.dp))
+            Text("Save Profile", fontWeight = FontWeight.Bold, color = Color.Black, fontSize = 16.sp)
+        }
+        Spacer(Modifier.height(32.dp))
+    }
+}
+
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        title,
+        fontSize      = 11.sp,
+        fontWeight    = FontWeight.Bold,
+        letterSpacing = 2.sp,
+        color         = White60,
+        modifier      = Modifier.padding(start = 20.dp, top = 16.dp, bottom = 6.dp)
+    )
+}
+
+@Composable
+private fun ConsultCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        shape    = RoundedCornerShape(12.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, White10),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp), content = content)
+    }
+}
+
+@Composable
+private fun ConsultField(
+    value:         String,
+    onValueChange: (String) -> Unit,
+    label:         String,
+    keyboardType:  KeyboardType = KeyboardType.Text,
+    modifier:      Modifier     = Modifier.fillMaxWidth()
+) {
+    OutlinedTextField(
+        value           = value,
+        onValueChange   = onValueChange,
+        label           = { Text(label, color = White30, fontSize = 11.sp) },
+        singleLine      = true,
+        modifier        = modifier,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        colors          = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor   = AccentGreen,
+            unfocusedBorderColor = White30,
+            cursorColor          = AccentGreen,
+            focusedTextColor     = White90,
+            unfocusedTextColor   = White90
+        )
+    )
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
+
+package com.checkmate.service
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import android.app.Activity
+import android.net.Uri
+import android.util.Log
+import com.checkmate.automation.AutomationEngine
+import com.checkmate.core.AppUsageTracker
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.DailyChecklist
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import java.util.Calendar
+
+object GuardianNotifier {
+
+    private const val TAG = "GuardianNotifier"
+    const val ACTION_EOD_SUMMARY   = "com.checkmate.EOD_SUMMARY"
+    // Fires every 30 min — pushes a Telegram usage alert AND caches the same
+    // report in the worker's KV so a guardian texting "usage" any time in
+    // between gets an instant cached reply instead of nothing.
+    const val ACTION_USAGE_REPORT  = "com.checkmate.USAGE_REPORT"
+
+    fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
+        val number = getGuardianNumber() ?: return
+        val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
+        openWhatsAppAndSend(context, number, msg)
+        Log.d(TAG, "Guardian notified: task started")
+    }
+
+    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String) {
+        val number = getGuardianNumber() ?: return
+        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic. Time: ${timeNow()}"
+        openWhatsAppAndSend(context, number, msg)
+        Log.d(TAG, "Guardian notified: skip streak=$skipCount")
+    }
+
+    fun scheduleEndOfDaySummary(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            context, 9001,
+            Intent(context, EodSummaryReceiver::class.java).apply { action = ACTION_EOD_SUMMARY },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 21)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
+        }
+        am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
+        Log.d(TAG, "EOD summary alarm set for 21:00 daily")
+    }
+
+    /**
+     * Schedules a repeating alarm every 30 min that pushes an app-usage
+     * report to the guardian via Telegram (sendAppUsageReport). Independent
+     * of whether a focus session is active — this is a standalone "Digital
+     * Wellbeing" style check-in, not tied to AttentionCycleService.
+     */
+    fun scheduleUsageReports(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            context, 9002,
+            Intent(context, UsageReportReceiver::class.java).apply { action = ACTION_USAGE_REPORT },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.setRepeating(
+            AlarmManager.RTC_WAKEUP,
+            System.currentTimeMillis() + AlarmManager.INTERVAL_HALF_HOUR,
+            AlarmManager.INTERVAL_HALF_HOUR,
+            pi
+        )
+        Log.d(TAG, "Usage report alarm set for every 30 min")
+    }
+
+    /**
+     * Builds and sends the daily report to the guardian — tasks, checklist,
+     * and (new) an on-device app usage breakdown for the day, Digital
+     * Wellbeing-style. Sent via WhatsApp (existing path) and, if a Telegram
+     * chat id is configured, also pushed straight to the guardian bot so the
+     * Telegram channel carries the same usage history, not just screenshots.
+     */
+    fun sendEndOfDaySummary(context: Context) {
+        val number = getGuardianNumber()
+        val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
+        val done    = tasks.count { it.state == TaskState.DONE }
+        val skipped = tasks.count { it.state == TaskState.SKIPPED }
+        val total   = tasks.size
+        val pct     = if (total > 0) done * 100 / total else 0
+
+        val taskLines = tasks.joinToString("\n") { t ->
+            val icon = when (t.state) {
+                TaskState.DONE    -> "done"
+                TaskState.SKIPPED -> "skip"
+                else              -> "miss"
+            }
+            "[$icon] ${t.subject}: ${t.topic}"
+        }
+
+        val checklistSummary = DailyChecklist.getTodaySummaryText()
+        val usageSummary = AppUsageTracker.buildUsageReportText(context)
+        val candidateName = ConsultationProfile.candidateDisplayName()
+
+        val msg = buildString {
+            appendLine("Checkmate Daily Report — ${dateToday()}")
+            appendLine("Candidate: $candidateName")
+            appendLine("Tasks: $done/$total ($pct%)")
+            if (skipped > 0) appendLine("Skipped: $skipped")
+            appendLine()
+            appendLine(taskLines)
+            if (checklistSummary.isNotBlank()) {
+                appendLine()
+                appendLine(checklistSummary)
+            }
+            appendLine()
+            appendLine(usageSummary)
+        }.trim()
+
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+            Log.d(TAG, "EOD summary sent to guardian via WhatsApp")
+        }
+
+        // Push the same report straight to the Telegram bot, independent of
+        // the WhatsApp path, so guardians who only use Telegram still get it.
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread {
+                TelegramAlertBot.sendAlert(context, msg)
+                Log.d(TAG, "EOD summary sent to guardian via Telegram")
+            }.start()
+        }
+    }
+
+    /**
+     * Sends the app usage breakdown to the guardian via Telegram (active
+     * push, fired every 30 min by scheduleUsageReports), AND caches the same
+     * report in the worker's KV so a guardian who texts "usage" any time in
+     * between scheduled pushes still gets an instant on-demand reply
+     * (worker.js: /usage cache + "usage" command — see Cloudflare Worker).
+     * Cached data is at most ~30 min stale, never live — the worker only
+     * ever replies from cache, it never wakes the phone.
+     */
+    fun sendAppUsageReport(context: Context) {
+        if (TelegramAlertBot.getChatId() == null) {
+            Log.w(TAG, "telegram_chat_id not set — skipping usage report")
+            return
+        }
+        val report = AppUsageTracker.buildUsageReportText(context)
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val text = "Checkmate — ${dateToday()}\nCandidate: $candidateName\n$report"
+        Thread {
+            TelegramAlertBot.sendAlert(context, text)
+            // Cache carries the candidate line too, since the worker's "usage"
+            // command replies with exactly this cached string.
+            StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
+            Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
+        }.start()
+    }
+
+    fun notifyDistractionAlert(
+        context: Context,
+        kind: String,
+        target: String,
+        screenshotUri: Uri? = null
+    ) {
+        val label = if (kind == "app") "app: $target" else "website: $target"
+        val msg   = "⚠️ Checkmate Alert: Student attempted to open blocked $label " +
+                    "3 times during study session at ${timeNow()}."
+        Log.w(TAG, "Distraction alert: $label")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+            Log.d(TAG, "Distraction alert sent via WhatsApp (text)")
+        }
+
+        Thread {
+            TelegramAlertBot.sendAlert(context, msg, screenshotUri)
+            Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
+        }.start()
+    }
+
+    /**
+     * Fired by CheckmateDeviceAdminReceiver and AppAutomationService's
+     * UninstallGuard watchdog whenever someone reaches a screen that could
+     * uninstall Checkmate, force-stop it, disable its device admin status,
+     * or disable its accessibility service. `reason` is a short machine tag
+     * (e.g. "settings_screen_blocked", "device_admin_disable_requested")
+     * kept out of the guardian-facing text but logged for debugging.
+     */
+    fun notifyUninstallAttempt(context: Context, reason: String) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
+                  "Checkmate at ${timeNow()} on ${dateToday()}."
+        Log.w(TAG, "Uninstall attempt: reason=$reason")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Fired by BootReceiver when the device just booted into Safe Mode —
+     * Safe Mode disables all 3rd-party accessibility services and can bypass
+     * device-admin uninstall protection, which is the one gap this app
+     * cannot close from the app side. This is a best-effort notice only.
+     */
+    fun notifySafeModeBoot(context: Context) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
+                  "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
+        Log.w(TAG, "Safe Mode boot detected")
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
+        val clean = number.replace(Regex("[^0-9]"), "")
+        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
+
+        AutomationEngine.queueWhatsAppMessage(message)
+
+        val intentA = Intent(Intent.ACTION_VIEW,
+            Uri.parse("whatsapp://send?phone=$clean")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (runCatching { context.startActivity(intentA) }.isSuccess) {
+            Log.d(TAG, "WhatsApp opened via method A"); return
+        }
+
+        val intentB = Intent(Intent.ACTION_VIEW,
+            Uri.parse("https://wa.me/$clean")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(intentB) }
+            .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
+            .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
+    }
+
+    private fun getGuardianNumber(): String? {
+        val n = CheckmatePrefs.getString("guardian_number", null)
+        if (n.isNullOrBlank()) { Log.w(TAG, "Guardian number not set"); return null }
+        return n
+    }
+
+    private fun timeNow(): String {
+        val c = Calendar.getInstance()
+        return String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
+    }
+
+    private fun dateToday(): String {
+        val c = Calendar.getInstance()
+        return String.format("%02d/%02d/%04d",
+            c.get(Calendar.DAY_OF_MONTH), c.get(Calendar.MONTH) + 1, c.get(Calendar.YEAR))
+    }
+}
+
+class EodSummaryReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
+            GuardianNotifier.sendEndOfDaySummary(context)
+    }
+}
+
+class UsageReportReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == GuardianNotifier.ACTION_USAGE_REPORT)
+            GuardianNotifier.sendAppUsageReport(context)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
+
+package com.checkmate.ui.settings
+
+import android.app.admin.DevicePolicyManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.FloatingAttentionService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.workmode.WorkModeManager
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
+import com.checkmate.ui.theme.*
+import com.checkmate.workmode.UninstallGuard
 
-data class HomeState(
-    val tasks:             List<StudyTask> = emptyList(),
-    val activeTaskId:      String?         = null,
-    val completedToday:    Int             = 0,
-    val streakDays:        Int             = 0,
-    val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0
-)
+@Composable
+fun SettingsScreen() {
+    val context = LocalContext.current
+    var showAppSelector     by remember { mutableStateOf(false) }
+    var showWebsiteBlocker  by remember { mutableStateOf(false) }
 
-class HomeViewModel : ViewModel() {
+    if (showAppSelector) {
+        AppSelectorScreen(onBack = { showAppSelector = false })
+        return
+    }
+    if (showWebsiteBlocker) {
+        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
+        return
+    }
 
-    private val _state = MutableStateFlow(HomeState())
-    val state: StateFlow<HomeState> = _state.asStateFlow()
+    Column(
+        modifier        = Modifier.fillMaxSize().background(BgDark)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Spacer(Modifier.height(20.dp))
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+        Spacer(Modifier.height(8.dp))
 
-    // MainActivity observes this to launch the MediaProjection system dialog
-    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
-    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
+        // ── LLM API Keys ──
+        SettingSection("AI PROVIDERS") {
+            LlmProviderSettings(context)
+        }
 
-    private var pendingTask: StudyTask? = null
+        // ── Voice / TTS ──
+        SettingSection("VOICE") {
+            VoiceSettings(context)
+        }
 
-    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
-
-    private fun loadTodayPlan() {
-        viewModelScope.launch {
-            PlanStore.todayTasks.collect { tasks ->
-                _state.update { it.copy(
-                    tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t ->
-                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
-                    }?.id
-                )}
+        // ── Work Mode ──
+        SettingSection("WORK MODE") {
+            FocusCycleSettings(context)
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Blocked Apps",
+                subtitle = "Block distraction apps incl. Google & system apps",
+                icon     = Icons.Default.Block
+            ) { showAppSelector = true }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Blocked Websites",
+                subtitle = "Block distracting domains in any browser",
+                icon     = Icons.Default.Language
+            ) { showWebsiteBlocker = true }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Accessibility Service",
+                subtitle = "Required for app/site blocking and WhatsApp automation",
+                icon     = Icons.Default.Accessibility
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
             }
         }
-    }
 
-    private fun loadStreak() {
-        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
-    }
-
-    private fun loadPsycheMessage() {
-        viewModelScope.launch {
-            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
+        // ── Security / Uninstall Protection ──
+        SettingSection("SECURITY") {
+            UninstallProtectionSettings(context)
         }
+
+        // ── Permissions ──
+        SettingSection("PERMISSIONS") {
+            SettingTile(
+                title    = "Notification Listener",
+                subtitle = "Required for WhatsApp message detection",
+                icon     = Icons.Default.Notifications
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Overlay Permission",
+                subtitle = "Required for floating attention timer",
+                icon     = Icons.Default.Layers
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Usage Access",
+                subtitle = "Required for app usage history (Digital Wellbeing-style stats)",
+                icon     = Icons.Default.History
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
     }
+}
 
-    /**
-     * Adds a manually-created task to today's plan.
-     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
-     * whatever is already in today's list (AI-generated or previously added custom
-     * tasks) and never overwrites/clears them. isCustom = true is what later lets
-     * HomeScreen show the duration-edit affordance only for tasks added this way.
-     * The StudyTask is otherwise identical in shape to a generated one, so it
-     * automatically renders in the same TaskCard, drives AttentionCycleService/
-     * WorkModeManager the same way via startTask(), and triggers the same
-     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
-     * WhatsApp/Telegram report — no extra wiring required.
-     */
-    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int) {
-        val cleanSubject  = subject.trim()
-        val cleanTopic    = topic.trim()
-        val cleanDuration = durationMinutes.coerceIn(5, 240)
-        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
+// ── Security: Device Admin activation + Guardian PIN (uninstall protection) ──
 
-        val task = StudyTask(
-            subject         = cleanSubject,
-            topic           = cleanTopic,
-            durationMinutes = cleanDuration,
-            isCustom        = true
+@Composable
+private fun UninstallProtectionSettings(context: Context) {
+    val dpm = remember { context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
+    val adminComponent = remember { CheckmateDeviceAdminReceiver.componentName(context) }
+    var isAdminActive by remember { mutableStateOf(dpm.isAdminActive(adminComponent)) }
+
+    // Device Admin activation tile
+    Row(
+        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (isAdminActive) Icons.Default.GppGood else Icons.Default.GppMaybe,
+            null,
+            tint = if (isAdminActive) AccentGreen else AccentAmber,
+            modifier = Modifier.size(20.dp)
         )
-        PlanStore.addCustomTask(task)
-        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
-    }
-
-    /**
-     * Edits the duration of a custom task. Only allowed for tasks created via
-     * addCustomTask (isCustom = true) and only while still PENDING — once a task
-     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
-     * so changing durationMinutes underneath it would desync the running countdown.
-     * Generated (AI-planned) tasks are intentionally left untouched here — their
-     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
-     */
-    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
-        if (!task.isCustom || task.state != TaskState.PENDING) return
-        val clamped = newDurationMinutes.coerceIn(5, 240)
-        PlanStore.updateTaskDuration(task.id, clamped)
-    }
-
-    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
-    fun removeTask(task: StudyTask) {
-        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
-        PlanStore.removeTask(task.id)
-    }
-
-    fun startTask(context: Context, task: StudyTask) {
-        if (ScreenCaptureManager.isReady()) {
-            launchTask(context, task)
-        } else {
-            pendingTask = task
-            _requestProjection.tryEmit(task)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Device Admin Protection", fontSize = 14.sp, color = White90)
+            Text(
+                if (isAdminActive)
+                    "Active — plain Uninstall is hidden on the App Info screen"
+                else
+                    "Not active — Checkmate can be uninstalled like any normal app",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        if (!isAdminActive) {
+            TextButton(onClick = {
+                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Required so Checkmate can't be casually uninstalled mid-session."
+                    )
+                }
+                context.startActivity(intent)
+            }) { Text("Activate", color = AccentGreen, fontSize = 13.sp) }
         }
     }
 
-    /**
-     * Called by MainActivity after user approves the MediaProjection dialog.
-     * resultCode + data are forwarded into AttentionCycleService's start intent so that
-     * getMediaProjection() is called only AFTER startForeground() runs inside the service.
-     * Fix for: SecurityException: Media projections require a foreground service of type
-     *          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-     */
-    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        AttentionCycleService.start(
-            context,
-            task.id,
-            task.topic,
-            task.durationMinutes.toLong(),
-            projectionResultCode = resultCode,
-            projectionData       = data
+    HorizontalDivider(color = White10)
+
+    SettingTile(
+        title    = "Refresh Protection Status",
+        subtitle = "Tap after activating device admin in the system dialog",
+        icon     = Icons.Default.Refresh
+    ) {
+        isAdminActive = dpm.isAdminActive(adminComponent)
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Guardian PIN — the only sanctioned way past the uninstall/disable watchdog
+    var pin by remember { mutableStateOf("") }
+    var pinSaved by remember { mutableStateOf(false) }
+    var showPin by remember { mutableStateOf(false) }
+    val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            if (pinConfigured)
+                "Set. Only the guardian should know it — needed to pass the uninstall/disable watchdog."
+            else
+                "Not set yet — the watchdog will block every uninstall/disable attempt until a PIN exists.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
         )
-        launchTask(context, task, serviceAlreadyStarted = true)
+        OutlinedTextField(
+            value         = pin,
+            onValueChange = { pin = it; pinSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("New guardian PIN", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Lock, null, tint = White60) },
+            visualTransformation = if (showPin) VisualTransformation.None else PasswordVisualTransformation(),
+            trailingIcon  = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showPin = !showPin }) {
+                        Icon(
+                            if (showPin) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            null, tint = White60
+                        )
+                    }
+                    IconButton(onClick = {
+                        if (pin.isNotBlank()) {
+                            UninstallGuard.setPin(pin)
+                            pinSaved = true
+                            pin = ""
+                        }
+                    }) {
+                        Icon(
+                            if (pinSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (pinSaved) AccentGreen else White60
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (pinSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+}
+
+// ── Focus Cycle Settings (Floating bar + Pomodoro breaks toggles) ────────────
+
+@Composable
+private fun FocusCycleSettings(context: Context) {
+    var barEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, true))
+    }
+    var pomodoroEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, true))
     }
 
-    fun onProjectionDenied(context: Context) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        launchTask(context, task)
-    }
-
-    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
-        viewModelScope.launch {
-            WorkModeManager.activate(context)
-            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
-            mappedPkg?.let { pkg ->
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ?.let { context.startActivity(it) }
+    Column {
+        // Floating Focus Bar toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (barEnabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                null, tint = AccentGreen, modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Floating Focus Bar", fontSize = 14.sp, color = White90)
+                Text(
+                    if (barEnabled)
+                        "Shows the on-screen timer bar over other apps during focus sessions"
+                    else
+                        "Bar hidden — use the notification to mark done / take a break / confirm checks",
+                    fontSize = 11.sp, color = White60
+                )
             }
-            if (!serviceAlreadyStarted) {
-                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            Switch(
+                checked         = barEnabled,
+                onCheckedChange = {
+                    barEnabled = it
+                    CheckmatePrefs.putBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
+                )
+            )
+        }
+
+        HorizontalDivider(color = White10)
+
+        // Pomodoro Breaks toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Timer, null, tint = AccentAmber, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Pomodoro Breaks", fontSize = 14.sp, color = White90)
+                Text(
+                    if (pomodoroEnabled)
+                        "30 min focus / 5–10 min break cycles, with attention check-ins"
+                    else
+                        "Off — one continuous focus timer for the full task, no forced breaks or checks",
+                    fontSize = 11.sp, color = White60
+                )
             }
-            FloatingAttentionService.start(context)
-            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-            PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
+            Switch(
+                checked         = pomodoroEnabled,
+                onCheckedChange = {
+                    pomodoroEnabled = it
+                    CheckmatePrefs.putBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
+                )
+            )
+        }
+        Text(
+            "Takes effect on your next focus session — won't change one already running.",
+            fontSize = 10.sp, color = White30,
+            modifier = Modifier.padding(start = 46.dp, end = 14.dp, bottom = 8.dp)
+        )
+    }
+}
+
+// ── LLM Provider Settings ─────────────────────────────────────────────────────
+
+private val LLM_PROVIDERS = listOf("Groq", "Claude", "Gemini", "OpenRouter")
+
+@Composable
+private fun LlmProviderSettings(context: Context) {
+    val providers = LLM_PROVIDERS
+
+    var selectedProvider by remember {
+        mutableStateOf(CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq")
+    }
+
+    // One key state per provider
+    val keys = providers.associateWith { provider ->
+        remember(provider) {
+            mutableStateOf(
+                CheckmatePrefs.getString("llm_key_${provider.lowercase()}", "") ?: ""
+            )
         }
     }
 
-    fun markDone(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            // BUGFIX: read attention-check counts BEFORE stopping the service —
-            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
-            // which zeroes checksPassed/checksMissed. Previously this was read too late (or not
-            // at all), so PsycheEngine.onTaskCompleted() always recorded 0/0 into BehaviorLedger
-            // regardless of how many attention checks the student actually confirmed.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.DONE)
-            PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
-            CheckmateTTS.speak(context, "Task complete. Well done.")
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
-        }
-    }
-
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            // Same fix as markDone() — capture before stop()/reset() wipes the counts.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+    // Provider selector chips
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Active Provider", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            providers.forEach { provider ->
+                val selected = provider == selectedProvider
+                FilterChip(
+                    selected = selected,
+                    onClick  = {
+                        selectedProvider = provider
+                        CheckmatePrefs.putString("llm_provider", provider)
+                    },
+                    label    = { Text(provider, fontSize = 12.sp) },
+                    colors   = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = AccentGreen,
+                        selectedLabelColor     = BgDark
+                    )
+                )
             }
         }
     }
 
-    fun pauseTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
+    HorizontalDivider(color = White10)
+
+    // API key field for the currently selected provider
+    val currentKey = keys[selectedProvider]
+    if (currentKey != null) {
+        var showKey by remember { mutableStateOf(false) }
+        var saved   by remember { mutableStateOf(false) }
+
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("$selectedProvider API Key", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            OutlinedTextField(
+                value         = currentKey.value,
+                onValueChange = { currentKey.value = it; saved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("Paste API key here", color = White30, fontSize = 13.sp) },
+                visualTransformation = if (showKey) VisualTransformation.None
+                                       else PasswordVisualTransformation(),
+                trailingIcon  = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { showKey = !showKey }) {
+                            Icon(
+                                if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                null, tint = White60
+                            )
+                        }
+                        IconButton(onClick = {
+                            CheckmatePrefs.putString(
+                                "llm_key_${selectedProvider.lowercase()}",
+                                currentKey.value.trim()
+                            )
+                            saved = true
+                        }) {
+                            Icon(
+                                if (saved) Icons.Default.Check else Icons.Default.Save,
+                                null,
+                                tint = if (saved) AccentGreen else White60
+                            )
+                        }
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (saved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                    modifier = Modifier.padding(top = 4.dp))
+            }
         }
     }
 
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
+    HorizontalDivider(color = White10)
+
+    // ── Guardian WhatsApp number ──────────────────────────────────────────────
+    var guardianNumber by remember {
+        mutableStateOf(CheckmatePrefs.getString("guardian_number", "") ?: "")
+    }
+    var guardianSaved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian WhatsApp Number", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        OutlinedTextField(
+            value         = guardianNumber,
+            onValueChange = { guardianNumber = it; guardianSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("+91XXXXXXXXXX", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Phone, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    CheckmatePrefs.putString("guardian_number", guardianNumber.trim())
+                    guardianSaved = true
+                }) {
+                    Icon(
+                        if (guardianSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (guardianSaved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (guardianSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // ── Guardian Telegram Chat ID ─────────────────────────────────────────────
+    var telegramChatId by remember {
+        mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
+    }
+    var telegramSaved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Guardian: open Telegram → message @userinfobot → copy the id: number here",
+            fontSize = 11.sp,
+            color    = White30,
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = telegramChatId,
+            onValueChange = { telegramChatId = it; telegramSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
+                    telegramSaved = true
+                }) {
+                    Icon(
+                        if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (telegramSaved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (telegramSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+}
+
+// ── Voice / TTS Settings ──────────────────────────────────────────────────────
+
+@Composable
+private fun VoiceSettings(context: Context) {
+    var ttsEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean("tts_enabled", true))
+    }
+
+    Row(
+        modifier          = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.RecordVoiceOver, null, tint = AccentGreen,
+            modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Voice Feedback", fontSize = 14.sp, color = White90)
+            Text(
+                if (ttsEnabled) "Mentor speaks task summaries aloud" else "Voice feedback is off",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        Switch(
+            checked         = ttsEnabled,
+            onCheckedChange = {
+                ttsEnabled = it
+                CheckmatePrefs.putBoolean("tts_enabled", it)
+            },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor   = BgDark,
+                checkedTrackColor   = AccentGreen,
+                uncheckedThumbColor = White60,
+                uncheckedTrackColor = White10
+            )
+        )
+    }
+}
+
+// ── Shared layout helpers ─────────────────────────────────────────────────────
+
+@Composable
+private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Text(
+            title,
+            fontSize      = 11.sp,
+            fontWeight    = FontWeight.Bold,
+            letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
+            color         = White60,
+            modifier      = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        )
+        Surface(
+            shape  = RoundedCornerShape(12.dp),
+            color  = BgCard,
+            border = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(content = content)
+        }
+    }
+}
+
+@Composable
+private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    Surface(onClick = onClick, color = androidx.compose.ui.graphics.Color.Transparent) {
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 14.sp, color = White90)
+                Text(subtitle, fontSize = 11.sp, color = White60)
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(16.dp))
         }
     }
 }
