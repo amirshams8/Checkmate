@@ -21,6 +21,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.LaunchedEffect
 import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
@@ -28,6 +29,105 @@ import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.ui.theme.*
 import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeSchedule
+import kotlinx.coroutines.delay
+
+// ── Guardian lock gate for Work Mode settings ─────────────────────────────────
+//
+// Wraps any Work Mode-related settings (Blocked Apps, Blocked Websites, the
+// Focus Cycle toggles) that must not be editable by the student while
+// blocking is enforced — either because a focus session is running or
+// because the hardcoded 19:00-02:00 window (WorkModeSchedule) is live.
+// Shows a PIN-unlock prompt instead of [content] until a correct guardian
+// PIN is entered, reusing UninstallGuard's existing PIN/hash/lockout flow
+// so there's still exactly one PIN, and the student never sees it either
+// way.
+@Composable
+fun WorkModeLockGate(content: @Composable () -> Unit) {
+    val context = LocalContext.current
+
+    // Poll every second - settingsLocked() depends on wall-clock time (the
+    // schedule) and on UninstallGuard's unlock-window expiry, neither of
+    // which trigger recomposition on their own.
+    var tick by remember { mutableStateOf(0L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            tick = System.currentTimeMillis()
+        }
+    }
+    val locked = remember(tick) { WorkModeManager.settingsLocked() }
+
+    if (!locked) {
+        content()
+        return
+    }
+
+    var pin by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    var statusColor by remember { mutableStateOf(AccentRed) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Lock, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
+        }
+        Text(
+            "Blocked Apps, Blocked Websites, and Focus Cycle settings are locked while " +
+                "a focus session or the daily ${WorkModeSchedule.LABEL} window is active.",
+            fontSize = 11.sp, color = White60,
+            modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
+        )
+        OutlinedTextField(
+            value         = pin,
+            onValueChange = { if (it.length <= 6) { pin = it; status = null } },
+            label         = { Text("Guardian PIN", color = White30) },
+            singleLine    = true,
+            modifier      = Modifier.fillMaxWidth(),
+            visualTransformation = PasswordVisualTransformation(),
+            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    when (val result = UninstallGuard.unlockWithPin(pin)) {
+                        is UninstallGuard.UnlockResult.Success -> {
+                            status = "Unlocked for 2 minutes"
+                            statusColor = AccentGreen
+                            pin = ""
+                            tick = System.currentTimeMillis()
+                        }
+                        is UninstallGuard.UnlockResult.WrongPin -> {
+                            status = "Incorrect PIN"
+                            statusColor = AccentRed
+                        }
+                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
+                            status = "No PIN generated yet - see Security settings"
+                            statusColor = AccentAmber
+                        }
+                        is UninstallGuard.UnlockResult.LockedOut -> {
+                            status = "Too many wrong attempts - locked for ${result.secondsLeft / 60}m"
+                            statusColor = AccentRed
+                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
+                        }
+                    }
+                }) {
+                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        status?.let {
+            Text(it, fontSize = 11.sp, color = statusColor, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+}
 
 @Composable
 fun SettingsScreen() {
@@ -67,19 +167,33 @@ fun SettingsScreen() {
 
         // ── Work Mode ──
         SettingSection("WORK MODE") {
-            FocusCycleSettings(context)
+            Text(
+                "Hardcoded daily block window: ${WorkModeSchedule.LABEL}. " +
+                    "This window isn't editable from the app — see your guardian to change it.",
+                fontSize = 11.sp, color = White60,
+                modifier = Modifier.padding(horizontal = 14.dp, top = 10.dp, bottom = 10.dp)
+            )
             HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Blocked Apps",
-                subtitle = "Block distraction apps incl. Google & system apps",
-                icon     = Icons.Default.Block
-            ) { showAppSelector = true }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Blocked Websites",
-                subtitle = "Block distracting domains in any browser",
-                icon     = Icons.Default.Language
-            ) { showWebsiteBlocker = true }
+            // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are
+            // read-only for the student while Work Mode is enforcing (an active
+            // session OR the hardcoded window) — closes the loophole where blocked
+            // apps get removed from the list mid-session. Only a guardian PIN
+            // unlock (same PIN used for uninstall protection) lifts the lock.
+            WorkModeLockGate {
+                FocusCycleSettings(context)
+                HorizontalDivider(color = White10)
+                SettingTile(
+                    title    = "Blocked Apps",
+                    subtitle = "Block distraction apps incl. Google & system apps",
+                    icon     = Icons.Default.Block
+                ) { showAppSelector = true }
+                HorizontalDivider(color = White10)
+                SettingTile(
+                    title    = "Blocked Websites",
+                    subtitle = "Block distracting domains in any browser",
+                    icon     = Icons.Default.Language
+                ) { showWebsiteBlocker = true }
+            }
             HorizontalDivider(color = White10)
             SettingTile(
                 title    = "Accessibility Service",

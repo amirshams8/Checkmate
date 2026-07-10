@@ -6,8 +6,11 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.TelegramAlertBot
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
 
 /**
  * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
@@ -25,9 +28,17 @@ class BootReceiver : BroadcastReceiver() {
         if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
 
         CheckmatePrefs.init(context)
+        CheckmateState.init(context)
         GuardianNotifier.scheduleEndOfDaySummary(context)
         GuardianNotifier.scheduleUsageReports(context)
-        Log.d("BootReceiver", "Guardian alarms rescheduled after boot")
+
+        // Re-arm Work Mode's hardcoded schedule: reconcile immediately (in
+        // case the reboot landed mid-window) and re-register the two daily
+        // boundary alarms, since AlarmManager repeating alarms are cleared
+        // on reboot just like the guardian-reporting ones above.
+        WorkModeManager.init(context)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(context)
+        Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
 
         val inSafeMode = context.packageManager.isSafeMode
         if (inSafeMode && TelegramAlertBot.getChatId() != null) {

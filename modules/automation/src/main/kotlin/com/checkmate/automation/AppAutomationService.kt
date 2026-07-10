@@ -69,6 +69,12 @@ class AppAutomationService : AccessibilityService() {
     private var typingAttempted = false
     private var lastWindowClass = ""
 
+    // Throttle for reconciling WorkModeManager against the hardcoded daily
+    // schedule (WorkModeSchedule) — cheap timestamp check, real work only
+    // happens at most once per 30s even though accessibility events can
+    // fire dozens of times a second.
+    private var lastScheduleCheckAt = 0L
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
@@ -78,8 +84,20 @@ class AppAutomationService : AccessibilityService() {
         if (event == null) return
         val pkg = event.packageName?.toString() ?: return
 
+        // ── Hardcoded schedule reconciliation ──────────────────────────────────
+        // Keeps Work Mode's forced 19:00-02:00 window enforced even if the
+        // student never starts a task, or if the process restarted mid-window
+        // and lost its in-memory isActive flag.
+        val now = System.currentTimeMillis()
+        if (now - lastScheduleCheckAt > 30_000L) {
+            lastScheduleCheckAt = now
+            WorkModeManager.evaluateSchedule(applicationContext)
+        }
+
         // ── Work Mode: blocked app check ─────────────────────────────────────
-        if (WorkModeManager.isActive.value &&
+        // isEnforcing() (not the raw isActive flag) so the hardcoded window
+        // blocks apps even when no manual task session is running.
+        if (WorkModeManager.isEnforcing() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
             val blockedApps = WorkModeManager.getBlockedApps()
@@ -92,7 +110,7 @@ class AppAutomationService : AccessibilityService() {
         }
 
         // ── Work Mode: blocked website check ─────────────────────────────────
-        if (WorkModeManager.isActive.value && pkg in BROWSER_PACKAGES) {
+        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 checkAndBlockUrl(pkg)

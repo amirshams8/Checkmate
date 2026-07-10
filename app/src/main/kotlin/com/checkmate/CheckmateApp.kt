@@ -11,6 +11,8 @@ import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
 
 class CheckmateApp : Application() {
     override fun onCreate() {
@@ -18,6 +20,13 @@ class CheckmateApp : Application() {
         CheckmatePrefs.init(this)
         CheckmateState.init(this)
         CheckmateTTS.init(this)
+
+        // Reconcile Work Mode with the hardcoded 19:00-02:00 daily schedule
+        // and re-arm the two daily boundary alarms (AlarmManager repeating
+        // alarms don't survive a reboot, hence also doing this in
+        // BootReceiver). This must run after CheckmateState.init() above.
+        WorkModeManager.init(this)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
         // Every 30 min: pushes an app-usage Telegram alert + caches it in the
         // worker's KV for the on-demand "usage" command (see worker.js).

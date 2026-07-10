@@ -20,6 +20,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.settings.WorkModeLockGate
 import com.checkmate.ui.theme.*
 
 // Common distracting sites shown as quick-add chips
@@ -72,6 +73,11 @@ fun WebsiteBlockerScreen(onBack: () -> Unit) {
                     fontSize = 11.sp, color = White60)
             }
         }
+
+        // Editing is locked out while Work Mode is enforcing (active session
+        // or the hardcoded daily window) unless a guardian PIN unlock is
+        // active. See WorkModeLockGate in SettingsScreen.kt.
+        WorkModeLockGate {
 
         // ── Add domain input ──────────────────────────────────────────────────
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
@@ -202,5 +208,6 @@ fun WebsiteBlockerScreen(onBack: () -> Unit) {
             }
             item { Spacer(Modifier.height(24.dp)) }
         }
+        } // WorkModeLockGate
     }
 }

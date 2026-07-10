@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.ui.settings.WorkModeLockGate
 import com.checkmate.ui.theme.*
 
 data class AppInfo(
@@ -84,6 +85,12 @@ fun AppSelectorScreen(onBack: () -> Unit) {
             }
             Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
         }
+
+        // Editing is locked out while Work Mode is enforcing (active session
+        // or the hardcoded daily window) unless a guardian PIN unlock is
+        // active — this is the fix for "remove the app from the block list,
+        // then open it" mid-session. See WorkModeLockGate in SettingsScreen.kt.
+        WorkModeLockGate {
 
         // ── Search ───────────────────────────────────────────────────────────
         OutlinedTextField(
@@ -219,5 +226,6 @@ fun AppSelectorScreen(onBack: () -> Unit) {
             }
             item { Spacer(Modifier.height(24.dp)) }
         }
+        } // WorkModeLockGate
     }
 }
