@@ -171,7 +171,7 @@ fun SettingsScreen() {
                 "Hardcoded daily block window: ${WorkModeSchedule.LABEL}. " +
                     "This window isn't editable from the app — see your guardian to change it.",
                 fontSize = 11.sp, color = White60,
-                modifier = Modifier.padding(horizontal = 14.dp, top = 10.dp, bottom = 10.dp)
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
             )
             HorizontalDivider(color = White10)
             // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are
