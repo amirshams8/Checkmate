@@ -165,7 +165,9 @@ class AppAutomationService : AccessibilityService() {
         val lower = text.lowercase()
 
         val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
-        if (!UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)) return
+        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
+        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt) return
 
         Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
         performGlobalAction(GLOBAL_ACTION_HOME)

@@ -75,6 +75,22 @@ object UninstallGuard {
         "com.samsung.android.settings"
     )
 
+    // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
+    // on both the activate AND deactivate device-admin paths. It never
+    // mentions "Checkmate" by name (it's the OS's generic copy for ANY
+    // device-admin app), so it can't ride the targetsCheckmate gate that
+    // GUARD_KEYWORDS uses below — matched name-agnostically instead.
+    val DEVICE_ADMIN_PROMPT_KEYWORDS = listOf(
+        "activate device admin apps",
+        "deactivate device admin app"
+    )
+
+    /** True if this window is the OS-level activate/deactivate device-admin prompt (with or without the app named). */
+    fun isDeviceAdminPrompt(visibleText: String): Boolean {
+        val lower = visibleText.lowercase()
+        return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
+    }
+
     /**
      * Injected by CheckmateApp.onCreate so :workmode (and :automation, which
      * calls this object) never directly references GuardianNotifier.
