@@ -75,8 +75,9 @@ fun WorkModeLockGate(content: @Composable () -> Unit) {
             Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
         }
         Text(
-            "Blocked Apps, Blocked Websites, and Focus Cycle settings are locked while " +
-                "a focus session or the daily ${WorkModeSchedule.LABEL} window is active.",
+            "Blocked Apps, Blocked Websites, Focus Cycle, and the Guardian Telegram Chat ID " +
+                "are locked once a guardian PIN is set — not just during a focus session or the " +
+                "daily ${WorkModeSchedule.LABEL} window. Enter the PIN to make changes.",
             fontSize = 11.sp, color = White60,
             modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
         )
@@ -651,50 +652,58 @@ private fun LlmProviderSettings(context: Context) {
     HorizontalDivider(color = White10)
 
     // ── Guardian Telegram Chat ID ─────────────────────────────────────────────
-    var telegramChatId by remember {
-        mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
-    }
-    var telegramSaved by remember { mutableStateOf(false) }
+    // Locked the same way as Blocked Apps / Blocked Websites / Focus Cycle —
+    // reuses WorkModeLockGate (same PIN/unlock flow, defined above in this
+    // file). Open on first launch (no PIN configured yet) so the guardian
+    // can do initial setup, then locked permanently — independent of
+    // session/schedule state — until the guardian PIN is entered. Without
+    // this, a student could just repoint alerts to their own Telegram chat.
+    WorkModeLockGate {
+        var telegramChatId by remember {
+            mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
+        }
+        var telegramSaved by remember { mutableStateOf(false) }
 
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            "Guardian: open Telegram → message @userinfobot → copy the id: number here",
-            fontSize = 11.sp,
-            color    = White30,
-            modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = telegramChatId,
-            onValueChange = { telegramChatId = it; telegramSaved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
-                    telegramSaved = true
-                }) {
-                    Icon(
-                        if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (telegramSaved) AccentGreen else White60
-                    )
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                "Guardian: open Telegram → message @userinfobot → copy the id: number here",
+                fontSize = 11.sp,
+                color    = White30,
+                modifier = Modifier.padding(bottom = 6.dp)
             )
-        )
-        if (telegramSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                modifier = Modifier.padding(top = 4.dp))
+            OutlinedTextField(
+                value         = telegramChatId,
+                onValueChange = { telegramChatId = it; telegramSaved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
+                        telegramSaved = true
+                    }) {
+                        Icon(
+                            if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (telegramSaved) AccentGreen else White60
+                        )
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (telegramSaved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                    modifier = Modifier.padding(top = 4.dp))
+            }
         }
     }
 }

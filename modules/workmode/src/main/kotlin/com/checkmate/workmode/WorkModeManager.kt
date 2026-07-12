@@ -78,12 +78,19 @@ object WorkModeManager {
 
     /**
      * True when Work Mode settings (Blocked Apps, Blocked Websites, Focus
-     * Cycle toggles) must be read-only in the UI. The only way past this is
-     * a guardian PIN unlock — the same UninstallGuard mechanism that gates
-     * uninstall protection, so there's still exactly one PIN, and the
-     * student never sees it either way.
+     * Cycle toggles, Guardian Telegram Chat ID) must be read-only in the UI.
+     *
+     * Locked permanently as soon as a guardian PIN exists — NOT just while
+     * a session/the hardcoded window is enforcing. Before any PIN has been
+     * generated (first launch / initial setup) these stay open so the
+     * guardian can configure them once. After that, the only way past this
+     * gate is a guardian PIN unlock — the same UninstallGuard mechanism
+     * that gates uninstall protection, so there's still exactly one PIN,
+     * and the student never sees it either way. Tying this to enforcement
+     * state alone used to leave a window (outside 19:00-02:00, no active
+     * session) where these were freely editable; that loophole is now closed.
      */
-    fun settingsLocked(): Boolean = isEnforcing() && !UninstallGuard.isUnlocked()
+    fun settingsLocked(): Boolean = UninstallGuard.hasPinConfigured() && !UninstallGuard.isUnlocked()
 
     /**
      * Reconciles [isActive] with the hardcoded schedule. Call on app start,
