@@ -1,889 +1,449 @@
-//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/UninstallGuard.kt =====
-package com.checkmate.workmode
+//===== FILE: app/src/main/kotlin/com/jarvismini/voice/PorcupineWakeWordDetector.kt =====
+package com.jarvismini.voice
 
-import com.checkmate.core.CheckmatePrefs
-import java.security.MessageDigest
-import java.security.SecureRandom
+import ai.picovoice.porcupine.Porcupine
+import ai.picovoice.porcupine.PorcupineException
+import android.content.Context
+import android.util.Log
+
+/*
+===== GRADLE DEPENDENCY NEEDED (apply manually) =====
+
+Add this line inside the dependencies { } block of app/build.gradle.kts:
+
+    implementation("ai.picovoice:porcupine-android:3.0.3")
+
+(3.0.3 is the current latest stable release on Maven Central as of this
+session — mavenCentral() is almost certainly already in your repositories
+block since other dependencies in this project pull from it.)
+
+===== VERSION COMPATIBILITY WARNING =====
+
+Picovoice .ppn keyword files are version-locked to the Porcupine SDK/model
+version they were generated with. Since this is an OLDER .ppn file, it may
+fail to load against SDK 3.0.3 with a PorcupineInvalidArgumentException or
+similar at build() time. This class catches that and falls back safely
+(WakeWordService will drop back to RmsThresholdDetector — see below) instead
+of crashing, but if you see wake word detection silently not working, this
+version mismatch is the first thing to check. Fix options if it happens:
+  1. Regenerate the .ppn from the current Picovoice Console (requires login,
+     not the blocked signup flow — should work once you have an account).
+  2. Or pin the SDK to whatever version your .ppn was originally generated
+     with, if you know/remember it.
+*/
 
 /**
- * UninstallGuard — the shared brain behind Checkmate's uninstall protection.
+ * Real wake-word detector backed by Picovoice Porcupine, using your existing
+ * AccessKey + .ppn keyword file.
  *
- * IMPORTANT DESIGN NOTE: the guardian PIN is never typed in by hand and never
- * shown on screen. Whoever holds the phone can tap "Generate PIN", but the
- * PIN itself only ever reaches the guardian's Telegram chat — the device
- * stores only a SHA-256 hash, and the plaintext is never persisted or
- * displayed anywhere in the UI. This closes the obvious loophole where a
- * student sets their own PIN in a plaintext field: generating a new PIN is
- * harmless self-sabotage from the student's side, since they still never
- * learn what it is.
+ * Buffers incoming PCM internally into exact Porcupine frameLength chunks
+ * (512 samples @ 16kHz) since WakeWordService's AudioRecord read sizes won't
+ * naturally align with what Porcupine's native process() call requires.
  *
- * Three cooperating pieces close the uninstall loop:
- *  1. Device Admin activation (CheckmateDeviceAdminReceiver) hides the plain
- *     "Uninstall" button on the App Info screen.
- *  2. This object holds the guardian-PIN-gated "temporary unlock" window.
- *  3. AppAutomationService (accessibility service) watches for navigation
- *     into screens that could remove/disable Checkmate and, unless
- *     currently unlocked, bounces to Home and alerts the guardian.
- *
- * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
- * those are OS-level and no on-device app can intercept them.
+ * Expects the .ppn file at app/src/main/assets/<keywordAssetPath> — Porcupine's
+ * Android SDK accepts a path relative to the assets/ folder directly, no
+ * manual extraction needed.
  */
-object UninstallGuard {
+class PorcupineWakeWordDetector(
+    private val context: Context,
+    private val accessKey: String,
+    private val keywordAssetPath: String = "porcupine_jarvis.ppn",
+    private val sensitivity: Float = 0.6f
+) : WakeWordDetector {
 
-    private const val KEY_PIN_HASH        = "guardian_pin_hash"
-    private const val KEY_UNLOCK_UNTIL    = "uninstall_unlock_until"
-    private const val KEY_LAST_ALERT      = "uninstall_last_alert_at"
-    private const val KEY_LAST_GENERATED  = "guardian_pin_last_generated"
-    private const val KEY_FAIL_COUNT      = "guardian_pin_fail_count"
-    private const val KEY_LOCKOUT_UNTIL   = "guardian_pin_lockout_until"
-
-    // How long a correct PIN entry keeps the watchdog from bouncing the user,
-    // so a guardian can actually walk through the uninstall/disable flow.
-    private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
-
-    // Don't fire a fresh Telegram alert more than once per this window even
-    // if the watchdog keeps re-triggering while the user sits on the screen.
-    private const val ALERT_THROTTLE_MS = 20 * 1000L
-
-    // Minimum time between PIN (re)generations — stops a student from
-    // spamming "generate" to flood the guardian's Telegram.
-    private const val REGEN_COOLDOWN_MS = 5 * 60 * 1000L
-
-    // Brute-force protection on the unlock field itself.
-    private const val MAX_FAILED_ATTEMPTS = 5
-    private const val LOCKOUT_MS = 10 * 60 * 1000L
-
-    /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
-    val GUARD_KEYWORDS = listOf(
-        "uninstall",
-        "force stop",
-        "disable device admin app",
-        "deactivate this device admin app",
-        "deactivate",
-        "remove admin",
-        "turn off",          // accessibility-service disable toggle wording on many OEMs
-        "app info"
-    )
-
-    // Package names whose screens we watch. Settings itself, plus common
-    // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
-    val WATCHED_PACKAGES = setOf(
-        "com.android.settings",
-        "com.android.permissioncontroller",
-        "com.miui.securitycenter",
-        "com.coloros.securepay",
-        "com.oppo.securepay",
-        "com.samsung.android.settings"
-    )
-
-    // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
-    // on both the activate AND deactivate device-admin paths. It never
-    // mentions "Checkmate" by name (it's the OS's generic copy for ANY
-    // device-admin app), so it can't ride the targetsCheckmate gate that
-    // GUARD_KEYWORDS uses below — matched name-agnostically instead.
-    val DEVICE_ADMIN_PROMPT_KEYWORDS = listOf(
-        "activate device admin apps",
-        "deactivate device admin app"
-    )
-
-    /** True if this window is the OS-level activate/deactivate device-admin prompt (with or without the app named). */
-    fun isDeviceAdminPrompt(visibleText: String): Boolean {
-        val lower = visibleText.lowercase()
-        return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
+    companion object {
+        private const val TAG = "PorcupineDetector"
     }
 
-    /**
-     * Injected by CheckmateApp.onCreate so :workmode (and :automation, which
-     * calls this object) never directly references GuardianNotifier.
-     */
-    var listener: UninstallAlertListener? = null
+    private var porcupine: Porcupine? = null
+    private var accumulator: ShortArray = ShortArray(0)
 
-    // ── Result types ─────────────────────────────────────────────────────────
+    /** True once Porcupine has successfully initialized. WakeWordService checks
+     *  this after start() to decide whether to fall back to RmsThresholdDetector. */
+    var isReady: Boolean = false
+        private set
 
-    sealed class UnlockResult {
-        object Success : UnlockResult()
-        object WrongPin : UnlockResult()
-        object NoPinConfigured : UnlockResult()
-        data class LockedOut(val secondsLeft: Long, val justTriggered: Boolean) : UnlockResult()
+    override fun start() {
+        try {
+            porcupine = Porcupine.Builder()
+                .setAccessKey(accessKey)
+                .setKeywordPath(keywordAssetPath)
+                .setSensitivity(sensitivity)
+                .build(context)
+            accumulator = ShortArray(0)
+            isReady = true
+            Log.d(
+                TAG,
+                "Porcupine initialized OK — frameLength=${porcupine?.frameLength}, " +
+                    "sampleRate=${porcupine?.sampleRate}"
+            )
+        } catch (e: PorcupineException) {
+            Log.e(
+                TAG,
+                "Porcupine failed to initialize (likely .ppn/SDK version mismatch — " +
+                    "see version compatibility warning in this file's header): ${e.message}",
+                e
+            )
+            porcupine = null
+            isReady = false
+        }
     }
 
-    // ── PIN generation (device-side hash only — plaintext goes to guardian) ────
+    override fun processFrame(pcm: ShortArray, readCount: Int): Boolean {
+        val p = porcupine ?: return false
+        val frameLength = p.frameLength
 
-    fun hasPinConfigured(): Boolean = !CheckmatePrefs.getString(KEY_PIN_HASH, null).isNullOrBlank()
+        // Append newly read samples to leftover from the previous call.
+        val combined = ShortArray(accumulator.size + readCount)
+        System.arraycopy(accumulator, 0, combined, 0, accumulator.size)
+        System.arraycopy(pcm, 0, combined, accumulator.size, readCount)
 
-    fun generateRandomPin(): String {
-        val n = SecureRandom().nextInt(1_000_000)
-        return n.toString().padStart(6, '0')
-    }
+        var offset = 0
+        var detected = false
 
-    /** Stores only the hash. Also invalidates any active unlock window and clears lockout state. */
-    fun storeNewPinHash(pin: String) {
-        CheckmatePrefs.putString(KEY_PIN_HASH, hashPin(pin))
-        CheckmatePrefs.putLong(KEY_LAST_GENERATED, System.currentTimeMillis())
-        CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
-        CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-        CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, 0L)
-    }
+        while (combined.size - offset >= frameLength) {
+            val chunk = combined.copyOfRange(offset, offset + frameLength)
+            try {
+                val keywordIndex = p.process(chunk)
+                if (keywordIndex >= 0) {
+                    detected = true
+                }
+            } catch (e: PorcupineException) {
+                Log.e(TAG, "process() failed: ${e.message}", e)
+            }
+            offset += frameLength
+        }
 
-    fun canRegeneratePin(): Boolean {
-        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
-        return System.currentTimeMillis() - last >= REGEN_COOLDOWN_MS
-    }
-
-    fun regenCooldownRemainingSeconds(): Long {
-        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
-        val remaining = REGEN_COOLDOWN_MS - (System.currentTimeMillis() - last)
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    private fun hashPin(pin: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(pin.trim().toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    // ── Unlock flow (guardian enters the PIN they received on Telegram) ────────
-
-    fun isLockedOut(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L)
-
-    fun lockoutRemainingSeconds(): Long {
-        val remaining = CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L) - System.currentTimeMillis()
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    fun unlockWithPin(pin: String): UnlockResult {
-        if (!hasPinConfigured()) return UnlockResult.NoPinConfigured
-        if (isLockedOut()) return UnlockResult.LockedOut(lockoutRemainingSeconds(), justTriggered = false)
-
-        val stored = CheckmatePrefs.getString(KEY_PIN_HASH, null)
-        return if (hashPin(pin) == stored) {
-            CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
-            CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-            UnlockResult.Success
+        // Keep any leftover samples that didn't fill a full frame this round.
+        accumulator = if (offset < combined.size) {
+            combined.copyOfRange(offset, combined.size)
         } else {
-            val fails = CheckmatePrefs.getInt(KEY_FAIL_COUNT, 0) + 1
-            if (fails >= MAX_FAILED_ATTEMPTS) {
-                CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-                CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, System.currentTimeMillis() + LOCKOUT_MS)
-                UnlockResult.LockedOut(LOCKOUT_MS / 1000, justTriggered = true)
-            } else {
-                CheckmatePrefs.putInt(KEY_FAIL_COUNT, fails)
-                UnlockResult.WrongPin
-            }
+            ShortArray(0)
         }
+
+        return detected
     }
 
-    fun isUnlocked(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L)
-
-    fun unlockSecondsRemaining(): Long {
-        val remaining = CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L) - System.currentTimeMillis()
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
-
-    // ── Screen detection (used by AppAutomationService) ─────────────────────────
-
-    /** True if this window's visible text suggests an uninstall/disable screen for Checkmate. */
-    fun looksLikeGuardedScreen(visibleText: String, targetsCheckmate: Boolean): Boolean {
-        if (!targetsCheckmate) return false
-        val lower = visibleText.lowercase()
-        return GUARD_KEYWORDS.any { lower.contains(it) }
-    }
-
-    /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */
-    fun shouldAlert(): Boolean {
-        val last = CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L)
-        val now = System.currentTimeMillis()
-        if (now - last < ALERT_THROTTLE_MS) return false
-        CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
-        return true
+    override fun stop() {
+        porcupine?.delete()
+        porcupine = null
+        accumulator = ShortArray(0)
+        isReady = false
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
-package com.checkmate.automation
+//===== FILE: app/src/main/kotlin/com/jarvismini/voice/WakeWordService.kt =====
+package com.jarvismini.voice
 
-import android.accessibilityservice.AccessibilityService
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.net.Uri
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Build
+import android.os.IBinder
 import android.util.Log
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import java.util.ArrayDeque
+import androidx.core.app.NotificationCompat
+import com.jarvismini.agent.AgentRepository
+import com.jarvismini.core.JarvisPrefs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
-class AppAutomationService : AccessibilityService() {
+/**
+ * WakeWordService — always-on foreground service that listens for the wake
+ * word and, on detection, triggers a one-shot VoiceTriggerManager session
+ * (existing push-to-talk STT -> jarvis_conversation.py pipeline).
+ *
+ * AUTO-RUN: wake-word-triggered tasks execute immediately via
+ * AgentRepository.runTask() — no dashboard confirmation, no manual Run tap.
+ * Device address is read from JarvisPrefs("agent_device") — the same pref
+ * the Agent Dashboard's Device box persists to.
+ *
+ * DETECTOR (this session): now tries PorcupineWakeWordDetector first, using
+ * an AccessKey from JarvisPrefs("picovoice_access_key") and the .ppn file at
+ * assets/porcupine_jarvis.ppn (see PorcupineWakeWordDetector.kt for the
+ * exact asset path/filename — rename your .ppn to match, or change
+ * KEYWORD_ASSET_PATH below). Falls back to RmsThresholdDetector (loud-sound
+ * placeholder, NOT real wake word matching) if:
+ *   - no AccessKey is set in JarvisPrefs, or
+ *   - Porcupine fails to initialize (e.g. old .ppn / SDK version mismatch —
+ *     see the warning in PorcupineWakeWordDetector.kt)
+ * Check logcat for "PorcupineDetector" / "WakeWordService" tags to see which
+ * detector actually ended up active.
+ *
+ * Manifest requirements (add these — see notes at bottom of this file):
+ *   - <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+ *   - <service android:name=".voice.WakeWordService"
+ *              android:foregroundServiceType="microphone" />
+ *   (RECORD_AUDIO permission already exists in the manifest.)
+ *
+ * Gradle requirement: see the dependency block noted at the top of
+ * PorcupineWakeWordDetector.kt — must be added to app/build.gradle.kts.
+ */
+class WakeWordService : Service() {
 
-    private val TAG      = "WA_SEND"
-    private val GUARD_TAG = "UninstallGuard"
-    private val WHATSAPP = "com.whatsapp"
-    private val SELF_PKG get() = packageName // "com.checkmate"
+    companion object {
+        private const val TAG = "WakeWordService"
+        private const val CHANNEL_ID = "jarvis_wake_word"
+        private const val NOTIFICATION_ID = 4201
+        private const val DEFAULT_DEVICE = "192.168.29.48:40657"
+        private const val KEYWORD_ASSET_PATH = "porcupine_jarvis.ppn"
 
-    // ── Browser packages whose URL bar we scan for blocked domains ────────────
-    // All major browsers expose their address bar as an accessible text node.
-    private val BROWSER_PACKAGES = setOf(
-        "com.android.chrome",           // Chrome (system on most devices)
-        "com.chrome.beta",
-        "com.chrome.dev",
-        "com.chrome.canary",
-        "org.mozilla.firefox",
-        "org.mozilla.firefox_beta",
-        "org.mozilla.focus",
-        "com.microsoft.emmx",           // Edge
-        "com.brave.browser",
-        "com.opera.browser",
-        "com.opera.mini.native",
-        "com.sec.android.app.sbrowser", // Samsung Internet
-        "com.UCMobile.intl",            // UC Browser
-        "com.duckduckgo.mobile.android",
-        "mark.via.gp",                  // Via Browser
-        "com.kiwibrowser.browser"
-    )
-
-    // Address bar view IDs per browser package.
-    // Tried in order; first non-null text match wins.
-    private val URL_BAR_IDS = mapOf(
-        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
-        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
-        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
-        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
-        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
-                                                   "org.mozilla.firefox:id/url_bar_title"),
-        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
-        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
-        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
-        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
-        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
-        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
-        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
-    )
-    // Generic fallback content-descriptions used across unknown browsers
-    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
-
-    // Track last seen URL per browser package to avoid firing on every tiny content change
-    private val lastSeenUrl = mutableMapOf<String, String>()
-
-    // WhatsApp automation state
-    private var typingAttempted = false
-    private var lastWindowClass = ""
-
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        Log.d(TAG, "=== AutomationService CONNECTED ===")
+        // Guard against re-triggering while a VoiceTriggerManager session is
+        // already active (e.g. user is mid-conversation).
+        @Volatile
+        var listeningForCommand: Boolean = false
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        val pkg = event.packageName?.toString() ?: return
+    private var audioRecord: AudioRecord? = null
+    private var detector: WakeWordDetector = RmsThresholdDetector()
+    private var captureJob: Job? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-        // ── Work Mode: blocked app check ─────────────────────────────────────
-        if (WorkModeManager.isActive.value &&
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+    private var voiceTriggerManager: VoiceTriggerManager? = null
 
-            val blockedApps = WorkModeManager.getBlockedApps()
-            if (pkg in blockedApps) {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                // Record attempt — alert guardian on 3rd
-                DistractionGuard.recordAppAttempt(this, pkg)
-                return
-            }
-        }
-
-        // ── Work Mode: blocked website check ─────────────────────────────────
-        if (WorkModeManager.isActive.value && pkg in BROWSER_PACKAGES) {
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                checkAndBlockUrl(pkg)
-            }
-        }
-
-        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
-        // Runs regardless of Work Mode — uninstall protection is always on.
-        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
-            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
-            checkGuardedScreen()
-        }
-
-        // ── WhatsApp automation ───────────────────────────────────────────────
-        if (pkg != WHATSAPP) return
-        if (!AutomationEngine.hasPendingMessage()) return
-
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-
-        val cls = event.className?.toString() ?: ""
-        if (cls != lastWindowClass) {
-            typingAttempted = false
-            lastWindowClass = cls
-        }
-        if (typingAttempted) return
-
-        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
-        val found = tryTypeAndSend(root)
-        if (!found) {
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
-                rootInActiveWindow?.let { tryTypeAndSend(it) }
-            }, 1200)
-        }
-    }
-
-    // ── Uninstall / disable watchdog ────────────────────────────────────────────
-
-    /**
-     * Scans the current window's visible text for a combination of "this is
-     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
-     * If matched and no guardian PIN unlock is active, bounces to Home and
-     * fires a throttled guardian alert. Deliberately conservative: requires
-     * BOTH signals so we never interfere with unrelated Settings browsing.
-     */
-    private fun checkGuardedScreen() {
-        if (UninstallGuard.isUnlocked()) return
-
-        val root = rootInActiveWindow ?: return
-        val text = collectAllText(root)
-        val lower = text.lowercase()
-
-        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
-        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
-        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
-        if (!isNamedGuardedScreen && !isDeviceAdminPrompt) return
-
-        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
-        performGlobalAction(GLOBAL_ACTION_HOME)
-
-        if (UninstallGuard.shouldAlert()) {
-            Thread {
-                com.checkmate.service.GuardianNotifier.notifyUninstallAttempt(
-                    applicationContext, "settings_screen_blocked"
-                )
-            }.start()
-        }
-    }
-
-    /** Depth-first collection of all text + content-description on screen, space-joined. */
-    private fun collectAllText(root: AccessibilityNodeInfo): String {
-        val sb = StringBuilder()
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        var visited = 0
-        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
-            val node = stack.removeFirst()
-            visited++
-            node.text?.let { sb.append(it).append(' ') }
-            node.contentDescription?.let { sb.append(it).append(' ') }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return sb.toString()
-    }
-
-    // ── URL scanning ──────────────────────────────────────────────────────────
-
-    private fun checkAndBlockUrl(browserPkg: String) {
-        val root = rootInActiveWindow ?: return
-        val url  = extractUrl(root, browserPkg) ?: return
-
-        // Debounce: only act when URL actually changes
-        if (lastSeenUrl[browserPkg] == url) return
-        lastSeenUrl[browserPkg] = url
-
-        val hostname = parseHostname(url) ?: return
-        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
-
-        val blockedDomains = WorkModeManager.getBlockedDomains()
-        val matched = blockedDomains.firstOrNull { blocked ->
-            hostname == blocked || hostname.endsWith(".$blocked")
-        } ?: return
-
-        Log.w(TAG, "Blocked domain matched: $matched — going back")
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        // Record and potentially alert
-        DistractionGuard.recordDomainAttempt(this, matched)
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification("Listening for wake word..."))
+        voiceTriggerManager = VoiceTriggerManager(applicationContext)
+        detector = buildDetector()
+        startCapture()
     }
 
     /**
-     * Tries known view IDs for the browser first, then falls back to
-     * scanning all text nodes whose content-description suggests a URL bar.
+     * Picks PorcupineWakeWordDetector if an AccessKey is configured and it
+     * initializes successfully; otherwise falls back to the RMS placeholder
+     * so the service still runs (just without real wake-word matching).
      */
-    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
-        // Try known IDs for this browser
-        val ids = URL_BAR_IDS[pkg] ?: emptyList()
-        for (id in ids) {
-            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
-            val text = node?.text?.toString()?.trim()
-            if (!text.isNullOrBlank()) return text
+    private fun buildDetector(): WakeWordDetector {
+        val accessKey = JarvisPrefs.getString("picovoice_access_key")
+        if (accessKey.isNullOrBlank()) {
+            Log.w(
+                TAG,
+                "No AccessKey in JarvisPrefs(\"picovoice_access_key\") — " +
+                    "using RmsThresholdDetector placeholder. Set the key to enable real wake word."
+            )
+            return RmsThresholdDetector()
         }
 
-        // Generic fallback: find any node whose description sounds like an address bar
-        // and whose text looks like a URL
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            val desc = node.contentDescription?.toString() ?: ""
-            val text = node.text?.toString()?.trim() ?: ""
-            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
-                && looksLikeUrl(text)) {
-                return text
+        val porcupine = PorcupineWakeWordDetector(
+            context = applicationContext,
+            accessKey = accessKey,
+            keywordAssetPath = KEYWORD_ASSET_PATH
+        )
+        porcupine.start()
+        return if (porcupine.isReady) {
+            Log.d(TAG, "Using PorcupineWakeWordDetector (real wake word matching active)")
+            porcupine
+        } else {
+            Log.w(
+                TAG,
+                "Porcupine failed to initialize — falling back to RmsThresholdDetector " +
+                    "placeholder. Check PorcupineDetector logs above for the exact reason " +
+                    "(likely .ppn/SDK version mismatch)."
+            )
+            porcupine.stop()
+            RmsThresholdDetector()
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Sticky so the OS restarts this service if it gets killed — wake
+        // word detection is only useful if it's actually always running.
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        stopCapture()
+        voiceTriggerManager?.destroy()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    // ── Audio capture loop ──────────────────────────────────────────────────
+
+    @Suppress("MissingPermission") // RECORD_AUDIO checked before service is started
+    private fun startCapture() {
+        val sampleRate = WakeWordDetector.SAMPLE_RATE_HZ
+        val minBufSize = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufSize <= 0) {
+            Log.e(TAG, "Invalid AudioRecord buffer size, stopping service")
+            stopSelf()
+            return
+        }
+
+        val bufferSize = minBufSize * 2
+
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+        } catch (e: SecurityException) {
+            Log.e(TAG, "RECORD_AUDIO permission missing, stopping service", e)
+            stopSelf()
+            return
+        }
+
+        val record = audioRecord ?: return
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord failed to initialize, stopping service")
+            stopSelf()
+            return
+        }
+
+        detector.start()
+        record.startRecording()
+
+        captureJob = serviceScope.launch {
+            val pcm = ShortArray(bufferSize)
+            while (true) {
+                if (listeningForCommand) {
+                    kotlinx.coroutines.delay(200)
+                    continue
+                }
+
+                val readCount = record.read(pcm, 0, pcm.size)
+                if (readCount <= 0) continue
+
+                val detected = detector.processFrame(pcm, readCount)
+                if (detected) {
+                    Log.d(TAG, "Wake word detected — starting command capture")
+                    onWakeWordDetected()
+                }
             }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
-        return null
     }
 
-    private fun looksLikeUrl(text: String): Boolean {
-        if (text.isBlank() || text.length < 4) return false
-        return text.contains('.') &&
-               !text.contains(' ') &&
-               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
-    }
-
-    /**
-     * Parses the registered hostname from a raw URL string.
-     * "https://www.youtube.com/watch?v=..." → "youtube.com"
-     *
-     * Strips "www." so the stored domain "youtube.com" matches both
-     * "youtube.com" and "www.youtube.com".
-     */
-    private fun parseHostname(raw: String): String? {
-        return try {
-            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
-            val host = Uri.parse(withScheme).host ?: return null
-            host.removePrefix("www.").lowercase().trim()
-        } catch (_: Exception) { null }
-    }
-
-    // ── WhatsApp typing ───────────────────────────────────────────────────────
-
-    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
-        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
-        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
-
-        val inputNode =
-            findNodeById(root, "com.whatsapp:id/entry")
-                ?.also { Log.d(TAG, "input via id/entry") }
-            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
-                ?.also { Log.d(TAG, "input via id/conversation_entry") }
-            ?: findNodeByClass(root, "android.widget.EditText")
-                ?.also { Log.d(TAG, "input via EditText fallback") }
-
-        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
-
-        typingAttempted = true
-        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+    private fun stopCapture() {
+        captureJob?.cancel()
+        captureJob = null
+        detector.stop()
+        audioRecord?.let {
+            try {
+                it.stop()
+            } catch (_: IllegalStateException) {
+                // already stopped
+            }
+            it.release()
         }
-        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
-
-        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
-
-        AutomationEngine.consumePendingWhatsAppMessage()
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
-            val sendNode =
-                findNodeById(freshRoot, "com.whatsapp:id/send")
-                    ?.also { Log.d(TAG, "send btn via id/send") }
-                ?: findNodeByDesc(freshRoot, "Send")
-                    ?.also { Log.d(TAG, "send btn via desc") }
-            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                .also { Log.d(TAG, "send clicked: $it") }
-                ?: Log.e(TAG, "send button not found")
-        }, 500)
-
-        return true
+        audioRecord = null
     }
 
-    // ── Node finders ──────────────────────────────────────────────────────────
+    // ── Wake word -> command capture handoff ────────────────────────────────
 
-    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
-        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+    private fun onWakeWordDetected() {
+        listeningForCommand = true
+        updateNotification("Listening for command...")
 
-    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            if (node.className?.toString() == className && node.isEditable) return node
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        voiceTriggerManager?.start(
+            onReady = {
+                updateNotification("Listening...")
+            },
+            onResult = { _ ->
+                listeningForCommand = false
+                updateNotification("Listening for wake word...")
+            },
+            onError = { msg ->
+                Log.w(TAG, "Voice trigger error: $msg")
+                listeningForCommand = false
+                updateNotification("Listening for wake word...")
+            },
+            onTaskDetected = { task ->
+                Log.d(TAG, "Auto-running task from wake word: $task")
+                updateNotification("Running: $task")
+                val device = JarvisPrefs.getString("agent_device") ?: DEFAULT_DEVICE
+
+                serviceScope.launch(Dispatchers.Main) {
+                    AgentRepository.runTask(task, device)
+                        .onSuccess {
+                            AgentRepository.speak("Got it. Starting: $task")
+                        }
+                        .onFailure { e ->
+                            Log.w(TAG, "Auto-run failed: ${e.message}")
+                            AgentRepository.speak("Sorry, I couldn't start that task.")
+                        }
+                    listeningForCommand = false
+                    updateNotification("Listening for wake word...")
+                }
+            }
+        )
+    }
+
+    // ── Notification plumbing ───────────────────────────────────────────────
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Jarvis Wake Word",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Shows when Jarvis is listening for its wake word"
+                setShowBadge(false)
+            }
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
         }
-        return null
     }
 
-    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
-                && node.isClickable) return node
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return null
+    private fun buildNotification(text: String): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Jarvis")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
     }
 
-    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
+    private fun updateNotification(text: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(text))
+    }
 }
 
+/*
+===== MANIFEST CHANGES NEEDED (apply manually if not already done) =====
 
+1. Add this permission near the existing RECORD_AUDIO line:
 
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
-//===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
-package com.checkmate.automation
+2. Add this service declaration inside <application>...</application>:
 
-import android.accessibilityservice.AccessibilityService
-import android.content.Intent
-import android.net.Uri
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.util.Log
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import java.util.ArrayDeque
+    <service
+        android:name=".voice.WakeWordService"
+        android:foregroundServiceType="microphone"
+        android:exported="false" />
 
-class AppAutomationService : AccessibilityService() {
+===== HOW TO SET YOUR ACCESSKEY (no Settings UI field yet) =====
 
-    private val TAG      = "WA_SEND"
-    private val GUARD_TAG = "UninstallGuard"
-    private val WHATSAPP = "com.whatsapp"
-    private val SELF_PKG get() = packageName // "com.checkmate"
+Quickest way to set it once without building a Settings field: temporarily
+add this single line somewhere it'll run once (e.g. top of onCreate() in
+MainActivity), run the app once, then remove the line:
 
-    // ── Browser packages whose URL bar we scan for blocked domains ────────────
-    // All major browsers expose their address bar as an accessible text node.
-    private val BROWSER_PACKAGES = setOf(
-        "com.android.chrome",           // Chrome (system on most devices)
-        "com.chrome.beta",
-        "com.chrome.dev",
-        "com.chrome.canary",
-        "org.mozilla.firefox",
-        "org.mozilla.firefox_beta",
-        "org.mozilla.focus",
-        "com.microsoft.emmx",           // Edge
-        "com.brave.browser",
-        "com.opera.browser",
-        "com.opera.mini.native",
-        "com.sec.android.app.sbrowser", // Samsung Internet
-        "com.UCMobile.intl",            // UC Browser
-        "com.duckduckgo.mobile.android",
-        "mark.via.gp",                  // Via Browser
-        "com.kiwibrowser.browser"
-    )
+    JarvisPrefs.putString("picovoice_access_key", "YOUR_ACCESS_KEY_HERE")
 
-    // Address bar view IDs per browser package.
-    // Tried in order; first non-null text match wins.
-    private val URL_BAR_IDS = mapOf(
-        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
-        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
-        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
-        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
-        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
-                                                   "org.mozilla.firefox:id/url_bar_title"),
-        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
-        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
-        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
-        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
-        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
-        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
-        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
-    )
-    // Generic fallback content-descriptions used across unknown browsers
-    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
-
-    // Track last seen URL per browser package to avoid firing on every tiny content change
-    private val lastSeenUrl = mutableMapOf<String, String>()
-
-    // WhatsApp automation state
-    private var typingAttempted = false
-    private var lastWindowClass = ""
-
-    // Throttle for reconciling WorkModeManager against the hardcoded daily
-    // schedule (WorkModeSchedule) — cheap timestamp check, real work only
-    // happens at most once per 30s even though accessibility events can
-    // fire dozens of times a second.
-    private var lastScheduleCheckAt = 0L
-
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        Log.d(TAG, "=== AutomationService CONNECTED ===")
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        val pkg = event.packageName?.toString() ?: return
-
-        // ── Hardcoded schedule reconciliation ──────────────────────────────────
-        // Keeps Work Mode's forced 19:00-02:00 window enforced even if the
-        // student never starts a task, or if the process restarted mid-window
-        // and lost its in-memory isActive flag.
-        val now = System.currentTimeMillis()
-        if (now - lastScheduleCheckAt > 30_000L) {
-            lastScheduleCheckAt = now
-            WorkModeManager.evaluateSchedule(applicationContext)
-        }
-
-        // ── Work Mode: blocked app check ─────────────────────────────────────
-        // isEnforcing() (not the raw isActive flag) so the hardcoded window
-        // blocks apps even when no manual task session is running.
-        if (WorkModeManager.isEnforcing() &&
-            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-
-            val blockedApps = WorkModeManager.getBlockedApps()
-            if (pkg in blockedApps) {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                // Record attempt — alert guardian on 3rd
-                DistractionGuard.recordAppAttempt(this, pkg)
-                return
-            }
-        }
-
-        // ── Work Mode: blocked website check ─────────────────────────────────
-        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                checkAndBlockUrl(pkg)
-            }
-        }
-
-        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
-        // Runs regardless of Work Mode — uninstall protection is always on.
-        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
-            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
-            checkGuardedScreen()
-        }
-
-        // ── WhatsApp automation ───────────────────────────────────────────────
-        if (pkg != WHATSAPP) return
-        if (!AutomationEngine.hasPendingMessage()) return
-
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-
-        val cls = event.className?.toString() ?: ""
-        if (cls != lastWindowClass) {
-            typingAttempted = false
-            lastWindowClass = cls
-        }
-        if (typingAttempted) return
-
-        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
-        val found = tryTypeAndSend(root)
-        if (!found) {
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
-                rootInActiveWindow?.let { tryTypeAndSend(it) }
-            }, 1200)
-        }
-    }
-
-    // ── Uninstall / disable watchdog ────────────────────────────────────────────
-
-    /**
-     * Scans the current window's visible text for a combination of "this is
-     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
-     * If matched and no guardian PIN unlock is active, bounces to Home and
-     * fires a throttled guardian alert. Deliberately conservative: requires
-     * BOTH signals so we never interfere with unrelated Settings browsing.
-     */
-    private fun checkGuardedScreen() {
-        if (UninstallGuard.isUnlocked()) return
-
-        val root = rootInActiveWindow ?: return
-        val text = collectAllText(root)
-        val lower = text.lowercase()
-
-        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
-        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
-        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
-        if (!isNamedGuardedScreen && !isDeviceAdminPrompt) return
-
-        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
-        performGlobalAction(GLOBAL_ACTION_HOME)
-
-        if (UninstallGuard.shouldAlert()) {
-            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, "settings_screen_blocked")
-        }
-    }
-
-    /** Depth-first collection of all text + content-description on screen, space-joined. */
-    private fun collectAllText(root: AccessibilityNodeInfo): String {
-        val sb = StringBuilder()
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        var visited = 0
-        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
-            val node = stack.removeFirst()
-            visited++
-            node.text?.let { sb.append(it).append(' ') }
-            node.contentDescription?.let { sb.append(it).append(' ') }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return sb.toString()
-    }
-
-    // ── URL scanning ──────────────────────────────────────────────────────────
-
-    private fun checkAndBlockUrl(browserPkg: String) {
-        val root = rootInActiveWindow ?: return
-        val url  = extractUrl(root, browserPkg) ?: return
-
-        // Debounce: only act when URL actually changes
-        if (lastSeenUrl[browserPkg] == url) return
-        lastSeenUrl[browserPkg] = url
-
-        val hostname = parseHostname(url) ?: return
-        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
-
-        val blockedDomains = WorkModeManager.getBlockedDomains()
-        val matched = blockedDomains.firstOrNull { blocked ->
-            hostname == blocked || hostname.endsWith(".$blocked")
-        } ?: return
-
-        Log.w(TAG, "Blocked domain matched: $matched — going back")
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        // Record and potentially alert
-        DistractionGuard.recordDomainAttempt(this, matched)
-    }
-
-    /**
-     * Tries known view IDs for the browser first, then falls back to
-     * scanning all text nodes whose content-description suggests a URL bar.
-     */
-    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
-        // Try known IDs for this browser
-        val ids = URL_BAR_IDS[pkg] ?: emptyList()
-        for (id in ids) {
-            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
-            val text = node?.text?.toString()?.trim()
-            if (!text.isNullOrBlank()) return text
-        }
-
-        // Generic fallback: find any node whose description sounds like an address bar
-        // and whose text looks like a URL
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            val desc = node.contentDescription?.toString() ?: ""
-            val text = node.text?.toString()?.trim() ?: ""
-            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
-                && looksLikeUrl(text)) {
-                return text
-            }
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return null
-    }
-
-    private fun looksLikeUrl(text: String): Boolean {
-        if (text.isBlank() || text.length < 4) return false
-        return text.contains('.') &&
-               !text.contains(' ') &&
-               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
-    }
-
-    /**
-     * Parses the registered hostname from a raw URL string.
-     * "https://www.youtube.com/watch?v=..." → "youtube.com"
-     *
-     * Strips "www." so the stored domain "youtube.com" matches both
-     * "youtube.com" and "www.youtube.com".
-     */
-    private fun parseHostname(raw: String): String? {
-        return try {
-            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
-            val host = Uri.parse(withScheme).host ?: return null
-            host.removePrefix("www.").lowercase().trim()
-        } catch (_: Exception) { null }
-    }
-
-    // ── WhatsApp typing ───────────────────────────────────────────────────────
-
-    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
-        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
-        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
-
-        val inputNode =
-            findNodeById(root, "com.whatsapp:id/entry")
-                ?.also { Log.d(TAG, "input via id/entry") }
-            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
-                ?.also { Log.d(TAG, "input via id/conversation_entry") }
-            ?: findNodeByClass(root, "android.widget.EditText")
-                ?.also { Log.d(TAG, "input via EditText fallback") }
-
-        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
-
-        typingAttempted = true
-        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
-        }
-        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
-
-        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
-
-        AutomationEngine.consumePendingWhatsAppMessage()
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
-            val sendNode =
-                findNodeById(freshRoot, "com.whatsapp:id/send")
-                    ?.also { Log.d(TAG, "send btn via id/send") }
-                ?: findNodeByDesc(freshRoot, "Send")
-                    ?.also { Log.d(TAG, "send btn via desc") }
-            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                .also { Log.d(TAG, "send clicked: $it") }
-                ?: Log.e(TAG, "send button not found")
-        }, 500)
-
-        return true
-    }
-
-    // ── Node finders ──────────────────────────────────────────────────────────
-
-    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
-        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
-
-    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            if (node.className?.toString() == className && node.isEditable) return node
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return null
-    }
-
-    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        while (stack.isNotEmpty()) {
-            val node = stack.removeFirst()
-            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
-                && node.isClickable) return node
-            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
-        }
-        return null
-    }
-
-    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
-}
-
-
+This persists it to SharedPreferences, so it survives after you remove the
+line and rebuild.
+*/
