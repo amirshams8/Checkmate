@@ -21,16 +21,22 @@ class CheckmateApp : Application() {
         CheckmateState.init(this)
         CheckmateTTS.init(this)
 
-        // Reconcile Work Mode with the hardcoded 19:00-02:00 daily schedule
-        // and re-arm the two daily boundary alarms (AlarmManager repeating
-        // alarms don't survive a reboot, hence also doing this in
-        // BootReceiver). This must run after CheckmateState.init() above.
+        // Reconcile Work Mode with the hardcoded daily schedule (usual
+        // 19:00-05:00 window every day, plus an extra 01:00-17:30 window on
+        // Sunday/Wednesday) and re-arm the four daily boundary alarms
+        // (AlarmManager repeating alarms don't survive a reboot, hence also
+        // doing this in BootReceiver). This must run after
+        // CheckmateState.init() above.
         WorkModeManager.init(this)
         WorkModeScheduleReceiver.scheduleDailyAlarms(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
         // Every 30 min: pushes an app-usage Telegram alert + caches it in the
         // worker's KV for the on-demand "usage" command (see worker.js).
         GuardianNotifier.scheduleUsageReports(this)
+        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
+        // guardian report via WhatsApp + Telegram. Previously never
+        // scheduled anywhere, which is why the weekly report never sent.
+        GuardianNotifier.scheduleWeeklyReport(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
@@ -54,3 +60,4 @@ class CheckmateApp : Application() {
         }
     }
 }
+-e

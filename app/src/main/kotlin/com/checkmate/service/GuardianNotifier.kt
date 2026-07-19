@@ -14,7 +14,12 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.PsycheEngine
 import com.checkmate.workmode.UninstallGuard
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.Calendar
 
 object GuardianNotifier {
@@ -25,6 +30,19 @@ object GuardianNotifier {
     // report in the worker's KV so a guardian texting "usage" any time in
     // between gets an instant cached reply instead of nothing.
     const val ACTION_USAGE_REPORT  = "com.checkmate.USAGE_REPORT"
+    // Fires weekly — builds PsycheEngine's weekly report and pushes it to
+    // the guardian. Previously nothing ever called this: PsycheEngine.
+    // getGuardianWeeklyReport() built the report string but no alarm,
+    // receiver, or call site existed anywhere in the app, so the weekly
+    // report never actually went out. This action + its alarm/receiver is
+    // the fix.
+    const val ACTION_WEEKLY_REPORT = "com.checkmate.WEEKLY_REPORT"
+
+    // GuardianNotifier is a singleton object living for the app process's
+    // lifetime, same as it being wired from CheckmateApp.onCreate — a
+    // module-level scope here follows the same pattern used by long-lived
+    // services elsewhere (e.g. AttentionCycleService, ReminderService).
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
         val number = getGuardianNumber() ?: return
@@ -78,6 +96,39 @@ object GuardianNotifier {
             pi
         )
         Log.d(TAG, "Usage report alarm set for every 30 min")
+    }
+
+    /**
+     * Schedules a repeating weekly alarm (every 7 days, Sunday 20:00) that
+     * builds and delivers PsycheEngine's weekly report. This was previously
+     * missing entirely — PsycheEngine.getGuardianWeeklyReport() existed and
+     * worked, but nothing ever scheduled or invoked it, so no weekly report
+     * was ever sent. Mirrors the same fixed-clock-time am.setRepeating
+     * pattern as the EOD summary and usage-report alarms above, just with a
+     * 7-day interval and a day-of-week anchor instead of a daily one.
+     */
+    fun scheduleWeeklyReport(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(
+            context, 9003,
+            Intent(context, WeeklyReportReceiver::class.java).apply { action = ACTION_WEEKLY_REPORT },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.DAY_OF_WEEK, Calendar.SUNDAY)
+            set(Calendar.HOUR_OF_DAY, 20)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 7)
+        }
+        am.setRepeating(
+            AlarmManager.RTC_WAKEUP,
+            cal.timeInMillis,
+            AlarmManager.INTERVAL_DAY * 7,
+            pi
+        )
+        Log.d(TAG, "Weekly report alarm set for Sunday 20:00, every 7 days")
     }
 
     /**
@@ -162,6 +213,46 @@ object GuardianNotifier {
             StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
             Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
         }.start()
+    }
+
+    /**
+     * Builds PsycheEngine's weekly report (streak, tasks missed, consistency,
+     * attention-check stats, week-over-week delta) and delivers it to the
+     * guardian via BOTH channels — WhatsApp (existing openWhatsAppAndSend
+     * path, same as the daily/EOD report) and Telegram (if a chat id is
+     * configured), matching sendEndOfDaySummary's dual-delivery pattern.
+     *
+     * PsycheEngine.getGuardianWeeklyReport() is a suspend fun (it may call
+     * out to LlmGateway), so this runs on GuardianNotifier's own IO-scoped
+     * coroutine rather than a raw Thread.
+     */
+    fun sendWeeklyReport(context: Context) {
+        val number = getGuardianNumber()
+        val hasTelegram = TelegramAlertBot.getChatId() != null
+
+        if (number == null && !hasTelegram) {
+            Log.w(TAG, "No guardian number or Telegram chat id set — skipping weekly report")
+            return
+        }
+
+        scope.launch {
+            val report = try {
+                PsycheEngine.getGuardianWeeklyReport()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to build weekly report", e)
+                return@launch
+            }
+
+            if (number != null) {
+                openWhatsAppAndSend(context, number, report)
+                Log.d(TAG, "Weekly report sent to guardian via WhatsApp")
+            }
+
+            if (hasTelegram) {
+                TelegramAlertBot.sendAlert(context, report)
+                Log.d(TAG, "Weekly report sent to guardian via Telegram")
+            }
+        }
     }
 
     fun notifyDistractionAlert(
@@ -325,3 +416,11 @@ class UsageReportReceiver : BroadcastReceiver() {
             GuardianNotifier.sendAppUsageReport(context)
     }
 }
+
+class WeeklyReportReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action == GuardianNotifier.ACTION_WEEKLY_REPORT)
+            GuardianNotifier.sendWeeklyReport(context)
+    }
+}
+-e

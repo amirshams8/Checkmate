@@ -14,8 +14,8 @@ import com.checkmate.workmode.WorkModeScheduleReceiver
 
 /**
  * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
- * reports) are cancelled on reboot; this puts them back so guardian
- * reporting survives a restart instead of silently going quiet.
+ * reports, weekly report) are cancelled on reboot; this puts them back so
+ * guardian reporting survives a restart instead of silently going quiet.
  *
  * Also fires a one-time "device rebooted" note to the guardian when the
  * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
@@ -31,9 +31,12 @@ class BootReceiver : BroadcastReceiver() {
         CheckmateState.init(context)
         GuardianNotifier.scheduleEndOfDaySummary(context)
         GuardianNotifier.scheduleUsageReports(context)
+        // Previously missing — the weekly report alarm was never scheduled
+        // anywhere, including here, which was part of why it never fired.
+        GuardianNotifier.scheduleWeeklyReport(context)
 
         // Re-arm Work Mode's hardcoded schedule: reconcile immediately (in
-        // case the reboot landed mid-window) and re-register the two daily
+        // case the reboot landed mid-window) and re-register the four daily
         // boundary alarms, since AlarmManager repeating alarms are cleared
         // on reboot just like the guardian-reporting ones above.
         WorkModeManager.init(context)
@@ -48,3 +51,4 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 }
+-e
