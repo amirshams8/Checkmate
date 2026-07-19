@@ -60,4 +60,3 @@ class CheckmateApp : Application() {
         }
     }
 }
--e

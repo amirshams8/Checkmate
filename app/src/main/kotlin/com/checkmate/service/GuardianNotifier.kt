@@ -423,4 +423,3 @@ class WeeklyReportReceiver : BroadcastReceiver() {
             GuardianNotifier.sendWeeklyReport(context)
     }
 }
--e
