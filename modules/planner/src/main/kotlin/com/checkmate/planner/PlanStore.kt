@@ -73,6 +73,18 @@ object PlanStore {
         task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
     }
 
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+
+    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
+    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
+        it.copy(intentionText = intentionText)
+    }
+
+    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
+    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
+        it.copy(completedStatus = status)
+    }
+
     private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
         val updated = _todayTasks.value.map { if (it.id == taskId) block(it) else it }
         _todayTasks.value = updated

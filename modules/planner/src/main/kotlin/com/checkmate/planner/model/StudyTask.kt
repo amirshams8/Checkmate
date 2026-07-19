@@ -22,8 +22,11 @@ data class StudyTask(
     val totalPausedMs:   Long       = 0L,     // accumulated pause time across all pauses
     val actualMinutes:   Int        = 0,      // real focus time excluding paused periods
     // ── Manual task tracking ──
-    val isCustom:        Boolean    = false   // true only for tasks added via HomeViewModel.addCustomTask;
+    val isCustom:        Boolean    = false,  // true only for tasks added via HomeViewModel.addCustomTask;
                                                // gates the duration-edit affordance in HomeScreen
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+    val intentionText:   String     = "",     // free-text answer to "What will you study?" (pre-session)
+    val completedStatus: String?    = null    // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
 )
 
 @Serializable

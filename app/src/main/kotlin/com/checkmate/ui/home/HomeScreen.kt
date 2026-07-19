@@ -63,7 +63,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                         task           = task,
                         isActive       = state.activeTaskId == task.id,
                         onStart        = { vm.startTask(context, task) },
-                        onDone         = { vm.markDone(context, task) },
+                        onDone         = { vm.requestCompletion(context, task) },
                         onSkip         = { vm.markSkip(context, task) },
                         onPause        = { vm.pauseTask(context, task) },
                         onResume       = { vm.resumeTask(context, task) },
@@ -115,6 +115,22 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                 vm.editTaskDuration(task, newDuration)
                 editingTask = null
             }
+        )
+    }
+
+    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──────────────
+    state.intentionPromptTask?.let { task ->
+        IntentionDialog(
+            task      = task,
+            onDismiss = { vm.dismissIntentionPrompt() },
+            onConfirm = { intentionText -> vm.confirmIntentionAndStart(context, task, intentionText) }
+        )
+    }
+
+    state.completionPromptTask?.let { task ->
+        CompletionCheckDialog(
+            task     = task,
+            onSelect = { status -> vm.confirmCompletion(context, task, status) }
         )
     }
 }
@@ -232,6 +248,115 @@ private fun ChecklistSection() {
             }
         }
     }
+}
+
+// ── Blueprint 10.1: Intention Declaration + Session Check-In dialogs ──────────
+
+/**
+ * Pre-session "What will you study?" prompt. Shown from HomeScreen whenever
+ * HomeState.intentionPromptTask is non-null (i.e. right after tapping "Start Now",
+ * before the session actually launches). Pre-fills with the task's topic so a
+ * student in a hurry can just tap Start Session, but free-text lets them commit
+ * to something more specific (e.g. "finish rolling motion numericals, not just review").
+ */
+@Composable
+private fun IntentionDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (intentionText: String) -> Unit
+) {
+    var intention by remember { mutableStateOf(task.topic) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("What will you study?", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "${task.subject} — ${task.topic} · ${task.durationMinutes}m",
+                    fontSize = 12.sp, color = White60
+                )
+                OutlinedTextField(
+                    value         = intention,
+                    onValueChange = { intention = it },
+                    label         = { Text("Your intention", color = White30) },
+                    singleLine    = false,
+                    modifier      = Modifier.fillMaxWidth(),
+                    colors        = dialogFieldColors()
+                )
+                Text(
+                    "Writing it down raises follow-through — you'll be asked how it went right after.",
+                    fontSize = 11.sp, color = White30
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { onConfirm(intention) },
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Start Session", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+/**
+ * Post-session "Did you finish it?" check-in. Shown from HomeScreen whenever
+ * HomeState.completionPromptTask is non-null (i.e. right after tapping "Done",
+ * before the session actually wraps up). Dismissing outside the dialog counts
+ * as YES — the session is ending regardless of how this is answered, this is
+ * purely a self-report accountability signal, not a gate on completion.
+ */
+@Composable
+private fun CompletionCheckDialog(
+    task:     StudyTask,
+    onSelect: (status: String) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { onSelect("YES") },
+        containerColor   = BgCard,
+        title = {
+            Text("Did you finish it?", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                if (task.intentionText.isNotBlank() && task.intentionText != task.topic) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Your intention: \"${task.intentionText}\"",
+                        fontSize = 12.sp, color = White30
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = { onSelect("NO") }) {
+                    Text("No", color = AccentRed, fontWeight = FontWeight.SemiBold)
+                }
+                TextButton(onClick = { onSelect("PARTIAL") }) {
+                    Text("Partial", color = AccentAmber, fontWeight = FontWeight.SemiBold)
+                }
+                Button(
+                    onClick = { onSelect("YES") },
+                    colors  = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+                ) {
+                    Text("Yes", fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+            }
+        }
+    )
 }
 
 // ── Rest of HomeScreen (unchanged) ───────────────────────────────────────────

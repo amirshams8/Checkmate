@@ -26,7 +26,11 @@ data class HomeState(
     val completedToday:    Int             = 0,
     val streakDays:        Int             = 0,
     val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0
+    val consecutiveSkips:  Int             = 0,
+    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──
+    // Non-null exactly while the corresponding dialog should be showing on HomeScreen.
+    val intentionPromptTask:  StudyTask?   = null,
+    val completionPromptTask: StudyTask?   = null
 )
 
 class HomeViewModel : ViewModel() {
@@ -114,7 +118,27 @@ class HomeViewModel : ViewModel() {
         PlanStore.removeTask(task.id)
     }
 
+    /**
+     * Blueprint 10.1: Intention Declaration.
+     * Tapping "Start Now" no longer launches the session directly — it first
+     * surfaces the "What will you study?" prompt on HomeScreen via
+     * intentionPromptTask. The actual launch (media projection check, service
+     * starts, WorkMode activation, etc.) is deferred to
+     * confirmIntentionAndStart() once the student answers.
+     */
     fun startTask(context: Context, task: StudyTask) {
+        _state.update { it.copy(intentionPromptTask = task) }
+    }
+
+    fun dismissIntentionPrompt() {
+        _state.update { it.copy(intentionPromptTask = null) }
+    }
+
+    /** Called from HomeScreen's IntentionDialog once the student confirms their intention. */
+    fun confirmIntentionAndStart(context: Context, task: StudyTask, intentionText: String) {
+        val clean = intentionText.trim().ifBlank { task.topic }
+        PlanStore.setIntention(task.id, clean)
+        _state.update { it.copy(intentionPromptTask = null) }
         if (ScreenCaptureManager.isReady()) {
             launchTask(context, task)
         } else {
@@ -170,29 +194,62 @@ class HomeViewModel : ViewModel() {
         }
     }
 
-    fun markDone(context: Context, task: StudyTask) {
+    /**
+     * Blueprint 10.1: Session Check-In.
+     * Replaces the old direct call to markDone() from the "Done" button —
+     * surfaces the "Did you finish it?" prompt on HomeScreen via
+     * completionPromptTask first. The actual completion (service stop, state
+     * update, TTS) happens in confirmCompletion() once the student answers.
+     */
+    fun requestCompletion(context: Context, task: StudyTask) {
+        _state.update { it.copy(completionPromptTask = task) }
+    }
+
+    fun dismissCompletionPrompt() {
+        _state.update { it.copy(completionPromptTask = null) }
+    }
+
+    /**
+     * status is one of "YES" | "PARTIAL" | "NO" — a self-report of whether the
+     * declared intention was met. The task is still marked DONE either way
+     * (the session ended); completedStatus is a separate accountability signal
+     * (surfaced later in Stats / the weekly guardian report), not a change to
+     * task state.
+     */
+    fun confirmCompletion(context: Context, task: StudyTask, status: String) {
         viewModelScope.launch {
-            // BUGFIX: read attention-check counts BEFORE stopping the service —
+            // BUGFIX (carried over): read attention-check counts BEFORE stopping the service —
             // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
-            // which zeroes checksPassed/checksMissed. Previously this was read too late (or not
-            // at all), so PsycheEngine.onTaskCompleted() always recorded 0/0 into BehaviorLedger
-            // regardless of how many attention checks the student actually confirmed.
+            // which zeroes checksPassed/checksMissed. Read too late (or not at all) and
+            // PsycheEngine.onTaskCompleted() always records 0/0 into BehaviorLedger regardless
+            // of how many attention checks the student actually confirmed.
             val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.DONE)
+            PlanStore.setCompletionStatus(task.id, status)
             PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
-            CheckmateTTS.speak(context, "Task complete. Well done.")
+            val spoken = when (status) {
+                "NO"      -> "Noted. Every session still counts — reset for the next one."
+                "PARTIAL" -> "Task marked complete. Partial progress logged."
+                else      -> "Task complete. Well done."
+            }
+            CheckmateTTS.speak(context, spoken)
             val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = 0) }
+            _state.update { it.copy(
+                activeTaskId         = null,
+                psycheMessage        = msg,
+                consecutiveSkips     = 0,
+                completionPromptTask = null
+            ) }
         }
     }
 
     fun markSkip(context: Context, task: StudyTask) {
         viewModelScope.launch {
-            // Same fix as markDone() — capture before stop()/reset() wipes the counts.
+            // Same fix as confirmCompletion() — capture before stop()/reset() wipes the counts.
             val cycleState = AttentionCycleManager.currentState()
             AttentionCycleService.stop(context)
             FloatingAttentionService.stop(context)
