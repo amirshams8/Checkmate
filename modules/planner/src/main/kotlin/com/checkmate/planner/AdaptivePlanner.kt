@@ -9,6 +9,7 @@ import com.checkmate.core.CoachingPlannerEntry
 import com.checkmate.core.DailyCheckIn
 import com.checkmate.core.DailyChecklist
 import com.checkmate.core.PYQWeightage
+import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
@@ -33,8 +34,13 @@ object AdaptivePlanner {
         // feeds tomorrow's plan so an incomplete checklist skews the next plan
         // toward catching up on fundamentals rather than piling on new PYQ topics.
         val checklistContext  = buildChecklistContext()
+        // Mentor v2 (spec 3.7): read TodayContext directly (not only via the cached
+        // behavior_summary string) so a mid-day regenerate always reflects the latest
+        // same-day free-text updates even if refreshBehaviorSummaryCache() hasn't run
+        // since the last one (e.g. the very first plan of the day).
+        val todayContext      = TodayContext.getSummaryText()
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
         if (llmPlan.isNotEmpty()) return llmPlan
 
         return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
@@ -93,7 +99,8 @@ object AdaptivePlanner {
         checkIn: DailyCheckIn?,
         coachingContext: String,
         pyqContext: String,
-        checklistContext: String
+        checklistContext: String,
+        todayContext: String = ""
     ): List<StudyTask> {
         val systemPrompt = """
 You are an adaptive study planner for competitive exam students.
@@ -111,6 +118,9 @@ Rules:
 - If TODAY'S CHECKLIST STATUS shows incomplete fundamentals (lecture notes, DPP, NCERT reading)
   from earlier today, prioritize catching those up over introducing new topics — an unfinished
   checklist means the student is behind on today's baseline, not ready for additional load
+- If TODAY'S LOGGED UPDATES mentions something already covered today (e.g. "back from coaching,
+  did Physics 2hrs"), do not re-assign that same subject/topic — build on it or move to the next
+  weak area instead
 """.trimIndent()
 
         val prompt = buildString {
@@ -139,6 +149,11 @@ Rules:
             if (checklistContext.isNotBlank()) {
                 appendLine("TODAY'S CHECKLIST STATUS:")
                 appendLine(checklistContext)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES (from Mentor chat / quick-log):")
+                appendLine(todayContext)
                 appendLine()
             }
             appendLine("BEHAVIOR DATA: $behaviorSummary")

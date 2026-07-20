@@ -94,6 +94,23 @@ class AppAutomationService : AccessibilityService() {
             WorkModeManager.evaluateSchedule(applicationContext)
         }
 
+        // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────
+        // Independent of, and checked before, the normal Work Mode blocklist below:
+        // during the timed window opened by WorkModeManager.startPostSkipLockdown()
+        // (HomeViewModel.markSkip()), any app on the escalation watchlist is bounced
+        // immediately on first foreground — no 3-attempt grace period like the normal
+        // DistractionGuard flow. Still records the attempt (so the guardian alert and
+        // BehaviorLedger correlation data stay consistent), just doesn't wait for a
+        // 3rd try before acting.
+        if (WorkModeManager.isInPostSkipLockdown() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            pkg in WorkModeManager.getEscalationWatchlist()
+        ) {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            DistractionGuard.recordAppAttempt(this, pkg)
+            return
+        }
+
         // ── Work Mode: blocked app check ─────────────────────────────────────
         // isEnforcing() (not the raw isActive flag) so the hardcoded window
         // blocks apps even when no manual task session is running.

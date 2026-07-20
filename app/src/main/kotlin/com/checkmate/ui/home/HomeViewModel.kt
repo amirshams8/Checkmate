@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import android.app.Activity
+import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.TodayContext
@@ -16,6 +17,7 @@ import com.checkmate.psyche.PsycheEngine
 import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.flow.*
@@ -262,16 +264,27 @@ class HomeViewModel : ViewModel() {
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
-            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
+            // Mentor v2 (spec 3.6): capture whatever app was most recently foregrounded so the
+            // skip event — and any guardian alert built from it — can name the actual cause.
+            val distractionApp = try {
+                AppUsageTracker.getMostRecentForegroundApp(context)
+            } catch (_: Exception) { null }
+            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
             // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
             // skips too, not just completions, so a same-day regenerate reflects the skip.
             PsycheEngine.refreshBehaviorSummaryCache()
+            // Mentor v2 (spec 3.4): opens the escalation-watchlist lockdown window — checked by
+            // AppAutomationService alongside the normal blocklist for the configured duration.
+            WorkModeManager.startPostSkipLockdown(context)
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
+            // Mentor v2 (spec 3.2): same reaction text, also logged into Mentor's persisted
+            // chat so it's a running log, not just a spoken line that's gone once said.
+            ProactiveMentor.onSkip(context, msg)
             val newSkips = _state.value.consecutiveSkips + 1
             _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
             if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}")
+                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}", distractionApp)
             }
         }
     }

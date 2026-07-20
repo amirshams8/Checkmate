@@ -115,6 +115,13 @@ Rules:
         val todayDone     = BehaviorLedger.getTodayCompletedSummary()
         val todayContext  = TodayContext.getSummaryText()
 
+        // Mentor v2 (spec 3.5): same bridge pattern as KEY_BEHAVIOR_SUMMARY_CACHE below —
+        // "recent_skip_rate" was ALSO a dead pref key (read by AdaptivePlanner.ruleBasedPlan()
+        // and now also by WorkModeManager.skipRateExceedsThreshold(), never written anywhere).
+        // Writing it here, alongside the existing cache refresh, fixes both readers with one
+        // call site.
+        CheckmatePrefs.putString("recent_skip_rate", BehaviorLedger.getRecentSkipRate().toString())
+
         val combined = buildString {
             append(aggregate)
             if (todayDone.isNotBlank()) {

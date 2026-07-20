@@ -1,6 +1,7 @@
 package com.checkmate.core
 
 import android.app.AppOpsManager
+import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -83,6 +84,46 @@ object AppUsageTracker {
             }
             .sortedByDescending { it.foregroundMillis }
             .take(limit)
+    }
+
+    /**
+     * Mentor v2 (spec 3.6): returns the label of whichever non-Checkmate app was most
+     * recently foregrounded within [withinMinutes], or null if usage access isn't granted,
+     * nothing was foregrounded in that window, or the last app was Checkmate itself.
+     *
+     * Called from HomeViewModel.markSkip() at the moment of skip so BehaviorLedger.TaskEvent
+     * .distractionApp can record what the student was actually doing right before skipping —
+     * e.g. "skipped Chemistry, Instagram open 3 min prior" rather than just "skipped Chemistry".
+     * Uses UsageEvents (event-level, MOVE_TO_FOREGROUND) rather than the bucketed
+     * queryUsageStats() used elsewhere, since we need "what was last on screen", not
+     * aggregate duration.
+     */
+    fun getMostRecentForegroundApp(context: Context, withinMinutes: Int = 10): String? {
+        if (!hasUsageAccess(context)) return null
+
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val endTime = System.currentTimeMillis()
+        val startTime = endTime - withinMinutes * 60 * 1000L
+
+        return try {
+            val events = usm.queryEvents(startTime, endTime)
+            val event = UsageEvents.Event()
+            var lastPkg: String? = null
+            var lastTs = 0L
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event)
+                if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND &&
+                    event.packageName != context.packageName &&
+                    event.timeStamp >= lastTs
+                ) {
+                    lastPkg = event.packageName
+                    lastTs = event.timeStamp
+                }
+            }
+            lastPkg?.let { resolveLabel(context.packageManager, it) }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Total tracked screen time today, in millis, across all apps (not just the top [limit]). */

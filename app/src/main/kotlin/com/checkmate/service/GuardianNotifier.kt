@@ -51,11 +51,17 @@ object GuardianNotifier {
         Log.d(TAG, "Guardian notified: task started")
     }
 
-    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String) {
+    // Mentor v2 (spec 3.6): distractionApp is the label of whatever app was foregrounded
+    // right before the skip (from AppUsageTracker.getMostRecentForegroundApp, captured by
+    // HomeViewModel.markSkip). Null/blank means nothing was detected in the lookback window —
+    // message falls back to the original skip-only wording so this never regresses when usage
+    // access isn't granted.
+    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String, distractionApp: String? = null) {
         val number = getGuardianNumber() ?: return
-        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic. Time: ${timeNow()}"
+        val distractionClause = if (!distractionApp.isNullOrBlank()) " $distractionApp was open right before." else ""
+        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic.$distractionClause Time: ${timeNow()}"
         openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "Guardian notified: skip streak=$skipCount")
+        Log.d(TAG, "Guardian notified: skip streak=$skipCount distractionApp=$distractionApp")
     }
 
     fun scheduleEndOfDaySummary(context: Context) {

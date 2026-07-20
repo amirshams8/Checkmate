@@ -16,6 +16,29 @@ object WorkModeManager {
     private const val SOURCE_MANUAL   = "manual"
     private const val SOURCE_SCHEDULE = "schedule"
 
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown window.
+    private const val KEY_LOCKDOWN_UNTIL     = "post_skip_lockdown_until"
+    private const val DEFAULT_LOCKDOWN_MIN   = 45
+    private const val KEY_LOCKDOWN_MINUTES   = "post_skip_lockdown_minutes"
+    // Fixed default watchlist for the escalation window — deliberately broader than the
+    // permanent blocklist since it's temporary. Guardian can extend it via
+    // "escalation_watchlist" (comma-separated package names), same storage pattern as
+    // getBlockedApps()/getBlockedDomains(). Package names, not labels — matched directly
+    // against AccessibilityEvent.packageName in AppAutomationService.
+    private val DEFAULT_ESCALATION_WATCHLIST = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",   // TikTok
+        "com.snapchat.android",
+        "com.facebook.katana",
+        "com.twitter.android",
+        "com.reddit.frontpage"
+    )
+
+    // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
+    private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
+    private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
+
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
 
@@ -90,7 +113,58 @@ object WorkModeManager {
      * state alone used to leave a window (outside 19:00-02:00, no active
      * session) where these were freely editable; that loophole is now closed.
      */
-    fun settingsLocked(): Boolean = UninstallGuard.hasPinConfigured() && !UninstallGuard.isUnlocked()
+    // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —
+    // even a correct guardian PIN unlock doesn't reopen settings while the recent skip rate
+    // is over threshold. This is deliberate escalation, not a bug: a guardian who's just
+    // unlocked settings during a bad week should still see them locked back down once the
+    // unlock window (UNLOCK_WINDOW_MS in UninstallGuard) lapses, same as before — the new
+    // clause only matters while skipRateExceedsThreshold() is true, which requires an actual
+    // sustained skip pattern (see DEFAULT_ESCALATION_THRESHOLD), not a one-off.
+    // Recommended mitigation for the "guardian genuinely needs in during an escalation"
+    // case: UninstallGuard.grantRemoteOverride() (Telegram-command driven, see that file) —
+    // it bypasses this gate entirely rather than fighting it.
+    fun settingsLocked(): Boolean =
+        UninstallGuard.hasPinConfigured() &&
+        !UninstallGuard.hasRemoteOverride() &&
+        (!UninstallGuard.isUnlocked() || skipRateExceedsThreshold())
+
+    /**
+     * Mentor v2 (spec 3.5): reads the skip rate PsycheEngine.refreshBehaviorSummaryCache()
+     * writes into "recent_skip_rate" (a plain CheckmatePrefs bridge, same pattern as the
+     * "behavior_summary" cache — :modules:workmode has no dependency on :modules:psyche, so
+     * this avoids adding one). Threshold is configurable via "escalation_skip_threshold";
+     * defaults to DEFAULT_ESCALATION_THRESHOLD.
+     */
+    fun skipRateExceedsThreshold(): Boolean {
+        val rate = CheckmatePrefs.getString("recent_skip_rate", "0")?.toFloatOrNull() ?: 0f
+        val threshold = CheckmatePrefs.getString(KEY_ESCALATION_THRESHOLD, null)?.toFloatOrNull()
+            ?: DEFAULT_ESCALATION_THRESHOLD
+        return rate > threshold
+    }
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown.
+
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip(). */
+    fun startPostSkipLockdown(context: Context) {
+        val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
+            .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
+        val until = System.currentTimeMillis() + minutes * 60 * 1000L
+        CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+    }
+
+    /** True while a post-skip lockdown window is active. AppAutomationService checks this
+     *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
+     *  grace period for apps on [getEscalationWatchlist]. */
+    fun isInPostSkipLockdown(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
+
+    /** Package names blocked on first foreground during a post-skip lockdown window — the
+     *  permanent blocklist plus a fixed distraction-prone watchlist (extendable via prefs). */
+    fun getEscalationWatchlist(): Set<String> {
+        val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
+        val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet
+    }
 
     /**
      * Reconciles [isActive] with the hardcoded schedule. Call on app start,

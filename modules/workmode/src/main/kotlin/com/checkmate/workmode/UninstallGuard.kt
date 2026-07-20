@@ -36,6 +36,20 @@ object UninstallGuard {
     private const val KEY_FAIL_COUNT      = "guardian_pin_fail_count"
     private const val KEY_LOCKOUT_UNTIL   = "guardian_pin_lockout_until"
 
+    // Mentor v2 (spec 3.5): remote override window, independent of KEY_UNLOCK_UNTIL. A guardian
+    // can be PIN-unlocked (isUnlocked() == true) while WorkModeManager.settingsLocked() still
+    // reads locked because skipRateExceedsThreshold() is also true — that's the intended
+    // escalation behavior. This is the documented emergency bypass for that case: a guardian
+    // command relayed through the existing Telegram bot/Cloudflare worker (the same
+    // infrastructure StatusReporter already pushes to for "status"/"usage") sets this window,
+    // and WorkModeManager.settingsLocked() treats it as a full bypass of BOTH gates.
+    // NOTE: this object only stores/checks the window. The inbound half — the worker route that
+    // listens for a guardian command (e.g. "unlock") and the on-device poll that calls
+    // grantRemoteOverride() — lives at the app layer (see ReminderService.pollRemoteOverride())
+    // since :modules:workmode has no network dependency and shouldn't gain one just for this.
+    private const val KEY_REMOTE_OVERRIDE_UNTIL = "remote_override_until"
+    private const val REMOTE_OVERRIDE_WINDOW_MS = 5 * 60 * 1000L
+
     // How long a correct PIN entry keeps the watchdog from bouncing the user,
     // so a guardian can actually walk through the uninstall/disable flow.
     private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
@@ -181,6 +195,15 @@ object UninstallGuard {
     }
 
     fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
+
+    /** Opens the remote-override window. Call only after verifying a guardian-issued command
+     *  (see the NOTE above KEY_REMOTE_OVERRIDE_UNTIL) — this has no PIN check of its own. */
+    fun grantRemoteOverride() {
+        CheckmatePrefs.putLong(KEY_REMOTE_OVERRIDE_UNTIL, System.currentTimeMillis() + REMOTE_OVERRIDE_WINDOW_MS)
+    }
+
+    fun hasRemoteOverride(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_REMOTE_OVERRIDE_UNTIL, 0L)
 
     // ── Screen detection (used by AppAutomationService) ─────────────────────────
 

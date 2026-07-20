@@ -6,6 +6,7 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
@@ -46,6 +47,9 @@ class CheckmateApp : Application() {
                     val uri = ScreenCaptureManager.capture(context)
                     GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
                 }.start()
+                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
+                // the guardian-facing alert above — this is student-facing, not parent-facing.
+                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
             }
         }
 

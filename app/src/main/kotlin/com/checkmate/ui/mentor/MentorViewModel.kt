@@ -3,12 +3,17 @@ package com.checkmate.ui.mentor
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
 import com.checkmate.core.MentorKnowledge
+import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -77,7 +82,7 @@ class MentorViewModel : ViewModel() {
 
         viewModelScope.launch {
             val response = try {
-                val systemPrompt = buildSystemPrompt(text)
+                val systemPrompt = buildSystemPrompt(context, text)
                 val history      = buildHistoryForLlm()
                 LlmGateway.complete(history, systemPrompt)
             } catch (e: Exception) {
@@ -114,10 +119,36 @@ class MentorViewModel : ViewModel() {
         }
     }
 
-    private fun buildSystemPrompt(currentQuery: String): String {
+    private fun buildSystemPrompt(context: Context, currentQuery: String): String {
         val profile         = ConsultationProfile.load()
         val ledger          = BehaviorLedger.getSummaryForPlanner()
         val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
+
+        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
+        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
+        // updates, and upcoming coaching tests. These four blocks close that gap.
+        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
+        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
+            todayTasks.joinToString("\n") { t ->
+                val marker = when (t.state) {
+                    TaskState.DONE    -> "[DONE]"
+                    TaskState.SKIPPED -> "[SKIPPED]"
+                    TaskState.ACTIVE  -> "[ACTIVE]"
+                    TaskState.PAUSED  -> "[PAUSED]"
+                    TaskState.PENDING -> "[PENDING]"
+                }
+                val custom = if (t.isCustom) " (custom)" else ""
+                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
+            }
+        }
+
+        val usageSummary = try {
+            AppUsageTracker.getTodayUsage(context, limit = 5)
+                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
+        } catch (_: Exception) { "" }
+
+        val todayContext = TodayContext.getSummaryText()
+        val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
 
         return buildString {
             appendLine("""
@@ -127,6 +158,8 @@ Keep responses under 5 lines unless a detailed breakdown is needed.
 Never give generic motivation. React to actual data.
 Refer to specific topics, chapters, marks gaps, and deadlines.
 You also have access to the full conversation history above — refer to it naturally when relevant.
+If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
+you may briefly flag it — but don't derail the actual question they asked.
             """.trimIndent())
             appendLine()
             appendLine("STUDENT PROFILE:")
@@ -134,6 +167,24 @@ You also have access to the full conversation history above — refer to it natu
             appendLine()
             appendLine("BEHAVIOR DATA: $ledger")
             appendLine()
+            appendLine("TODAY'S PLAN:")
+            appendLine(planSummary)
+            appendLine()
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES:")
+                appendLine(todayContext)
+                appendLine()
+            }
+            if (usageSummary.isNotBlank()) {
+                appendLine("TODAY'S APP USAGE (top 5):")
+                appendLine(usageSummary)
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING TESTS/LECTURES (next 3 days):")
+                appendLine(coachingContext)
+                appendLine()
+            }
             if (knowledgeBlocks.isNotBlank()) {
                 appendLine("RELEVANT KNOWLEDGE:")
                 appendLine(knowledgeBlocks)
@@ -141,5 +192,27 @@ You also have access to the full conversation history above — refer to it natu
             }
             appendLine("Respond as Mentor.")
         }.trim()
+    }
+
+    companion object {
+        /**
+         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
+         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
+         * directly into the same persisted chat history MentorViewModel reads on init — turning
+         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
+         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
+         * methods above so a message appended here shows up next time MentorScreen is opened.
+         */
+        fun appendProactiveMessage(text: String) {
+            val clean = text.trim()
+            if (clean.isEmpty()) return
+            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+            val existing = if (saved != null) {
+                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+                catch (_: Exception) { emptyList() }
+            } else emptyList()
+            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(updated))
+        }
     }
 }
