@@ -3,6 +3,7 @@ package com.checkmate.psyche
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -29,6 +30,15 @@ object PsycheEngine {
 
     private const val TAG = "PsycheEngine"
     private const val KEY_LAST_SNAPSHOT = "psyche_last_week_snapshot"
+    // Mentor v2 (spec section 0): this is the pref key AdaptivePlanner.getBehaviorSummary()
+    // reads. It previously had NO writer anywhere in the codebase — AdaptivePlanner always
+    // saw "No behavior data yet" no matter how much behavior history existed. :modules:planner
+    // can't depend on :modules:psyche directly (psyche already depends on planner for
+    // StudyTask/TaskState, so the reverse would be circular) — refreshBehaviorSummaryCache()
+    // below is the bridge: the :app layer (which depends on both modules) calls it after
+    // every completion/skip, and it writes the real summary into this shared CheckmatePrefs
+    // key so planner's read-only access keeps working with no new module dependency.
+    private const val KEY_BEHAVIOR_SUMMARY_CACHE = "behavior_summary"
     private val json = Json { ignoreUnknownKeys = true }
 
     private val SYSTEM_PROMPT = """
@@ -75,21 +85,66 @@ Rules:
         BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
     }
 
-    fun onTaskSkipped(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
-        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed)
+    // Mentor v2 (spec 2.2/3.6): distractionApp is optional — pass the label of whatever app
+    // was foregrounded right before/at the moment of skip (e.g. from AppUsageTracker or an
+    // active DistractionGuard counter) so parent alerts can name the actual cause, not just
+    // report that a skip happened.
+    fun onTaskSkipped(
+        task: StudyTask,
+        checksPassed: Int = 0,
+        checksMissed: Int = 0,
+        distractionApp: String? = null
+    ) {
+        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed, distractionApp)
     }
 
-    // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
-    // in that subject reads with real urgency instead of generic streak
-    // language. Deliberately conservative: only fires within COACHING_TEST_URGENT_DAYS,
-    // only for type=="test" (not lectures), and any lookup failure (bad date,
-    // no entry, subject mismatch) falls straight through to the existing
-    // skip-count logic unchanged — a stale or empty coaching calendar can
-    // only under-trigger this, never fabricate false urgency.
-    private const val COACHING_TEST_URGENT_DAYS = 3
+    /**
+     * Mentor v2 (spec section 0 + 3.7): rebuilds the cached behavior-summary string that
+     * AdaptivePlanner reads (KEY_BEHAVIOR_SUMMARY_CACHE) — the previously-dead pref key.
+     * Combines the existing 7-day aggregate (streak/skip rate) with today's actual completed
+     * tasks (BehaviorLedger.getTodayCompletedSummary()) and any free-text same-day updates
+     * (TodayContext), so a fresh call to AdaptivePlanner.generateDailyPlan() reflects what's
+     * really happened today — e.g. already back from coaching — not just morning intent.
+     *
+     * Call this from the :app layer any time behavior state changes: after
+     * onTaskCompleted/onTaskSkipped (HomeViewModel), and ideally whenever TodayContext gets
+     * a new entry, so the cache never goes stale between plan regenerations.
+     */
+    fun refreshBehaviorSummaryCache() {
+        val aggregate     = BehaviorLedger.getSummaryForPlanner()
+        val todayDone     = BehaviorLedger.getTodayCompletedSummary()
+        val todayContext  = TodayContext.getSummaryText()
+
+        val combined = buildString {
+            append(aggregate)
+            if (todayDone.isNotBlank()) {
+                append("\nAlready completed today:\n")
+                append(todayDone)
+            }
+            if (todayContext.isNotBlank()) {
+                append("\nToday's logged updates:\n")
+                append(todayContext)
+            }
+        }
+        CheckmatePrefs.putString(KEY_BEHAVIOR_SUMMARY_CACHE, combined)
+        Log.d(TAG, "behavior_summary cache refreshed")
+    }
+
+    // Mentor v2 (spec 3.3): specific-pattern branch, layered on top of the existing
+    // aggregate-skip-count logic below rather than replacing it — a student can be low on
+    // aggregate skips but still have a real pattern in one task type/subject.
+    private const val PATTERN_SKIP_THRESHOLD = 3
+    private const val PATTERN_WINDOW_DAYS    = 7
 
     fun getSkipReaction(task: StudyTask): String {
         val skipCount = BehaviorLedger.getSkipCountForSubject(task.subject, withinDays = 7)
+
+        val patternSkips = BehaviorLedger.getSkipCountByType(
+            task.subject, task.taskType.name, withinDays = PATTERN_WINDOW_DAYS
+        )
+        val patternClause = if (patternSkips >= PATTERN_SKIP_THRESHOLD) {
+            " That's $patternSkips ${task.taskType.name.lowercase()} skips in ${task.subject} this week specifically — not just an overall dip."
+        } else ""
 
         val upcomingTest = try {
             CoachingPlannerEntry.nearestUpcomingTest(task.subject, withinDays = COACHING_TEST_URGENT_DAYS)
@@ -104,11 +159,20 @@ Rules:
         } ?: ""
 
         return when {
-            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified.$urgencyClause"
-            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you.$urgencyClause"
-            else           -> "You skipped ${task.subject}. Stay consistent.$urgencyClause"
+            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified.$urgencyClause$patternClause"
+            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you.$urgencyClause$patternClause"
+            else           -> "You skipped ${task.subject}. Stay consistent.$urgencyClause$patternClause"
         }
     }
+
+    // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
+    // in that subject reads with real urgency instead of generic streak
+    // language. Deliberately conservative: only fires within COACHING_TEST_URGENT_DAYS,
+    // only for type=="test" (not lectures), and any lookup failure (bad date,
+    // no entry, subject mismatch) falls straight through to the existing
+    // skip-count logic unchanged — a stale or empty coaching calendar can
+    // only under-trigger this, never fabricate false urgency.
+    private const val COACHING_TEST_URGENT_DAYS = 3
 
     suspend fun getGuardianWeeklyReport(): String {
         val skipTotal = BehaviorLedger.getTotalSkipCount(7)

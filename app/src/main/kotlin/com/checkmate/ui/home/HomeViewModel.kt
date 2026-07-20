@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import android.app.Activity
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TodayContext
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
@@ -231,6 +232,11 @@ class HomeViewModel : ViewModel() {
             PlanStore.markTask(task.id, TaskState.DONE)
             PlanStore.setCompletionStatus(task.id, status)
             PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
+            // Mentor v2 (spec 3.7): log the completion into TodayContext so AdaptivePlanner
+            // sees what's actually been finished today, then refresh the cached summary
+            // AdaptivePlanner reads (previously-dead "behavior_summary" pref — see PsycheEngine).
+            TodayContext.appendUpdate("Completed ${task.subject}: ${task.topic} (${task.taskType})")
+            PsycheEngine.refreshBehaviorSummaryCache()
             val spoken = when (status) {
                 "NO"      -> "Noted. Every session still counts — reset for the next one."
                 "PARTIAL" -> "Task marked complete. Partial progress logged."
@@ -257,6 +263,9 @@ class HomeViewModel : ViewModel() {
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
             PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed)
+            // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
+            // skips too, not just completions, so a same-day regenerate reflects the skip.
+            PsycheEngine.refreshBehaviorSummaryCache()
             val msg = PsycheEngine.getSkipReaction(task)
             CheckmateTTS.speak(context, msg)
             val newSkips = _state.value.consecutiveSkips + 1

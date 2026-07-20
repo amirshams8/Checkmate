@@ -4,6 +4,11 @@ import kotlinx.serialization.Serializable
 
 enum class TaskState { PENDING, ACTIVE, PAUSED, DONE, SKIPPED }
 
+// Mentor v2 (spec 2.1): task-type dimension, separate from free-text topic.
+// Lets BehaviorLedger detect patterns like "skips PRACTICE specifically in
+// Physics" instead of only an aggregate skip rate across all task types.
+enum class TaskType { LECTURE, PRACTICE, REVISION, READING, OTHER }
+
 @Serializable
 data class StudyTask(
     val id:              String     = java.util.UUID.randomUUID().toString(),
@@ -26,7 +31,12 @@ data class StudyTask(
                                                // gates the duration-edit affordance in HomeScreen
     // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
     val intentionText:   String     = "",     // free-text answer to "What will you study?" (pre-session)
-    val completedStatus: String?    = null    // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
+    val completedStatus: String?    = null,   // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
+    // ── Mentor v2: skip-pattern granularity (spec 2.1) ──
+    val taskType:        TaskType   = TaskType.OTHER  // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
+                                                        // for existing/rule-based tasks that don't set it explicitly.
+                                                        // AdaptivePlanner's LLM plan should map sessionType (LEARN/
+                                                        // REVISE/PRACTICE/TEST_PREP) onto this when generating tasks.
 )
 
 @Serializable
