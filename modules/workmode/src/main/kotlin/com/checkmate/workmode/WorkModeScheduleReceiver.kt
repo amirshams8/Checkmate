@@ -37,6 +37,7 @@ class WorkModeScheduleReceiver : BroadcastReceiver() {
         // if already initialized.
         CheckmatePrefs.init(context)
         CheckmateState.init(context)
+        TrustedTime.refreshIfNeeded(context)
         WorkModeManager.evaluateSchedule(context)
     }
 

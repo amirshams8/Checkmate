@@ -49,11 +49,22 @@ object WorkModeSchedule {
         "7:00 PM \u2013 5:00 AM daily (Sun & Wed also locked 1:00 AM \u2013 5:30 PM)"
 
     /**
-     * True if [cal] (defaults to now) falls inside a locked window:
+     * True if [cal] (defaults to the trusted, tamper-resistant "now" — see
+     * TrustedTime — NOT the raw device clock) falls inside a locked window:
      *  - the usual 19:00-05:00 window, every day, OR
      *  - on Sunday/Wednesday only, the extra 01:00-17:30 window.
+     *
+     * Deliberately does NOT default to Calendar.getInstance() (raw device
+     * time) — that was spoofable by simply changing Settings > Date & time,
+     * which made evaluateSchedule() see "outside the window" and turn
+     * blocking off for real. TrustedTime.nowMillis() is anchored to a
+     * network-verified timestamp plus elapsedRealtime (monotonic, unaffected
+     * by clock changes), so this now only trusts the device's own clock
+     * before any network sync has ever completed.
      */
-    fun isWithinScheduledWindow(cal: Calendar = Calendar.getInstance()): Boolean {
+    fun isWithinScheduledWindow(
+        cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
+    ): Boolean {
         val hour = cal.get(Calendar.HOUR_OF_DAY)
 
         // Usual window wraps past midnight: active from START_HOUR..23:59 AND

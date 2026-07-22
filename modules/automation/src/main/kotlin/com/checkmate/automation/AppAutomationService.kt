@@ -11,6 +11,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.TrustedTime
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
@@ -96,6 +97,7 @@ class AppAutomationService : AccessibilityService() {
         val now = System.currentTimeMillis()
         if (now - lastScheduleCheckAt > 30_000L) {
             lastScheduleCheckAt = now
+            TrustedTime.refreshIfNeeded(applicationContext)
             WorkModeManager.evaluateSchedule(applicationContext)
         }
 

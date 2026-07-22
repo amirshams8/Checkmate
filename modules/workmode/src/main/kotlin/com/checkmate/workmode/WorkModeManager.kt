@@ -52,6 +52,7 @@ object WorkModeManager {
      * against the hardcoded schedule.
      */
     fun init(context: Context) {
+        TrustedTime.refreshIfNeeded(context)
         _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
         evaluateSchedule(context)
     }
