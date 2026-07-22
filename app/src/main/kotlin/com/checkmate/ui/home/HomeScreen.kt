@@ -28,6 +28,7 @@ import androidx.navigation.NavController
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import com.checkmate.ui.theme.*
 
 @Composable
@@ -100,8 +101,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     if (showAddTaskDialog) {
         AddCustomTaskDialog(
             onDismiss = { showAddTaskDialog = false },
-            onConfirm = { subject, topic, duration ->
-                vm.addCustomTask(context, subject, topic, duration)
+            onConfirm = { subject, topic, duration, taskType ->
+                vm.addCustomTask(context, subject, topic, duration, taskType)
                 showAddTaskDialog = false
             }
         )
@@ -364,11 +365,12 @@ private fun CompletionCheckDialog(
 @Composable
 private fun AddCustomTaskDialog(
     onDismiss: () -> Unit,
-    onConfirm: (subject: String, topic: String, durationMinutes: Int) -> Unit
+    onConfirm: (subject: String, topic: String, durationMinutes: Int, taskType: TaskType) -> Unit
 ) {
     var subject  by remember { mutableStateOf("") }
     var topic    by remember { mutableStateOf("") }
     var duration by remember { mutableStateOf("30") }
+    var taskType by remember { mutableStateOf(TaskType.OTHER) }
 
     val durationInt = duration.toIntOrNull()
     val isValid = subject.isNotBlank() && topic.isNotBlank() && durationInt != null && durationInt > 0
@@ -410,11 +412,31 @@ private fun AddCustomTaskDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     colors          = dialogFieldColors()
                 )
+                Text("Task type", fontSize = 12.sp, color = White60)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                ) {
+                    TaskType.values().forEach { type ->
+                        val selected = taskType == type
+                        FilterChip(
+                            selected = selected,
+                            onClick  = { taskType = type },
+                            label    = { Text(type.name, fontSize = 11.sp) },
+                            colors   = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = AccentGreen,
+                                selectedLabelColor     = Color.Black,
+                                containerColor          = BgDark,
+                                labelColor              = White60
+                            )
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick  = { durationInt?.let { onConfirm(subject.trim(), topic.trim(), it) } },
+                onClick  = { durationInt?.let { onConfirm(subject.trim(), topic.trim(), it, taskType) } },
                 enabled  = isValid,
                 colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
             ) {

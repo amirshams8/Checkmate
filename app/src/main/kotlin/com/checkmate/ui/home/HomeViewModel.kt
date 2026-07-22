@@ -13,6 +13,7 @@ import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import com.checkmate.psyche.PsycheEngine
 import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.FloatingAttentionService
@@ -85,7 +86,7 @@ class HomeViewModel : ViewModel() {
      * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
      * WhatsApp/Telegram report — no extra wiring required.
      */
-    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int) {
+    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int, taskType: TaskType = TaskType.OTHER) {
         val cleanSubject  = subject.trim()
         val cleanTopic    = topic.trim()
         val cleanDuration = durationMinutes.coerceIn(5, 240)
@@ -95,7 +96,8 @@ class HomeViewModel : ViewModel() {
             subject         = cleanSubject,
             topic           = cleanTopic,
             durationMinutes = cleanDuration,
-            isCustom        = true
+            isCustom        = true,
+            taskType        = taskType
         )
         PlanStore.addCustomTask(task)
         CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")

@@ -76,6 +76,14 @@ object WorkModeManager {
     fun deactivate(context: Context): Boolean {
         DistractionGuard.reset()
         if (WorkModeSchedule.isWithinScheduledWindow() && !UninstallGuard.isUnlocked()) {
+            // Whatever session requested this deactivate (e.g. a manual task
+            // finishing) is over, but the hardcoded schedule is still in force.
+            // Hand the active-source tag back to "schedule" so evaluateSchedule()
+            // can auto-release Work Mode once the window itself ends — otherwise
+            // this stays tagged as the task's source (e.g. "manual") forever, the
+            // natural-end auto-release check never matches, and blocking silently
+            // continues past the hardcoded window until manually toggled off.
+            CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
             return false
         }
         CheckmateState.setMode(context, StudyMode.NORMAL)
