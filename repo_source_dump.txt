@@ -170,6 +170,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── workmode
 │   │   │   │   │   │   │   │   ├── DistractionGuard.kt
 │   │   │   │   │   │   │   │   ├── DistractionListener.kt
+│   │   │   │   │   │   │   │   ├── ScrollGuard.kt
 │   │   │   │   │   │   │   │   ├── UninstallAlertListener.kt
 │   │   │   │   │   │   │   │   ├── UninstallGuard.kt
 │   │   │   │   │   │   │   │   ├── WorkModeManager.kt
@@ -554,6 +555,7 @@ import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
@@ -585,7 +587,9 @@ class CheckmateApp : Application() {
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
-        DistractionGuard.listener = object : DistractionListener {
+        // (and ScrollGuard, which reuses the same listener/pipeline for its
+        // "scroll" kind — see ScrollGuard.kt)
+        val distractionListener = object : DistractionListener {
             override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
                 Thread {
                     val uri = ScreenCaptureManager.capture(context)
@@ -596,6 +600,8 @@ class CheckmateApp : Application() {
                 ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
             }
         }
+        DistractionGuard.listener = distractionListener
+        ScrollGuard.listener = distractionListener
 
         // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
         // (via :workmode's UninstallGuard) into GuardianNotifier.
@@ -1684,10 +1690,17 @@ object GuardianNotifier {
         target: String,
         screenshotUri: Uri? = null
     ) {
-        val label = if (kind == "app") "app: $target" else "website: $target"
-        val msg   = "⚠️ Checkmate Alert: Student attempted to open blocked $label " +
-                    "3 times during study session at ${timeNow()}."
-        Log.w(TAG, "Distraction alert: $label")
+        val msg = when (kind) {
+            "app"    -> "⚠️ Checkmate Alert: Student attempted to open blocked app: $target " +
+                        "3 times during study session at ${timeNow()}."
+            "site"   -> "⚠️ Checkmate Alert: Student attempted to open blocked website: $target " +
+                        "3 times during study session at ${timeNow()}."
+            "scroll" -> "⚠️ Checkmate Alert: Student hit the continuous-scroll limit in $target " +
+                        "at ${timeNow()}."
+            else     -> "⚠️ Checkmate Alert: Student attempted to open blocked $target " +
+                        "3 times during study session at ${timeNow()}."
+        }
+        Log.w(TAG, "Distraction alert: $kind/$target")
 
         val number = getGuardianNumber()
         if (number != null) {
@@ -1930,8 +1943,11 @@ object ProactiveMentor {
     /** Call from CheckmateApp's DistractionGuard.listener alongside the existing
      *  GuardianNotifier.notifyDistractionAlert() call. */
     fun onDistractionThreshold(context: Context, kind: String, target: String) {
-        val what = if (kind == "site") "the site $target" else target
-        val msg = "You tried opening $what while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+        val msg = when (kind) {
+            "scroll" -> "You've been scrolling $target for a while — take a break before it turns into an hour."
+            "site"   -> "You tried opening the site $target while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+            else     -> "You tried opening $target while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+        }
         MentorViewModel.appendProactiveMessage(msg)
         MentorNotifier.notify(context, msg)
         Log.d(TAG, "onDistractionThreshold logged to Mentor chat: $kind/$target")
@@ -3443,9 +3459,7 @@ private fun AddCustomTaskDialog(
                             label    = { Text(type.name, fontSize = 11.sp) },
                             colors   = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = AccentGreen,
-                                selectedLabelColor     = Color.Black,
-                                containerColor          = BgDark,
-                                labelColor              = White60
+                                selectedLabelColor     = Color.Black
                             )
                         )
                     }
@@ -7246,7 +7260,8 @@ fun CheckmateTheme(content: @Composable () -> Unit) {
         typeWindowStateChanged
         | typeWindowContentChanged
         | typeViewClicked
-        | typeViewFocused"
+        | typeViewFocused
+        | typeViewScrolled"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="
         flagReportViewIds
@@ -7254,7 +7269,7 @@ fun CheckmateTheme(content: @Composable () -> Unit) {
         | flagRequestEnhancedWebAccessibility"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
-    android:notificationTimeout="100"
+    android:notificationTimeout="0"
     android:description="@string/service_desc"
     android:label="@string/app_name" />
 
@@ -7364,6 +7379,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
@@ -7429,6 +7445,10 @@ class AppAutomationService : AccessibilityService() {
     // fire dozens of times a second.
     private var lastScheduleCheckAt = 0L
 
+    // Last foreground package, used only to detect when a ScrollGuard-watched
+    // app leaves the foreground so its scroll session resets cleanly.
+    private var lastForegroundPkg = ""
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
@@ -7446,6 +7466,22 @@ class AppAutomationService : AccessibilityService() {
         if (now - lastScheduleCheckAt > 30_000L) {
             lastScheduleCheckAt = now
             WorkModeManager.evaluateSchedule(applicationContext)
+        }
+
+        // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
+        // Deliberately independent of Work Mode / isEnforcing() — this applies
+        // at all times, not just during study sessions, per product decision.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != lastForegroundPkg) {
+            if (lastForegroundPkg in ScrollGuard.WATCHED_PACKAGES) {
+                ScrollGuard.onAppBackgrounded(lastForegroundPkg)
+            }
+            lastForegroundPkg = pkg
+        }
+        if (pkg in ScrollGuard.WATCHED_PACKAGES && event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (ScrollGuard.recordScroll(this, pkg)) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            return
         }
 
         // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────
@@ -11041,6 +11077,96 @@ interface DistractionListener {
      * @param target   package name or hostname
      */
     fun onAlertThresholdReached(context: Context, kind: String, target: String)
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/ScrollGuard.kt =====
+package com.checkmate.workmode
+
+import android.content.Context
+import android.util.Log
+
+/**
+ * ScrollGuard — interrupts continuous scrolling in short-form-video feeds
+ * (Instagram, YouTube — Reels/Shorts) before it turns into unbounded
+ * doomscrolling.
+ *
+ * Unlike DistractionGuard, this runs ALWAYS, independent of Work Mode or any
+ * task session — per product decision, it is not gated on
+ * WorkModeManager.isEnforcing() and its counters are NOT wiped by
+ * WorkModeManager.deactivate(). Instead each package's count self-resets
+ * whenever scrolling pauses for more than [SCROLL_PAUSE_RESET_MS] — i.e. it
+ * tracks one continuous scrolling session, not a lifetime total.
+ *
+ * Counters live in memory only; process death naturally resets them, which
+ * is fine here — this is a soft nudge against binge-scrolling, not a
+ * security boundary like UninstallGuard.
+ *
+ * Thread-safety: all mutations are @Synchronized, same convention as
+ * DistractionGuard.
+ */
+object ScrollGuard {
+
+    private const val TAG = "ScrollGuard"
+
+    /** Packages this watches. Not user/guardian-configurable — always on, per product decision. */
+    val WATCHED_PACKAGES = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube"
+    )
+
+    /** Consecutive scrolls (each no more than [SCROLL_PAUSE_RESET_MS] apart) before bouncing home. */
+    const val SCROLL_THRESHOLD = 15
+
+    /** A gap this long between scroll events counts as "stopped scrolling" — counter resets. */
+    private const val SCROLL_PAUSE_RESET_MS = 4_000L
+
+    private data class Session(var count: Int, var lastScrollAt: Long)
+
+    // packageName → in-progress scroll session
+    private val sessions = mutableMapOf<String, Session>()
+
+    /**
+     * Injected by CheckmateApp.onCreate, same DistractionListener used by
+     * DistractionGuard — kind = "scroll" — so guardian alert delivery
+     * (WhatsApp/Telegram + Mentor chat) is reused rather than duplicated.
+     */
+    var listener: DistractionListener? = null
+
+    /**
+     * Called by AppAutomationService on every TYPE_VIEW_SCROLLED event for a
+     * watched package. Returns true if the threshold was just hit (caller
+     * should bounce to Home) — the counter is reset internally either way
+     * once it fires.
+     */
+    @Synchronized
+    fun recordScroll(context: Context, packageName: String): Boolean {
+        val now = System.currentTimeMillis()
+        val session = sessions.getOrPut(packageName) { Session(0, now) }
+
+        if (now - session.lastScrollAt > SCROLL_PAUSE_RESET_MS) {
+            session.count = 0
+        }
+        session.count += 1
+        session.lastScrollAt = now
+
+        Log.d(TAG, "Scroll: $packageName -> ${session.count}")
+
+        if (session.count >= SCROLL_THRESHOLD) {
+            session.count = 0
+            listener?.onAlertThresholdReached(context, "scroll", packageName)
+                ?: Log.w(TAG, "No DistractionListener set — scroll alert suppressed")
+            return true
+        }
+        return false
+    }
+
+    /** Call when a watched package leaves the foreground, so switching away and back later
+     *  starts a fresh scrolling session instead of resuming a stale count. */
+    @Synchronized
+    fun onAppBackgrounded(packageName: String) {
+        sessions.remove(packageName)
+    }
 }
 
 
