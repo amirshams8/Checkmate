@@ -33,8 +33,11 @@ object ProactiveMentor {
     /** Call from CheckmateApp's DistractionGuard.listener alongside the existing
      *  GuardianNotifier.notifyDistractionAlert() call. */
     fun onDistractionThreshold(context: Context, kind: String, target: String) {
-        val what = if (kind == "site") "the site $target" else target
-        val msg = "You tried opening $what while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+        val msg = when (kind) {
+            "scroll" -> "You've been scrolling $target for a while — take a break before it turns into an hour."
+            "site"   -> "You tried opening the site $target while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+            else     -> "You tried opening $target while a task was active. That's the ${DistractionGuardThreshold} attempt — stay on task."
+        }
         MentorViewModel.appendProactiveMessage(msg)
         MentorNotifier.notify(context, msg)
         Log.d(TAG, "onDistractionThreshold logged to Mentor chat: $kind/$target")

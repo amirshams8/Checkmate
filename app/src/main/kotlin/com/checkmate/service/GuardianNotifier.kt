@@ -267,10 +267,17 @@ object GuardianNotifier {
         target: String,
         screenshotUri: Uri? = null
     ) {
-        val label = if (kind == "app") "app: $target" else "website: $target"
-        val msg   = "⚠️ Checkmate Alert: Student attempted to open blocked $label " +
-                    "3 times during study session at ${timeNow()}."
-        Log.w(TAG, "Distraction alert: $label")
+        val msg = when (kind) {
+            "app"    -> "⚠️ Checkmate Alert: Student attempted to open blocked app: $target " +
+                        "3 times during study session at ${timeNow()}."
+            "site"   -> "⚠️ Checkmate Alert: Student attempted to open blocked website: $target " +
+                        "3 times during study session at ${timeNow()}."
+            "scroll" -> "⚠️ Checkmate Alert: Student hit the continuous-scroll limit in $target " +
+                        "at ${timeNow()}."
+            else     -> "⚠️ Checkmate Alert: Student attempted to open blocked $target " +
+                        "3 times during study session at ${timeNow()}."
+        }
+        Log.w(TAG, "Distraction alert: $kind/$target")
 
         val number = getGuardianNumber()
         if (number != null) {

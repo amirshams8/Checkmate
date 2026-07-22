@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import java.util.ArrayDeque
@@ -75,6 +76,10 @@ class AppAutomationService : AccessibilityService() {
     // fire dozens of times a second.
     private var lastScheduleCheckAt = 0L
 
+    // Last foreground package, used only to detect when a ScrollGuard-watched
+    // app leaves the foreground so its scroll session resets cleanly.
+    private var lastForegroundPkg = ""
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
@@ -92,6 +97,22 @@ class AppAutomationService : AccessibilityService() {
         if (now - lastScheduleCheckAt > 30_000L) {
             lastScheduleCheckAt = now
             WorkModeManager.evaluateSchedule(applicationContext)
+        }
+
+        // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
+        // Deliberately independent of Work Mode / isEnforcing() — this applies
+        // at all times, not just during study sessions, per product decision.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != lastForegroundPkg) {
+            if (lastForegroundPkg in ScrollGuard.WATCHED_PACKAGES) {
+                ScrollGuard.onAppBackgrounded(lastForegroundPkg)
+            }
+            lastForegroundPkg = pkg
+        }
+        if (pkg in ScrollGuard.WATCHED_PACKAGES && event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (ScrollGuard.recordScroll(this, pkg)) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            return
         }
 
         // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────

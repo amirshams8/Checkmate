@@ -10,6 +10,7 @@ import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
@@ -41,7 +42,9 @@ class CheckmateApp : Application() {
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
-        DistractionGuard.listener = object : DistractionListener {
+        // (and ScrollGuard, which reuses the same listener/pipeline for its
+        // "scroll" kind — see ScrollGuard.kt)
+        val distractionListener = object : DistractionListener {
             override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
                 Thread {
                     val uri = ScreenCaptureManager.capture(context)
@@ -52,6 +55,8 @@ class CheckmateApp : Application() {
                 ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
             }
         }
+        DistractionGuard.listener = distractionListener
+        ScrollGuard.listener = distractionListener
 
         // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
         // (via :workmode's UninstallGuard) into GuardianNotifier.

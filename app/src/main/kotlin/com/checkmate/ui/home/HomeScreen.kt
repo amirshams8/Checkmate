@@ -425,9 +425,7 @@ private fun AddCustomTaskDialog(
                             label    = { Text(type.name, fontSize = 11.sp) },
                             colors   = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = AccentGreen,
-                                selectedLabelColor     = Color.Black,
-                                containerColor          = BgDark,
-                                labelColor              = White60
+                                selectedLabelColor     = Color.Black
                             )
                         )
                     }
