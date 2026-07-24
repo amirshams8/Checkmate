@@ -235,7 +235,16 @@ class HomeViewModel : ViewModel() {
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.DONE)
             PlanStore.setCompletionStatus(task.id, status)
-            PsycheEngine.onTaskCompleted(task, cycleState.checksPassed, cycleState.checksMissed)
+            // BUGFIX (Blueprint 2.6): cycleState.totalSessionSeconds is the tick loop's real
+            // elapsed time — it freezes while PAUSED (see AttentionCycleManager.tick()), so
+            // this is genuinely "focus time, not wall clock." Previously nothing ever wrote it
+            // onto the task, so StudyTask.focusMinutes/actualMinutes — and everything downstream
+            // that reads them (BehaviorLedger's "Avg Focus" stat, Stats' "Focus Today") — always
+            // saw 0 regardless of how long the student actually focused.
+            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
+            PlanStore.setFocusMinutes(task.id, focusMin)
+            val completedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
+            PsycheEngine.onTaskCompleted(completedTask, cycleState.checksPassed, cycleState.checksMissed)
             // Mentor v2 (spec 3.7): log the completion into TodayContext so AdaptivePlanner
             // sees what's actually been finished today, then refresh the cached summary
             // AdaptivePlanner reads (previously-dead "behavior_summary" pref — see PsycheEngine).
@@ -266,12 +275,18 @@ class HomeViewModel : ViewModel() {
             WorkModeManager.deactivate(context)
             ScreenCaptureManager.release()
             PlanStore.markTask(task.id, TaskState.SKIPPED)
+            // BUGFIX (Blueprint 2.6): same focus-time fix as confirmCompletion() — a skipped
+            // session still did real focus minutes before the skip, worth recording rather
+            // than leaving at the StudyTask default of 0.
+            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
+            PlanStore.setFocusMinutes(task.id, focusMin)
+            val skippedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
             // Mentor v2 (spec 3.6): capture whatever app was most recently foregrounded so the
             // skip event — and any guardian alert built from it — can name the actual cause.
             val distractionApp = try {
                 AppUsageTracker.getMostRecentForegroundApp(context)
             } catch (_: Exception) { null }
-            PsycheEngine.onTaskSkipped(task, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
+            PsycheEngine.onTaskSkipped(skippedTask, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
             // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
             // skips too, not just completions, so a same-day regenerate reflects the skip.
             PsycheEngine.refreshBehaviorSummaryCache()

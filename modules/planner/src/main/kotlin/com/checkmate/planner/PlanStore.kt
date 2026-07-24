@@ -11,6 +11,19 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import java.util.Calendar
 
+// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
+// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
+// excluded — see StudyTask.actualMinutes) across today's completed sessions.
+// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
+// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
+// no pause behavior to measure), so a fatigue/distraction trend is visible
+// even on a day with zero completions.
+data class PauseStats(
+    val actualFocusMinutesToday: Int   = 0,
+    val avgPausesPerSession:     Float = 0f,
+    val pauseRatePercent:        Int   = 0
+)
+
 object PlanStore {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -64,8 +77,21 @@ object PlanStore {
         it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
     }
 
+    /**
+     * Blueprint 2.6: records the session's real focus time — as measured by
+     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
+     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
+     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
+     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
+     * clock)"). Previously neither field was ever written, so both stats silently
+     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
+     */
+    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
+        it.copy(focusMinutes = minutes, actualMinutes = minutes)
+    }
+
     fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
-        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt)
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
     }
 
     fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
@@ -141,6 +167,31 @@ object PlanStore {
         _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
             Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
         }
+
+    /** Blueprint 2.6 — see PauseStats doc above. */
+    fun getPauseStats(): PauseStats {
+        val actualFocusToday = _todayTasks.value
+            .filter { it.state == TaskState.DONE }
+            .sumOf { it.actualMinutes }
+
+        val cal = Calendar.getInstance()
+        val weekSessions = mutableListOf<StudyTask>()
+        repeat(7) {
+            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+
+        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
+
+        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
+        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
+
+        return PauseStats(
+            actualFocusMinutesToday = actualFocusToday,
+            avgPausesPerSession     = avgPauses,
+            pauseRatePercent        = pauseRate
+        )
+    }
 
     private fun loadDay(key: String): List<StudyTask> {
         val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()

@@ -131,6 +131,31 @@ object AppUsageTracker {
         getTodayUsage(context, limit = Int.MAX_VALUE).sumOf { it.foregroundMillis }
 
     /**
+     * Blueprint 10.3: total non-Checkmate foreground time within an arbitrary
+     * [startMillis, endMillis) window — unlike getTodayUsage()/getTodayTotalMillis(),
+     * which are always pinned to "today", this takes any caller-supplied range.
+     * Used by StatsViewModel to measure how much distracting-app usage fell
+     * inside today's WorkModeSchedule locked window(s), for the Work Mode
+     * adherence component of the focus score. Returns 0 (never throws) if
+     * Usage Access isn't granted or the range is empty/inverted.
+     */
+    fun getUsageMillisInRange(context: Context, startMillis: Long, endMillis: Long): Long {
+        if (!hasUsageAccess(context)) return 0L
+        if (endMillis <= startMillis) return 0L
+
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val stats = try {
+            usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startMillis, endMillis)
+        } catch (e: Exception) {
+            null
+        } ?: return 0L
+
+        return stats
+            .filter { it.packageName != context.packageName }
+            .sumOf { it.totalTimeInForeground }
+    }
+
+    /**
      * Last [days] days of total foreground screen time, oldest first —
      * feeds a Digital-Wellbeing-style weekly history bar chart.
      */

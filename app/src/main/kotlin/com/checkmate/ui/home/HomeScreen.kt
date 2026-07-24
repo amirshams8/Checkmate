@@ -31,6 +31,10 @@ import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
 import com.checkmate.ui.theme.*
 
+// Blueprint 4.3: HomeScreen view toggle — LIST is the original flat list, TIMELINE
+// lays tasks out by StudyTask.scheduledStartTime (see FreeSlotCalculator/AdaptivePlanner).
+private enum class HomeViewMode { LIST, TIMELINE }
+
 @Composable
 fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     val state   by vm.state.collectAsState()
@@ -38,6 +42,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
+    var viewMode            by remember { mutableStateOf(HomeViewMode.LIST) }
 
     Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
         LazyColumn(
@@ -59,19 +64,38 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
             if (state.tasks.isEmpty()) {
                 item { EmptyPlanCard(onPlan = { navController.navigate("planner") }, onAddCustom = { showAddTaskDialog = true }) }
             } else {
-                items(state.tasks, key = { it.id }) { task ->
-                    TaskCard(
-                        task           = task,
-                        isActive       = state.activeTaskId == task.id,
-                        onStart        = { vm.startTask(context, task) },
-                        onDone         = { vm.requestCompletion(context, task) },
-                        onSkip         = { vm.markSkip(context, task) },
-                        onPause        = { vm.pauseTask(context, task) },
-                        onResume       = { vm.resumeTask(context, task) },
-                        onRemove       = { vm.removeTask(task) },
-                        onEditDuration = { editingTask = task }
-                    )
+                item { ViewModeToggle(viewMode = viewMode, onChange = { viewMode = it }) }
+
+                if (viewMode == HomeViewMode.LIST) {
+                    items(state.tasks, key = { it.id }) { task ->
+                        TaskCard(
+                            task           = task,
+                            isActive       = state.activeTaskId == task.id,
+                            onStart        = { vm.startTask(context, task) },
+                            onDone         = { vm.requestCompletion(context, task) },
+                            onSkip         = { vm.markSkip(context, task) },
+                            onPause        = { vm.pauseTask(context, task) },
+                            onResume       = { vm.resumeTask(context, task) },
+                            onRemove       = { vm.removeTask(task) },
+                            onEditDuration = { editingTask = task }
+                        )
+                    }
+                } else {
+                    item {
+                        TimelineView(
+                            tasks          = state.tasks,
+                            activeTaskId   = state.activeTaskId,
+                            onStart        = { vm.startTask(context, it) },
+                            onDone         = { vm.requestCompletion(context, it) },
+                            onSkip         = { vm.markSkip(context, it) },
+                            onPause        = { vm.pauseTask(context, it) },
+                            onResume       = { vm.resumeTask(context, it) },
+                            onRemove       = { vm.removeTask(it) },
+                            onEditDuration = { editingTask = it }
+                        )
+                    }
                 }
+
                 item {
                     TextButton(onClick = { showAddTaskDialog = true }) {
                         Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = AccentGreen)
@@ -133,6 +157,158 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
             task     = task,
             onSelect = { status -> vm.confirmCompletion(context, task, status) }
         )
+    }
+}
+
+// ── Blueprint 4.3: LIST / TIMELINE toggle ──────────────────────────────────────
+
+@Composable
+private fun ViewModeToggle(viewMode: HomeViewMode, onChange: (HomeViewMode) -> Unit) {
+    Row(
+        modifier              = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        HomeViewMode.values().forEach { mode ->
+            val selected = mode == viewMode
+            Surface(
+                modifier = Modifier.weight(1f).clickable { onChange(mode) },
+                shape    = RoundedCornerShape(10.dp),
+                color    = if (selected) AccentGreen.copy(alpha = 0.15f) else BgCard,
+                border   = BorderStroke(1.dp, if (selected) AccentGreen.copy(alpha = 0.5f) else White10)
+            ) {
+                Row(
+                    modifier              = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (mode == HomeViewMode.LIST) Icons.Default.ViewList else Icons.Default.Schedule,
+                        contentDescription = null,
+                        tint     = if (selected) AccentGreen else White60,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text       = if (mode == HomeViewMode.LIST) "List" else "Timeline",
+                        fontSize   = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color      = if (selected) AccentGreen else White60
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Blueprint 4.3: tasks laid out as a vertical day strip, grouped by
+ * StudyTask.scheduledStartTime and color-coded by subject (via the same
+ * subjectColor() used on TaskCard's badge). Tasks the planner couldn't fit
+ * into a free slot (scheduledStartTime == null — see AdaptivePlanner.
+ * assignScheduledTimes) are listed separately under "Unscheduled" rather than
+ * silently dropped. Each row still renders the full interactive TaskCard, so
+ * Start/Pause/Done/Skip work exactly the same as in LIST view.
+ */
+@Composable
+private fun TimelineView(
+    tasks:          List<StudyTask>,
+    activeTaskId:   String?,
+    onStart:        (StudyTask) -> Unit,
+    onDone:         (StudyTask) -> Unit,
+    onSkip:         (StudyTask) -> Unit,
+    onPause:        (StudyTask) -> Unit,
+    onResume:       (StudyTask) -> Unit,
+    onRemove:       (StudyTask) -> Unit,
+    onEditDuration: (StudyTask) -> Unit
+) {
+    val scheduled   = tasks.filter { !it.scheduledStartTime.isNullOrBlank() }
+        .sortedBy { it.scheduledStartTime }
+    val unscheduled = tasks.filter { it.scheduledStartTime.isNullOrBlank() }
+
+    Column {
+        scheduled.forEach { task ->
+            TimelineRow(
+                task           = task,
+                isActive       = activeTaskId == task.id,
+                onStart        = { onStart(task) },
+                onDone         = { onDone(task) },
+                onSkip         = { onSkip(task) },
+                onPause        = { onPause(task) },
+                onResume       = { onResume(task) },
+                onRemove       = { onRemove(task) },
+                onEditDuration = { onEditDuration(task) }
+            )
+        }
+        if (unscheduled.isNotEmpty()) {
+            if (scheduled.isNotEmpty()) Spacer(Modifier.height(4.dp))
+            Text(
+                "UNSCHEDULED",
+                fontSize      = 11.sp,
+                fontWeight    = FontWeight.Bold,
+                letterSpacing = 1.5.sp,
+                color         = White30,
+                fontFamily    = FontFamily.Monospace,
+                modifier      = Modifier.padding(bottom = 8.dp)
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                unscheduled.forEach { task ->
+                    TaskCard(
+                        task           = task,
+                        isActive       = activeTaskId == task.id,
+                        onStart        = { onStart(task) },
+                        onDone         = { onDone(task) },
+                        onSkip         = { onSkip(task) },
+                        onPause        = { onPause(task) },
+                        onResume       = { onResume(task) },
+                        onRemove       = { onRemove(task) },
+                        onEditDuration = { onEditDuration(task) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TimelineRow(
+    task:           StudyTask,
+    isActive:       Boolean,
+    onStart:        () -> Unit,
+    onDone:         () -> Unit,
+    onSkip:         () -> Unit,
+    onPause:        () -> Unit,
+    onResume:       () -> Unit,
+    onRemove:       () -> Unit,
+    onEditDuration: () -> Unit
+) {
+    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+        Column(
+            modifier             = Modifier.width(52.dp).padding(top = 4.dp),
+            horizontalAlignment  = Alignment.CenterHorizontally
+        ) {
+            Text(
+                task.scheduledStartTime ?: "--:--",
+                fontSize   = 11.sp,
+                color      = White60,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(Modifier.height(6.dp))
+            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
+        }
+        Spacer(Modifier.width(10.dp))
+        Box(modifier = Modifier.weight(1f)) {
+            TaskCard(
+                task           = task,
+                isActive       = isActive,
+                onStart        = onStart,
+                onDone         = onDone,
+                onSkip         = onSkip,
+                onPause        = onPause,
+                onResume       = onResume,
+                onRemove       = onRemove,
+                onEditDuration = onEditDuration
+            )
+        }
     }
 }
 

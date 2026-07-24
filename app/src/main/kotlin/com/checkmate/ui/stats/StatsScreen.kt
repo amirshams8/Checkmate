@@ -35,6 +35,33 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
             Text("Stats", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
             Text("Your performance overview", fontSize = 13.sp, color = White60)
         }
+
+        // ── Blueprint 10.3: Focus Score (single 0-100 number) ─────────────────
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            color    = BgCard,
+            border   = BorderStroke(0.5.dp, White10)
+        ) {
+            Row(
+                modifier          = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Focus Score", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                    Spacer(Modifier.height(2.dp))
+                    Text("Work Mode adherence + session completion", fontSize = 11.sp, color = White60)
+                }
+                Text(
+                    "${state.focusScore}",
+                    fontSize   = 34.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    color      = focusScoreColor(state.focusScore)
+                )
+            }
+        }
+
         Row(
             modifier              = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -84,6 +111,16 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
                     AttentionStat("Checks Passed", "${state.attentionChecksPassed}")
                     AttentionStat("Checks Missed", "${state.attentionChecksMissed}")
                     AttentionStat("Avg Focus",     "${state.avgFocusMinutes}m")
+                }
+
+                // ── Blueprint 2.6: actual focus time + pause count/rate ────────
+                Spacer(Modifier.height(14.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                    AttentionStat("Focus Today",  "${state.actualFocusMinutesToday}m")
+                    AttentionStat("Pauses/Sesh",  "%.1f".format(state.avgPausesPerSession))
+                    AttentionStat("Pause Rate",   "${state.pauseRatePercent}%")
                 }
             }
         }
@@ -270,6 +307,12 @@ private fun ScreenTimeBarChart(data: List<Pair<String, Int>>) {
             }
         }
     }
+}
+
+private fun focusScoreColor(score: Int): Color = when {
+    score >= 70 -> AccentGreen
+    score >= 40 -> AccentAmber
+    else        -> AccentRed
 }
 
 private fun formatMinutes(totalMinutes: Int): String {

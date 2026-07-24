@@ -40,10 +40,53 @@ object AdaptivePlanner {
         // since the last one (e.g. the very first plan of the day).
         val todayContext      = TodayContext.getSummaryText()
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
-        if (llmPlan.isNotEmpty()) return llmPlan
+        // Blueprint 4.1: today's free windows (study window minus school/coaching
+        // blocked slots). Computed once, applied to whichever plan comes out below.
+        val freeSlots = FreeSlotCalculator.computeFreeSlots(
+            profile.blockedSlots, config.studyStartTime, config.studyEndTime
+        )
 
-        return ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
+        if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
+
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours), freeSlots)
+    }
+
+    /**
+     * Blueprint 4.2: packs tasks sequentially into today's free slots in the
+     * order they were generated — which is already priority order (highest
+     * subject weightage / PYQ-driven reason first, from both the LLM and
+     * rule-based paths) — so the hardest/highest-priority work naturally lands
+     * in the earliest slots rather than needing a second re-sort here.
+     *
+     * A task that doesn't fit in the slot it's currently pointed at moves the
+     * cursor to the next free slot; a task that doesn't fit anywhere (total
+     * plan exceeds available free time) is returned with scheduledStartTime
+     * left null — HomeScreen's timeline view groups those under "Unscheduled"
+     * instead of silently dropping them.
+     */
+    private fun assignScheduledTimes(
+        tasks: List<StudyTask>,
+        freeSlots: List<FreeSlotCalculator.FreeSlot>
+    ): List<StudyTask> {
+        if (tasks.isEmpty() || freeSlots.isEmpty()) return tasks
+
+        var slotIndex = 0
+        var cursor = freeSlots[0].startMinute
+
+        return tasks.map { task ->
+            while (slotIndex < freeSlots.size && cursor + task.durationMinutes > freeSlots[slotIndex].endMinute) {
+                slotIndex++
+                cursor = if (slotIndex < freeSlots.size) freeSlots[slotIndex].startMinute else -1
+            }
+            if (slotIndex >= freeSlots.size || cursor < 0) {
+                task
+            } else {
+                val scheduled = task.copy(scheduledStartTime = FreeSlotCalculator.formatMinutes(cursor))
+                cursor += task.durationMinutes
+                scheduled
+            }
+        }
     }
 
     private fun getBehaviorSummary(): String =

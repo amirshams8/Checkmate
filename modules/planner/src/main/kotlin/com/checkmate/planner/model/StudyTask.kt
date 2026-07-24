@@ -26,6 +26,8 @@ data class StudyTask(
     val pausedAt:        Long?      = null,   // epoch ms when task was paused
     val totalPausedMs:   Long       = 0L,     // accumulated pause time across all pauses
     val actualMinutes:   Int        = 0,      // real focus time excluding paused periods
+    // ── Blueprint 2.6: pause count per session, feeds Stats "pause rate" ──
+    val pauseCount:       Int       = 0,      // incremented once per pause -> resume cycle (PlanStore.pauseTask)
     // ── Manual task tracking ──
     val isCustom:        Boolean    = false,  // true only for tasks added via HomeViewModel.addCustomTask;
                                                // gates the duration-edit affordance in HomeScreen
@@ -33,10 +35,17 @@ data class StudyTask(
     val intentionText:   String     = "",     // free-text answer to "What will you study?" (pre-session)
     val completedStatus: String?    = null,   // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
     // ── Mentor v2: skip-pattern granularity (spec 2.1) ──
-    val taskType:        TaskType   = TaskType.OTHER  // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
+    val taskType:        TaskType   = TaskType.OTHER, // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
                                                         // for existing/rule-based tasks that don't set it explicitly.
                                                         // AdaptivePlanner's LLM plan should map sessionType (LEARN/
                                                         // REVISE/PRACTICE/TEST_PREP) onto this when generating tasks.
+    // ── Blueprint 4.2: Smart Scheduling ──
+    val scheduledStartTime: String? = null    // "HH:mm" 24h clock time this task is slotted into today's
+                                               // free time (computed by AdaptivePlanner from
+                                               // ConsultationProfile.blockedSlots — see FreeSlotCalculator).
+                                               // Null means the planner couldn't fit it into a free slot
+                                               // (e.g. total plan exceeds available time) — HomeScreen's
+                                               // timeline view falls back to an "Unscheduled" section for these.
 )
 
 @Serializable
