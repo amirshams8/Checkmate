@@ -75,7 +75,19 @@ object UninstallGuard {
         "deactivate",
         "remove admin",
         "turn off",          // accessibility-service disable toggle wording on many OEMs
-        "app info"
+        "app info",
+        // Settings → Accessibility → "Downloaded apps" (Android 13+) / "Installed
+        // services" (older AOSP) / "Installed apps" (some OEMs) — the list screen
+        // that shows every accessibility service with its On/Off state and is the
+        // gateway a student would use to flip Checkmate's accessibility service
+        // off without ever hitting a screen that literally says "turn off". Gated
+        // the same way as everything else here: only fires when "checkmate" is
+        // also present in the visible text (targetsCheckmate), so browsing this
+        // list for an unrelated service before Checkmate is installed, or before
+        // its row is visible, isn't affected.
+        "downloaded apps",
+        "installed services",
+        "installed apps"
     )
 
     // Package names whose screens we watch. Settings itself, plus common
