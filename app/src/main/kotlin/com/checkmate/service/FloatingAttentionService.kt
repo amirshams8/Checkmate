@@ -12,6 +12,7 @@ import android.view.WindowManager
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +38,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.AttentionPhase
 import com.checkmate.core.CheckmatePrefs
+import kotlin.math.roundToInt
 
 class FloatingAttentionService : Service(),
     LifecycleOwner,
@@ -54,6 +57,7 @@ class FloatingAttentionService : Service(),
 
     private lateinit var windowManager: WindowManager
     private var overlayView: ComposeView? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
 
     companion object {
         private const val CHANNEL_ID = "floating_attention_channel"
@@ -64,6 +68,10 @@ class FloatingAttentionService : Service(),
         // controls (Done / Break / Confirm / Pause) via notification buttons
         // added in AttentionCycleService, so nothing becomes un-controllable.
         const val PREF_FOCUS_BAR_ENABLED = "focus_bar_enabled"
+
+        // Persisted vertical offset (px) of the bar, set by dragging the
+        // grip handle. Restored on the next time the overlay is shown.
+        private const val PREF_FOCUS_BAR_Y = "focus_bar_y"
 
         fun start(context: Context) {
             if (!CheckmatePrefs.getBoolean(PREF_FOCUS_BAR_ENABLED, true)) return
@@ -100,6 +108,9 @@ class FloatingAttentionService : Service(),
 
     private fun showOverlay() {
         if (overlayView != null) return
+
+        val savedY = CheckmatePrefs.getInt(PREF_FOCUS_BAR_Y, 0)
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -110,22 +121,46 @@ class FloatingAttentionService : Service(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP }
+        ).apply {
+            gravity = Gravity.TOP
+            y = savedY.coerceAtLeast(0)
+        }
+        overlayParams = params
 
         val view = ComposeView(this).apply {
             setViewTreeLifecycleOwner(this@FloatingAttentionService)
             setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
             setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
-            setContent { AttentionBar(onDismiss = { stop(this@FloatingAttentionService) }) }
+            setContent {
+                AttentionBar(
+                    onDismiss = { stop(this@FloatingAttentionService) },
+                    onDrag    = { dy -> moveOverlayBy(dy) }
+                )
+            }
         }
         windowManager.addView(view, params)
         overlayView = view
+    }
+
+    /** Moves the overlay vertically by [deltaY] px, clamped to the screen, and persists it. */
+    private fun moveOverlayBy(deltaY: Float) {
+        val view = overlayView ?: return
+        val params = overlayParams ?: return
+
+        val screenHeight = resources.displayMetrics.heightPixels
+        // Leave a little headroom so the bar can never be dragged fully off-screen.
+        val maxY = (screenHeight * 0.85f).roundToInt()
+
+        params.y = (params.y + deltaY.roundToInt()).coerceIn(0, maxY)
+        windowManager.updateViewLayout(view, params)
+        CheckmatePrefs.putInt(PREF_FOCUS_BAR_Y, params.y)
     }
 
     override fun onDestroy() {
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         overlayView?.let { windowManager.removeView(it) }
         overlayView = null
+        overlayParams = null
         super.onDestroy()
     }
 
@@ -157,7 +192,7 @@ private val CBg     = Color(0xF0111122)
 // ── Bar Composable ────────────────────────────────────────────────────────────
 
 @Composable
-private fun AttentionBar(onDismiss: () -> Unit) {
+private fun AttentionBar(onDismiss: () -> Unit, onDrag: (Float) -> Unit) {
     val cs by AttentionCycleManager.stateFlow.collectAsState()
 
     LaunchedEffect(cs.phase) {
@@ -223,13 +258,17 @@ private fun AttentionBar(onDismiss: () -> Unit) {
                 verticalAlignment     = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(
-                    text       = "30m done!",
-                    fontSize   = 12.sp,
-                    color      = displayColor,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    DragHandle(onDrag)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        text       = "30m done!",
+                        fontSize   = 12.sp,
+                        color      = displayColor,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                     // ✅ Mark task done
                     Text(
@@ -258,7 +297,7 @@ private fun AttentionBar(onDismiss: () -> Unit) {
                 }
             }
         } else {
-            // ── Normal row: phase label + timer + controls ────────────────────
+            // ── Normal row: drag handle + phase label + timer + controls ──────
             Row(
                 modifier              = Modifier
                     .fillMaxWidth()
@@ -266,8 +305,10 @@ private fun AttentionBar(onDismiss: () -> Unit) {
                 verticalAlignment     = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                // Left: phase + timer + cycle
+                // Left: drag handle + phase + timer + cycle
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    DragHandle(onDrag)
+                    Spacer(Modifier.width(10.dp))
                     Text(
                         text       = phaseLabel,
                         fontSize   = 11.sp,
@@ -354,4 +395,26 @@ private fun AttentionBar(onDismiss: () -> Unit) {
             trackColor = displayColor.copy(alpha = 0.12f)
         )
     }
+}
+
+// ── Drag handle ───────────────────────────────────────────────────────────────
+// A small grip the student presses and drags to move the bar up/down the
+// screen. Kept separate from the rest of the row so it never eats touches
+// meant for the Done/Break/pause/dismiss buttons.
+
+@Composable
+private fun DragHandle(onDrag: (Float) -> Unit) {
+    Text(
+        text     = "⠿",
+        fontSize = 14.sp,
+        color    = CGray.copy(alpha = 0.7f),
+        modifier = Modifier
+            .padding(end = 2.dp)
+            .pointerInput(Unit) {
+                detectDragGestures { change, dragAmount ->
+                    change.consume()
+                    onDrag(dragAmount.y)
+                }
+            }
+    )
 }
