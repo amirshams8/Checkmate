@@ -1,421 +1,238 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/service/FloatingAttentionService.kt =====
-package com.checkmate.service
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/UninstallGuard.kt =====
+package com.checkmate.workmode
 
-import android.app.*
-import android.content.Context
-import android.content.Intent
-import android.graphics.PixelFormat
-import android.os.Build
-import android.os.IBinder
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.WindowManager
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.core.app.NotificationCompat
-import androidx.lifecycle.*
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
-import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.AttentionPhase
 import com.checkmate.core.CheckmatePrefs
-import kotlin.math.roundToInt
+import java.security.MessageDigest
+import java.security.SecureRandom
 
-class FloatingAttentionService : Service(),
-    LifecycleOwner,
-    ViewModelStoreOwner,
-    SavedStateRegistryOwner {
+/**
+ * UninstallGuard — the shared brain behind Checkmate's uninstall protection.
+ *
+ * IMPORTANT DESIGN NOTE: the guardian PIN is never typed in by hand and never
+ * shown on screen. Whoever holds the phone can tap "Generate PIN", but the
+ * PIN itself only ever reaches the guardian's Telegram chat — the device
+ * stores only a SHA-256 hash, and the plaintext is never persisted or
+ * displayed anywhere in the UI. This closes the obvious loophole where a
+ * student sets their own PIN in a plaintext field: generating a new PIN is
+ * harmless self-sabotage from the student's side, since they still never
+ * learn what it is.
+ *
+ * Three cooperating pieces close the uninstall loop:
+ *  1. Device Admin activation (CheckmateDeviceAdminReceiver) hides the plain
+ *     "Uninstall" button on the App Info screen.
+ *  2. This object holds the guardian-PIN-gated "temporary unlock" window.
+ *  3. AppAutomationService (accessibility service) watches for navigation
+ *     into screens that could remove/disable Checkmate and, unless
+ *     currently unlocked, bounces to Home and alerts the guardian.
+ *
+ * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
+ * those are OS-level and no on-device app can intercept them.
+ */
+object UninstallGuard {
 
-    private val lifecycleRegistry = LifecycleRegistry(this)
-    override val lifecycle: Lifecycle get() = lifecycleRegistry
+    private const val KEY_PIN_HASH        = "guardian_pin_hash"
+    private const val KEY_UNLOCK_UNTIL    = "uninstall_unlock_until"
+    private const val KEY_LAST_ALERT      = "uninstall_last_alert_at"
+    private const val KEY_LAST_GENERATED  = "guardian_pin_last_generated"
+    private const val KEY_FAIL_COUNT      = "guardian_pin_fail_count"
+    private const val KEY_LOCKOUT_UNTIL   = "guardian_pin_lockout_until"
 
-    private val vmStore = ViewModelStore()
-    override val viewModelStore: ViewModelStore get() = vmStore
+    // Mentor v2 (spec 3.5): remote override window, independent of KEY_UNLOCK_UNTIL. A guardian
+    // can be PIN-unlocked (isUnlocked() == true) while WorkModeManager.settingsLocked() still
+    // reads locked because skipRateExceedsThreshold() is also true — that's the intended
+    // escalation behavior. This is the documented emergency bypass for that case: a guardian
+    // command relayed through the existing Telegram bot/Cloudflare worker (the same
+    // infrastructure StatusReporter already pushes to for "status"/"usage") sets this window,
+    // and WorkModeManager.settingsLocked() treats it as a full bypass of BOTH gates.
+    // NOTE: this object only stores/checks the window. The inbound half — the worker route that
+    // listens for a guardian command (e.g. "unlock") and the on-device poll that calls
+    // grantRemoteOverride() — lives at the app layer (see ReminderService.pollRemoteOverride())
+    // since :modules:workmode has no network dependency and shouldn't gain one just for this.
+    private const val KEY_REMOTE_OVERRIDE_UNTIL = "remote_override_until"
+    private const val REMOTE_OVERRIDE_WINDOW_MS = 5 * 60 * 1000L
 
-    private val savedStateController = SavedStateRegistryController.create(this)
-    override val savedStateRegistry: SavedStateRegistry
-        get() = savedStateController.savedStateRegistry
+    // How long a correct PIN entry keeps the watchdog from bouncing the user,
+    // so a guardian can actually walk through the uninstall/disable flow.
+    private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
 
-    private lateinit var windowManager: WindowManager
-    private var overlayView: ComposeView? = null
-    private var overlayParams: WindowManager.LayoutParams? = null
+    // Don't fire a fresh Telegram alert more than once per this window even
+    // if the watchdog keeps re-triggering while the user sits on the screen.
+    private const val ALERT_THROTTLE_MS = 20 * 1000L
 
-    companion object {
-        private const val CHANNEL_ID = "floating_attention_channel"
-        private const val NOTIF_ID   = 99
+    // Minimum time between PIN (re)generations — stops a student from
+    // spamming "generate" to flood the guardian's Telegram.
+    private const val REGEN_COOLDOWN_MS = 5 * 60 * 1000L
 
-        // Pref key for the Settings → Work Mode → "Floating Focus Bar" toggle.
-        // When off, the overlay never shows; the student still gets the same
-        // controls (Done / Break / Confirm / Pause) via notification buttons
-        // added in AttentionCycleService, so nothing becomes un-controllable.
-        const val PREF_FOCUS_BAR_ENABLED = "focus_bar_enabled"
+    // Brute-force protection on the unlock field itself.
+    private const val MAX_FAILED_ATTEMPTS = 5
+    private const val LOCKOUT_MS = 10 * 60 * 1000L
 
-        // Persisted vertical offset (px) of the bar, set by dragging the
-        // grip handle. Restored on the next time the overlay is shown.
-        private const val PREF_FOCUS_BAR_Y = "focus_bar_y"
-
-        fun start(context: Context) {
-            if (!CheckmatePrefs.getBoolean(PREF_FOCUS_BAR_ENABLED, true)) return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                !android.provider.Settings.canDrawOverlays(context)) return
-            val intent = Intent(context, FloatingAttentionService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                context.startForegroundService(intent)
-            else
-                context.startService(intent)
-        }
-
-        fun stop(context: Context) {
-            context.stopService(Intent(context, FloatingAttentionService::class.java))
-        }
-    }
-
-    override fun onCreate() {
-        savedStateController.performAttach()
-        savedStateController.performRestore(null)
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        super.onCreate()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        createChannel()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
-        showOverlay()
-        return START_NOT_STICKY
-    }
-
-    private fun showOverlay() {
-        if (overlayView != null) return
-
-        val savedY = CheckmatePrefs.getInt(PREF_FOCUS_BAR_Y, 0)
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP
-            y = savedY.coerceAtLeast(0)
-        }
-        overlayParams = params
-
-        val view = ComposeView(this).apply {
-            setViewTreeLifecycleOwner(this@FloatingAttentionService)
-            setViewTreeViewModelStoreOwner(this@FloatingAttentionService)
-            setViewTreeSavedStateRegistryOwner(this@FloatingAttentionService)
-            setContent {
-                AttentionBar(
-                    onDismiss = { stop(this@FloatingAttentionService) },
-                    onDrag    = { dy -> moveOverlayBy(dy) }
-                )
-            }
-        }
-        windowManager.addView(view, params)
-        overlayView = view
-    }
-
-    /** Moves the overlay vertically by [deltaY] px, clamped to the screen, and persists it. */
-    private fun moveOverlayBy(deltaY: Float) {
-        val view = overlayView ?: return
-        val params = overlayParams ?: return
-
-        val screenHeight = resources.displayMetrics.heightPixels
-        // Leave a little headroom so the bar can never be dragged fully off-screen.
-        val maxY = (screenHeight * 0.85f).roundToInt()
-
-        params.y = (params.y + deltaY.roundToInt()).coerceIn(0, maxY)
-        windowManager.updateViewLayout(view, params)
-        CheckmatePrefs.putInt(PREF_FOCUS_BAR_Y, params.y)
-    }
-
-    override fun onDestroy() {
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        overlayView?.let { windowManager.removeView(it) }
-        overlayView = null
-        overlayParams = null
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun buildNotification(): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Attention overlay active")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW).build()
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "Floating Attention Bar", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
-    }
-}
-
-// ── Colors ────────────────────────────────────────────────────────────────────
-
-private val CGreen  = Color(0xFF00C896)
-private val CAmber  = Color(0xFFFFB347)
-private val CGray   = Color(0xFF9090A8)
-private val CRed    = Color(0xFFFF4444)
-private val CPurple = Color(0xFFBB86FC)
-private val CBg     = Color(0xF0111122)
-
-// ── Bar Composable ────────────────────────────────────────────────────────────
-
-@Composable
-private fun AttentionBar(onDismiss: () -> Unit, onDrag: (Float) -> Unit) {
-    val cs by AttentionCycleManager.stateFlow.collectAsState()
-
-    LaunchedEffect(cs.phase) {
-        if (cs.phase == AttentionPhase.DONE) onDismiss()
-    }
-
-    val phaseColor = when (cs.phase) {
-        AttentionPhase.FOCUS        -> CGreen
-        AttentionPhase.SHORT_BREAK  -> CGreen
-        AttentionPhase.LONG_BREAK   -> CAmber
-        AttentionPhase.PAUSED       -> CAmber
-        AttentionPhase.PROMPT_DONE  -> CPurple
-        AttentionPhase.DONE         -> CGray
-    }
-
-    // FOCUS phase length depends on mode: a fixed 30-min block in Pomodoro
-    // mode, or the whole task duration in plain continuous-timer mode.
-    val totalPhaseSecs = when (cs.phase) {
-        AttentionPhase.FOCUS       -> if (cs.pomodoroEnabled) 30 * 60L
-                                       else cs.totalDurationSecs.coerceAtLeast(1L)
-        AttentionPhase.SHORT_BREAK -> 5  * 60L
-        AttentionPhase.LONG_BREAK  -> 10 * 60L
-        else                       -> 1L
-    }
-    val progress = when (cs.phase) {
-        AttentionPhase.PROMPT_DONE -> 1f   // bar full at prompt
-        else -> (1f - cs.phaseSecondsLeft.toFloat() / totalPhaseSecs.toFloat()).coerceIn(0f, 1f)
-    }
-
-    val m = cs.phaseSecondsLeft / 60
-    val s = cs.phaseSecondsLeft % 60
-
-    val phaseLabel = when (cs.phase) {
-        AttentionPhase.FOCUS        -> "FOCUS"
-        AttentionPhase.SHORT_BREAK  -> "BREAK"
-        AttentionPhase.LONG_BREAK   -> "LONG BREAK"
-        AttentionPhase.PAUSED       -> "PAUSED"
-        AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
-        AttentionPhase.DONE         -> "DONE"
-    }
-
-    // Pulse color when paused or prompting
-    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue  = 0.5f,
-        targetValue   = 1f,
-        animationSpec = infiniteRepeatable(
-            tween(700, easing = LinearEasing), RepeatMode.Reverse
-        ),
-        label = "pulseAlpha"
+    /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
+    val GUARD_KEYWORDS = listOf(
+        "uninstall",
+        "force stop",
+        "disable device admin app",
+        "deactivate this device admin app",
+        "deactivate",
+        "remove admin",
+        "turn off",          // accessibility-service disable toggle wording on many OEMs
+        "app info",
+        // Settings → Accessibility → "Downloaded apps" (Android 13+) / "Installed
+        // services" (older AOSP) / "Installed apps" (some OEMs) — the list screen
+        // that shows every accessibility service with its On/Off state and is the
+        // gateway a student would use to flip Checkmate's accessibility service
+        // off without ever hitting a screen that literally says "turn off". Gated
+        // the same way as everything else here: only fires when "checkmate" is
+        // also present in the visible text (targetsCheckmate), so browsing this
+        // list for an unrelated service before Checkmate is installed, or before
+        // its row is visible, isn't affected.
+        "downloaded apps",
+        "installed services",
+        "installed apps"
     )
-    val shouldPulse = cs.phase == AttentionPhase.PAUSED || cs.phase == AttentionPhase.PROMPT_DONE
-    val displayColor = if (shouldPulse) phaseColor.copy(alpha = pulseAlpha) else phaseColor
 
-    Column(Modifier.fillMaxWidth().background(CBg)) {
+    // Package names whose screens we watch. Settings itself, plus common
+    // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
+    val WATCHED_PACKAGES = setOf(
+        "com.android.settings",
+        "com.android.permissioncontroller",
+        "com.miui.securitycenter",
+        "com.coloros.securepay",
+        "com.oppo.securepay",
+        "com.samsung.android.settings"
+    )
 
-        if (cs.phase == AttentionPhase.PROMPT_DONE) {
-            // ── Prompt row: task done or take a break? ────────────────────────
-            Row(
-                modifier              = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    DragHandle(onDrag)
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        text       = "30m done!",
-                        fontSize   = 12.sp,
-                        color      = displayColor,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    // ✅ Mark task done
-                    Text(
-                        text       = "✅ Done",
-                        fontSize   = 13.sp,
-                        color      = CGreen,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() }
-                        ) { AttentionCycleManager.confirmDone() }
-                    )
-                    // ➡ Take break and continue task
-                    Text(
-                        text       = "➡ Break",
-                        fontSize   = 13.sp,
-                        color      = CAmber,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() }
-                        ) { AttentionCycleManager.dismissPromptAndBreak() }
-                    )
-                }
-            }
+    // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
+    // on both the activate AND deactivate device-admin paths. It never
+    // mentions "Checkmate" by name (it's the OS's generic copy for ANY
+    // device-admin app), so it can't ride the targetsCheckmate gate that
+    // GUARD_KEYWORDS uses below — matched name-agnostically instead.
+    val DEVICE_ADMIN_PROMPT_KEYWORDS = listOf(
+        "activate device admin apps",
+        "deactivate device admin app"
+    )
+
+    /** True if this window is the OS-level activate/deactivate device-admin prompt (with or without the app named). */
+    fun isDeviceAdminPrompt(visibleText: String): Boolean {
+        val lower = visibleText.lowercase()
+        return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /**
+     * Injected by CheckmateApp.onCreate so :workmode (and :automation, which
+     * calls this object) never directly references GuardianNotifier.
+     */
+    var listener: UninstallAlertListener? = null
+
+    // ── Result types ─────────────────────────────────────────────────────────
+
+    sealed class UnlockResult {
+        object Success : UnlockResult()
+        object WrongPin : UnlockResult()
+        object NoPinConfigured : UnlockResult()
+        data class LockedOut(val secondsLeft: Long, val justTriggered: Boolean) : UnlockResult()
+    }
+
+    // ── PIN generation (device-side hash only — plaintext goes to guardian) ────
+
+    fun hasPinConfigured(): Boolean = !CheckmatePrefs.getString(KEY_PIN_HASH, null).isNullOrBlank()
+
+    fun generateRandomPin(): String {
+        val n = SecureRandom().nextInt(1_000_000)
+        return n.toString().padStart(6, '0')
+    }
+
+    /** Stores only the hash. Also invalidates any active unlock window and clears lockout state. */
+    fun storeNewPinHash(pin: String) {
+        CheckmatePrefs.putString(KEY_PIN_HASH, hashPin(pin))
+        CheckmatePrefs.putLong(KEY_LAST_GENERATED, System.currentTimeMillis())
+        CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
+        CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
+        CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, 0L)
+    }
+
+    fun canRegeneratePin(): Boolean {
+        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
+        return System.currentTimeMillis() - last >= REGEN_COOLDOWN_MS
+    }
+
+    fun regenCooldownRemainingSeconds(): Long {
+        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
+        val remaining = REGEN_COOLDOWN_MS - (System.currentTimeMillis() - last)
+        return if (remaining > 0) remaining / 1000 else 0
+    }
+
+    private fun hashPin(pin: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(pin.trim().toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    // ── Unlock flow (guardian enters the PIN they received on Telegram) ────────
+
+    fun isLockedOut(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L)
+
+    fun lockoutRemainingSeconds(): Long {
+        val remaining = CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L) - System.currentTimeMillis()
+        return if (remaining > 0) remaining / 1000 else 0
+    }
+
+    fun unlockWithPin(pin: String): UnlockResult {
+        if (!hasPinConfigured()) return UnlockResult.NoPinConfigured
+        if (isLockedOut()) return UnlockResult.LockedOut(lockoutRemainingSeconds(), justTriggered = false)
+
+        val stored = CheckmatePrefs.getString(KEY_PIN_HASH, null)
+        return if (hashPin(pin) == stored) {
+            CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
+            CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
+            UnlockResult.Success
         } else {
-            // ── Normal row: drag handle + phase label + timer + controls ──────
-            Row(
-                modifier              = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                // Left: drag handle + phase + timer + cycle
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    DragHandle(onDrag)
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        text       = phaseLabel,
-                        fontSize   = 11.sp,
-                        color      = displayColor,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text       = "%02d:%02d".format(m, s),
-                        fontSize   = 13.sp,
-                        color      = displayColor,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    if (cs.pomodoroEnabled) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text       = "· C${cs.cycleIndex}",
-                            fontSize   = 10.sp,
-                            color      = CGray,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                }
-
-                // Right: ✅ confirm attention + ⏸/▶ pause + ✕ dismiss
-                Row(verticalAlignment = Alignment.CenterVertically) {
-
-                    if (cs.needsAttentionCheck) {
-                        Text(
-                            text     = "✅",
-                            fontSize = 18.sp,
-                            modifier = Modifier
-                                .padding(end = 12.dp)
-                                .clickable(
-                                    indication        = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) { AttentionCycleManager.confirmAttention() }
-                        )
-                    }
-
-                    if (cs.phase != AttentionPhase.DONE) {
-                        val pauseIcon  = if (cs.phase == AttentionPhase.PAUSED) "▶" else "⏸"
-                        val pauseColor = if (cs.phase == AttentionPhase.PAUSED) CGreen else CAmber
-                        Text(
-                            text     = pauseIcon,
-                            fontSize = 16.sp,
-                            color    = pauseColor,
-                            modifier = Modifier
-                                .padding(end = 12.dp)
-                                .clickable(
-                                    indication        = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) {
-                                    if (cs.phase == AttentionPhase.PAUSED) AttentionCycleManager.resume()
-                                    else AttentionCycleManager.pause()
-                                }
-                        )
-                    }
-
-                    Text(
-                        text       = "✕",
-                        fontSize   = 13.sp,
-                        color      = CRed.copy(alpha = 0.85f),
-                        fontFamily = FontFamily.Monospace,
-                        modifier   = Modifier.clickable(
-                            indication        = null,
-                            interactionSource = remember { MutableInteractionSource() },
-                            onClick           = onDismiss
-                        )
-                    )
-                }
+            val fails = CheckmatePrefs.getInt(KEY_FAIL_COUNT, 0) + 1
+            if (fails >= MAX_FAILED_ATTEMPTS) {
+                CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
+                CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, System.currentTimeMillis() + LOCKOUT_MS)
+                UnlockResult.LockedOut(LOCKOUT_MS / 1000, justTriggered = true)
+            } else {
+                CheckmatePrefs.putInt(KEY_FAIL_COUNT, fails)
+                UnlockResult.WrongPin
             }
         }
-
-        LinearProgressIndicator(
-            progress   = { progress },
-            modifier   = Modifier
-                .fillMaxWidth()
-                .height(3.dp)
-                .clip(RoundedCornerShape(0.dp)),
-            color      = displayColor,
-            trackColor = displayColor.copy(alpha = 0.12f)
-        )
     }
-}
 
-// ── Drag handle ───────────────────────────────────────────────────────────────
-// A small grip the student presses and drags to move the bar up/down the
-// screen. Kept separate from the rest of the row so it never eats touches
-// meant for the Done/Break/pause/dismiss buttons.
+    fun isUnlocked(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L)
 
-@Composable
-private fun DragHandle(onDrag: (Float) -> Unit) {
-    Text(
-        text     = "⠿",
-        fontSize = 14.sp,
-        color    = CGray.copy(alpha = 0.7f),
-        modifier = Modifier
-            .padding(end = 2.dp)
-            .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
-                    change.consume()
-                    onDrag(dragAmount.y)
-                }
-            }
-    )
+    fun unlockSecondsRemaining(): Long {
+        val remaining = CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L) - System.currentTimeMillis()
+        return if (remaining > 0) remaining / 1000 else 0
+    }
+
+    fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
+
+    /** Opens the remote-override window. Call only after verifying a guardian-issued command
+     *  (see the NOTE above KEY_REMOTE_OVERRIDE_UNTIL) — this has no PIN check of its own. */
+    fun grantRemoteOverride() {
+        CheckmatePrefs.putLong(KEY_REMOTE_OVERRIDE_UNTIL, System.currentTimeMillis() + REMOTE_OVERRIDE_WINDOW_MS)
+    }
+
+    fun hasRemoteOverride(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_REMOTE_OVERRIDE_UNTIL, 0L)
+
+    // ── Screen detection (used by AppAutomationService) ─────────────────────────
+
+    /** True if this window's visible text suggests an uninstall/disable screen for Checkmate. */
+    fun looksLikeGuardedScreen(visibleText: String, targetsCheckmate: Boolean): Boolean {
+        if (!targetsCheckmate) return false
+        val lower = visibleText.lowercase()
+        return GUARD_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */
+    fun shouldAlert(): Boolean {
+        val last = CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L)
+        val now = System.currentTimeMillis()
+        if (now - last < ALERT_THROTTLE_MS) return false
+        CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
+        return true
+    }
 }
