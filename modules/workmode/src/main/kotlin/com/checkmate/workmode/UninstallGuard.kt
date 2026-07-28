@@ -25,7 +25,10 @@ import java.security.SecureRandom
  *     currently unlocked, bounces to Home and alerts the guardian.
  *
  * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
- * those are OS-level and no on-device app can intercept them.
+ * those are OS-level and no on-device app can intercept them. Developer
+ * Options is the one on-device path that leads there without a factory
+ * reset or physical Safe Mode boot, so it's guarded too (see
+ * DEV_OPTIONS_KEYWORDS below) even though it never mentions "Checkmate".
  */
 object UninstallGuard {
 
@@ -98,7 +101,13 @@ object UninstallGuard {
         "com.miui.securitycenter",
         "com.coloros.securepay",
         "com.oppo.securepay",
-        "com.samsung.android.settings"
+        "com.samsung.android.settings",
+        // Samsung splits its Accessibility section into its own separate app
+        // rather than hosting it inside com.android.settings — the "Installed
+        // apps" service list (where Checkmate's accessibility toggle actually
+        // lives on One UI) runs under this package, so it needed its own entry
+        // or that screen was invisible to WATCHED_PACKAGES entirely.
+        "com.samsung.accessibility"
     )
 
     // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
@@ -115,6 +124,28 @@ object UninstallGuard {
     fun isDeviceAdminPrompt(visibleText: String): Boolean {
         val lower = visibleText.lowercase()
         return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
+    }
+
+    // Developer Options rows that expose an ADB path. Enabling USB or Wireless
+    // debugging lets a student later run `adb uninstall`/`adb shell pm disable`
+    // from a computer, which bypasses the accessibility-service watchdog and
+    // the device-admin uninstall block entirely — neither of those OS-level
+    // paths ever surfaces "Checkmate" on screen, so like the device-admin
+    // prompt above this is matched name-agnostically rather than gated on
+    // targetsCheckmate. Matching on these labels means the whole Developer
+    // Options screen is guarded, not just the moment a toggle is flipped —
+    // same "block the screen outright" precedent as "app info" in GUARD_KEYWORDS.
+    val DEV_OPTIONS_KEYWORDS = listOf(
+        "usb debugging",
+        "wireless debugging",
+        "disable adb authorisation timeout",
+        "disable adb authorization timeout"
+    )
+
+    /** True if this window is a Developer Options screen exposing USB/Wireless debugging. */
+    fun isDeveloperOptionsScreen(visibleText: String): Boolean {
+        val lower = visibleText.lowercase()
+        return DEV_OPTIONS_KEYWORDS.any { lower.contains(it) }
     }
 
     /**

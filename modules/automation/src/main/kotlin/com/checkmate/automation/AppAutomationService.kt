@@ -191,11 +191,17 @@ class AppAutomationService : AccessibilityService() {
     // ── Uninstall / disable watchdog ────────────────────────────────────────────
 
     /**
-     * Scans the current window's visible text for a combination of "this is
-     * about Checkmate" + "this is an uninstall/force-stop/disable screen".
+     * Scans the current window's visible text for either:
+     *  (a) "this is about Checkmate" + "this is an uninstall/force-stop/disable
+     *      screen" (looksLikeGuardedScreen — requires BOTH signals so we never
+     *      interfere with unrelated Settings browsing), or
+     *  (b) a name-agnostic OS/bypass screen that never mentions Checkmate at
+     *      all — the device-admin activate/deactivate prompt, or a Developer
+     *      Options screen exposing USB/Wireless debugging (the on-device path
+     *      to an `adb uninstall`/`adb shell pm disable` that skips this
+     *      watchdog entirely).
      * If matched and no guardian PIN unlock is active, bounces to Home and
-     * fires a throttled guardian alert. Deliberately conservative: requires
-     * BOTH signals so we never interfere with unrelated Settings browsing.
+     * fires a throttled guardian alert.
      */
     private fun checkGuardedScreen() {
         if (UninstallGuard.isUnlocked()) return
@@ -207,7 +213,8 @@ class AppAutomationService : AccessibilityService() {
         val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
         val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
-        if (!isNamedGuardedScreen && !isDeviceAdminPrompt) return
+        val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) return
 
         Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
         performGlobalAction(GLOBAL_ACTION_HOME)
