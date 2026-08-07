@@ -24,6 +24,16 @@ class AppAutomationService : AccessibilityService() {
     private val TAG      = "WA_SEND"
     private val GUARD_TAG = "UninstallGuard"
     private val WHATSAPP = "com.whatsapp"
+
+    // How long to freeze touch the instant a *new* watched-package screen
+    // appears, before checkGuardedScreen() has even read+classified it. This
+    // has to cover the rootInActiveWindow() binder call + collectAllText()'s
+    // node walk, which is the real source of the exploitable gap — a fast or
+    // auto-tap can beat detection itself, not just the Home transition.
+    private val PRE_CHECK_BLOCK_MS = 350L
+    // How long to hold the block once a screen IS confirmed guarded, giving
+    // GLOBAL_ACTION_HOME time to actually take effect.
+    private val POST_DETECT_BLOCK_MS = 700L
     private val SELF_PKG get() = packageName // "com.checkmate"
 
     // ── Browser packages whose URL bar we scan for blocked domains ────────────
@@ -221,10 +231,22 @@ class AppAutomationService : AccessibilityService() {
 
         // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
         // Runs regardless of Work Mode — uninstall protection is always on.
-        if (pkg in UninstallGuard.WATCHED_PACKAGES &&
-            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
-            checkGuardedScreen()
+        if (pkg in UninstallGuard.WATCHED_PACKAGES && !UninstallGuard.isUnlocked()) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                // Brand-new screen inside Settings — freeze touch right away,
+                // before checkGuardedScreen() has read a single node off it.
+                // That call below either extends this into the full
+                // post-detection block (guarded screen) or tears it straight
+                // back down (ordinary Settings browsing) — this pre-check
+                // block is deliberately not scoped to CONTENT_CHANGED too, or
+                // scrolling through an unrelated Settings list would freeze
+                // touch on every content change.
+                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
+            }
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+                checkGuardedScreen()
+            }
         }
 
         // ── WhatsApp automation ───────────────────────────────────────────────
@@ -266,9 +288,15 @@ class AppAutomationService : AccessibilityService() {
      * fires a throttled guardian alert.
      */
     private fun checkGuardedScreen() {
-        if (UninstallGuard.isUnlocked()) return
+        if (UninstallGuard.isUnlocked()) { removeTouchBlocker(); return }
 
-        val root = rootInActiveWindow ?: return
+        val root = rootInActiveWindow ?: run {
+            // Can't classify without a node tree — release the pre-check
+            // block rather than leave touch frozen on a screen we never
+            // actually inspected.
+            removeTouchBlocker()
+            return
+        }
         val text = collectAllText(root)
         val lower = text.lowercase()
 
@@ -276,14 +304,19 @@ class AppAutomationService : AccessibilityService() {
         val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
         val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
-        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) return
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
+            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing)
+            // — drop the pre-check block immediately instead of waiting out
+            // its timer, so normal Settings use doesn't feel laggy.
+            removeTouchBlocker()
+            return
+        }
 
         Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
-        // Swallow touches first — performGlobalAction(HOME) below isn't
-        // instantaneous, and the guarded screen is still fully tappable
-        // until it takes effect. Without this, a fast/repeated tap can land
-        // on the real toggle/button in that gap.
-        blockTouchesBriefly()
+        // Extend/refresh the block to cover the Home transition itself —
+        // the pre-check block above was only sized for classification, not
+        // for GLOBAL_ACTION_HOME actually taking effect.
+        blockTouchesBriefly(POST_DETECT_BLOCK_MS)
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
