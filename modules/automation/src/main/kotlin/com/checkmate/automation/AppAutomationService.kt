@@ -2,11 +2,14 @@ package com.checkmate.automation
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.checkmate.workmode.DistractionGuard
@@ -80,6 +83,65 @@ class AppAutomationService : AccessibilityService() {
     // Last foreground package, used only to detect when a ScrollGuard-watched
     // app leaves the foreground so its scroll session resets cleanly.
     private var lastForegroundPkg = ""
+
+    // ── Guarded-screen touch blocker ────────────────────────────────────────
+    // checkGuardedScreen() only fires on an accessibility event (window
+    // state/content changed), and performGlobalAction(GLOBAL_ACTION_HOME)
+    // itself takes a beat to actually navigate away. In that gap the guarded
+    // screen (e.g. the accessibility service's own "Installed apps" toggle,
+    // or the uninstall confirmation) is still fully tappable — fast/repeated
+    // tapping ("brute forcing") can hit the real Disable/Uninstall button
+    // before Home takes effect. TYPE_ACCESSIBILITY_OVERLAY lets an
+    // AccessibilityService add a system-level window without the
+    // SYSTEM_ALERT_WINDOW permission; a full-screen, transparent, non-focusable
+    // instance of it still swallows every touch that lands on it, which is
+    // exactly what's needed to close that window without changing anything
+    // about how the guard screen is detected.
+    private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private var touchBlockerView: View? = null
+    private val touchBlockerHandler = Handler(Looper.getMainLooper())
+    private val removeTouchBlockerRunnable = Runnable { removeTouchBlocker() }
+
+    /**
+     * Adds a full-screen, invisible, touch-swallowing overlay for [durationMs]
+     * so nothing under it can be tapped, then auto-removes itself. Safe to
+     * call repeatedly while a guarded screen keeps re-triggering the
+     * watchdog — it just extends the existing overlay's lifetime instead of
+     * stacking a second window.
+     */
+    private fun blockTouchesBriefly(durationMs: Long = 700L) {
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        if (touchBlockerView == null) {
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            val view = View(this)
+            try {
+                windowManager.addView(view, params)
+                touchBlockerView = view
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "touch blocker overlay failed to add", e)
+                return
+            }
+        }
+        touchBlockerHandler.postDelayed(removeTouchBlockerRunnable, durationMs)
+    }
+
+    private fun removeTouchBlocker() {
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        val view = touchBlockerView ?: return
+        touchBlockerView = null
+        try {
+            windowManager.removeView(view)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "touch blocker overlay failed to remove", e)
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -217,6 +279,11 @@ class AppAutomationService : AccessibilityService() {
         if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) return
 
         Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+        // Swallow touches first — performGlobalAction(HOME) below isn't
+        // instantaneous, and the guarded screen is still fully tappable
+        // until it takes effect. Without this, a fast/repeated tap can land
+        // on the real toggle/button in that gap.
+        blockTouchesBriefly()
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
@@ -388,5 +455,13 @@ class AppAutomationService : AccessibilityService() {
         return null
     }
 
-    override fun onInterrupt() { Log.d(TAG, "Service interrupted") }
+    override fun onInterrupt() {
+        Log.d(TAG, "Service interrupted")
+        removeTouchBlocker()
+    }
+
+    override fun onDestroy() {
+        removeTouchBlocker()
+        super.onDestroy()
+    }
 }
