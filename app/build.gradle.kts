@@ -83,4 +83,5 @@ dependencies {
     implementation(project(":modules:workmode"))
     implementation(project(":modules:psyche"))
     implementation(project(":modules:planner"))
+    implementation(project(":modules:testmate"))
 }

@@ -27,6 +27,7 @@ import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
@@ -206,6 +207,11 @@ fun SettingsScreen() {
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             }
+        }
+
+        // ── Test Platform (Testmate) ──
+        SettingSection("TEST PLATFORM") {
+            TestmateSettings()
         }
 
         // ── Security / Uninstall Protection ──
@@ -745,6 +751,107 @@ private fun VoiceSettings(context: Context) {
                 uncheckedTrackColor = White10
             )
         )
+    }
+}
+
+// ── Testmate (test platform) settings ─────────────────────────────────────────
+
+@Composable
+private fun TestmateSettings() {
+    var baseUrl by remember {
+        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, "") ?: "")
+    }
+    var baseUrlSaved by remember { mutableStateOf(false) }
+
+    var token by remember {
+        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, "") ?: "")
+    }
+    var showToken by remember { mutableStateOf(false) }
+    var tokenSaved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Testmate Base URL", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        OutlinedTextField(
+            value         = baseUrl,
+            onValueChange = { baseUrl = it; baseUrlSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("https://testmate2.vercel.app", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    CheckmatePrefs.putString(TestmateApi.PREF_BASE_URL, baseUrl.trim())
+                    baseUrlSaved = true
+                }) {
+                    Icon(
+                        if (baseUrlSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (baseUrlSaved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (baseUrlSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Access Token", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Token-authed per test-platform-blueprint.md §3/§5 — issued by Testmate for this device.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = token,
+            onValueChange = { token = it; tokenSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("Paste access token here", color = White30, fontSize = 13.sp) },
+            visualTransformation = if (showToken) VisualTransformation.None
+                                   else PasswordVisualTransformation(),
+            trailingIcon  = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showToken = !showToken }) {
+                        Icon(
+                            if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            null, tint = White60
+                        )
+                    }
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString(TestmateApi.PREF_TOKEN, token.trim())
+                        tokenSaved = true
+                    }) {
+                        Icon(
+                            if (tokenSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (tokenSaved) AccentGreen else White60
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (tokenSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
     }
 }
 

@@ -17,10 +17,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
 import com.checkmate.ui.theme.*
 
 @Composable
-fun StatsScreen(vm: StatsViewModel = viewModel()) {
+fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewModel()) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
 
@@ -177,6 +178,30 @@ fun StatsScreen(vm: StatsViewModel = viewModel()) {
                     Text("Screen Time — Last 7 Days", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
                     Spacer(Modifier.height(16.dp))
                     ScreenTimeBarChart(state.screenTimeHistory)
+                }
+            }
+        }
+
+        // ── Testmate — fetch a session result from the test platform ─────────
+        if (navController != null) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                shape    = RoundedCornerShape(14.dp),
+                color    = BgCard,
+                border   = BorderStroke(0.5.dp, White10),
+                onClick  = { navController.navigate("test_results") }
+            ) {
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Quiz, null, tint = AccentBlue, modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Test Platform", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text("View a Testmate session result", fontSize = 11.sp, color = White60)
+                    }
+                    Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
                 }
             }
         }

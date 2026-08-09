@@ -21,6 +21,7 @@ import com.checkmate.ui.planner.CoachingPlannerScreen
 import com.checkmate.ui.consultation.ConsultationScreen
 import com.checkmate.ui.stats.StatsScreen
 import com.checkmate.ui.settings.SettingsScreen
+import com.checkmate.ui.testresults.TestResultsScreen
 import com.checkmate.ui.theme.*
 
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
@@ -83,13 +84,16 @@ fun MainScreen(homeViewModel: HomeViewModel) {
             composable(Screen.Home.route)     { HomeScreen(navController, vm = homeViewModel) }
             composable(Screen.Planner.route)  { PlannerScreen(navController) }
             composable(Screen.Mentor.route)   { MentorScreen() }
-            composable(Screen.Stats.route)    { StatsScreen() }
+            composable(Screen.Stats.route)    { StatsScreen(navController) }
             composable(Screen.Settings.route) { SettingsScreen() }
 
             // Blueprint 6 new routes
             composable("consultation")   { ConsultationScreen(navController) }
             composable("daily_checkin")  { DailyCheckInScreen(navController) }
             composable("coaching_plan")  { CoachingPlannerScreen(navController) }
+
+            // Testmate integration (Phase 6)
+            composable("test_results")  { TestResultsScreen(navController) }
         }
     }
 }
