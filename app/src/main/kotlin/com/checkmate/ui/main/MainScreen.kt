@@ -22,6 +22,7 @@ import com.checkmate.ui.consultation.ConsultationScreen
 import com.checkmate.ui.stats.StatsScreen
 import com.checkmate.ui.settings.SettingsScreen
 import com.checkmate.ui.testresults.TestResultsScreen
+import com.checkmate.ui.testresults.TestmateWebScreen
 import com.checkmate.ui.theme.*
 
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
@@ -94,6 +95,7 @@ fun MainScreen(homeViewModel: HomeViewModel) {
 
             // Testmate integration (Phase 6)
             composable("test_results")  { TestResultsScreen(navController) }
+            composable("test_web")      { TestmateWebScreen(navController) }
         }
     }
 }

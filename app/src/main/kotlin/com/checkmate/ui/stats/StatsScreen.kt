@@ -182,8 +182,29 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
             }
         }
 
-        // ── Testmate — fetch a session result from the test platform ─────────
+        // ── Testmate — take a test / view a result ────────────────────────────
         if (navController != null) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                shape    = RoundedCornerShape(14.dp),
+                color    = BgCard,
+                border   = BorderStroke(0.5.dp, White10),
+                onClick  = { navController.navigate("test_web") }
+            ) {
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Quiz, null, tint = AccentBlue, modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Test Platform", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text("Take a test on Testmate", fontSize = 11.sp, color = White60)
+                    }
+                    Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             Surface(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                 shape    = RoundedCornerShape(14.dp),
@@ -195,11 +216,11 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                     modifier          = Modifier.fillMaxWidth().padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.Quiz, null, tint = AccentBlue, modifier = Modifier.size(22.dp))
+                    Icon(Icons.Default.BarChart, null, tint = AccentGreen, modifier = Modifier.size(22.dp))
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Test Platform", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
-                        Text("View a Testmate session result", fontSize = 11.sp, color = White60)
+                        Text("Test Results", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text("Look up a session result by ID", fontSize = 11.sp, color = White60)
                     }
                     Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
                 }
