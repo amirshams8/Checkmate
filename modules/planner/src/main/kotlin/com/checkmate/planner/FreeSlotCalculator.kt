@@ -80,6 +80,11 @@ object FreeSlotCalculator {
         if (h !in 0..23 || m !in 0..59) null else h * 60 + m
     } catch (_: Exception) { null }
 
+    /** Public wrapper around parseMinutesOrNull — lets callers outside this object (e.g.
+     *  HomeViewModel.findNextFreeSlot) turn a task's existing "HH:mm" scheduledStartTime
+     *  back into minutes-from-midnight without duplicating the parsing rules here. */
+    fun parseTimeOrNull(hhmm: String): Int? = parseMinutesOrNull(hhmm)
+
     /** Formats a minutes-from-midnight value back to "HH:mm" for StudyTask.scheduledStartTime. */
     fun formatMinutes(totalMinutes: Int): String {
         val clamped = totalMinutes.coerceIn(0, 24 * 60 - 1)
@@ -87,6 +92,41 @@ object FreeSlotCalculator {
         val m = clamped % 60
         return "%02d:%02d".format(h, m)
     }
+
+    /**
+     * Carves already-occupied (startMinute, endMinute) ranges — e.g. tasks today's plan
+     * has already scheduled — out of a set of free slots. Same clip-and-merge approach as
+     * computeFreeSlots() uses for blockedSlots, just applied to StudyTask occupancy instead
+     * of ConsultationProfile entries, so HomeViewModel.addCustomTask can find room for a
+     * newly-added task without double-booking a slot AdaptivePlanner already used.
+     */
+    fun subtractOccupied(freeSlots: List<FreeSlot>, occupied: List<Pair<Int, Int>>): List<FreeSlot> {
+        if (occupied.isEmpty()) return freeSlots
+        val merged = occupied.sortedBy { it.first }.let { mergeOverlapping(it) }
+        val result = mutableListOf<FreeSlot>()
+        for (slot in freeSlots) {
+            var cursor = slot.startMinute
+            for ((oStart, oEnd) in merged) {
+                val s = oStart.coerceIn(slot.startMinute, slot.endMinute)
+                val e = oEnd.coerceIn(slot.startMinute, slot.endMinute)
+                if (e <= s) continue
+                if (s > cursor) result.add(FreeSlot(cursor, s))
+                cursor = maxOf(cursor, e)
+            }
+            if (cursor < slot.endMinute) result.add(FreeSlot(cursor, slot.endMinute))
+        }
+        return result.filter { it.durationMinutes > 0 }
+    }
+
+    /**
+     * First-fit: the earliest free slot (slots are expected in chronological order, as
+     * computeFreeSlots()/subtractOccupied() already return them) with at least
+     * durationMinutes of room, returned as a minutes-from-midnight start. Null means
+     * nothing today fits — callers should leave StudyTask.scheduledStartTime null rather
+     * than fabricate a time, same contract as AdaptivePlanner.assignScheduledTimes().
+     */
+    fun firstFitStart(durationMinutes: Int, freeSlots: List<FreeSlot>): Int? =
+        freeSlots.firstOrNull { it.durationMinutes >= durationMinutes }?.startMinute
 
     private const val DEFAULT_WINDOW_START = 9 * 60   // 09:00 — mirrors PlannerState's default
     private const val DEFAULT_WINDOW_END   = 21 * 60  // 21:00 — mirrors PlannerState's default

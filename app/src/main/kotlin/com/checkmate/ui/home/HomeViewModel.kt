@@ -8,8 +8,10 @@ import android.app.Activity
 import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.TodayContext
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -85,6 +87,13 @@ class HomeViewModel : ViewModel() {
      * WorkModeManager the same way via startTask(), and triggers the same
      * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
      * WhatsApp/Telegram report — no extra wiring required.
+     *
+     * scheduledStartTime is now resolved via findNextFreeSlot() instead of being left
+     * null — previously every custom task landed in Timeline view's "Unscheduled"
+     * section unconditionally, since only AdaptivePlanner's generated plan ever ran
+     * assignScheduledTimes(). A custom task that genuinely doesn't fit anywhere in
+     * today's free time still comes back null and still falls into "Unscheduled" —
+     * that part is unchanged.
      */
     fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int, taskType: TaskType = TaskType.OTHER) {
         val cleanSubject  = subject.trim()
@@ -93,14 +102,53 @@ class HomeViewModel : ViewModel() {
         if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
 
         val task = StudyTask(
-            subject         = cleanSubject,
-            topic           = cleanTopic,
-            durationMinutes = cleanDuration,
-            isCustom        = true,
-            taskType        = taskType
+            subject            = cleanSubject,
+            topic              = cleanTopic,
+            durationMinutes    = cleanDuration,
+            isCustom           = true,
+            taskType           = taskType,
+            scheduledStartTime = findNextFreeSlot(cleanDuration)
         )
         PlanStore.addCustomTask(task)
         CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
+    }
+
+    /**
+     * Mirrors AdaptivePlanner.assignScheduledTimes() for a single manually-added task:
+     * today's free slots (study window minus ConsultationProfile.blockedSlots) minus
+     * whatever today's plan has already scheduled, first-fit. Reads study_start/study_end
+     * straight from CheckmatePrefs — the same keys PlannerViewModel persists them under —
+     * so this doesn't need the Plan screen's ViewModel in scope. Returns null when nothing
+     * today has room, same as the generated-plan path.
+     */
+    private fun findNextFreeSlot(durationMinutes: Int): String? {
+        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
+        val studyEnd   = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
+        val profile    = ConsultationProfile.load()
+
+        val freeSlots = FreeSlotCalculator.computeFreeSlots(profile.blockedSlots, studyStart, studyEnd)
+        val occupied  = PlanStore.todayTasks.value.mapNotNull { t ->
+            val start = t.scheduledStartTime ?: return@mapNotNull null
+            val startMinute = FreeSlotCalculator.parseTimeOrNull(start) ?: return@mapNotNull null
+            startMinute to (startMinute + t.durationMinutes)
+        }
+        val remaining = FreeSlotCalculator.subtractOccupied(freeSlots, occupied)
+        return FreeSlotCalculator.firstFitStart(durationMinutes, remaining)
+            ?.let { FreeSlotCalculator.formatMinutes(it) }
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — the "Schedule" action on an
+     * Unscheduled TaskCard in Timeline view. Available for both custom and generated
+     * tasks: a generated task can end up unscheduled too when the day's plan doesn't fit
+     * today's free time (see AdaptivePlanner.assignScheduledTimes), and until now there
+     * was no way to fix that from HomeScreen except deleting and re-adding it. Same
+     * PENDING-only guard as editTaskDuration/removeTask — once a task is running its
+     * position on the timeline isn't meaningful to change.
+     */
+    fun scheduleTask(task: StudyTask, hhmm: String) {
+        if (task.state != TaskState.PENDING) return
+        PlanStore.updateTaskSchedule(task.id, hhmm)
     }
 
     /**

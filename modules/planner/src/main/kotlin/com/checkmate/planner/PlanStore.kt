@@ -71,6 +71,18 @@ object PlanStore {
         it.copy(durationMinutes = durationMinutes)
     }
 
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
+     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
+     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
+     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
+     * fit it into today's free time, and this is how the student fixes that from HomeScreen
+     * without deleting and re-adding it.
+     */
+    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime)
+    }
+
     fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
 
     fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {

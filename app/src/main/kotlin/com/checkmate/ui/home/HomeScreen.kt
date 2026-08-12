@@ -42,6 +42,7 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
+    var schedulingTask      by remember { mutableStateOf<StudyTask?>(null) }
     var viewMode            by remember { mutableStateOf(HomeViewMode.LIST) }
 
     Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
@@ -77,7 +78,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                             onPause        = { vm.pauseTask(context, task) },
                             onResume       = { vm.resumeTask(context, task) },
                             onRemove       = { vm.removeTask(task) },
-                            onEditDuration = { editingTask = task }
+                            onEditDuration = { editingTask = task },
+                            onSchedule     = { schedulingTask = task }
                         )
                     }
                 } else {
@@ -91,7 +93,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                             onPause        = { vm.pauseTask(context, it) },
                             onResume       = { vm.resumeTask(context, it) },
                             onRemove       = { vm.removeTask(it) },
-                            onEditDuration = { editingTask = it }
+                            onEditDuration = { editingTask = it },
+                            onSchedule     = { schedulingTask = it }
                         )
                     }
                 }
@@ -139,6 +142,17 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
             onConfirm = { newDuration ->
                 vm.editTaskDuration(task, newDuration)
                 editingTask = null
+            }
+        )
+    }
+
+    schedulingTask?.let { task ->
+        ScheduleTaskDialog(
+            task      = task,
+            onDismiss = { schedulingTask = null },
+            onConfirm = { hhmm ->
+                vm.scheduleTask(task, hhmm)
+                schedulingTask = null
             }
         )
     }
@@ -219,7 +233,8 @@ private fun TimelineView(
     onPause:        (StudyTask) -> Unit,
     onResume:       (StudyTask) -> Unit,
     onRemove:       (StudyTask) -> Unit,
-    onEditDuration: (StudyTask) -> Unit
+    onEditDuration: (StudyTask) -> Unit,
+    onSchedule:     (StudyTask) -> Unit
 ) {
     val scheduled   = tasks.filter { !it.scheduledStartTime.isNullOrBlank() }
         .sortedBy { it.scheduledStartTime }
@@ -236,7 +251,8 @@ private fun TimelineView(
                 onPause        = { onPause(task) },
                 onResume       = { onResume(task) },
                 onRemove       = { onRemove(task) },
-                onEditDuration = { onEditDuration(task) }
+                onEditDuration = { onEditDuration(task) },
+                onSchedule     = { onSchedule(task) }
             )
         }
         if (unscheduled.isNotEmpty()) {
@@ -261,7 +277,8 @@ private fun TimelineView(
                         onPause        = { onPause(task) },
                         onResume       = { onResume(task) },
                         onRemove       = { onRemove(task) },
-                        onEditDuration = { onEditDuration(task) }
+                        onEditDuration = { onEditDuration(task) },
+                        onSchedule     = { onSchedule(task) }
                     )
                 }
             }
@@ -279,7 +296,8 @@ private fun TimelineRow(
     onPause:        () -> Unit,
     onResume:       () -> Unit,
     onRemove:       () -> Unit,
-    onEditDuration: () -> Unit
+    onEditDuration: () -> Unit,
+    onSchedule:     () -> Unit
 ) {
     Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
         Column(
@@ -306,7 +324,8 @@ private fun TimelineRow(
                 onPause        = onPause,
                 onResume       = onResume,
                 onRemove       = onRemove,
-                onEditDuration = onEditDuration
+                onEditDuration = onEditDuration,
+                onSchedule     = onSchedule
             )
         }
     }
@@ -668,6 +687,66 @@ private fun EditDurationDialog(
     )
 }
 
+/**
+ * Manual "Schedule" action for a task sitting in Timeline view's Unscheduled section —
+ * lets the student give it an "HH:mm" slot directly instead of only being able to delete
+ * and re-add it. Pre-fills with the study window's start time as a reasonable default.
+ * Validation mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59) so a bad value
+ * can't get saved onto the task.
+ */
+@Composable
+private fun ScheduleTaskDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (hhmm: String) -> Unit
+) {
+    var time by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+
+    fun isValidTime(value: String): Boolean {
+        val parts = value.trim().split(":")
+        if (parts.size != 2) return false
+        val h = parts[0].toIntOrNull() ?: return false
+        val m = parts[1].toIntOrNull() ?: return false
+        return h in 0..23 && m in 0..59
+    }
+
+    val isValid = isValidTime(time)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Schedule Task", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                OutlinedTextField(
+                    value           = time,
+                    onValueChange   = { input -> if (input.length <= 5) time = input },
+                    label           = { Text("Start time (HH:mm)", color = White30) },
+                    placeholder     = { Text("e.g. 16:30", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { if (isValid) onConfirm(time.trim()) },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
 @Composable
 private fun dialogFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedBorderColor   = AccentGreen,
@@ -754,7 +833,8 @@ private fun TaskCard(
     onPause:        () -> Unit,
     onResume:       () -> Unit,
     onRemove:       () -> Unit,
-    onEditDuration: () -> Unit
+    onEditDuration: () -> Unit,
+    onSchedule:     () -> Unit
 ) {
     val isPaused    = task.state == TaskState.PAUSED
     val borderColor = when {
@@ -822,6 +902,11 @@ private fun TaskCard(
                     if (task.isCustom && task.state == TaskState.PENDING) {
                         IconButton(onClick = onEditDuration, modifier = Modifier.size(20.dp)) {
                             Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
+                        }
+                    }
+                    if (task.scheduledStartTime.isNullOrBlank() && task.state == TaskState.PENDING) {
+                        IconButton(onClick = onSchedule, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Schedule, null, tint = AccentGreen, modifier = Modifier.size(14.dp))
                         }
                     }
                     if (task.state == TaskState.PENDING) {
