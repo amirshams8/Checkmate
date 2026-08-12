@@ -6,6 +6,7 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import com.checkmate.ui.mentor.MentorViewModel
+import com.checkmate.workmode.WorkModeSchedule
 import java.util.Calendar
 
 /**
@@ -114,5 +115,37 @@ object ProactiveMentor {
         GuardianNotifier.notifyStudyInactivity(context, missedDays)
         CheckmatePrefs.putString(KEY_LAST_INACTIVITY_ALERT_DAY, todayKey)
         Log.d(TAG, "consistencyCheckIfNeeded fired: missedDays=$missedDays")
+    }
+
+    // ── Weekly holiday prompt ───────────────────────────────────────────────
+
+    private const val KEY_LAST_HOLIDAY_PROMPT_WEEK = "mentor_last_holiday_prompt_week"
+
+    /**
+     * Call once daily (from ReminderService's existing 15-min loop). Only actually fires on
+     * Wednesdays, and at most once per calendar week (guarded by an ISO-ish "$year_$weekOfYear"
+     * key, same pattern as the day-key guards elsewhere in this object) — asks whether any
+     * holiday should be marked for the coming days. Marking a holiday is still entirely a
+     * guardian action gated behind the PIN (see HolidaySchedule / SettingsScreen's
+     * HolidaySettings) — this only surfaces the question regularly instead of relying on
+     * someone remembering to check Settings unprompted. Also pings the guardian directly via
+     * GuardianNotifier, since they're the one who actually has to act on it.
+     */
+    fun holidayPromptIfNeeded(context: Context) {
+        val cal = Calendar.getInstance()
+        if (cal.get(Calendar.DAY_OF_WEEK) != Calendar.WEDNESDAY) return
+
+        val weekKey = "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.WEEK_OF_YEAR)}"
+        if (CheckmatePrefs.getString(KEY_LAST_HOLIDAY_PROMPT_WEEK, "") == weekKey) return
+
+        val msg = "Any holidays coming up? Ask your guardian to mark them in " +
+            "Settings \u2192 Work Mode \u2192 Holidays. On a marked holiday the usual " +
+            "${WorkModeSchedule.LABEL} window is replaced by a single reduced lock, " +
+            "1:00 AM \u2013 5:30 PM only, for that day."
+        MentorViewModel.appendProactiveMessage(msg)
+        MentorNotifier.notify(context, msg)
+        GuardianNotifier.notifyHolidayPrompt(context)
+        CheckmatePrefs.putString(KEY_LAST_HOLIDAY_PROMPT_WEEK, weekKey)
+        Log.d(TAG, "holidayPromptIfNeeded fired")
     }
 }

@@ -146,8 +146,9 @@ private fun HolidaySettings() {
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Holidays", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 4.dp))
         Text(
-            "On a marked holiday, the ${WorkModeSchedule.LABEL} window doesn't apply for that " +
-                "whole calendar day. Every other day is unaffected.",
+            "On a marked holiday, the ${WorkModeSchedule.LABEL} window is replaced by a " +
+                "single reduced lock from 1:00 AM \u2013 5:30 PM for that day only \u2014 not " +
+                "removed entirely. Every other day is unaffected.",
             fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
         )
 

@@ -16,6 +16,7 @@ import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.PsycheEngine
 import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeSchedule
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -333,6 +334,29 @@ object GuardianNotifier {
                   "study recorded — no plan generated or nothing completed — as of ${timeNow()} " +
                   "on ${dateToday()}."
         Log.w(TAG, "Study inactivity alert: missedDays=$missedDays")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Fired by ProactiveMentor.holidayPromptIfNeeded() every Wednesday, once per week — a
+     * standing reminder for the guardian to review and mark any upcoming holiday, since that's
+     * the only way WorkModeSchedule's hardcoded window ever eases for a specific day (see
+     * HolidaySchedule). Purely informational; doesn't touch the holiday list itself.
+     */
+    fun notifyHolidayPrompt(context: Context) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🗓️ Checkmate: weekly holiday check-in for $candidateName. Any holidays " +
+                  "coming up? Mark them in the app's Settings \u2192 Work Mode \u2192 Holidays " +
+                  "(guardian PIN required) — a marked holiday reduces that day's lock to " +
+                  "1:00 AM \u2013 5:30 PM only, instead of the usual ${WorkModeSchedule.LABEL} schedule."
+        Log.d(TAG, "Holiday prompt sent")
 
         val number = getGuardianNumber()
         if (number != null) {

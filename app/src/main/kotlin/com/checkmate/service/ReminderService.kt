@@ -60,6 +60,9 @@ class ReminderService : Service() {
                 // no plan/completion, nudges the student and alerts the guardian. Same
                 // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
                 try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
+                // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
+                try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min

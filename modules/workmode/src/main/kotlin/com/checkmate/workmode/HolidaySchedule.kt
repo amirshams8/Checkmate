@@ -9,9 +9,11 @@ import java.util.Locale
  * HolidaySchedule — the one guardian-controlled exception to WorkModeSchedule's otherwise
  * hardcoded, student-unreachable lock window (see the design note atop WorkModeSchedule).
  *
- * A "holiday" here is a specific calendar date a guardian has explicitly marked exempt — on
- * that date, both the usual 19:00-07:00 window and the Sunday/Wednesday extra 01:00-17:30
- * window are skipped entirely (see WorkModeSchedule.isWithinScheduledWindow).
+ * A "holiday" here is a specific calendar date a guardian has explicitly marked — on that
+ * date, the usual 19:00-07:00 window (and the Sunday/Wednesday extra window, if applicable)
+ * are both replaced by a single reduced 01:00-17:30 lock, the same hours the regular Sunday/
+ * Wednesday window already uses (see WorkModeSchedule.isWithinScheduledWindow). A holiday
+ * eases the schedule for the day rather than removing it entirely.
  *
  * This is intentionally NOT reachable without a guardian PIN unlock. SettingsScreen's
  * HolidaySettings wraps add/remove behind the same WorkModeLockGate every other Work Mode

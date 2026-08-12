@@ -25,8 +25,11 @@ import java.util.Calendar
  *
  * The ONE exception is [HolidaySchedule]: specific calendar dates a guardian
  * has explicitly marked exempt (see that file's doc for why it's gated
- * behind a guardian PIN unlock rather than being freely editable). Every
- * other day, this schedule behaves exactly as before.
+ * behind a guardian PIN unlock rather than being freely editable). On a
+ * marked holiday, the usual 19:00-07:00 window is replaced by a single
+ * reduced 01:00-17:30 lock instead — a holiday eases the schedule for the
+ * day, it doesn't remove it. Every other day, this schedule behaves exactly
+ * as before.
  */
 object WorkModeSchedule {
 
@@ -59,9 +62,11 @@ object WorkModeSchedule {
      * TrustedTime — NOT the raw device clock) falls inside a locked window:
      *  - the usual 19:00-07:00 window, every day, OR
      *  - on Sunday/Wednesday only, the extra 01:00-17:30 window.
-     *  - UNLESS [cal]'s calendar date is a guardian-marked holiday
-     *    (HolidaySchedule.isHoliday), in which case neither window applies
-     *    for that whole day.
+     *  - EXCEPT on a guardian-marked holiday (HolidaySchedule.isHoliday): the usual
+     *    19:00-07:00 window (and, if it's also a Sunday/Wednesday, that extra window too)
+     *    are both replaced by a single reduced 01:00-17:30 lock, same hours as the regular
+     *    Sunday/Wednesday window. A holiday eases the schedule for the day — it doesn't
+     *    remove structure from it entirely.
      *
      * Deliberately does NOT default to Calendar.getInstance() (raw device
      * time) — that was spoofable by simply changing Settings > Date & time,
@@ -74,11 +79,22 @@ object WorkModeSchedule {
     fun isWithinScheduledWindow(
         cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
     ): Boolean {
-        // Guardian-marked holiday: the whole calendar day is exempt from both lock windows.
-        // See HolidaySchedule's doc for why this can only be set behind a guardian PIN unlock.
-        if (HolidaySchedule.isHoliday(cal)) return false
-
         val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val minute = cal.get(Calendar.MINUTE)
+
+        fun withinSpecialWindow(): Boolean {
+            val afterSpecialStart = hour > SPECIAL_START_HOUR ||
+                (hour == SPECIAL_START_HOUR && minute >= SPECIAL_START_MINUTE)
+            val beforeSpecialEnd = hour < SPECIAL_END_HOUR ||
+                (hour == SPECIAL_END_HOUR && minute < SPECIAL_END_MINUTE)
+            return afterSpecialStart && beforeSpecialEnd
+        }
+
+        // Guardian-marked holiday: the usual 19:00-07:00 window (and the Sunday/Wednesday
+        // extra window, if applicable) are both replaced by just the reduced 01:00-17:30
+        // window — see HolidaySchedule's doc for why this can only be set behind a guardian
+        // PIN unlock.
+        if (HolidaySchedule.isHoliday(cal)) return withinSpecialWindow()
 
         // Usual window wraps past midnight: active from START_HOUR..23:59 AND
         // 00:00..(END_HOUR-1):59. Applies every day of the week.
@@ -87,14 +103,7 @@ object WorkModeSchedule {
         // Extra Sunday/Wednesday window: 01:00 (inclusive) to 17:30 (exclusive).
         // Doesn't wrap past midnight, so it's a plain same-day range check.
         val day = cal.get(Calendar.DAY_OF_WEEK)
-        if (day in SPECIAL_DAYS) {
-            val minute = cal.get(Calendar.MINUTE)
-            val afterSpecialStart = hour > SPECIAL_START_HOUR ||
-                (hour == SPECIAL_START_HOUR && minute >= SPECIAL_START_MINUTE)
-            val beforeSpecialEnd = hour < SPECIAL_END_HOUR ||
-                (hour == SPECIAL_END_HOUR && minute < SPECIAL_END_MINUTE)
-            if (afterSpecialStart && beforeSpecialEnd) return true
-        }
+        if (day in SPECIAL_DAYS && withinSpecialWindow()) return true
 
         return false
     }
