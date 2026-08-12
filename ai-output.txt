@@ -1,3 +1,751 @@
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
+package com.checkmate.planner
+
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+
+// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
+// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
+// excluded — see StudyTask.actualMinutes) across today's completed sessions.
+// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
+// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
+// no pause behavior to measure), so a fatigue/distraction trend is visible
+// even on a day with zero completions.
+data class PauseStats(
+    val actualFocusMinutesToday: Int   = 0,
+    val avgPausesPerSession:     Float = 0f,
+    val pauseRatePercent:        Int   = 0
+)
+
+object PlanStore {
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
+    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
+
+    init { reload() }
+
+    private fun reload() {
+        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
+        _todayTasks.value = saved?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+    }
+
+    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
+
+    /**
+     * Appends a single manually-created task to today's plan WITHOUT touching any
+     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
+     * the whole list, this is additive — safe to call any time, any number of times.
+     * The new task goes through the exact same StudyTask model as AdaptivePlanner
+     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
+     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
+     * code path needed anywhere downstream.
+     */
+    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
+
+    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
+    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
+
+    /** Edits the planned duration of a single task — used for custom-task duration editing. */
+    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(durationMinutes = durationMinutes)
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
+     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
+     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
+     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
+     * fit it into today's free time, and this is how the student fixes that from HomeScreen
+     * without deleting and re-adding it.
+     */
+    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime)
+    }
+
+    /**
+     * Manually sets both scheduledStartTime AND durationMinutes for a task in a single
+     * write — backs the Timeline/List clock-icon's start+end time editor (see
+     * HomeViewModel.rescheduleTask / HomeScreen's ScheduleTaskDialog). Unlike calling
+     * updateTaskSchedule() and updateTaskDuration() separately, this goes through one
+     * persist() call so the two fields can never observably desync mid-update (e.g. a
+     * StateFlow collector seeing the new start time paired with the old duration for one
+     * frame).
+     */
+    fun updateTaskScheduleAndDuration(taskId: String, scheduledStartTime: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime, durationMinutes = durationMinutes)
+    }
+
+    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
+
+    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
+        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+    }
+
+    /**
+     * Blueprint 2.6: records the session's real focus time — as measured by
+     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
+     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
+     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
+     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
+     * clock)"). Previously neither field was ever written, so both stats silently
+     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
+     */
+    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
+        it.copy(focusMinutes = minutes, actualMinutes = minutes)
+    }
+
+    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
+    }
+
+    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
+        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
+    }
+
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+
+    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
+    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
+        it.copy(intentionText = intentionText)
+    }
+
+    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
+    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
+        it.copy(completedStatus = status)
+    }
+
+    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
+        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
+    }
+
+    /**
+     * Single write path for today's task list — every mutating function above funnels
+     * through this instead of duplicating the "encode + persist + update StateFlow"
+     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
+     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
+     * copy is newer, without PlanStore itself knowing anything about sync/network —
+     * this module stays local-storage-only, same as before.
+     */
+    private fun persist(tasks: List<StudyTask>) {
+        val key = todayKey()
+        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
+        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
+        _todayTasks.value = tasks
+    }
+
+    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
+    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
+
+    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
+     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
+    fun currentDayKey(): String = todayKey()
+
+    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
+
+    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
+    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
+
+    fun getTodayCompletionPercent(): Int {
+        val t = _todayTasks.value
+        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
+    }
+
+    fun getStreakDays(): Int {
+        var streak = 0
+        val cal = Calendar.getInstance()
+        for (i in 0..30) {
+            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
+            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
+            // Fix: previously "tasks.count{DONE}==0 && tasks.isNotEmpty()" meant a day where a
+            // plan was saved with ZERO tasks (empty list) did NOT break the streak — an empty
+            // plan silently counted as a study day. No tasks in the plan means no study, same
+            // as a day with tasks that were never done, so this now breaks on either case.
+            if (tasks.count { it.state == TaskState.DONE } == 0) break
+            streak++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return streak
+    }
+
+    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
+
+    /**
+     * Per-day study status used by the Stats consistency calendar and by
+     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
+     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
+     * neutral/unknown state, which is what silently reading everything as 0% used to do.
+     */
+    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
+
+    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
+    fun getDayStatus(cal: Calendar): DayStudyStatus {
+        val today = Calendar.getInstance()
+        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
+            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
+        if (isFuture) return DayStudyStatus.FUTURE
+
+        val tasks = loadDay(keyForDay(cal))
+        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
+        val done = tasks.count { it.state == TaskState.DONE }
+        return when {
+            done == tasks.size -> DayStudyStatus.COMPLETE
+            done > 0            -> DayStudyStatus.PARTIAL
+            else                 -> DayStudyStatus.MISSED
+        }
+    }
+
+    /**
+     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
+     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
+     * dots per day, like a GitHub-style contribution grid).
+     */
+    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.YEAR, year)
+        cal.set(Calendar.MONTH, month)
+        cal.set(Calendar.DAY_OF_MONTH, 1)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val result = LinkedHashMap<Int, DayStudyStatus>()
+        for (d in 1..daysInMonth) {
+            cal.set(Calendar.DAY_OF_MONTH, d)
+            result[d] = getDayStatus(cal)
+        }
+        return result
+    }
+
+    /**
+     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
+     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
+     * lets the app actually notice "the student hasn't studied in N days" instead of that
+     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
+     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
+     * guardian once this crosses a threshold.
+     */
+    fun getConsecutiveMissedDays(): Int {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -1)
+        var missed = 0
+        for (i in 0 until 60) {
+            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
+            missed++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return missed
+    }
+
+    fun getWeekCompletionPercent(): Int {
+        val cal = Calendar.getInstance(); var total = 0; var done = 0
+        repeat(7) {
+            val tasks = loadDay(keyForDay(cal))
+            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return if (total == 0) 0 else done * 100 / total
+    }
+
+    fun getWeeklyData(): List<Pair<String, Int>> {
+        val cal = Calendar.getInstance()
+        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
+        val result = mutableListOf<Pair<String, Int>>()
+        repeat(7) { i ->
+            val tasks = loadDay(keyForDay(cal))
+            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
+            result.add(0, Pair(days[6 - i], pct))
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return result
+    }
+
+    fun getSubjectStats(): List<Pair<String, Int>> =
+        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
+            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
+        }
+
+    /** Blueprint 2.6 — see PauseStats doc above. */
+    fun getPauseStats(): PauseStats {
+        val actualFocusToday = _todayTasks.value
+            .filter { it.state == TaskState.DONE }
+            .sumOf { it.actualMinutes }
+
+        val cal = Calendar.getInstance()
+        val weekSessions = mutableListOf<StudyTask>()
+        repeat(7) {
+            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+
+        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
+
+        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
+        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
+
+        return PauseStats(
+            actualFocusMinutesToday = actualFocusToday,
+            avgPausesPerSession     = avgPauses,
+            pauseRatePercent        = pauseRate
+        )
+    }
+
+    private fun loadDay(key: String): List<StudyTask> {
+        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
+        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
+    }
+
+    private fun todayKey() = keyForDay(Calendar.getInstance())
+    private fun keyForDay(cal: Calendar) =
+        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+}
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
+package com.checkmate.ui.home
+
+import android.content.Context
+import android.content.Intent
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import android.app.Activity
+import com.checkmate.core.AppUsageTracker
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.TodayContext
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.FreeSlotCalculator
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import com.checkmate.psyche.PsycheEngine
+import com.checkmate.service.AttentionCycleService
+import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.service.TaskSyncManager
+import com.checkmate.workmode.WorkModeManager
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+
+data class HomeState(
+    val tasks:             List<StudyTask> = emptyList(),
+    val activeTaskId:      String?         = null,
+    val completedToday:    Int             = 0,
+    val streakDays:        Int             = 0,
+    val psycheMessage:     String          = "",
+    val consecutiveSkips:  Int             = 0,
+    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──
+    // Non-null exactly while the corresponding dialog should be showing on HomeScreen.
+    val intentionPromptTask:  StudyTask?   = null,
+    val completionPromptTask: StudyTask?   = null,
+    // ── Task Sync (two-device) ── true only while a manual sync tap is in flight.
+    val syncEnabled:        Boolean        = false,
+    val syncing:            Boolean        = false
+)
+
+class HomeViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(HomeState())
+    val state: StateFlow<HomeState> = _state.asStateFlow()
+
+    // MainActivity observes this to launch the MediaProjection system dialog
+    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
+    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
+
+    private var pendingTask: StudyTask? = null
+
+    init {
+        _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
+        loadTodayPlan(); loadStreak(); loadPsycheMessage()
+        pullSync()
+    }
+
+    /**
+     * Every emission of PlanStore.todayTasks — i.e. every local task mutation, since
+     * all of PlanStore's writes funnel through the same StateFlow — also pushes today's
+     * plan to TaskSyncManager. This is the single hook point for auto-sync: add/remove/
+     * edit-duration/schedule/start/pause/resume/done/skip all end up here without
+     * needing a push call added at each individual call site. TaskSyncManager itself
+     * no-ops instantly if no sync code is configured, so this is free on a device that
+     * hasn't opted into sync. Runs on a plain background thread (not viewModelScope),
+     * same convention as StatusReporter/GuardianNotifier elsewhere in the app, since
+     * it's fire-and-forget and outlives any single Compose recomposition anyway.
+     */
+    private fun loadTodayPlan() {
+        viewModelScope.launch {
+            PlanStore.todayTasks.collect { tasks ->
+                _state.update { it.copy(
+                    tasks          = tasks,
+                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
+                    activeTaskId   = tasks.firstOrNull { t ->
+                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
+                    }?.id
+                )}
+                if (TaskSyncManager.isEnabled()) {
+                    Thread { TaskSyncManager.pushTasks(tasks) }.start()
+                }
+            }
+        }
+    }
+
+    /**
+     * Pulls the other device's copy of today's plan if it's newer, silently, once —
+     * called from init so opening the app on either device picks up whatever the
+     * other one last did. See syncNow() for the manual on-demand version (HomeHeader's
+     * sync button), which is the only way to re-check without relaunching the screen.
+     */
+    private fun pullSync() {
+        if (!TaskSyncManager.isEnabled()) return
+        Thread {
+            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
+            if (remote != null) PlanStore.saveTodayTasks(remote)
+        }.start()
+    }
+
+    /** Manual sync trigger for HomeHeader's sync icon — same pull as init, plus a brief spinner. */
+    fun syncNow() {
+        if (!TaskSyncManager.isEnabled()) return
+        _state.update { it.copy(syncing = true) }
+        Thread {
+            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
+            if (remote != null) PlanStore.saveTodayTasks(remote)
+            _state.update { it.copy(syncing = false) }
+        }.start()
+    }
+
+    private fun loadStreak() {
+        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
+    }
+
+    private fun loadPsycheMessage() {
+        viewModelScope.launch {
+            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
+        }
+    }
+
+    /**
+     * Adds a manually-created task to today's plan.
+     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
+     * whatever is already in today's list (AI-generated or previously added custom
+     * tasks) and never overwrites/clears them. isCustom = true is what later lets
+     * HomeScreen show the duration-edit affordance only for tasks added this way.
+     * The StudyTask is otherwise identical in shape to a generated one, so it
+     * automatically renders in the same TaskCard, drives AttentionCycleService/
+     * WorkModeManager the same way via startTask(), and triggers the same
+     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
+     * WhatsApp/Telegram report — no extra wiring required.
+     *
+     * scheduledStartTime is now resolved via findNextFreeSlot() instead of being left
+     * null — previously every custom task landed in Timeline view's "Unscheduled"
+     * section unconditionally, since only AdaptivePlanner's generated plan ever ran
+     * assignScheduledTimes(). A custom task that genuinely doesn't fit anywhere in
+     * today's free time still comes back null and still falls into "Unscheduled" —
+     * that part is unchanged.
+     */
+    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int, taskType: TaskType = TaskType.OTHER) {
+        val cleanSubject  = subject.trim()
+        val cleanTopic    = topic.trim()
+        val cleanDuration = durationMinutes.coerceIn(5, 240)
+        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
+
+        val task = StudyTask(
+            subject            = cleanSubject,
+            topic              = cleanTopic,
+            durationMinutes    = cleanDuration,
+            isCustom           = true,
+            taskType           = taskType,
+            scheduledStartTime = findNextFreeSlot(cleanDuration)
+        )
+        PlanStore.addCustomTask(task)
+        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
+    }
+
+    /**
+     * Mirrors AdaptivePlanner.assignScheduledTimes() for a single manually-added task:
+     * today's free slots (study window minus ConsultationProfile.blockedSlots) minus
+     * whatever today's plan has already scheduled, first-fit. Reads study_start/study_end
+     * straight from CheckmatePrefs — the same keys PlannerViewModel persists them under —
+     * so this doesn't need the Plan screen's ViewModel in scope. Returns null when nothing
+     * today has room, same as the generated-plan path.
+     */
+    private fun findNextFreeSlot(durationMinutes: Int): String? {
+        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
+        val studyEnd   = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
+        val profile    = ConsultationProfile.load()
+
+        val freeSlots = FreeSlotCalculator.computeFreeSlots(profile.blockedSlots, studyStart, studyEnd)
+        val occupied  = PlanStore.todayTasks.value.mapNotNull { t ->
+            val start = t.scheduledStartTime ?: return@mapNotNull null
+            val startMinute = FreeSlotCalculator.parseTimeOrNull(start) ?: return@mapNotNull null
+            startMinute to (startMinute + t.durationMinutes)
+        }
+        val remaining = FreeSlotCalculator.subtractOccupied(freeSlots, occupied)
+        return FreeSlotCalculator.firstFitStart(durationMinutes, remaining)
+            ?.let { FreeSlotCalculator.formatMinutes(it) }
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — the "Schedule" action on an
+     * Unscheduled TaskCard in Timeline view. Available for both custom and generated
+     * tasks: a generated task can end up unscheduled too when the day's plan doesn't fit
+     * today's free time (see AdaptivePlanner.assignScheduledTimes), and until now there
+     * was no way to fix that from HomeScreen except deleting and re-adding it. Same
+     * PENDING-only guard as editTaskDuration/removeTask — once a task is running its
+     * position on the timeline isn't meaningful to change.
+     */
+    fun scheduleTask(task: StudyTask, hhmm: String) {
+        if (task.state != TaskState.PENDING) return
+        PlanStore.updateTaskSchedule(task.id, hhmm)
+    }
+
+    /**
+     * Sets a task's start AND end time directly — the clock-icon action on TaskCard,
+     * available on both List and Timeline views for any PENDING task (scheduled or not).
+     * endHHmm must be strictly after startHHmm (same-day only, no overnight wraparound);
+     * durationMinutes is derived from the difference so it and scheduledStartTime can
+     * never drift apart from each other. Same PENDING-only guard as scheduleTask() /
+     * editTaskDuration() — a task that's already ACTIVE/PAUSED has a running timer that
+     * shouldn't be resliced underneath it.
+     */
+    fun rescheduleTask(task: StudyTask, startHHmm: String, endHHmm: String) {
+        if (task.state != TaskState.PENDING) return
+        val startMinute = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return
+        val endMinute   = FreeSlotCalculator.parseTimeOrNull(endHHmm) ?: return
+        val duration    = endMinute - startMinute
+        if (duration <= 0) return
+        PlanStore.updateTaskScheduleAndDuration(task.id, startHHmm, duration)
+    }
+
+    /**
+     * Edits the duration of a custom task. Only allowed for tasks created via
+     * addCustomTask (isCustom = true) and only while still PENDING — once a task
+     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
+     * so changing durationMinutes underneath it would desync the running countdown.
+     * Generated (AI-planned) tasks are intentionally left untouched here — their
+     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
+     */
+    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
+        if (!task.isCustom || task.state != TaskState.PENDING) return
+        val clamped = newDurationMinutes.coerceIn(5, 240)
+        PlanStore.updateTaskDuration(task.id, clamped)
+    }
+
+    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
+    fun removeTask(task: StudyTask) {
+        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
+        PlanStore.removeTask(task.id)
+    }
+
+    /**
+     * Blueprint 10.1: Intention Declaration.
+     * Tapping "Start Now" no longer launches the session directly — it first
+     * surfaces the "What will you study?" prompt on HomeScreen via
+     * intentionPromptTask. The actual launch (media projection check, service
+     * starts, WorkMode activation, etc.) is deferred to
+     * confirmIntentionAndStart() once the student answers.
+     */
+    fun startTask(context: Context, task: StudyTask) {
+        _state.update { it.copy(intentionPromptTask = task) }
+    }
+
+    fun dismissIntentionPrompt() {
+        _state.update { it.copy(intentionPromptTask = null) }
+    }
+
+    /** Called from HomeScreen's IntentionDialog once the student confirms their intention. */
+    fun confirmIntentionAndStart(context: Context, task: StudyTask, intentionText: String) {
+        val clean = intentionText.trim().ifBlank { task.topic }
+        PlanStore.setIntention(task.id, clean)
+        _state.update { it.copy(intentionPromptTask = null) }
+        if (ScreenCaptureManager.isReady()) {
+            launchTask(context, task)
+        } else {
+            pendingTask = task
+            _requestProjection.tryEmit(task)
+        }
+    }
+
+    /**
+     * Called by MainActivity after user approves the MediaProjection dialog.
+     * resultCode + data are forwarded into AttentionCycleService's start intent so that
+     * getMediaProjection() is called only AFTER startForeground() runs inside the service.
+     * Fix for: SecurityException: Media projections require a foreground service of type
+     *          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+     */
+    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        AttentionCycleService.start(
+            context,
+            task.id,
+            task.topic,
+            task.durationMinutes.toLong(),
+            projectionResultCode = resultCode,
+            projectionData       = data
+        )
+        launchTask(context, task, serviceAlreadyStarted = true)
+    }
+
+    fun onProjectionDenied(context: Context) {
+        val task = pendingTask ?: return
+        pendingTask = null
+        launchTask(context, task)
+    }
+
+    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
+        viewModelScope.launch {
+            WorkModeManager.activate(context)
+            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
+            mappedPkg?.let { pkg ->
+                context.packageManager.getLaunchIntentForPackage(pkg)
+                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ?.let { context.startActivity(it) }
+            }
+            if (!serviceAlreadyStarted) {
+                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
+            }
+            FloatingAttentionService.start(context)
+            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
+            PlanStore.setTaskActive(task.id)
+            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
+            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
+        }
+    }
+
+    /**
+     * Blueprint 10.1: Session Check-In.
+     * Replaces the old direct call to markDone() from the "Done" button —
+     * surfaces the "Did you finish it?" prompt on HomeScreen via
+     * completionPromptTask first. The actual completion (service stop, state
+     * update, TTS) happens in confirmCompletion() once the student answers.
+     */
+    fun requestCompletion(context: Context, task: StudyTask) {
+        _state.update { it.copy(completionPromptTask = task) }
+    }
+
+    fun dismissCompletionPrompt() {
+        _state.update { it.copy(completionPromptTask = null) }
+    }
+
+    /**
+     * status is one of "YES" | "PARTIAL" | "NO" — a self-report of whether the
+     * declared intention was met. The task is still marked DONE either way
+     * (the session ended); completedStatus is a separate accountability signal
+     * (surfaced later in Stats / the weekly guardian report), not a change to
+     * task state.
+     */
+    fun confirmCompletion(context: Context, task: StudyTask, status: String) {
+        viewModelScope.launch {
+            // BUGFIX (carried over): read attention-check counts BEFORE stopping the service —
+            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
+            // which zeroes checksPassed/checksMissed. Read too late (or not at all) and
+            // PsycheEngine.onTaskCompleted() always records 0/0 into BehaviorLedger regardless
+            // of how many attention checks the student actually confirmed.
+            val cycleState = AttentionCycleManager.currentState()
+            AttentionCycleService.stop(context)
+            FloatingAttentionService.stop(context)
+            WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
+            PlanStore.markTask(task.id, TaskState.DONE)
+            PlanStore.setCompletionStatus(task.id, status)
+            // BUGFIX (Blueprint 2.6): cycleState.totalSessionSeconds is the tick loop's real
+            // elapsed time — it freezes while PAUSED (see AttentionCycleManager.tick()), so
+            // this is genuinely "focus time, not wall clock." Previously nothing ever wrote it
+            // onto the task, so StudyTask.focusMinutes/actualMinutes — and everything downstream
+            // that reads them (BehaviorLedger's "Avg Focus" stat, Stats' "Focus Today") — always
+            // saw 0 regardless of how long the student actually focused.
+            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
+            PlanStore.setFocusMinutes(task.id, focusMin)
+            val completedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
+            PsycheEngine.onTaskCompleted(completedTask, cycleState.checksPassed, cycleState.checksMissed)
+            // Mentor v2 (spec 3.7): log the completion into TodayContext so AdaptivePlanner
+            // sees what's actually been finished today, then refresh the cached summary
+            // AdaptivePlanner reads (previously-dead "behavior_summary" pref — see PsycheEngine).
+            TodayContext.appendUpdate("Completed ${task.subject}: ${task.topic} (${task.taskType})")
+            PsycheEngine.refreshBehaviorSummaryCache()
+            val spoken = when (status) {
+                "NO"      -> "Noted. Every session still counts — reset for the next one."
+                "PARTIAL" -> "Task marked complete. Partial progress logged."
+                else      -> "Task complete. Well done."
+            }
+            CheckmateTTS.speak(context, spoken)
+            val msg = PsycheEngine.getDailyMorningMessage()
+            _state.update { it.copy(
+                activeTaskId         = null,
+                psycheMessage        = msg,
+                consecutiveSkips     = 0,
+                completionPromptTask = null
+            ) }
+        }
+    }
+
+    fun markSkip(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            // Same fix as confirmCompletion() — capture before stop()/reset() wipes the counts.
+            val cycleState = AttentionCycleManager.currentState()
+            AttentionCycleService.stop(context)
+            FloatingAttentionService.stop(context)
+            WorkModeManager.deactivate(context)
+            ScreenCaptureManager.release()
+            PlanStore.markTask(task.id, TaskState.SKIPPED)
+            // BUGFIX (Blueprint 2.6): same focus-time fix as confirmCompletion() — a skipped
+            // session still did real focus minutes before the skip, worth recording rather
+            // than leaving at the StudyTask default of 0.
+            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
+            PlanStore.setFocusMinutes(task.id, focusMin)
+            val skippedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
+            // Mentor v2 (spec 3.6): capture whatever app was most recently foregrounded so the
+            // skip event — and any guardian alert built from it — can name the actual cause.
+            val distractionApp = try {
+                AppUsageTracker.getMostRecentForegroundApp(context)
+            } catch (_: Exception) { null }
+            PsycheEngine.onTaskSkipped(skippedTask, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
+            // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
+            // skips too, not just completions, so a same-day regenerate reflects the skip.
+            PsycheEngine.refreshBehaviorSummaryCache()
+            // Mentor v2 (spec 3.4): opens the escalation-watchlist lockdown window — checked by
+            // AppAutomationService alongside the normal blocklist for the configured duration.
+            WorkModeManager.startPostSkipLockdown(context)
+            val msg = PsycheEngine.getSkipReaction(task)
+            CheckmateTTS.speak(context, msg)
+            // Mentor v2 (spec 3.2): same reaction text, also logged into Mentor's persisted
+            // chat so it's a running log, not just a spoken line that's gone once said.
+            ProactiveMentor.onSkip(context, msg)
+            val newSkips = _state.value.consecutiveSkips + 1
+            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
+            if (newSkips >= 3) {
+                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}", distractionApp)
+            }
+        }
+    }
+
+    fun pauseTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            PlanStore.pauseTask(task.id, System.currentTimeMillis())
+            AttentionCycleService.sendPause(context)
+        }
+    }
+
+    fun resumeTask(context: Context, task: StudyTask) {
+        viewModelScope.launch {
+            PlanStore.resumeTask(task.id, System.currentTimeMillis())
+            AttentionCycleService.sendResume(context)
+        }
+    }
+}
+
 //===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeScreen.kt =====
 package com.checkmate.ui.home
 
@@ -27,6 +775,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.checkmate.core.DailyChecklist
+import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -154,8 +903,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
         ScheduleTaskDialog(
             task      = task,
             onDismiss = { schedulingTask = null },
-            onConfirm = { hhmm ->
-                vm.scheduleTask(task, hhmm)
+            onConfirm = { start, end ->
+                vm.rescheduleTask(task, start, end)
                 schedulingTask = null
             }
         )
@@ -692,19 +1441,31 @@ private fun EditDurationDialog(
 }
 
 /**
- * Manual "Schedule" action for a task sitting in Timeline view's Unscheduled section —
- * lets the student give it an "HH:mm" slot directly instead of only being able to delete
- * and re-add it. Pre-fills with the study window's start time as a reasonable default.
- * Validation mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59) so a bad value
- * can't get saved onto the task.
+ * Manual "Schedule" action, reachable via the clock icon on ANY pending TaskCard (List
+ * or Timeline, scheduled or not) — lets the student set start AND end time directly
+ * instead of only being able to delete and re-add a task to change its slot. End time
+ * pre-fills from the task's current scheduledStartTime + durationMinutes when it already
+ * has one, so opening the dialog on an already-scheduled task shows its real current
+ * window rather than blank fields. durationMinutes itself is derived from end − start on
+ * save (see HomeViewModel.rescheduleTask) so the two can never drift apart. Validation
+ * mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59), plus an end-after-start
+ * check, so a bad value can't get saved onto the task.
  */
 @Composable
 private fun ScheduleTaskDialog(
     task:      StudyTask,
     onDismiss: () -> Unit,
-    onConfirm: (hhmm: String) -> Unit
+    onConfirm: (startHHmm: String, endHHmm: String) -> Unit
 ) {
-    var time by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+    var startTime by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+    var endTime by remember {
+        mutableStateOf(
+            task.scheduledStartTime
+                ?.let { FreeSlotCalculator.parseTimeOrNull(it) }
+                ?.let { FreeSlotCalculator.formatMinutes(it + task.durationMinutes) }
+                ?: ""
+        )
+    }
 
     fun isValidTime(value: String): Boolean {
         val parts = value.trim().split(":")
@@ -714,7 +1475,11 @@ private fun ScheduleTaskDialog(
         return h in 0..23 && m in 0..59
     }
 
-    val isValid = isValidTime(time)
+    val startValid = isValidTime(startTime)
+    val endValid   = isValidTime(endTime)
+    val orderValid = startValid && endValid &&
+        (FreeSlotCalculator.parseTimeOrNull(endTime) ?: 0) > (FreeSlotCalculator.parseTimeOrNull(startTime) ?: 0)
+    val isValid = startValid && endValid && orderValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -726,19 +1491,31 @@ private fun ScheduleTaskDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
                 OutlinedTextField(
-                    value           = time,
-                    onValueChange   = { input -> if (input.length <= 5) time = input },
+                    value           = startTime,
+                    onValueChange   = { input -> if (input.length <= 5) startTime = input },
                     label           = { Text("Start time (HH:mm)", color = White30) },
                     placeholder     = { Text("e.g. 16:30", color = White30) },
                     singleLine      = true,
                     modifier        = Modifier.fillMaxWidth(),
                     colors          = dialogFieldColors()
                 )
+                OutlinedTextField(
+                    value           = endTime,
+                    onValueChange   = { input -> if (input.length <= 5) endTime = input },
+                    label           = { Text("End time (HH:mm)", color = White30) },
+                    placeholder     = { Text("e.g. 17:45", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                if (startValid && endValid && !orderValid) {
+                    Text("End time must be after start time", fontSize = 11.sp, color = AccentRed)
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick  = { if (isValid) onConfirm(time.trim()) },
+                onClick  = { if (isValid) onConfirm(startTime.trim(), endTime.trim()) },
                 enabled  = isValid,
                 colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
             ) {
@@ -935,7 +1712,11 @@ private fun TaskCard(
                             Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
                         }
                     }
-                    if (task.scheduledStartTime.isNullOrBlank() && task.state == TaskState.PENDING) {
+                    // Clock icon: available on ANY PENDING task now, not just unscheduled
+                    // ones — opens ScheduleTaskDialog to edit start+end time directly,
+                    // whether the task already has a slot or not (Timeline + List both
+                    // render TaskCard, so this reaches it in either view).
+                    if (task.state == TaskState.PENDING) {
                         IconButton(onClick = onSchedule, modifier = Modifier.size(20.dp)) {
                             Icon(Icons.Default.Schedule, null, tint = AccentGreen, modifier = Modifier.size(14.dp))
                         }
@@ -1068,2086 +1849,4 @@ private fun subjectColor(subject: String) = when (subject.lowercase()) {
     "physics"       -> Color(0xFFFFB347)
     "math", "maths" -> Color(0xFFFF4757)
     else            -> Color(0xFF9090A8)
-}
-
-
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
-package com.checkmate.ui.home
-
-import android.content.Context
-import android.content.Intent
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import android.app.Activity
-import com.checkmate.core.AppUsageTracker
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.core.TodayContext
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.FreeSlotCalculator
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.planner.model.TaskType
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.service.AttentionCycleService
-import com.checkmate.service.FloatingAttentionService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.service.TaskSyncManager
-import com.checkmate.workmode.WorkModeManager
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
-
-data class HomeState(
-    val tasks:             List<StudyTask> = emptyList(),
-    val activeTaskId:      String?         = null,
-    val completedToday:    Int             = 0,
-    val streakDays:        Int             = 0,
-    val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0,
-    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──
-    // Non-null exactly while the corresponding dialog should be showing on HomeScreen.
-    val intentionPromptTask:  StudyTask?   = null,
-    val completionPromptTask: StudyTask?   = null,
-    // ── Task Sync (two-device) ── true only while a manual sync tap is in flight.
-    val syncEnabled:        Boolean        = false,
-    val syncing:            Boolean        = false
-)
-
-class HomeViewModel : ViewModel() {
-
-    private val _state = MutableStateFlow(HomeState())
-    val state: StateFlow<HomeState> = _state.asStateFlow()
-
-    // MainActivity observes this to launch the MediaProjection system dialog
-    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
-    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
-
-    private var pendingTask: StudyTask? = null
-
-    init {
-        _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
-        loadTodayPlan(); loadStreak(); loadPsycheMessage()
-        pullSync()
-    }
-
-    /**
-     * Every emission of PlanStore.todayTasks — i.e. every local task mutation, since
-     * all of PlanStore's writes funnel through the same StateFlow — also pushes today's
-     * plan to TaskSyncManager. This is the single hook point for auto-sync: add/remove/
-     * edit-duration/schedule/start/pause/resume/done/skip all end up here without
-     * needing a push call added at each individual call site. TaskSyncManager itself
-     * no-ops instantly if no sync code is configured, so this is free on a device that
-     * hasn't opted into sync. Runs on a plain background thread (not viewModelScope),
-     * same convention as StatusReporter/GuardianNotifier elsewhere in the app, since
-     * it's fire-and-forget and outlives any single Compose recomposition anyway.
-     */
-    private fun loadTodayPlan() {
-        viewModelScope.launch {
-            PlanStore.todayTasks.collect { tasks ->
-                _state.update { it.copy(
-                    tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t ->
-                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
-                    }?.id
-                )}
-                if (TaskSyncManager.isEnabled()) {
-                    Thread { TaskSyncManager.pushTasks(tasks) }.start()
-                }
-            }
-        }
-    }
-
-    /**
-     * Pulls the other device's copy of today's plan if it's newer, silently, once —
-     * called from init so opening the app on either device picks up whatever the
-     * other one last did. See syncNow() for the manual on-demand version (HomeHeader's
-     * sync button), which is the only way to re-check without relaunching the screen.
-     */
-    private fun pullSync() {
-        if (!TaskSyncManager.isEnabled()) return
-        Thread {
-            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
-            if (remote != null) PlanStore.saveTodayTasks(remote)
-        }.start()
-    }
-
-    /** Manual sync trigger for HomeHeader's sync icon — same pull as init, plus a brief spinner. */
-    fun syncNow() {
-        if (!TaskSyncManager.isEnabled()) return
-        _state.update { it.copy(syncing = true) }
-        Thread {
-            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
-            if (remote != null) PlanStore.saveTodayTasks(remote)
-            _state.update { it.copy(syncing = false) }
-        }.start()
-    }
-
-    private fun loadStreak() {
-        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
-    }
-
-    private fun loadPsycheMessage() {
-        viewModelScope.launch {
-            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
-        }
-    }
-
-    /**
-     * Adds a manually-created task to today's plan.
-     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
-     * whatever is already in today's list (AI-generated or previously added custom
-     * tasks) and never overwrites/clears them. isCustom = true is what later lets
-     * HomeScreen show the duration-edit affordance only for tasks added this way.
-     * The StudyTask is otherwise identical in shape to a generated one, so it
-     * automatically renders in the same TaskCard, drives AttentionCycleService/
-     * WorkModeManager the same way via startTask(), and triggers the same
-     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
-     * WhatsApp/Telegram report — no extra wiring required.
-     *
-     * scheduledStartTime is now resolved via findNextFreeSlot() instead of being left
-     * null — previously every custom task landed in Timeline view's "Unscheduled"
-     * section unconditionally, since only AdaptivePlanner's generated plan ever ran
-     * assignScheduledTimes(). A custom task that genuinely doesn't fit anywhere in
-     * today's free time still comes back null and still falls into "Unscheduled" —
-     * that part is unchanged.
-     */
-    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int, taskType: TaskType = TaskType.OTHER) {
-        val cleanSubject  = subject.trim()
-        val cleanTopic    = topic.trim()
-        val cleanDuration = durationMinutes.coerceIn(5, 240)
-        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
-
-        val task = StudyTask(
-            subject            = cleanSubject,
-            topic              = cleanTopic,
-            durationMinutes    = cleanDuration,
-            isCustom           = true,
-            taskType           = taskType,
-            scheduledStartTime = findNextFreeSlot(cleanDuration)
-        )
-        PlanStore.addCustomTask(task)
-        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
-    }
-
-    /**
-     * Mirrors AdaptivePlanner.assignScheduledTimes() for a single manually-added task:
-     * today's free slots (study window minus ConsultationProfile.blockedSlots) minus
-     * whatever today's plan has already scheduled, first-fit. Reads study_start/study_end
-     * straight from CheckmatePrefs — the same keys PlannerViewModel persists them under —
-     * so this doesn't need the Plan screen's ViewModel in scope. Returns null when nothing
-     * today has room, same as the generated-plan path.
-     */
-    private fun findNextFreeSlot(durationMinutes: Int): String? {
-        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
-        val studyEnd   = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
-        val profile    = ConsultationProfile.load()
-
-        val freeSlots = FreeSlotCalculator.computeFreeSlots(profile.blockedSlots, studyStart, studyEnd)
-        val occupied  = PlanStore.todayTasks.value.mapNotNull { t ->
-            val start = t.scheduledStartTime ?: return@mapNotNull null
-            val startMinute = FreeSlotCalculator.parseTimeOrNull(start) ?: return@mapNotNull null
-            startMinute to (startMinute + t.durationMinutes)
-        }
-        val remaining = FreeSlotCalculator.subtractOccupied(freeSlots, occupied)
-        return FreeSlotCalculator.firstFitStart(durationMinutes, remaining)
-            ?.let { FreeSlotCalculator.formatMinutes(it) }
-    }
-
-    /**
-     * Manually assigns/edits a task's scheduledStartTime — the "Schedule" action on an
-     * Unscheduled TaskCard in Timeline view. Available for both custom and generated
-     * tasks: a generated task can end up unscheduled too when the day's plan doesn't fit
-     * today's free time (see AdaptivePlanner.assignScheduledTimes), and until now there
-     * was no way to fix that from HomeScreen except deleting and re-adding it. Same
-     * PENDING-only guard as editTaskDuration/removeTask — once a task is running its
-     * position on the timeline isn't meaningful to change.
-     */
-    fun scheduleTask(task: StudyTask, hhmm: String) {
-        if (task.state != TaskState.PENDING) return
-        PlanStore.updateTaskSchedule(task.id, hhmm)
-    }
-
-    /**
-     * Edits the duration of a custom task. Only allowed for tasks created via
-     * addCustomTask (isCustom = true) and only while still PENDING — once a task
-     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
-     * so changing durationMinutes underneath it would desync the running countdown.
-     * Generated (AI-planned) tasks are intentionally left untouched here — their
-     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
-     */
-    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
-        if (!task.isCustom || task.state != TaskState.PENDING) return
-        val clamped = newDurationMinutes.coerceIn(5, 240)
-        PlanStore.updateTaskDuration(task.id, clamped)
-    }
-
-    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
-    fun removeTask(task: StudyTask) {
-        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
-        PlanStore.removeTask(task.id)
-    }
-
-    /**
-     * Blueprint 10.1: Intention Declaration.
-     * Tapping "Start Now" no longer launches the session directly — it first
-     * surfaces the "What will you study?" prompt on HomeScreen via
-     * intentionPromptTask. The actual launch (media projection check, service
-     * starts, WorkMode activation, etc.) is deferred to
-     * confirmIntentionAndStart() once the student answers.
-     */
-    fun startTask(context: Context, task: StudyTask) {
-        _state.update { it.copy(intentionPromptTask = task) }
-    }
-
-    fun dismissIntentionPrompt() {
-        _state.update { it.copy(intentionPromptTask = null) }
-    }
-
-    /** Called from HomeScreen's IntentionDialog once the student confirms their intention. */
-    fun confirmIntentionAndStart(context: Context, task: StudyTask, intentionText: String) {
-        val clean = intentionText.trim().ifBlank { task.topic }
-        PlanStore.setIntention(task.id, clean)
-        _state.update { it.copy(intentionPromptTask = null) }
-        if (ScreenCaptureManager.isReady()) {
-            launchTask(context, task)
-        } else {
-            pendingTask = task
-            _requestProjection.tryEmit(task)
-        }
-    }
-
-    /**
-     * Called by MainActivity after user approves the MediaProjection dialog.
-     * resultCode + data are forwarded into AttentionCycleService's start intent so that
-     * getMediaProjection() is called only AFTER startForeground() runs inside the service.
-     * Fix for: SecurityException: Media projections require a foreground service of type
-     *          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-     */
-    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        AttentionCycleService.start(
-            context,
-            task.id,
-            task.topic,
-            task.durationMinutes.toLong(),
-            projectionResultCode = resultCode,
-            projectionData       = data
-        )
-        launchTask(context, task, serviceAlreadyStarted = true)
-    }
-
-    fun onProjectionDenied(context: Context) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        launchTask(context, task)
-    }
-
-    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
-        viewModelScope.launch {
-            WorkModeManager.activate(context)
-            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
-            mappedPkg?.let { pkg ->
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ?.let { context.startActivity(it) }
-            }
-            if (!serviceAlreadyStarted) {
-                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-            }
-            FloatingAttentionService.start(context)
-            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-            PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
-        }
-    }
-
-    /**
-     * Blueprint 10.1: Session Check-In.
-     * Replaces the old direct call to markDone() from the "Done" button —
-     * surfaces the "Did you finish it?" prompt on HomeScreen via
-     * completionPromptTask first. The actual completion (service stop, state
-     * update, TTS) happens in confirmCompletion() once the student answers.
-     */
-    fun requestCompletion(context: Context, task: StudyTask) {
-        _state.update { it.copy(completionPromptTask = task) }
-    }
-
-    fun dismissCompletionPrompt() {
-        _state.update { it.copy(completionPromptTask = null) }
-    }
-
-    /**
-     * status is one of "YES" | "PARTIAL" | "NO" — a self-report of whether the
-     * declared intention was met. The task is still marked DONE either way
-     * (the session ended); completedStatus is a separate accountability signal
-     * (surfaced later in Stats / the weekly guardian report), not a change to
-     * task state.
-     */
-    fun confirmCompletion(context: Context, task: StudyTask, status: String) {
-        viewModelScope.launch {
-            // BUGFIX (carried over): read attention-check counts BEFORE stopping the service —
-            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
-            // which zeroes checksPassed/checksMissed. Read too late (or not at all) and
-            // PsycheEngine.onTaskCompleted() always records 0/0 into BehaviorLedger regardless
-            // of how many attention checks the student actually confirmed.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.DONE)
-            PlanStore.setCompletionStatus(task.id, status)
-            // BUGFIX (Blueprint 2.6): cycleState.totalSessionSeconds is the tick loop's real
-            // elapsed time — it freezes while PAUSED (see AttentionCycleManager.tick()), so
-            // this is genuinely "focus time, not wall clock." Previously nothing ever wrote it
-            // onto the task, so StudyTask.focusMinutes/actualMinutes — and everything downstream
-            // that reads them (BehaviorLedger's "Avg Focus" stat, Stats' "Focus Today") — always
-            // saw 0 regardless of how long the student actually focused.
-            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
-            PlanStore.setFocusMinutes(task.id, focusMin)
-            val completedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
-            PsycheEngine.onTaskCompleted(completedTask, cycleState.checksPassed, cycleState.checksMissed)
-            // Mentor v2 (spec 3.7): log the completion into TodayContext so AdaptivePlanner
-            // sees what's actually been finished today, then refresh the cached summary
-            // AdaptivePlanner reads (previously-dead "behavior_summary" pref — see PsycheEngine).
-            TodayContext.appendUpdate("Completed ${task.subject}: ${task.topic} (${task.taskType})")
-            PsycheEngine.refreshBehaviorSummaryCache()
-            val spoken = when (status) {
-                "NO"      -> "Noted. Every session still counts — reset for the next one."
-                "PARTIAL" -> "Task marked complete. Partial progress logged."
-                else      -> "Task complete. Well done."
-            }
-            CheckmateTTS.speak(context, spoken)
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(
-                activeTaskId         = null,
-                psycheMessage        = msg,
-                consecutiveSkips     = 0,
-                completionPromptTask = null
-            ) }
-        }
-    }
-
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            // Same fix as confirmCompletion() — capture before stop()/reset() wipes the counts.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            // BUGFIX (Blueprint 2.6): same focus-time fix as confirmCompletion() — a skipped
-            // session still did real focus minutes before the skip, worth recording rather
-            // than leaving at the StudyTask default of 0.
-            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
-            PlanStore.setFocusMinutes(task.id, focusMin)
-            val skippedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
-            // Mentor v2 (spec 3.6): capture whatever app was most recently foregrounded so the
-            // skip event — and any guardian alert built from it — can name the actual cause.
-            val distractionApp = try {
-                AppUsageTracker.getMostRecentForegroundApp(context)
-            } catch (_: Exception) { null }
-            PsycheEngine.onTaskSkipped(skippedTask, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
-            // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
-            // skips too, not just completions, so a same-day regenerate reflects the skip.
-            PsycheEngine.refreshBehaviorSummaryCache()
-            // Mentor v2 (spec 3.4): opens the escalation-watchlist lockdown window — checked by
-            // AppAutomationService alongside the normal blocklist for the configured duration.
-            WorkModeManager.startPostSkipLockdown(context)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            // Mentor v2 (spec 3.2): same reaction text, also logged into Mentor's persisted
-            // chat so it's a running log, not just a spoken line that's gone once said.
-            ProactiveMentor.onSkip(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}", distractionApp)
-            }
-        }
-    }
-
-    fun pauseTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
-        }
-    }
-
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
-        }
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
-package com.checkmate.ui.settings
-
-import android.app.admin.DevicePolicyManager
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.provider.Settings
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.runtime.LaunchedEffect
-import com.checkmate.admin.CheckmateDeviceAdminReceiver
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.service.FloatingAttentionService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.testmate.TestmateApi
-import com.checkmate.ui.theme.*
-import com.checkmate.workmode.HolidaySchedule
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeSchedule
-import java.util.Calendar
-import kotlinx.coroutines.delay
-
-// ── Guardian lock gate for Work Mode settings ─────────────────────────────────
-//
-// Wraps any Work Mode-related settings (Blocked Apps, Blocked Websites, the
-// Focus Cycle toggles) that must not be editable by the student while
-// blocking is enforced — either because a focus session is running or
-// because the hardcoded 19:00-02:00 window (WorkModeSchedule) is live.
-// Shows a PIN-unlock prompt instead of [content] until a correct guardian
-// PIN is entered, reusing UninstallGuard's existing PIN/hash/lockout flow
-// so there's still exactly one PIN, and the student never sees it either
-// way.
-@Composable
-fun WorkModeLockGate(content: @Composable () -> Unit) {
-    val context = LocalContext.current
-
-    // Poll every second - settingsLocked() depends on wall-clock time (the
-    // schedule) and on UninstallGuard's unlock-window expiry, neither of
-    // which trigger recomposition on their own.
-    var tick by remember { mutableStateOf(0L) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(1000)
-            tick = System.currentTimeMillis()
-        }
-    }
-    val locked = remember(tick) { WorkModeManager.settingsLocked() }
-
-    if (!locked) {
-        content()
-        return
-    }
-
-    var pin by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf<String?>(null) }
-    var statusColor by remember { mutableStateOf(AccentRed) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Lock, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
-        }
-        Text(
-            "Blocked Apps, Blocked Websites, Focus Cycle, and the Guardian Telegram Chat ID " +
-                "are locked once a guardian PIN is set — not just during a focus session or the " +
-                "daily ${WorkModeSchedule.LABEL} window. Enter the PIN to make changes.",
-            fontSize = 11.sp, color = White60,
-            modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
-        )
-        OutlinedTextField(
-            value         = pin,
-            onValueChange = { if (it.length <= 6) { pin = it; status = null } },
-            label         = { Text("Guardian PIN", color = White30) },
-            singleLine    = true,
-            modifier      = Modifier.fillMaxWidth(),
-            visualTransformation = PasswordVisualTransformation(),
-            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    when (val result = UninstallGuard.unlockWithPin(pin)) {
-                        is UninstallGuard.UnlockResult.Success -> {
-                            status = "Unlocked for 2 minutes"
-                            statusColor = AccentGreen
-                            pin = ""
-                            tick = System.currentTimeMillis()
-                        }
-                        is UninstallGuard.UnlockResult.WrongPin -> {
-                            status = "Incorrect PIN"
-                            statusColor = AccentRed
-                        }
-                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
-                            status = "No PIN generated yet - see Security settings"
-                            statusColor = AccentAmber
-                        }
-                        is UninstallGuard.UnlockResult.LockedOut -> {
-                            status = "Too many wrong attempts - locked for ${result.secondsLeft / 60}m"
-                            statusColor = AccentRed
-                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
-                        }
-                    }
-                }) {
-                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        status?.let {
-            Text(it, fontSize = 11.sp, color = statusColor, modifier = Modifier.padding(top = 6.dp))
-        }
-    }
-}
-
-// ── Holidays: the one guardian-approved exception to the hardcoded lock window ────────────
-//
-// Lives behind WorkModeLockGate (same guardian-PIN gate as Blocked Apps/Websites/Focus Cycle)
-// — see HolidaySchedule's doc for why marking a holiday can't be a self-service action.
-@Composable
-private fun HolidaySettings() {
-    var holidays by remember { mutableStateOf(HolidaySchedule.getSortedHolidays()) }
-    var dateInput by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf<String?>(null) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Holidays", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 4.dp))
-        Text(
-            "On a marked holiday, the ${WorkModeSchedule.LABEL} window is replaced by a " +
-                "single reduced lock from 1:00 AM \u2013 3:10 PM for that day only \u2014 not " +
-                "removed entirely. Every other day is unaffected.",
-            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
-        )
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value         = dateInput,
-                onValueChange = { if (it.length <= 10) dateInput = it; status = null },
-                modifier      = Modifier.weight(1f),
-                singleLine    = true,
-                placeholder   = { Text("DD/MM/YYYY", color = White30, fontSize = 13.sp) },
-                leadingIcon   = { Icon(Icons.Default.Event, null, tint = White60) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-            Spacer(Modifier.width(8.dp))
-            IconButton(onClick = {
-                val parts = dateInput.split("/")
-                val cal = Calendar.getInstance()
-                val parsed = parts.size == 3 &&
-                    parts[0].toIntOrNull() != null && parts[1].toIntOrNull() != null && parts[2].toIntOrNull() != null
-                if (parsed) {
-                    cal.set(Calendar.DAY_OF_MONTH, 1) // avoid overflow when swapping month/day below
-                    cal.set(parts[2].toInt(), parts[1].toInt() - 1, parts[0].toInt())
-                    HolidaySchedule.addHoliday(cal)
-                    holidays = HolidaySchedule.getSortedHolidays()
-                    dateInput = ""
-                    status = "Holiday added"
-                } else {
-                    status = "Enter a valid DD/MM/YYYY date"
-                }
-            }) {
-                Icon(Icons.Default.Add, null, tint = AccentGreen)
-            }
-        }
-        status?.let { Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp)) }
-
-        if (holidays.isEmpty()) {
-            Text("No holidays marked.", fontSize = 11.sp, color = White30, modifier = Modifier.padding(top = 10.dp))
-        } else {
-            Spacer(Modifier.height(10.dp))
-            holidays.forEach { (key, label) ->
-                Row(
-                    modifier          = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(label, fontSize = 13.sp, color = White90)
-                    IconButton(onClick = {
-                        HolidaySchedule.removeHoliday(key)
-                        holidays = HolidaySchedule.getSortedHolidays()
-                    }) {
-                        Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(18.dp))
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun SettingsScreen() {
-    val context = LocalContext.current
-    var showAppSelector     by remember { mutableStateOf(false) }
-    var showWebsiteBlocker  by remember { mutableStateOf(false) }
-
-    if (showAppSelector) {
-        AppSelectorScreen(onBack = { showAppSelector = false })
-        return
-    }
-    if (showWebsiteBlocker) {
-        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
-        return
-    }
-
-    Column(
-        modifier        = Modifier.fillMaxSize().background(BgDark)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        Spacer(Modifier.height(20.dp))
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
-        }
-        Spacer(Modifier.height(8.dp))
-
-        // ── LLM API Keys ──
-        SettingSection("AI PROVIDERS") {
-            LlmProviderSettings(context)
-        }
-
-        // ── Voice / TTS ──
-        SettingSection("VOICE") {
-            VoiceSettings(context)
-        }
-
-        // ── Work Mode ──
-        SettingSection("WORK MODE") {
-            Text(
-                "Hardcoded daily block window: ${WorkModeSchedule.LABEL}. " +
-                    "This window isn't editable from the app — see your guardian to change it. " +
-                    "The one exception is a guardian-approved holiday, below.",
-                fontSize = 11.sp, color = White60,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-            )
-            HorizontalDivider(color = White10)
-            // Holidays (the only way the hardcoded schedule ever changes for a specific day),
-            // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are all
-            // read-only for the student while Work Mode is enforcing (an active session OR
-            // the hardcoded window) — closes the loophole where blocked apps get removed from
-            // the list, or a holiday gets self-approved, mid-session. Only a guardian PIN
-            // unlock (same PIN used for uninstall protection) lifts the lock. One shared gate
-            // for all of it, so unlocking once covers the whole section instead of prompting
-            // for the PIN twice.
-            WorkModeLockGate {
-                HolidaySettings()
-                HorizontalDivider(color = White10)
-                FocusCycleSettings(context)
-                HorizontalDivider(color = White10)
-                SettingTile(
-                    title    = "Blocked Apps",
-                    subtitle = "Block distraction apps incl. Google & system apps",
-                    icon     = Icons.Default.Block
-                ) { showAppSelector = true }
-                HorizontalDivider(color = White10)
-                SettingTile(
-                    title    = "Blocked Websites",
-                    subtitle = "Block distracting domains in any browser",
-                    icon     = Icons.Default.Language
-                ) { showWebsiteBlocker = true }
-            }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Accessibility Service",
-                subtitle = "Required for app/site blocking and WhatsApp automation",
-                icon     = Icons.Default.Accessibility
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-        }
-
-        // ── Task Sync (two-device) ──
-        SettingSection("TASK SYNC") {
-            TaskSyncSettings()
-        }
-
-        // ── Test Platform (Testmate) ──
-        SettingSection("TEST PLATFORM") {
-            TestmateSettings()
-        }
-
-        // ── Security / Uninstall Protection ──
-        SettingSection("SECURITY") {
-            UninstallProtectionSettings(context)
-        }
-
-        // ── Permissions ──
-        SettingSection("PERMISSIONS") {
-            SettingTile(
-                title    = "Notification Listener",
-                subtitle = "Required for WhatsApp message detection",
-                icon     = Icons.Default.Notifications
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Overlay Permission",
-                subtitle = "Required for floating attention timer",
-                icon     = Icons.Default.Layers
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:${context.packageName}"))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            HorizontalDivider(color = White10)
-            SettingTile(
-                title    = "Usage Access",
-                subtitle = "Required for app usage history (Digital Wellbeing-style stats)",
-                icon     = Icons.Default.History
-            ) {
-                context.startActivity(
-                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(32.dp))
-    }
-}
-
-// ── Security: Device Admin activation + Guardian PIN (uninstall protection) ──
-
-@Composable
-private fun UninstallProtectionSettings(context: Context) {
-    val dpm = remember { context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
-    val adminComponent = remember { CheckmateDeviceAdminReceiver.componentName(context) }
-    var isAdminActive by remember { mutableStateOf(dpm.isAdminActive(adminComponent)) }
-
-    // Device Admin activation tile
-    Row(
-        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            if (isAdminActive) Icons.Default.GppGood else Icons.Default.GppMaybe,
-            null,
-            tint = if (isAdminActive) AccentGreen else AccentAmber,
-            modifier = Modifier.size(20.dp)
-        )
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text("Device Admin Protection", fontSize = 14.sp, color = White90)
-            Text(
-                if (isAdminActive)
-                    "Active — plain Uninstall is hidden on the App Info screen"
-                else
-                    "Not active — Checkmate can be uninstalled like any normal app",
-                fontSize = 11.sp, color = White60
-            )
-        }
-        if (!isAdminActive) {
-            TextButton(onClick = {
-                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
-                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
-                    putExtra(
-                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
-                        "Required so Checkmate can't be casually uninstalled mid-session."
-                    )
-                }
-                context.startActivity(intent)
-            }) { Text("Activate", color = AccentGreen, fontSize = 13.sp) }
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    SettingTile(
-        title    = "Refresh Protection Status",
-        subtitle = "Tap after activating device admin in the system dialog",
-        icon     = Icons.Default.Refresh
-    ) {
-        isAdminActive = dpm.isAdminActive(adminComponent)
-    }
-
-    HorizontalDivider(color = White10)
-
-    // Guardian PIN — generated device-side, hashed on-device, plaintext sent
-    // ONLY to the guardian's Telegram. Whoever taps "Generate" never sees it,
-    // so tapping it from the student's side can't self-authorize anything.
-    val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
-    var genStatus by remember { mutableStateOf<String?>(null) }
-    var genInFlight by remember { mutableStateOf(false) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            if (pinConfigured)
-                "A PIN is set. It was sent only to the guardian's Telegram — nobody on this screen can see it."
-            else
-                "No PIN yet — the watchdog will block every uninstall/disable attempt until one is generated.",
-            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
-        )
-        Button(
-            onClick = {
-                genInFlight = true
-                GuardianNotifier.generateAndSendGuardianPin(context) { success, message ->
-                    genStatus = message
-                    genInFlight = false
-                }
-            },
-            enabled  = !genInFlight,
-            modifier = Modifier.fillMaxWidth(),
-            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-        ) {
-            Icon(Icons.Default.Send, null, modifier = Modifier.size(18.dp), tint = androidx.compose.ui.graphics.Color.Black)
-            Spacer(Modifier.width(8.dp))
-            Text(
-                if (pinConfigured) "Generate New PIN → Guardian's Telegram" else "Generate PIN → Guardian's Telegram",
-                color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp
-            )
-        }
-        genStatus?.let {
-            Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp))
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    // Unlock — only the person who has the PIN from Telegram (the guardian)
-    // can pass this. Wrong-PIN attempts are counted; 5 failures locks the
-    // unlock field for 10 minutes and alerts the guardian.
-    var unlockPin by remember { mutableStateOf("") }
-    var unlockStatus by remember { mutableStateOf<String?>(null) }
-    var unlockStatusColor by remember { mutableStateOf(White60) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Unlock Protection", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            "Guardian enters the PIN they received on Telegram to pass the watchdog for 2 minutes.",
-            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = unlockPin,
-            onValueChange = { if (it.length <= 6) unlockPin = it },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("6-digit guardian PIN", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    when (val result = UninstallGuard.unlockWithPin(unlockPin)) {
-                        is UninstallGuard.UnlockResult.Success -> {
-                            unlockStatus = "Unlocked for 2 minutes"
-                            unlockStatusColor = AccentGreen
-                            unlockPin = ""
-                        }
-                        is UninstallGuard.UnlockResult.WrongPin -> {
-                            unlockStatus = "Incorrect PIN"
-                            unlockStatusColor = AccentRed
-                        }
-                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
-                            unlockStatus = "No PIN generated yet"
-                            unlockStatusColor = AccentAmber
-                        }
-                        is UninstallGuard.UnlockResult.LockedOut -> {
-                            unlockStatus = "Too many wrong attempts — locked for ${result.secondsLeft / 60}m"
-                            unlockStatusColor = AccentRed
-                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
-                        }
-                    }
-                }) {
-                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        unlockStatus?.let {
-            Text(it, fontSize = 11.sp, color = unlockStatusColor, modifier = Modifier.padding(top = 4.dp))
-        }
-    }
-}
-
-// ── Focus Cycle Settings (Floating bar + Pomodoro breaks toggles) ────────────
-
-@Composable
-private fun FocusCycleSettings(context: Context) {
-    var barEnabled by remember {
-        mutableStateOf(CheckmatePrefs.getBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, true))
-    }
-    var pomodoroEnabled by remember {
-        mutableStateOf(CheckmatePrefs.getBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, true))
-    }
-
-    Column {
-        // Floating Focus Bar toggle
-        Row(
-            modifier          = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                if (barEnabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                null, tint = AccentGreen, modifier = Modifier.size(20.dp)
-            )
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Floating Focus Bar", fontSize = 14.sp, color = White90)
-                Text(
-                    if (barEnabled)
-                        "Shows the on-screen timer bar over other apps during focus sessions"
-                    else
-                        "Bar hidden — use the notification to mark done / take a break / confirm checks",
-                    fontSize = 11.sp, color = White60
-                )
-            }
-            Switch(
-                checked         = barEnabled,
-                onCheckedChange = {
-                    barEnabled = it
-                    CheckmatePrefs.putBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, it)
-                },
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor   = BgDark,
-                    checkedTrackColor   = AccentGreen,
-                    uncheckedThumbColor = White60,
-                    uncheckedTrackColor = White10
-                )
-            )
-        }
-
-        HorizontalDivider(color = White10)
-
-        // Pomodoro Breaks toggle
-        Row(
-            modifier          = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(Icons.Default.Timer, null, tint = AccentAmber, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Pomodoro Breaks", fontSize = 14.sp, color = White90)
-                Text(
-                    if (pomodoroEnabled)
-                        "30 min focus / 5–10 min break cycles, with attention check-ins"
-                    else
-                        "Off — one continuous focus timer for the full task, no forced breaks or checks",
-                    fontSize = 11.sp, color = White60
-                )
-            }
-            Switch(
-                checked         = pomodoroEnabled,
-                onCheckedChange = {
-                    pomodoroEnabled = it
-                    CheckmatePrefs.putBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, it)
-                },
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor   = BgDark,
-                    checkedTrackColor   = AccentGreen,
-                    uncheckedThumbColor = White60,
-                    uncheckedTrackColor = White10
-                )
-            )
-        }
-        Text(
-            "Takes effect on your next focus session — won't change one already running.",
-            fontSize = 10.sp, color = White30,
-            modifier = Modifier.padding(start = 46.dp, end = 14.dp, bottom = 8.dp)
-        )
-    }
-}
-
-// ── LLM Provider Settings ─────────────────────────────────────────────────────
-
-private val LLM_PROVIDERS = listOf("Groq", "Claude", "Gemini", "OpenRouter")
-
-@Composable
-private fun LlmProviderSettings(context: Context) {
-    val providers = LLM_PROVIDERS
-
-    var selectedProvider by remember {
-        mutableStateOf(CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq")
-    }
-
-    // One key state per provider
-    val keys = providers.associateWith { provider ->
-        remember(provider) {
-            mutableStateOf(
-                CheckmatePrefs.getString("llm_key_${provider.lowercase()}", "") ?: ""
-            )
-        }
-    }
-
-    // Provider selector chips
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Active Provider", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            providers.forEach { provider ->
-                val selected = provider == selectedProvider
-                FilterChip(
-                    selected = selected,
-                    onClick  = {
-                        selectedProvider = provider
-                        CheckmatePrefs.putString("llm_provider", provider)
-                    },
-                    label    = { Text(provider, fontSize = 12.sp) },
-                    colors   = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = AccentGreen,
-                        selectedLabelColor     = BgDark
-                    )
-                )
-            }
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    // API key field for the currently selected provider
-    val currentKey = keys[selectedProvider]
-    if (currentKey != null) {
-        var showKey by remember { mutableStateOf(false) }
-        var saved   by remember { mutableStateOf(false) }
-
-        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Text("$selectedProvider API Key", fontSize = 12.sp, color = White60,
-                modifier = Modifier.padding(bottom = 6.dp))
-            OutlinedTextField(
-                value         = currentKey.value,
-                onValueChange = { currentKey.value = it; saved = false },
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                placeholder   = { Text("Paste API key here", color = White30, fontSize = 13.sp) },
-                visualTransformation = if (showKey) VisualTransformation.None
-                                       else PasswordVisualTransformation(),
-                trailingIcon  = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { showKey = !showKey }) {
-                            Icon(
-                                if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                null, tint = White60
-                            )
-                        }
-                        IconButton(onClick = {
-                            CheckmatePrefs.putString(
-                                "llm_key_${selectedProvider.lowercase()}",
-                                currentKey.value.trim()
-                            )
-                            saved = true
-                        }) {
-                            Icon(
-                                if (saved) Icons.Default.Check else Icons.Default.Save,
-                                null,
-                                tint = if (saved) AccentGreen else White60
-                            )
-                        }
-                    }
-                },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-            if (saved) {
-                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                    modifier = Modifier.padding(top = 4.dp))
-            }
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    // ── Guardian WhatsApp number ──────────────────────────────────────────────
-    var guardianNumber by remember {
-        mutableStateOf(CheckmatePrefs.getString("guardian_number", "") ?: "")
-    }
-    var guardianSaved by remember { mutableStateOf(false) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Guardian WhatsApp Number", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        OutlinedTextField(
-            value         = guardianNumber,
-            onValueChange = { guardianNumber = it; guardianSaved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("+91XXXXXXXXXX", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Phone, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    CheckmatePrefs.putString("guardian_number", guardianNumber.trim())
-                    guardianSaved = true
-                }) {
-                    Icon(
-                        if (guardianSaved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (guardianSaved) AccentGreen else White60
-                    )
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        if (guardianSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                modifier = Modifier.padding(top = 4.dp))
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    // ── Guardian Telegram Chat ID ─────────────────────────────────────────────
-    // Locked the same way as Blocked Apps / Blocked Websites / Focus Cycle —
-    // reuses WorkModeLockGate (same PIN/unlock flow, defined above in this
-    // file). Open on first launch (no PIN configured yet) so the guardian
-    // can do initial setup, then locked permanently — independent of
-    // session/schedule state — until the guardian PIN is entered. Without
-    // this, a student could just repoint alerts to their own Telegram chat.
-    WorkModeLockGate {
-        var telegramChatId by remember {
-            mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
-        }
-        var telegramSaved by remember { mutableStateOf(false) }
-
-        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
-                modifier = Modifier.padding(bottom = 6.dp))
-            Text(
-                "Guardian: open Telegram → message @userinfobot → copy the id: number here",
-                fontSize = 11.sp,
-                color    = White30,
-                modifier = Modifier.padding(bottom = 6.dp)
-            )
-            OutlinedTextField(
-                value         = telegramChatId,
-                onValueChange = { telegramChatId = it; telegramSaved = false },
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
-                leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
-                trailingIcon  = {
-                    IconButton(onClick = {
-                        CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
-                        telegramSaved = true
-                    }) {
-                        Icon(
-                            if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
-                            null,
-                            tint = if (telegramSaved) AccentGreen else White60
-                        )
-                    }
-                },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-            if (telegramSaved) {
-                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
-                    modifier = Modifier.padding(top = 4.dp))
-            }
-        }
-    }
-}
-
-// ── Task Sync (two-device) ─────────────────────────────────────────────────────
-//
-// Deliberately not gated behind WorkModeLockGate — unlike the guardian-facing
-// fields above, a sync code isn't a safety control the student could abuse by
-// changing it, it's just how they tell two of their own devices to share today's
-// task list. Only today's PlanStore list is synced (see TaskSyncManager); every
-// other setting/stat on this screen stays exactly as device-local as before.
-@Composable
-private fun TaskSyncSettings() {
-    var syncCode by remember {
-        mutableStateOf(CheckmatePrefs.getString("sync_code", "") ?: "")
-    }
-    var saved by remember { mutableStateOf(false) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Sync Code", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            "Enter the exact same code on both devices to sync today's task list " +
-                "between them. Everything else (stats, streak, settings) stays separate.",
-            fontSize = 11.sp,
-            color    = White30,
-            modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = syncCode,
-            onValueChange = { syncCode = it; saved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("e.g. priya-neet-2027", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Sync, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    val trimmed = syncCode.trim()
-                    if (trimmed.isBlank()) CheckmatePrefs.remove("sync_code")
-                    else CheckmatePrefs.putString("sync_code", trimmed)
-                    syncCode = trimmed
-                    saved = true
-                }) {
-                    Icon(
-                        if (saved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (saved) AccentGreen else White60
-                    )
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        if (saved) {
-            Text(
-                if (syncCode.isBlank()) "Sync turned off ✓" else "Saved ✓",
-                fontSize = 11.sp, color = AccentGreen,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-        }
-    }
-}
-
-// ── Voice / TTS Settings ──────────────────────────────────────────────────────
-
-@Composable
-private fun VoiceSettings(context: Context) {
-    var ttsEnabled by remember {
-        mutableStateOf(CheckmatePrefs.getBoolean("tts_enabled", true))
-    }
-
-    Row(
-        modifier          = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(Icons.Default.RecordVoiceOver, null, tint = AccentGreen,
-            modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text("Voice Feedback", fontSize = 14.sp, color = White90)
-            Text(
-                if (ttsEnabled) "Mentor speaks task summaries aloud" else "Voice feedback is off",
-                fontSize = 11.sp, color = White60
-            )
-        }
-        Switch(
-            checked         = ttsEnabled,
-            onCheckedChange = {
-                ttsEnabled = it
-                CheckmatePrefs.putBoolean("tts_enabled", it)
-            },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor   = BgDark,
-                checkedTrackColor   = AccentGreen,
-                uncheckedThumbColor = White60,
-                uncheckedTrackColor = White10
-            )
-        )
-    }
-}
-
-// ── Testmate (test platform) settings ─────────────────────────────────────────
-
-@Composable
-private fun TestmateSettings() {
-    var baseUrl by remember {
-        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, "") ?: "")
-    }
-    var baseUrlSaved by remember { mutableStateOf(false) }
-    var baseUrlError by remember { mutableStateOf<String?>(null) }
-
-    var token by remember {
-        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, "") ?: "")
-    }
-    var showToken by remember { mutableStateOf(false) }
-    var tokenSaved by remember { mutableStateOf(false) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Testmate Base URL", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 4.dp))
-        Text(
-            "Only testmate2.com (or a subdomain) or the Testmate Supabase auth link are " +
-                "accepted — anything else is rejected before it's saved.",
-            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = baseUrl,
-            onValueChange = { baseUrl = it; baseUrlSaved = false; baseUrlError = null },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("https://testmate2.com", color = White30, fontSize = 13.sp) },
-            leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    val candidate = baseUrl.trim()
-                    // Allow-list gate (TestmateApi.isAllowedBaseUrl) — only testmate2.com (or
-                    // a subdomain) or this project's Supabase auth-verify URL get saved. Any
-                    // other host, including a plausible-looking lookalike, is rejected here
-                    // rather than silently persisted and only failing later at request time.
-                    if (TestmateApi.isAllowedBaseUrl(candidate)) {
-                        CheckmatePrefs.putString(TestmateApi.PREF_BASE_URL, candidate)
-                        baseUrlSaved = true
-                        baseUrlError = null
-                    } else {
-                        baseUrlSaved = false
-                        baseUrlError = "Only testmate2.com or the Testmate Supabase auth link are accepted"
-                    }
-                }) {
-                    Icon(
-                        if (baseUrlSaved) Icons.Default.Check else Icons.Default.Save,
-                        null,
-                        tint = if (baseUrlSaved) AccentGreen else White60
-                    )
-                }
-            },
-            isError = baseUrlError != null,
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90,
-                errorBorderColor     = AccentRed
-            )
-        )
-        if (baseUrlSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
-        }
-        baseUrlError?.let {
-            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(top = 4.dp))
-        }
-    }
-
-    HorizontalDivider(color = White10)
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-        Text("Access Token", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
-        Text(
-            "Token-authed per test-platform-blueprint.md §3/§5 — issued by Testmate for this device.",
-            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
-        )
-        OutlinedTextField(
-            value         = token,
-            onValueChange = { token = it; tokenSaved = false },
-            modifier      = Modifier.fillMaxWidth(),
-            singleLine    = true,
-            placeholder   = { Text("Paste access token here", color = White30, fontSize = 13.sp) },
-            visualTransformation = if (showToken) VisualTransformation.None
-                                   else PasswordVisualTransformation(),
-            trailingIcon  = {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { showToken = !showToken }) {
-                        Icon(
-                            if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            null, tint = White60
-                        )
-                    }
-                    IconButton(onClick = {
-                        CheckmatePrefs.putString(TestmateApi.PREF_TOKEN, token.trim())
-                        tokenSaved = true
-                    }) {
-                        Icon(
-                            if (tokenSaved) Icons.Default.Check else Icons.Default.Save,
-                            null,
-                            tint = if (tokenSaved) AccentGreen else White60
-                        )
-                    }
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-        if (tokenSaved) {
-            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
-        }
-    }
-}
-
-// ── Shared layout helpers ─────────────────────────────────────────────────────
-
-@Composable
-private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-        Text(
-            title,
-            fontSize      = 11.sp,
-            fontWeight    = FontWeight.Bold,
-            letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
-            color         = White60,
-            modifier      = Modifier.padding(top = 16.dp, bottom = 8.dp)
-        )
-        Surface(
-            shape  = RoundedCornerShape(12.dp),
-            color  = BgCard,
-            border = BorderStroke(0.5.dp, White10)
-        ) {
-            Column(content = content)
-        }
-    }
-}
-
-@Composable
-private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
-    Surface(onClick = onClick, color = androidx.compose.ui.graphics.Color.Transparent) {
-        Row(
-            modifier          = Modifier.fillMaxWidth().padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(icon, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 14.sp, color = White90)
-                Text(subtitle, fontSize = 11.sp, color = White60)
-            }
-            Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(16.dp))
-        }
-    }
-}
-
-
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/TaskSyncManager.kt =====
-package com.checkmate.service
-
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
-
-/**
- * TaskSyncManager — syncs ONLY today's task list (PlanStore.todayTasks) between two
- * devices that share the same sync code. Nothing else (settings, stats, streaks,
- * profile, checklist) is touched — every other screen keeps reading/writing its own
- * device-local CheckmatePrefs exactly as before.
- *
- * Reuses the same Cloudflare Worker StatusReporter/TelegramAlertBot already POST to
- * (steep-band-1bd0.amirshamse8.workers.dev) with a new /tasks route backed by KV,
- * same shape as the existing /status and /usage routes. See the /tasks worker.js
- * snippet shipped alongside this file — it needs to be added to the worker project
- * directly (that source isn't part of this Android repo).
- *
- * Sync model: last-write-wins, whole-list replace, keyed by "sync_code" (set
- * identically on both devices in Settings → TASK SYNC — deliberately separate from
- * the guardian's Telegram chat id, so this works even on a setup with no guardian
- * configured). Every push carries updatedAt (epoch ms) and dayKey (PlanStore's own
- * "yyyy_dayOfYear" key, via PlanStore.currentDayKey()) so a pull can never splice a
- * stale day's tasks onto today, and a push never clobbers a newer edit made on the
- * other device in the last few seconds.
- */
-object TaskSyncManager {
-
-    private const val TAG = "TaskSyncManager"
-    private const val TASKS_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/tasks"
-
-    private val json = Json { ignoreUnknownKeys = true }
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
-
-    private fun syncCode(): String? =
-        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
-
-    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
-    fun isEnabled(): Boolean = syncCode() != null
-
-    /**
-     * Pushes today's task list up to the worker under the configured sync code.
-     * No-op if no sync code is set (sync is opt-in — an unconfigured device never
-     * phones home). Must be called from a background thread; failures are logged
-     * and swallowed so a flaky connection never blocks a local task action.
-     */
-    fun pushTasks(tasks: List<StudyTask>) {
-        val code = syncCode() ?: return
-        try {
-            val tasksJson = json.encodeToString(tasks)
-            val payload = JSONObject().apply {
-                put("code", code)
-                put("dayKey", PlanStore.currentDayKey())
-                put("updatedAt", PlanStore.getLastUpdatedAt())
-                put("tasks", JSONArray(tasksJson))
-            }
-            val body = payload.toString().toRequestBody("application/json".toMediaType())
-            val response = client.newCall(Request.Builder().url(TASKS_URL).post(body).build()).execute()
-            Log.d(TAG, "pushTasks: ${response.code}")
-            response.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "pushTasks exception: ${e.message}")
-        }
-    }
-
-    /**
-     * Fetches the other device's synced tasks and returns them ONLY if they're for
-     * today and strictly newer than localUpdatedAt — otherwise returns null and the
-     * caller leaves today's plan untouched. Must be called from a background thread.
-     */
-    fun pullTasksIfNewer(localUpdatedAt: Long): List<StudyTask>? {
-        val code = syncCode() ?: return null
-        return try {
-            val request = Request.Builder().url("$TASKS_URL?code=$code").get().build()
-            val response = client.newCall(request).execute()
-            val bodyStr = response.body?.string()
-            response.close()
-            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
-
-            val obj = JSONObject(bodyStr)
-            val remoteDayKey    = obj.optString("dayKey", "")
-            val remoteUpdatedAt = obj.optLong("updatedAt", 0L)
-            // Different day (or worker has nothing yet) — never splice it onto today's plan.
-            if (remoteDayKey != PlanStore.currentDayKey()) return null
-            // Local copy is already the same age or newer — nothing to pull.
-            if (remoteUpdatedAt <= localUpdatedAt) return null
-
-            val tasksArr = obj.optJSONArray("tasks") ?: return null
-            json.decodeFromString<List<StudyTask>>(tasksArr.toString())
-        } catch (e: Exception) {
-            Log.w(TAG, "pullTasksIfNewer exception: ${e.message}")
-            null
-        }
-    }
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/FreeSlotCalculator.kt =====
-package com.checkmate.planner
-
-import com.checkmate.core.TimeSlot
-
-/**
- * FreeSlotCalculator — Blueprint 4.1: computes today's free study windows as
- * (study window) minus (ConsultationProfile.blockedSlots), e.g. school/coaching
- * hours. Pure function, no I/O — AdaptivePlanner feeds it profile.blockedSlots
- * plus PlannerState.studyStartTime/studyEndTime and uses the result to assign
- * each generated StudyTask a scheduledStartTime (see assignScheduledTimes()
- * in AdaptivePlanner.kt).
- *
- * All times are handled as minutes-from-midnight (0-1439) internally so slot
- * math is plain integer arithmetic instead of repeated string parsing.
- */
-object FreeSlotCalculator {
-
-    /** A contiguous free window today, in minutes-from-midnight. */
-    data class FreeSlot(val startMinute: Int, val endMinute: Int) {
-        val durationMinutes: Int get() = (endMinute - startMinute).coerceAtLeast(0)
-    }
-
-    /**
-     * Blueprint 4.1: studyWindow minus all blockedSlots, merging any overlapping
-     * blocked ranges first so back-to-back or overlapping entries (e.g. school
-     * ending late, coaching starting early) don't produce a spurious sliver of
-     * "free" time between them.
-     *
-     * Blocked slots outside the study window are clipped to it; blocked slots
-     * with unparseable or inverted (end <= start) times are dropped rather than
-     * corrupting the rest of the computation — a single bad entry in the
-     * student's profile shouldn't zero out the whole day's schedule.
-     */
-    fun computeFreeSlots(
-        blockedSlots:   List<TimeSlot>,
-        studyStartTime: String,
-        studyEndTime:   String
-    ): List<FreeSlot> {
-        val windowStart = parseMinutesOrNull(studyStartTime) ?: DEFAULT_WINDOW_START
-        val windowEnd   = parseMinutesOrNull(studyEndTime) ?: DEFAULT_WINDOW_END
-        if (windowEnd <= windowStart) return emptyList()
-
-        val blocked = blockedSlots
-            .mapNotNull { slot ->
-                val s = parseMinutesOrNull(slot.startTime) ?: return@mapNotNull null
-                val e = parseMinutesOrNull(slot.endTime) ?: return@mapNotNull null
-                if (e <= s) return@mapNotNull null
-                val clippedStart = s.coerceIn(windowStart, windowEnd)
-                val clippedEnd   = e.coerceIn(windowStart, windowEnd)
-                if (clippedEnd <= clippedStart) null else clippedStart to clippedEnd
-            }
-            .sortedBy { it.first }
-            .let { mergeOverlapping(it) }
-
-        val free = mutableListOf<FreeSlot>()
-        var cursor = windowStart
-        for ((bStart, bEnd) in blocked) {
-            if (bStart > cursor) free.add(FreeSlot(cursor, bStart))
-            cursor = maxOf(cursor, bEnd)
-        }
-        if (cursor < windowEnd) free.add(FreeSlot(cursor, windowEnd))
-        return free.filter { it.durationMinutes > 0 }
-    }
-
-    private fun mergeOverlapping(ranges: List<Pair<Int, Int>>): List<Pair<Int, Int>> {
-        if (ranges.isEmpty()) return ranges
-        val merged = mutableListOf(ranges.first())
-        for (r in ranges.drop(1)) {
-            val last = merged.last()
-            if (r.first <= last.second) merged[merged.size - 1] = last.first to maxOf(last.second, r.second)
-            else merged.add(r)
-        }
-        return merged
-    }
-
-    private fun parseMinutesOrNull(hhmm: String): Int? = try {
-        val parts = hhmm.trim().split(":")
-        val h = parts[0].trim().toInt()
-        val m = parts[1].trim().toInt()
-        if (h !in 0..23 || m !in 0..59) null else h * 60 + m
-    } catch (_: Exception) { null }
-
-    /** Public wrapper around parseMinutesOrNull — lets callers outside this object (e.g.
-     *  HomeViewModel.findNextFreeSlot) turn a task's existing "HH:mm" scheduledStartTime
-     *  back into minutes-from-midnight without duplicating the parsing rules here. */
-    fun parseTimeOrNull(hhmm: String): Int? = parseMinutesOrNull(hhmm)
-
-    /** Formats a minutes-from-midnight value back to "HH:mm" for StudyTask.scheduledStartTime. */
-    fun formatMinutes(totalMinutes: Int): String {
-        val clamped = totalMinutes.coerceIn(0, 24 * 60 - 1)
-        val h = clamped / 60
-        val m = clamped % 60
-        return "%02d:%02d".format(h, m)
-    }
-
-    /**
-     * Carves already-occupied (startMinute, endMinute) ranges — e.g. tasks today's plan
-     * has already scheduled — out of a set of free slots. Same clip-and-merge approach as
-     * computeFreeSlots() uses for blockedSlots, just applied to StudyTask occupancy instead
-     * of ConsultationProfile entries, so HomeViewModel.addCustomTask can find room for a
-     * newly-added task without double-booking a slot AdaptivePlanner already used.
-     */
-    fun subtractOccupied(freeSlots: List<FreeSlot>, occupied: List<Pair<Int, Int>>): List<FreeSlot> {
-        if (occupied.isEmpty()) return freeSlots
-        val merged = occupied.sortedBy { it.first }.let { mergeOverlapping(it) }
-        val result = mutableListOf<FreeSlot>()
-        for (slot in freeSlots) {
-            var cursor = slot.startMinute
-            for ((oStart, oEnd) in merged) {
-                val s = oStart.coerceIn(slot.startMinute, slot.endMinute)
-                val e = oEnd.coerceIn(slot.startMinute, slot.endMinute)
-                if (e <= s) continue
-                if (s > cursor) result.add(FreeSlot(cursor, s))
-                cursor = maxOf(cursor, e)
-            }
-            if (cursor < slot.endMinute) result.add(FreeSlot(cursor, slot.endMinute))
-        }
-        return result.filter { it.durationMinutes > 0 }
-    }
-
-    /**
-     * First-fit: the earliest free slot (slots are expected in chronological order, as
-     * computeFreeSlots()/subtractOccupied() already return them) with at least
-     * durationMinutes of room, returned as a minutes-from-midnight start. Null means
-     * nothing today fits — callers should leave StudyTask.scheduledStartTime null rather
-     * than fabricate a time, same contract as AdaptivePlanner.assignScheduledTimes().
-     */
-    fun firstFitStart(durationMinutes: Int, freeSlots: List<FreeSlot>): Int? =
-        freeSlots.firstOrNull { it.durationMinutes >= durationMinutes }?.startMinute
-
-    private const val DEFAULT_WINDOW_START = 9 * 60   // 09:00 — mirrors PlannerState's default
-    private const val DEFAULT_WINDOW_END   = 21 * 60  // 21:00 — mirrors PlannerState's default
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
-package com.checkmate.planner
-
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import java.util.Calendar
-
-// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
-// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
-// excluded — see StudyTask.actualMinutes) across today's completed sessions.
-// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
-// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
-// no pause behavior to measure), so a fatigue/distraction trend is visible
-// even on a day with zero completions.
-data class PauseStats(
-    val actualFocusMinutesToday: Int   = 0,
-    val avgPausesPerSession:     Float = 0f,
-    val pauseRatePercent:        Int   = 0
-)
-
-object PlanStore {
-
-    private val json = Json { ignoreUnknownKeys = true }
-    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
-    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
-
-    init { reload() }
-
-    private fun reload() {
-        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
-        _todayTasks.value = saved?.let {
-            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
-        } ?: emptyList()
-    }
-
-    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
-
-    /**
-     * Appends a single manually-created task to today's plan WITHOUT touching any
-     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
-     * the whole list, this is additive — safe to call any time, any number of times.
-     * The new task goes through the exact same StudyTask model as AdaptivePlanner
-     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
-     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
-     * code path needed anywhere downstream.
-     */
-    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
-
-    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
-    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
-
-    /** Edits the planned duration of a single task — used for custom-task duration editing. */
-    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
-        it.copy(durationMinutes = durationMinutes)
-    }
-
-    /**
-     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
-     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
-     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
-     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
-     * fit it into today's free time, and this is how the student fixes that from HomeScreen
-     * without deleting and re-adding it.
-     */
-    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
-        it.copy(scheduledStartTime = scheduledStartTime)
-    }
-
-    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
-
-    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
-        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
-    }
-
-    /**
-     * Blueprint 2.6: records the session's real focus time — as measured by
-     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
-     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
-     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
-     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
-     * clock)"). Previously neither field was ever written, so both stats silently
-     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
-     */
-    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
-        it.copy(focusMinutes = minutes, actualMinutes = minutes)
-    }
-
-    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
-        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
-    }
-
-    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
-        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
-        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
-    }
-
-    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
-
-    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
-    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
-        it.copy(intentionText = intentionText)
-    }
-
-    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
-    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
-        it.copy(completedStatus = status)
-    }
-
-    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
-        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
-    }
-
-    /**
-     * Single write path for today's task list — every mutating function above funnels
-     * through this instead of duplicating the "encode + persist + update StateFlow"
-     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
-     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
-     * copy is newer, without PlanStore itself knowing anything about sync/network —
-     * this module stays local-storage-only, same as before.
-     */
-    private fun persist(tasks: List<StudyTask>) {
-        val key = todayKey()
-        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
-        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
-        _todayTasks.value = tasks
-    }
-
-    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
-    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
-
-    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
-     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
-    fun currentDayKey(): String = todayKey()
-
-    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
-
-    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
-    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
-
-    fun getTodayCompletionPercent(): Int {
-        val t = _todayTasks.value
-        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
-    }
-
-    fun getStreakDays(): Int {
-        var streak = 0
-        val cal = Calendar.getInstance()
-        for (i in 0..30) {
-            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
-            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
-            // Fix: previously "tasks.count{DONE}==0 && tasks.isNotEmpty()" meant a day where a
-            // plan was saved with ZERO tasks (empty list) did NOT break the streak — an empty
-            // plan silently counted as a study day. No tasks in the plan means no study, same
-            // as a day with tasks that were never done, so this now breaks on either case.
-            if (tasks.count { it.state == TaskState.DONE } == 0) break
-            streak++
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return streak
-    }
-
-    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
-
-    /**
-     * Per-day study status used by the Stats consistency calendar and by
-     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
-     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
-     * neutral/unknown state, which is what silently reading everything as 0% used to do.
-     */
-    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
-
-    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
-    fun getDayStatus(cal: Calendar): DayStudyStatus {
-        val today = Calendar.getInstance()
-        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
-            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
-                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
-        if (isFuture) return DayStudyStatus.FUTURE
-
-        val tasks = loadDay(keyForDay(cal))
-        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
-        val done = tasks.count { it.state == TaskState.DONE }
-        return when {
-            done == tasks.size -> DayStudyStatus.COMPLETE
-            done > 0            -> DayStudyStatus.PARTIAL
-            else                 -> DayStudyStatus.MISSED
-        }
-    }
-
-    /**
-     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
-     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
-     * dots per day, like a GitHub-style contribution grid).
-     */
-    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
-        val cal = Calendar.getInstance()
-        cal.set(Calendar.YEAR, year)
-        cal.set(Calendar.MONTH, month)
-        cal.set(Calendar.DAY_OF_MONTH, 1)
-        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
-        val result = LinkedHashMap<Int, DayStudyStatus>()
-        for (d in 1..daysInMonth) {
-            cal.set(Calendar.DAY_OF_MONTH, d)
-            result[d] = getDayStatus(cal)
-        }
-        return result
-    }
-
-    /**
-     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
-     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
-     * lets the app actually notice "the student hasn't studied in N days" instead of that
-     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
-     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
-     * guardian once this crosses a threshold.
-     */
-    fun getConsecutiveMissedDays(): Int {
-        val cal = Calendar.getInstance()
-        cal.add(Calendar.DAY_OF_YEAR, -1)
-        var missed = 0
-        for (i in 0 until 60) {
-            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
-            missed++
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return missed
-    }
-
-    fun getWeekCompletionPercent(): Int {
-        val cal = Calendar.getInstance(); var total = 0; var done = 0
-        repeat(7) {
-            val tasks = loadDay(keyForDay(cal))
-            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return if (total == 0) 0 else done * 100 / total
-    }
-
-    fun getWeeklyData(): List<Pair<String, Int>> {
-        val cal = Calendar.getInstance()
-        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
-        val result = mutableListOf<Pair<String, Int>>()
-        repeat(7) { i ->
-            val tasks = loadDay(keyForDay(cal))
-            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
-            result.add(0, Pair(days[6 - i], pct))
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-        return result
-    }
-
-    fun getSubjectStats(): List<Pair<String, Int>> =
-        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
-            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
-        }
-
-    /** Blueprint 2.6 — see PauseStats doc above. */
-    fun getPauseStats(): PauseStats {
-        val actualFocusToday = _todayTasks.value
-            .filter { it.state == TaskState.DONE }
-            .sumOf { it.actualMinutes }
-
-        val cal = Calendar.getInstance()
-        val weekSessions = mutableListOf<StudyTask>()
-        repeat(7) {
-            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
-            cal.add(Calendar.DAY_OF_YEAR, -1)
-        }
-
-        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
-
-        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
-        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
-
-        return PauseStats(
-            actualFocusMinutesToday = actualFocusToday,
-            avgPausesPerSession     = avgPauses,
-            pauseRatePercent        = pauseRate
-        )
-    }
-
-    private fun loadDay(key: String): List<StudyTask> {
-        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
-        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
-    }
-
-    private fun todayKey() = keyForDay(Calendar.getInstance())
-    private fun keyForDay(cal: Calendar) =
-        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
-}
-
-
-//===== ADD TO: your existing Cloudflare Worker (worker.js) — new /tasks route, not part of the Android repo =====
-// Add this route to your existing Cloudflare Worker (the same one StatusReporter
-// and TelegramAlertBot already POST /status and /usage to). Requires a KV
-// namespace binding — e.g. `TASKS_KV` — added the same way you already bound
-// whatever KV namespace backs /status and /usage.
-//
-// POST caches the payload (code, dayKey, updatedAt, tasks) under tasks:<code>.
-// GET returns that cached payload as-is, or an empty/zeroed shape if nothing's
-// been pushed yet for that code — TaskSyncManager.pullTasksIfNewer() treats a
-// dayKey mismatch (including this empty default) as "nothing to pull."
-
-if (url.pathname === "/tasks" && request.method === "POST") {
-  const body = await request.json();
-  if (!body.code) return new Response("missing code", { status: 400 });
-  await env.TASKS_KV.put(`tasks:${body.code}`, JSON.stringify(body));
-  return new Response("ok");
-}
-
-if (url.pathname === "/tasks" && request.method === "GET") {
-  const code = url.searchParams.get("code");
-  if (!code) return new Response("missing code", { status: 400 });
-  const cached = await env.TASKS_KV.get(`tasks:${code}`);
-  if (!cached) {
-    return new Response(JSON.stringify({ dayKey: "", updatedAt: 0, tasks: [] }), {
-      headers: { "content-type": "application/json" }
-    });
-  }
-  return new Response(cached, { headers: { "content-type": "application/json" } });
 }
