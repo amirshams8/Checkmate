@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.checkmate.core.DailyChecklist
+import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -153,8 +154,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
         ScheduleTaskDialog(
             task      = task,
             onDismiss = { schedulingTask = null },
-            onConfirm = { hhmm ->
-                vm.scheduleTask(task, hhmm)
+            onConfirm = { start, end ->
+                vm.rescheduleTask(task, start, end)
                 schedulingTask = null
             }
         )
@@ -691,19 +692,31 @@ private fun EditDurationDialog(
 }
 
 /**
- * Manual "Schedule" action for a task sitting in Timeline view's Unscheduled section —
- * lets the student give it an "HH:mm" slot directly instead of only being able to delete
- * and re-add it. Pre-fills with the study window's start time as a reasonable default.
- * Validation mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59) so a bad value
- * can't get saved onto the task.
+ * Manual "Schedule" action, reachable via the clock icon on ANY pending TaskCard (List
+ * or Timeline, scheduled or not) — lets the student set start AND end time directly
+ * instead of only being able to delete and re-add a task to change its slot. End time
+ * pre-fills from the task's current scheduledStartTime + durationMinutes when it already
+ * has one, so opening the dialog on an already-scheduled task shows its real current
+ * window rather than blank fields. durationMinutes itself is derived from end − start on
+ * save (see HomeViewModel.rescheduleTask) so the two can never drift apart. Validation
+ * mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59), plus an end-after-start
+ * check, so a bad value can't get saved onto the task.
  */
 @Composable
 private fun ScheduleTaskDialog(
     task:      StudyTask,
     onDismiss: () -> Unit,
-    onConfirm: (hhmm: String) -> Unit
+    onConfirm: (startHHmm: String, endHHmm: String) -> Unit
 ) {
-    var time by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+    var startTime by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+    var endTime by remember {
+        mutableStateOf(
+            task.scheduledStartTime
+                ?.let { FreeSlotCalculator.parseTimeOrNull(it) }
+                ?.let { FreeSlotCalculator.formatMinutes(it + task.durationMinutes) }
+                ?: ""
+        )
+    }
 
     fun isValidTime(value: String): Boolean {
         val parts = value.trim().split(":")
@@ -713,7 +726,11 @@ private fun ScheduleTaskDialog(
         return h in 0..23 && m in 0..59
     }
 
-    val isValid = isValidTime(time)
+    val startValid = isValidTime(startTime)
+    val endValid   = isValidTime(endTime)
+    val orderValid = startValid && endValid &&
+        (FreeSlotCalculator.parseTimeOrNull(endTime) ?: 0) > (FreeSlotCalculator.parseTimeOrNull(startTime) ?: 0)
+    val isValid = startValid && endValid && orderValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -725,19 +742,31 @@ private fun ScheduleTaskDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
                 OutlinedTextField(
-                    value           = time,
-                    onValueChange   = { input -> if (input.length <= 5) time = input },
+                    value           = startTime,
+                    onValueChange   = { input -> if (input.length <= 5) startTime = input },
                     label           = { Text("Start time (HH:mm)", color = White30) },
                     placeholder     = { Text("e.g. 16:30", color = White30) },
                     singleLine      = true,
                     modifier        = Modifier.fillMaxWidth(),
                     colors          = dialogFieldColors()
                 )
+                OutlinedTextField(
+                    value           = endTime,
+                    onValueChange   = { input -> if (input.length <= 5) endTime = input },
+                    label           = { Text("End time (HH:mm)", color = White30) },
+                    placeholder     = { Text("e.g. 17:45", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                if (startValid && endValid && !orderValid) {
+                    Text("End time must be after start time", fontSize = 11.sp, color = AccentRed)
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick  = { if (isValid) onConfirm(time.trim()) },
+                onClick  = { if (isValid) onConfirm(startTime.trim(), endTime.trim()) },
                 enabled  = isValid,
                 colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
             ) {
@@ -934,7 +963,11 @@ private fun TaskCard(
                             Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
                         }
                     }
-                    if (task.scheduledStartTime.isNullOrBlank() && task.state == TaskState.PENDING) {
+                    // Clock icon: available on ANY PENDING task now, not just unscheduled
+                    // ones — opens ScheduleTaskDialog to edit start+end time directly,
+                    // whether the task already has a slot or not (Timeline + List both
+                    // render TaskCard, so this reaches it in either view).
+                    if (task.state == TaskState.PENDING) {
                         IconButton(onClick = onSchedule, modifier = Modifier.size(20.dp)) {
                             Icon(Icons.Default.Schedule, null, tint = AccentGreen, modifier = Modifier.size(14.dp))
                         }

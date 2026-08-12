@@ -72,6 +72,19 @@ object PlanStore {
         it.copy(scheduledStartTime = scheduledStartTime)
     }
 
+    /**
+     * Manually sets both scheduledStartTime AND durationMinutes for a task in a single
+     * write — backs the Timeline/List clock-icon's start+end time editor (see
+     * HomeViewModel.rescheduleTask / HomeScreen's ScheduleTaskDialog). Unlike calling
+     * updateTaskSchedule() and updateTaskDuration() separately, this goes through one
+     * persist() call so the two fields can never observably desync mid-update (e.g. a
+     * StateFlow collector seeing the new start time paired with the old duration for one
+     * frame).
+     */
+    fun updateTaskScheduleAndDuration(taskId: String, scheduledStartTime: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime, durationMinutes = durationMinutes)
+    }
+
     fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
 
     fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {

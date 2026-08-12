@@ -199,6 +199,24 @@ class HomeViewModel : ViewModel() {
     }
 
     /**
+     * Sets a task's start AND end time directly — the clock-icon action on TaskCard,
+     * available on both List and Timeline views for any PENDING task (scheduled or not).
+     * endHHmm must be strictly after startHHmm (same-day only, no overnight wraparound);
+     * durationMinutes is derived from the difference so it and scheduledStartTime can
+     * never drift apart from each other. Same PENDING-only guard as scheduleTask() /
+     * editTaskDuration() — a task that's already ACTIVE/PAUSED has a running timer that
+     * shouldn't be resliced underneath it.
+     */
+    fun rescheduleTask(task: StudyTask, startHHmm: String, endHHmm: String) {
+        if (task.state != TaskState.PENDING) return
+        val startMinute = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return
+        val endMinute   = FreeSlotCalculator.parseTimeOrNull(endHHmm) ?: return
+        val duration    = endMinute - startMinute
+        if (duration <= 0) return
+        PlanStore.updateTaskScheduleAndDuration(task.id, startHHmm, duration)
+    }
+
+    /**
      * Edits the duration of a custom task. Only allowed for tasks created via
      * addCustomTask (isCustom = true) and only while still PENDING — once a task
      * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
