@@ -297,6 +297,11 @@ fun SettingsScreen() {
             }
         }
 
+        // ── Task Sync (two-device) ──
+        SettingSection("TASK SYNC") {
+            TaskSyncSettings()
+        }
+
         // ── Test Platform (Testmate) ──
         SettingSection("TEST PLATFORM") {
             TestmateSettings()
@@ -798,6 +803,70 @@ private fun LlmProviderSettings(context: Context) {
                 Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
                     modifier = Modifier.padding(top = 4.dp))
             }
+        }
+    }
+}
+
+// ── Task Sync (two-device) ─────────────────────────────────────────────────────
+//
+// Deliberately not gated behind WorkModeLockGate — unlike the guardian-facing
+// fields above, a sync code isn't a safety control the student could abuse by
+// changing it, it's just how they tell two of their own devices to share today's
+// task list. Only today's PlanStore list is synced (see TaskSyncManager); every
+// other setting/stat on this screen stays exactly as device-local as before.
+@Composable
+private fun TaskSyncSettings() {
+    var syncCode by remember {
+        mutableStateOf(CheckmatePrefs.getString("sync_code", "") ?: "")
+    }
+    var saved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Sync Code", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Enter the exact same code on both devices to sync today's task list " +
+                "between them. Everything else (stats, streak, settings) stays separate.",
+            fontSize = 11.sp,
+            color    = White30,
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = syncCode,
+            onValueChange = { syncCode = it; saved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("e.g. priya-neet-2027", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Sync, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    val trimmed = syncCode.trim()
+                    if (trimmed.isBlank()) CheckmatePrefs.remove("sync_code")
+                    else CheckmatePrefs.putString("sync_code", trimmed)
+                    syncCode = trimmed
+                    saved = true
+                }) {
+                    Icon(
+                        if (saved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (saved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (saved) {
+            Text(
+                if (syncCode.isBlank()) "Sync turned off ✓" else "Saved ✓",
+                fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp)
+            )
         }
     }
 }

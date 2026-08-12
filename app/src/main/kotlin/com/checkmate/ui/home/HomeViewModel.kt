@@ -22,6 +22,7 @@ import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.service.TaskSyncManager
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -36,7 +37,10 @@ data class HomeState(
     // ── Blueprint 10.1: Intention Declaration + Session Check-In ──
     // Non-null exactly while the corresponding dialog should be showing on HomeScreen.
     val intentionPromptTask:  StudyTask?   = null,
-    val completionPromptTask: StudyTask?   = null
+    val completionPromptTask: StudyTask?   = null,
+    // ── Task Sync (two-device) ── true only while a manual sync tap is in flight.
+    val syncEnabled:        Boolean        = false,
+    val syncing:            Boolean        = false
 )
 
 class HomeViewModel : ViewModel() {
@@ -50,8 +54,23 @@ class HomeViewModel : ViewModel() {
 
     private var pendingTask: StudyTask? = null
 
-    init { loadTodayPlan(); loadStreak(); loadPsycheMessage() }
+    init {
+        _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
+        loadTodayPlan(); loadStreak(); loadPsycheMessage()
+        pullSync()
+    }
 
+    /**
+     * Every emission of PlanStore.todayTasks — i.e. every local task mutation, since
+     * all of PlanStore's writes funnel through the same StateFlow — also pushes today's
+     * plan to TaskSyncManager. This is the single hook point for auto-sync: add/remove/
+     * edit-duration/schedule/start/pause/resume/done/skip all end up here without
+     * needing a push call added at each individual call site. TaskSyncManager itself
+     * no-ops instantly if no sync code is configured, so this is free on a device that
+     * hasn't opted into sync. Runs on a plain background thread (not viewModelScope),
+     * same convention as StatusReporter/GuardianNotifier elsewhere in the app, since
+     * it's fire-and-forget and outlives any single Compose recomposition anyway.
+     */
     private fun loadTodayPlan() {
         viewModelScope.launch {
             PlanStore.todayTasks.collect { tasks ->
@@ -62,8 +81,36 @@ class HomeViewModel : ViewModel() {
                         t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
                     }?.id
                 )}
+                if (TaskSyncManager.isEnabled()) {
+                    Thread { TaskSyncManager.pushTasks(tasks) }.start()
+                }
             }
         }
+    }
+
+    /**
+     * Pulls the other device's copy of today's plan if it's newer, silently, once —
+     * called from init so opening the app on either device picks up whatever the
+     * other one last did. See syncNow() for the manual on-demand version (HomeHeader's
+     * sync button), which is the only way to re-check without relaunching the screen.
+     */
+    private fun pullSync() {
+        if (!TaskSyncManager.isEnabled()) return
+        Thread {
+            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
+            if (remote != null) PlanStore.saveTodayTasks(remote)
+        }.start()
+    }
+
+    /** Manual sync trigger for HomeHeader's sync icon — same pull as init, plus a brief spinner. */
+    fun syncNow() {
+        if (!TaskSyncManager.isEnabled()) return
+        _state.update { it.copy(syncing = true) }
+        Thread {
+            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
+            if (remote != null) PlanStore.saveTodayTasks(remote)
+            _state.update { it.copy(syncing = false) }
+        }.start()
     }
 
     private fun loadStreak() {

@@ -55,7 +55,10 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                 HomeHeader(
                     completedCount = state.completedToday,
                     totalCount     = state.tasks.size,
-                    streakDays     = state.streakDays
+                    streakDays     = state.streakDays,
+                    syncEnabled    = state.syncEnabled,
+                    syncing        = state.syncing,
+                    onSync         = { vm.syncNow() }
                 )
             }
             item { DayProgressBar(completed = state.completedToday, total = state.tasks.size) }
@@ -758,7 +761,14 @@ private fun dialogFieldColors() = OutlinedTextFieldDefaults.colors(
 )
 
 @Composable
-private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
+private fun HomeHeader(
+    completedCount: Int,
+    totalCount:     Int,
+    streakDays:     Int,
+    syncEnabled:    Boolean = false,
+    syncing:        Boolean = false,
+    onSync:         () -> Unit = {}
+) {
     Row(
         modifier              = Modifier.fillMaxWidth(),
         verticalAlignment     = Alignment.CenterVertically,
@@ -768,15 +778,35 @@ private fun HomeHeader(completedCount: Int, totalCount: Int, streakDays: Int) {
             Text("Today", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
             Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
         }
-        if (streakDays > 0) {
-            Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
-                Row(
-                    modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Task Sync (two-device): only shown once a sync code is set in Settings →
+            // TASK SYNC. Pulls the other device's copy of today's plan on tap — auto-sync
+            // already pushes on every local change and pulls once on screen open, this is
+            // just the "check right now" affordance for the case where nothing local has
+            // changed since the last pull but the other device might have moved on.
+            if (syncEnabled) {
+                IconButton(onClick = onSync, enabled = !syncing, modifier = Modifier.size(32.dp)) {
+                    if (syncing) {
+                        CircularProgressIndicator(
+                            modifier    = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color       = AccentGreen
+                        )
+                    } else {
+                        Icon(Icons.Default.Sync, contentDescription = "Sync tasks", tint = White60, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+            if (streakDays > 0) {
+                Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
+                    Row(
+                        modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }

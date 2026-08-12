@@ -39,10 +39,7 @@ object PlanStore {
         } ?: emptyList()
     }
 
-    fun saveTodayTasks(tasks: List<StudyTask>) {
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(tasks))
-        _todayTasks.value = tasks
-    }
+    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
 
     /**
      * Appends a single manually-created task to today's plan WITHOUT touching any
@@ -53,18 +50,10 @@ object PlanStore {
      * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
      * code path needed anywhere downstream.
      */
-    fun addCustomTask(task: StudyTask) {
-        val updated = _todayTasks.value + task
-        _todayTasks.value = updated
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
-    }
+    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
 
     /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
-    fun removeTask(taskId: String) {
-        val updated = _todayTasks.value.filterNot { it.id == taskId }
-        _todayTasks.value = updated
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
-    }
+    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
 
     /** Edits the planned duration of a single task — used for custom-task duration editing. */
     fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
@@ -124,10 +113,30 @@ object PlanStore {
     }
 
     private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
-        val updated = _todayTasks.value.map { if (it.id == taskId) block(it) else it }
-        _todayTasks.value = updated
-        CheckmatePrefs.putString("plan_${todayKey()}", json.encodeToString(updated))
+        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
     }
+
+    /**
+     * Single write path for today's task list — every mutating function above funnels
+     * through this instead of duplicating the "encode + persist + update StateFlow"
+     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
+     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
+     * copy is newer, without PlanStore itself knowing anything about sync/network —
+     * this module stays local-storage-only, same as before.
+     */
+    private fun persist(tasks: List<StudyTask>) {
+        val key = todayKey()
+        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
+        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
+        _todayTasks.value = tasks
+    }
+
+    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
+    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
+
+    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
+     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
+    fun currentDayKey(): String = todayKey()
 
     suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
 
@@ -284,4 +293,35 @@ object PlanStore {
     private fun todayKey() = keyForDay(Calendar.getInstance())
     private fun keyForDay(cal: Calendar) =
         "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+}
+
+
+//===== ADD TO: your existing Cloudflare Worker (worker.js) — new /tasks route, not part of the Android repo =====
+// Add this route to your existing Cloudflare Worker (the same one StatusReporter
+// and TelegramAlertBot already POST /status and /usage to). Requires a KV
+// namespace binding — e.g. `TASKS_KV` — added the same way you already bound
+// whatever KV namespace backs /status and /usage.
+//
+// POST caches the payload (code, dayKey, updatedAt, tasks) under tasks:<code>.
+// GET returns that cached payload as-is, or an empty/zeroed shape if nothing's
+// been pushed yet for that code — TaskSyncManager.pullTasksIfNewer() treats a
+// dayKey mismatch (including this empty default) as "nothing to pull."
+
+if (url.pathname === "/tasks" && request.method === "POST") {
+  const body = await request.json();
+  if (!body.code) return new Response("missing code", { status: 400 });
+  await env.TASKS_KV.put(`tasks:${body.code}`, JSON.stringify(body));
+  return new Response("ok");
+}
+
+if (url.pathname === "/tasks" && request.method === "GET") {
+  const code = url.searchParams.get("code");
+  if (!code) return new Response("missing code", { status: 400 });
+  const cached = await env.TASKS_KV.get(`tasks:${code}`);
+  if (!cached) {
+    return new Response(JSON.stringify({ dayKey: "", updatedAt: 0, tasks: [] }), {
+      headers: { "content-type": "application/json" }
+    });
+  }
+  return new Response(cached, { headers: { "content-type": "application/json" } });
 }
