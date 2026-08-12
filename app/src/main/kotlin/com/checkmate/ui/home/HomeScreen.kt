@@ -1,17 +1,1103 @@
-// This is a partial file — only the block containing the fix. Apply as a
-// find-and-replace inside your existing HomeScreen.kt; the rest of the file
-// is unchanged.
-//
-// BUG: `.sortedBy { it.scheduledStartTime }` sorts the raw "HH:mm" STRING,
-// not the actual time. Lexicographically "18:00" < "1:00" < "22:00" (because
-// '8' < ':' as characters), which is exactly the wrong order you saw:
-// 18:00, 1:00, 22:00 instead of 1:00, 18:00, 22:00.
-//
-// FIX: sort by parsed minutes-from-midnight using the existing
-// FreeSlotCalculator.parseTimeOrNull() helper (already used elsewhere in
-// this file for the same "HH:mm" -> Int conversion), so it's a real
-// chronological sort.
+package com.checkmate.ui.home
 
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.navigation.NavController
+import com.checkmate.core.DailyChecklist
+import com.checkmate.planner.FreeSlotCalculator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import com.checkmate.ui.theme.*
+
+// Blueprint 4.3: HomeScreen view toggle — LIST is the original flat list, TIMELINE
+// lays tasks out by StudyTask.scheduledStartTime (see FreeSlotCalculator/AdaptivePlanner).
+private enum class HomeViewMode { LIST, TIMELINE }
+
+@Composable
+fun HomeScreen(navController: NavController, vm: HomeViewModel) {
+    val state   by vm.state.collectAsState()
+    val context = LocalContext.current
+
+    var showAddTaskDialog by remember { mutableStateOf(false) }
+    var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
+    var schedulingTask      by remember { mutableStateOf<StudyTask?>(null) }
+    var viewMode            by remember { mutableStateOf(HomeViewMode.LIST) }
+
+    Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
+        LazyColumn(
+            modifier            = Modifier.fillMaxSize(),
+            contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                HomeHeader(
+                    completedCount = state.completedToday,
+                    totalCount     = state.tasks.size,
+                    streakDays     = state.streakDays,
+                    syncEnabled    = state.syncEnabled,
+                    syncing        = state.syncing,
+                    onSync         = { vm.syncNow() }
+                )
+            }
+            item { DayProgressBar(completed = state.completedToday, total = state.tasks.size) }
+            if (state.psycheMessage.isNotBlank()) {
+                item { PsycheMessageCard(message = state.psycheMessage) }
+            }
+            if (state.tasks.isEmpty()) {
+                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }, onAddCustom = { showAddTaskDialog = true }) }
+            } else {
+                item { ViewModeToggle(viewMode = viewMode, onChange = { viewMode = it }) }
+
+                if (viewMode == HomeViewMode.LIST) {
+                    items(state.tasks, key = { it.id }) { task ->
+                        TaskCard(
+                            task           = task,
+                            isActive       = state.activeTaskId == task.id,
+                            onStart        = { vm.startTask(context, task) },
+                            onDone         = { vm.requestCompletion(context, task) },
+                            onSkip         = { vm.markSkip(context, task) },
+                            onPause        = { vm.pauseTask(context, task) },
+                            onResume       = { vm.resumeTask(context, task) },
+                            onRemove       = { vm.removeTask(task) },
+                            onEditDuration = { editingTask = task },
+                            onSchedule     = { schedulingTask = task }
+                        )
+                    }
+                } else {
+                    item {
+                        TimelineView(
+                            tasks          = state.tasks,
+                            activeTaskId   = state.activeTaskId,
+                            onStart        = { vm.startTask(context, it) },
+                            onDone         = { vm.requestCompletion(context, it) },
+                            onSkip         = { vm.markSkip(context, it) },
+                            onPause        = { vm.pauseTask(context, it) },
+                            onResume       = { vm.resumeTask(context, it) },
+                            onRemove       = { vm.removeTask(it) },
+                            onEditDuration = { editingTask = it },
+                            onSchedule     = { schedulingTask = it }
+                        )
+                    }
+                }
+
+                item {
+                    TextButton(onClick = { showAddTaskDialog = true }) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = AccentGreen)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Add Custom Task", color = AccentGreen, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            // ── Daily Checklist ──────────────────────────────────────────────
+            item { ChecklistSection() }
+
+            item { Spacer(Modifier.height(72.dp)) }
+        }
+
+        FloatingActionButton(
+            onClick        = { showAddTaskDialog = true },
+            containerColor = AccentGreen,
+            modifier       = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(20.dp)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = "Add custom task", tint = Color.Black)
+        }
+    }
+
+    if (showAddTaskDialog) {
+        AddCustomTaskDialog(
+            onDismiss = { showAddTaskDialog = false },
+            onConfirm = { subject, topic, duration, taskType ->
+                vm.addCustomTask(context, subject, topic, duration, taskType)
+                showAddTaskDialog = false
+            }
+        )
+    }
+
+    editingTask?.let { task ->
+        EditDurationDialog(
+            task      = task,
+            onDismiss = { editingTask = null },
+            onConfirm = { newDuration ->
+                vm.editTaskDuration(task, newDuration)
+                editingTask = null
+            }
+        )
+    }
+
+    schedulingTask?.let { task ->
+        ScheduleTaskDialog(
+            task      = task,
+            onDismiss = { schedulingTask = null },
+            onConfirm = { start, end ->
+                vm.rescheduleTask(task, start, end)
+                schedulingTask = null
+            }
+        )
+    }
+
+    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──────────────
+    state.intentionPromptTask?.let { task ->
+        IntentionDialog(
+            task      = task,
+            onDismiss = { vm.dismissIntentionPrompt() },
+            onConfirm = { intentionText -> vm.confirmIntentionAndStart(context, task, intentionText) }
+        )
+    }
+
+    state.completionPromptTask?.let { task ->
+        CompletionCheckDialog(
+            task     = task,
+            onSelect = { status -> vm.confirmCompletion(context, task, status) }
+        )
+    }
+}
+
+// ── Blueprint 4.3: LIST / TIMELINE toggle ──────────────────────────────────────
+
+@Composable
+private fun ViewModeToggle(viewMode: HomeViewMode, onChange: (HomeViewMode) -> Unit) {
+    Row(
+        modifier              = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        HomeViewMode.values().forEach { mode ->
+            val selected = mode == viewMode
+            Surface(
+                modifier = Modifier.weight(1f).clickable { onChange(mode) },
+                shape    = RoundedCornerShape(10.dp),
+                color    = if (selected) AccentGreen.copy(alpha = 0.15f) else BgCard,
+                border   = BorderStroke(1.dp, if (selected) AccentGreen.copy(alpha = 0.5f) else White10)
+            ) {
+                Row(
+                    modifier              = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (mode == HomeViewMode.LIST) Icons.Default.ViewList else Icons.Default.Schedule,
+                        contentDescription = null,
+                        tint     = if (selected) AccentGreen else White60,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text       = if (mode == HomeViewMode.LIST) "List" else "Timeline",
+                        fontSize   = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color      = if (selected) AccentGreen else White60
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Blueprint 4.3: tasks laid out as a vertical day strip, grouped by
+ * StudyTask.scheduledStartTime and color-coded by subject (via the same
+ * subjectColor() used on TaskCard's badge). Tasks the planner couldn't fit
+ * into a free slot (scheduledStartTime == null — see AdaptivePlanner.
+ * assignScheduledTimes) are listed separately under "Unscheduled" rather than
+ * silently dropped. Each row still renders the full interactive TaskCard, so
+ * Start/Pause/Done/Skip work exactly the same as in LIST view.
+ */
+@Composable
+private fun TimelineView(
+    tasks:          List<StudyTask>,
+    activeTaskId:   String?,
+    onStart:        (StudyTask) -> Unit,
+    onDone:         (StudyTask) -> Unit,
+    onSkip:         (StudyTask) -> Unit,
+    onPause:        (StudyTask) -> Unit,
+    onResume:       (StudyTask) -> Unit,
+    onRemove:       (StudyTask) -> Unit,
+    onEditDuration: (StudyTask) -> Unit,
+    onSchedule:     (StudyTask) -> Unit
+) {
     val scheduled   = tasks.filter { !it.scheduledStartTime.isNullOrBlank() }
         .sortedBy { FreeSlotCalculator.parseTimeOrNull(it.scheduledStartTime!!) ?: Int.MAX_VALUE }
     val unscheduled = tasks.filter { it.scheduledStartTime.isNullOrBlank() }
+
+    Column {
+        scheduled.forEach { task ->
+            TimelineRow(
+                task           = task,
+                isActive       = activeTaskId == task.id,
+                onStart        = { onStart(task) },
+                onDone         = { onDone(task) },
+                onSkip         = { onSkip(task) },
+                onPause        = { onPause(task) },
+                onResume       = { onResume(task) },
+                onRemove       = { onRemove(task) },
+                onEditDuration = { onEditDuration(task) },
+                onSchedule     = { onSchedule(task) }
+            )
+        }
+        if (unscheduled.isNotEmpty()) {
+            if (scheduled.isNotEmpty()) Spacer(Modifier.height(4.dp))
+            Text(
+                "UNSCHEDULED",
+                fontSize      = 11.sp,
+                fontWeight    = FontWeight.Bold,
+                letterSpacing = 1.5.sp,
+                color         = White30,
+                fontFamily    = FontFamily.Monospace,
+                modifier      = Modifier.padding(bottom = 8.dp)
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                unscheduled.forEach { task ->
+                    TaskCard(
+                        task           = task,
+                        isActive       = activeTaskId == task.id,
+                        onStart        = { onStart(task) },
+                        onDone         = { onDone(task) },
+                        onSkip         = { onSkip(task) },
+                        onPause        = { onPause(task) },
+                        onResume       = { onResume(task) },
+                        onRemove       = { onRemove(task) },
+                        onEditDuration = { onEditDuration(task) },
+                        onSchedule     = { onSchedule(task) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TimelineRow(
+    task:           StudyTask,
+    isActive:       Boolean,
+    onStart:        () -> Unit,
+    onDone:         () -> Unit,
+    onSkip:         () -> Unit,
+    onPause:        () -> Unit,
+    onResume:       () -> Unit,
+    onRemove:       () -> Unit,
+    onEditDuration: () -> Unit,
+    onSchedule:     () -> Unit
+) {
+    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+        Column(
+            modifier             = Modifier.width(52.dp).padding(top = 4.dp),
+            horizontalAlignment  = Alignment.CenterHorizontally
+        ) {
+            Text(
+                task.scheduledStartTime ?: "--:--",
+                fontSize   = 11.sp,
+                color      = White60,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(Modifier.height(6.dp))
+            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
+        }
+        Spacer(Modifier.width(10.dp))
+        Box(modifier = Modifier.weight(1f)) {
+            TaskCard(
+                task           = task,
+                isActive       = isActive,
+                onStart        = onStart,
+                onDone         = onDone,
+                onSkip         = onSkip,
+                onPause        = onPause,
+                onResume       = onResume,
+                onRemove       = onRemove,
+                onEditDuration = onEditDuration,
+                onSchedule     = onSchedule
+            )
+        }
+    }
+}
+
+// ── Checklist Section ────────────────────────────────────────────────────────
+
+@Composable
+private fun ChecklistSection() {
+    var expanded by remember { mutableStateOf(false) }
+
+    // Load checklist items fresh each recomposition so toggle calls reflect immediately
+    var items by remember { mutableStateOf(DailyChecklist.getTodayItems()) }
+
+    // Refresh when section expands
+    LaunchedEffect(expanded) {
+        if (expanded) items = DailyChecklist.getTodayItems()
+    }
+
+    val doneCount  = items.count { it.isDone }
+    val totalCount = items.size
+    val allDone    = totalCount > 0 && doneCount == totalCount
+
+    val arrowAngle by animateFloatAsState(
+        targetValue   = if (expanded) 180f else 0f,
+        animationSpec = tween(200),
+        label         = "arrow"
+    )
+
+    Surface(
+        shape  = RoundedCornerShape(14.dp),
+        color  = BgCard,
+        border = BorderStroke(
+            1.dp,
+            if (allDone) AccentGreen.copy(alpha = 0.5f) else White10
+        )
+    ) {
+        Column {
+            // Header row — always visible, tap to expand/collapse
+            Row(
+                modifier          = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint     = if (allDone) AccentGreen else White30,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Daily Checklist",
+                        fontSize   = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color      = White90
+                    )
+                    Text(
+                        "$doneCount / $totalCount done",
+                        fontSize = 11.sp,
+                        color    = if (allDone) AccentGreen else White60
+                    )
+                }
+                Icon(
+                    Icons.Default.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint     = White30,
+                    modifier = Modifier.size(20.dp).rotate(arrowAngle)
+                )
+            }
+
+            // Expandable checklist items
+            AnimatedVisibility(
+                visible = expanded,
+                enter   = expandVertically() + fadeIn(),
+                exit    = shrinkVertically() + fadeOut()
+            ) {
+                Column {
+                    HorizontalDivider(color = White10, thickness = 0.5.dp)
+                    items.forEach { item ->
+                        Row(
+                            modifier          = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    DailyChecklist.toggleItem(item.id)
+                                    items = DailyChecklist.getTodayItems()
+                                }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked         = item.isDone,
+                                onCheckedChange = {
+                                    DailyChecklist.toggleItem(item.id)
+                                    items = DailyChecklist.getTodayItems()
+                                },
+                                colors = CheckboxDefaults.colors(
+                                    checkedColor   = AccentGreen,
+                                    uncheckedColor = White30
+                                )
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text      = item.label,
+                                fontSize  = 14.sp,
+                                color     = if (item.isDone) White60 else White90,
+                                fontWeight = if (item.isDone) FontWeight.Normal else FontWeight.Medium
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+            }
+        }
+    }
+}
+
+// ── Blueprint 10.1: Intention Declaration + Session Check-In dialogs ──────────
+
+/**
+ * Pre-session "What will you study?" prompt. Shown from HomeScreen whenever
+ * HomeState.intentionPromptTask is non-null (i.e. right after tapping "Start Now",
+ * before the session actually launches). Pre-fills with the task's topic so a
+ * student in a hurry can just tap Start Session, but free-text lets them commit
+ * to something more specific (e.g. "finish rolling motion numericals, not just review").
+ */
+@Composable
+private fun IntentionDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (intentionText: String) -> Unit
+) {
+    var intention by remember { mutableStateOf(task.topic) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("What will you study?", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "${task.subject} — ${task.topic} · ${task.durationMinutes}m",
+                    fontSize = 12.sp, color = White60
+                )
+                OutlinedTextField(
+                    value         = intention,
+                    onValueChange = { intention = it },
+                    label         = { Text("Your intention", color = White30) },
+                    singleLine    = false,
+                    modifier      = Modifier.fillMaxWidth(),
+                    colors        = dialogFieldColors()
+                )
+                Text(
+                    "Writing it down raises follow-through — you'll be asked how it went right after.",
+                    fontSize = 11.sp, color = White30
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { onConfirm(intention) },
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Start Session", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+/**
+ * Post-session "Did you finish it?" check-in. Shown from HomeScreen whenever
+ * HomeState.completionPromptTask is non-null (i.e. right after tapping "Done",
+ * before the session actually wraps up). Dismissing outside the dialog counts
+ * as YES — the session is ending regardless of how this is answered, this is
+ * purely a self-report accountability signal, not a gate on completion.
+ */
+@Composable
+private fun CompletionCheckDialog(
+    task:     StudyTask,
+    onSelect: (status: String) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { onSelect("YES") },
+        containerColor   = BgCard,
+        title = {
+            Text("Did you finish it?", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                if (task.intentionText.isNotBlank() && task.intentionText != task.topic) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Your intention: \"${task.intentionText}\"",
+                        fontSize = 12.sp, color = White30
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = { onSelect("NO") }) {
+                    Text("No", color = AccentRed, fontWeight = FontWeight.SemiBold)
+                }
+                TextButton(onClick = { onSelect("PARTIAL") }) {
+                    Text("Partial", color = AccentAmber, fontWeight = FontWeight.SemiBold)
+                }
+                Button(
+                    onClick = { onSelect("YES") },
+                    colors  = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+                ) {
+                    Text("Yes", fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+            }
+        }
+    )
+}
+
+// ── Rest of HomeScreen (unchanged) ───────────────────────────────────────────
+
+@Composable
+private fun AddCustomTaskDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (subject: String, topic: String, durationMinutes: Int, taskType: TaskType) -> Unit
+) {
+    var subject  by remember { mutableStateOf("") }
+    var topic    by remember { mutableStateOf("") }
+    var duration by remember { mutableStateOf("30") }
+    var taskType by remember { mutableStateOf(TaskType.OTHER) }
+
+    val durationInt = duration.toIntOrNull()
+    val isValid = subject.isNotBlank() && topic.isNotBlank() && durationInt != null && durationInt > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Add Custom Task", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Slots in alongside today's plan — nothing else is removed. Duration stays editable later.",
+                    fontSize = 12.sp, color = White60
+                )
+                OutlinedTextField(
+                    value           = subject,
+                    onValueChange   = { subject = it },
+                    label           = { Text("Subject", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                OutlinedTextField(
+                    value           = topic,
+                    onValueChange   = { topic = it },
+                    label           = { Text("Topic", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                OutlinedTextField(
+                    value           = duration,
+                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
+                    label           = { Text("Duration (minutes)", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors          = dialogFieldColors()
+                )
+                Text("Task type", fontSize = 12.sp, color = White60)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                ) {
+                    TaskType.values().forEach { type ->
+                        val selected = taskType == type
+                        FilterChip(
+                            selected = selected,
+                            onClick  = { taskType = type },
+                            label    = { Text(type.name, fontSize = 11.sp) },
+                            colors   = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = AccentGreen,
+                                selectedLabelColor     = Color.Black
+                            )
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { durationInt?.let { onConfirm(subject.trim(), topic.trim(), it, taskType) } },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Add Task", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+@Composable
+private fun EditDurationDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (durationMinutes: Int) -> Unit
+) {
+    var duration by remember { mutableStateOf(task.durationMinutes.toString()) }
+    val durationInt = duration.toIntOrNull()
+    val isValid = durationInt != null && durationInt > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Edit Duration", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                OutlinedTextField(
+                    value           = duration,
+                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
+                    label           = { Text("Duration (minutes)", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors          = dialogFieldColors()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { durationInt?.let(onConfirm) },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+/**
+ * Manual "Schedule" action, reachable via the clock icon on ANY pending TaskCard (List
+ * or Timeline, scheduled or not) — lets the student set start AND end time directly
+ * instead of only being able to delete and re-add a task to change its slot. End time
+ * pre-fills from the task's current scheduledStartTime + durationMinutes when it already
+ * has one, so opening the dialog on an already-scheduled task shows its real current
+ * window rather than blank fields. durationMinutes itself is derived from end − start on
+ * save (see HomeViewModel.rescheduleTask) so the two can never drift apart. Validation
+ * mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59), plus an end-after-start
+ * check, so a bad value can't get saved onto the task.
+ */
+@Composable
+private fun ScheduleTaskDialog(
+    task:      StudyTask,
+    onDismiss: () -> Unit,
+    onConfirm: (startHHmm: String, endHHmm: String) -> Unit
+) {
+    var startTime by remember { mutableStateOf(task.scheduledStartTime ?: "") }
+    var endTime by remember {
+        mutableStateOf(
+            task.scheduledStartTime
+                ?.let { FreeSlotCalculator.parseTimeOrNull(it) }
+                ?.let { FreeSlotCalculator.formatMinutes(it + task.durationMinutes) }
+                ?: ""
+        )
+    }
+
+    fun isValidTime(value: String): Boolean {
+        val parts = value.trim().split(":")
+        if (parts.size != 2) return false
+        val h = parts[0].toIntOrNull() ?: return false
+        val m = parts[1].toIntOrNull() ?: return false
+        return h in 0..23 && m in 0..59
+    }
+
+    val startValid = isValidTime(startTime)
+    val endValid   = isValidTime(endTime)
+    val orderValid = startValid && endValid &&
+        (FreeSlotCalculator.parseTimeOrNull(endTime) ?: 0) > (FreeSlotCalculator.parseTimeOrNull(startTime) ?: 0)
+    val isValid = startValid && endValid && orderValid
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = BgCard,
+        title = {
+            Text("Schedule Task", fontWeight = FontWeight.Bold, color = White90)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
+                OutlinedTextField(
+                    value           = startTime,
+                    onValueChange   = { input -> if (input.length <= 5) startTime = input },
+                    label           = { Text("Start time (HH:mm)", color = White30) },
+                    placeholder     = { Text("e.g. 16:30", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                OutlinedTextField(
+                    value           = endTime,
+                    onValueChange   = { input -> if (input.length <= 5) endTime = input },
+                    label           = { Text("End time (HH:mm)", color = White30) },
+                    placeholder     = { Text("e.g. 17:45", color = White30) },
+                    singleLine      = true,
+                    modifier        = Modifier.fillMaxWidth(),
+                    colors          = dialogFieldColors()
+                )
+                if (startValid && endValid && !orderValid) {
+                    Text("End time must be after start time", fontSize = 11.sp, color = AccentRed)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick  = { if (isValid) onConfirm(startTime.trim(), endTime.trim()) },
+                enabled  = isValid,
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
+        }
+    )
+}
+
+@Composable
+private fun dialogFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor   = AccentGreen,
+    unfocusedBorderColor = White30,
+    cursorColor          = AccentGreen,
+    focusedLabelColor    = AccentGreen,
+    focusedTextColor     = White90,
+    unfocusedTextColor   = White90
+)
+
+@Composable
+private fun HomeHeader(
+    completedCount: Int,
+    totalCount:     Int,
+    streakDays:     Int,
+    syncEnabled:    Boolean = false,
+    syncing:        Boolean = false,
+    onSync:         () -> Unit = {}
+) {
+    Row(
+        modifier              = Modifier.fillMaxWidth(),
+        verticalAlignment     = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column {
+            Text("Today", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+            Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Task Sync (two-device): only shown once a sync code is set in Settings →
+            // TASK SYNC. Pulls the other device's copy of today's plan on tap — auto-sync
+            // already pushes on every local change and pulls once on screen open, this is
+            // just the "check right now" affordance for the case where nothing local has
+            // changed since the last pull but the other device might have moved on.
+            if (syncEnabled) {
+                IconButton(onClick = onSync, enabled = !syncing, modifier = Modifier.size(32.dp)) {
+                    if (syncing) {
+                        CircularProgressIndicator(
+                            modifier    = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color       = AccentGreen
+                        )
+                    } else {
+                        Icon(Icons.Default.Sync, contentDescription = "Sync tasks", tint = White60, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+            if (streakDays > 0) {
+                Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
+                    Row(
+                        modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DayProgressBar(completed: Int, total: Int) {
+    val progress = if (total == 0) 0f else completed.toFloat() / total.toFloat()
+    val animatedProgress by animateFloatAsState(
+        targetValue   = progress,
+        animationSpec = tween(600, easing = FastOutSlowInEasing),
+        label         = "progress"
+    )
+    Column {
+        LinearProgressIndicator(
+            progress   = { animatedProgress },
+            modifier   = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+            color      = AccentGreen,
+            trackColor = White10,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text       = "${(progress * 100).toInt()}% complete",
+            fontSize   = 11.sp,
+            color      = White30,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun PsycheMessageCard(message: String) {
+    Surface(
+        shape  = RoundedCornerShape(10.dp),
+        color  = BgCardAlt,
+        border = BorderStroke(0.5.dp, AccentBlue.copy(alpha = 0.3f))
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Psychology, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(10.dp))
+            Text(message, fontSize = 13.sp, color = White90, lineHeight = 18.sp)
+        }
+    }
+}
+
+@Composable
+private fun TaskCard(
+    task:           StudyTask,
+    isActive:       Boolean,
+    onStart:        () -> Unit,
+    onDone:         () -> Unit,
+    onSkip:         () -> Unit,
+    onPause:        () -> Unit,
+    onResume:       () -> Unit,
+    onRemove:       () -> Unit,
+    onEditDuration: () -> Unit,
+    onSchedule:     () -> Unit
+) {
+    val isPaused    = task.state == TaskState.PAUSED
+    val borderColor = when {
+        isPaused                        -> AccentAmber
+        isActive                        -> AccentGreen
+        task.state == TaskState.DONE    -> AccentGreen.copy(alpha = 0.3f)
+        task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
+        else                            -> White10
+    }
+
+    Surface(
+        shape  = RoundedCornerShape(14.dp),
+        color  = if (isActive || isPaused) BgCardAlt else BgCard,
+        border = BorderStroke(1.dp, borderColor)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+
+            Row(
+                modifier              = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text          = task.subject.uppercase(),
+                        fontSize      = 11.sp,
+                        fontWeight    = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                        color         = subjectColor(task.subject),
+                        fontFamily    = FontFamily.Monospace
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (isPaused) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AccentAmber.copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                "⏸ PAUSED",
+                                fontSize   = 10.sp,
+                                color      = AccentAmber,
+                                fontWeight = FontWeight.Bold,
+                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                    if (task.isCustom) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = AccentBlue.copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                "CUSTOM",
+                                fontSize   = 10.sp,
+                                color      = AccentBlue,
+                                fontWeight = FontWeight.Bold,
+                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                    Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+                    if (task.isCustom && task.state == TaskState.PENDING) {
+                        IconButton(onClick = onEditDuration, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
+                        }
+                    }
+                    // Clock icon: available on ANY PENDING task now, not just unscheduled
+                    // ones — opens ScheduleTaskDialog to edit start+end time directly,
+                    // whether the task already has a slot or not (Timeline + List both
+                    // render TaskCard, so this reaches it in either view).
+                    if (task.state == TaskState.PENDING) {
+                        IconButton(onClick = onSchedule, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Schedule, null, tint = AccentGreen, modifier = Modifier.size(14.dp))
+                        }
+                    }
+                    if (task.state == TaskState.PENDING) {
+                        IconButton(onClick = onRemove, modifier = Modifier.size(20.dp)) {
+                            Icon(Icons.Default.Close, null, tint = White30, modifier = Modifier.size(14.dp))
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                text       = task.topic,
+                fontSize   = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
+            )
+
+            if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text     = if (task.state == TaskState.DONE) "✓ Completed" else "✗ Skipped",
+                    fontSize = 12.sp,
+                    color    = if (task.state == TaskState.DONE) AccentGreen else AccentRed
+                )
+            } else {
+                Spacer(Modifier.height(12.dp))
+
+                if (isPaused) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick  = onResume,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentAmber),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp), tint = Color.Black)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Resume", fontWeight = FontWeight.Bold, color = Color.Black)
+                        }
+                        OutlinedButton(
+                            onClick = onSkip,
+                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
+                        ) { Text("Skip") }
+                    }
+                } else if (isActive) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onPause,
+                            border  = BorderStroke(1.dp, AccentAmber.copy(alpha = 0.6f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentAmber)
+                        ) {
+                            Icon(Icons.Default.Pause, null, modifier = Modifier.size(16.dp))
+                        }
+                        Button(
+                            onClick  = onDone,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Done", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onSkip,
+                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
+                        ) { Text("Skip") }
+                    }
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick  = onStart,
+                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
+                            modifier = Modifier.weight(1f),
+                            enabled  = task.state == TaskState.PENDING
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Start Now", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick  = onSkip,
+                            border   = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                            colors   = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                            enabled  = task.state == TaskState.PENDING
+                        ) { Text("Skip") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyPlanCard(onPlan: () -> Unit, onAddCustom: () -> Unit) {
+    Surface(shape = RoundedCornerShape(14.dp), color = BgCard, border = BorderStroke(1.dp, White10)) {
+        Column(
+            modifier            = Modifier.fillMaxWidth().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Default.EventNote, null, tint = White30, modifier = Modifier.size(40.dp))
+            Spacer(Modifier.height(12.dp))
+            Text("No plan for today", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(6.dp))
+            Text("Set up your exam and subjects to generate a daily plan, or add a one-off task", fontSize = 13.sp, color = White60)
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
+                    Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+                OutlinedButton(
+                    onClick = onAddCustom,
+                    border  = BorderStroke(1.dp, White30),
+                    colors  = ButtonDefaults.outlinedButtonColors(contentColor = White90)
+                ) {
+                    Text("Add Custom Task")
+                }
+            }
+        }
+    }
+}
+
+private fun subjectColor(subject: String) = when (subject.lowercase()) {
+    "biology"       -> Color(0xFF00C896)
+    "chemistry"     -> Color(0xFF4A9EFF)
+    "physics"       -> Color(0xFFFFB347)
+    "math", "maths" -> Color(0xFFFF4757)
+    else            -> Color(0xFF9090A8)
+}
