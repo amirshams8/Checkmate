@@ -128,7 +128,7 @@ class StatsViewModel : ViewModel() {
     /**
      * Blueprint 10.3: "Work Mode adherence" half of the focus score. Measures
      * how much of today's already-elapsed WorkModeSchedule locked window(s)
-     * (00:00-05:00 every day, +01:00-17:30 on Sun/Wed, +19:00-now every day)
+     * (00:00-05:00 every day, +01:00-15:10 on Sun/Wed, +19:00-now every day)
      * had non-Checkmate app usage recorded — i.e. usage during hours the
      * student was supposed to be blocked out. 0 usage during locked time ->
      * 100% adherence; usage filling the whole locked window so far -> 0%.
@@ -162,7 +162,7 @@ class StatsViewModel : ViewModel() {
         // Tail of last night's usual 19:00-05:00 window, always present every day.
         rangeMillis(0, 0, WorkModeSchedule.END_HOUR, 0)?.let { ranges.add(it) }
 
-        // Sun/Wed extra window: 01:00-17:30 — only the part beyond END_HOUR is new
+        // Sun/Wed extra window: 01:00-15:10 — only the part beyond END_HOUR is new
         // (00:00-END_HOUR is already covered by the range above).
         if (now.get(Calendar.DAY_OF_WEEK) == Calendar.SUNDAY || now.get(Calendar.DAY_OF_WEEK) == Calendar.WEDNESDAY) {
             rangeMillis(

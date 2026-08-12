@@ -11,7 +11,7 @@ import java.util.Locale
  *
  * A "holiday" here is a specific calendar date a guardian has explicitly marked — on that
  * date, the usual 19:00-07:00 window (and the Sunday/Wednesday extra window, if applicable)
- * are both replaced by a single reduced 01:00-17:30 lock, the same hours the regular Sunday/
+ * are both replaced by a single reduced 01:00-15:10 lock, the same hours the regular Sunday/
  * Wednesday window already uses (see WorkModeSchedule.isWithinScheduledWindow). A holiday
  * eases the schedule for the day rather than removing it entirely.
  *

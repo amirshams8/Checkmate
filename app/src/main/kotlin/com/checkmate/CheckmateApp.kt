@@ -24,7 +24,7 @@ class CheckmateApp : Application() {
         CheckmateTTS.init(this)
 
         // Reconcile Work Mode with the hardcoded daily schedule (usual
-        // 19:00-05:00 window every day, plus an extra 01:00-17:30 window on
+        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
         // Sunday/Wednesday) and re-arm the four daily boundary alarms
         // (AlarmManager repeating alarms don't survive a reboot, hence also
         // doing this in BootReceiver). This must run after

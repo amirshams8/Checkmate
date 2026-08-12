@@ -141,7 +141,7 @@ object ProactiveMentor {
         val msg = "Any holidays coming up? Ask your guardian to mark them in " +
             "Settings \u2192 Work Mode \u2192 Holidays. On a marked holiday the usual " +
             "${WorkModeSchedule.LABEL} window is replaced by a single reduced lock, " +
-            "1:00 AM \u2013 5:30 PM only, for that day."
+            "1:00 AM \u2013 3:10 PM only, for that day."
         MentorViewModel.appendProactiveMessage(msg)
         MentorNotifier.notify(context, msg)
         GuardianNotifier.notifyHolidayPrompt(context)

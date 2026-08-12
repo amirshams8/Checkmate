@@ -12,8 +12,8 @@ import java.util.Calendar
  *
  * UPDATE: the usual hardcoded window's end was moved from 02:00 to 05:00,
  * and then to 07:00 (still starts 19:00). Sunday and Wednesday additionally
- * get a second, earlier lock window — 01:00 to 17:30 — so on those two days
- * the student is locked out almost all day with only a short 17:30-19:00
+ * get a second, earlier lock window — 01:00 to 15:10 — so on those two days
+ * the student is locked out almost all day with only a short 15:10-19:00
  * gap before the usual 19:00-07:00 window takes back over ("locked twice"
  * per day).
  *
@@ -27,7 +27,7 @@ import java.util.Calendar
  * has explicitly marked exempt (see that file's doc for why it's gated
  * behind a guardian PIN unlock rather than being freely editable). On a
  * marked holiday, the usual 19:00-07:00 window is replaced by a single
- * reduced 01:00-17:30 lock instead — a holiday eases the schedule for the
+ * reduced 01:00-15:10 lock instead — a holiday eases the schedule for the
  * day, it doesn't remove it. Every other day, this schedule behaves exactly
  * as before.
  */
@@ -42,29 +42,29 @@ object WorkModeSchedule {
      */
     const val END_HOUR = 7
 
-    /** Days that get the extra 01:00-17:30 lock window on top of the usual one. */
+    /** Days that get the extra 01:00-15:10 lock window on top of the usual one. */
     private val SPECIAL_DAYS = setOf(Calendar.SUNDAY, Calendar.WEDNESDAY)
 
     /** 24h clock hour the Sunday/Wednesday extra window begins (1 AM). */
     const val SPECIAL_START_HOUR = 1
     const val SPECIAL_START_MINUTE = 0
 
-    /** 24h clock hour/minute the Sunday/Wednesday extra window ends (5:30 PM). */
-    const val SPECIAL_END_HOUR = 17
-    const val SPECIAL_END_MINUTE = 30
+    /** 24h clock hour/minute the Sunday/Wednesday extra window ends (3:10 PM). */
+    const val SPECIAL_END_HOUR = 15
+    const val SPECIAL_END_MINUTE = 10
 
     /** Human-readable label for display in Settings only — not configurable from there. */
     const val LABEL =
-        "7:00 PM \u2013 7:00 AM daily (Sun & Wed also locked 1:00 AM \u2013 5:30 PM)"
+        "7:00 PM \u2013 7:00 AM daily (Sun & Wed also locked 1:00 AM \u2013 3:10 PM)"
 
     /**
      * True if [cal] (defaults to the trusted, tamper-resistant "now" — see
      * TrustedTime — NOT the raw device clock) falls inside a locked window:
      *  - the usual 19:00-07:00 window, every day, OR
-     *  - on Sunday/Wednesday only, the extra 01:00-17:30 window.
+     *  - on Sunday/Wednesday only, the extra 01:00-15:10 window.
      *  - EXCEPT on a guardian-marked holiday (HolidaySchedule.isHoliday): the usual
      *    19:00-07:00 window (and, if it's also a Sunday/Wednesday, that extra window too)
-     *    are both replaced by a single reduced 01:00-17:30 lock, same hours as the regular
+     *    are both replaced by a single reduced 01:00-15:10 lock, same hours as the regular
      *    Sunday/Wednesday window. A holiday eases the schedule for the day — it doesn't
      *    remove structure from it entirely.
      *
@@ -91,7 +91,7 @@ object WorkModeSchedule {
         }
 
         // Guardian-marked holiday: the usual 19:00-07:00 window (and the Sunday/Wednesday
-        // extra window, if applicable) are both replaced by just the reduced 01:00-17:30
+        // extra window, if applicable) are both replaced by just the reduced 01:00-15:10
         // window — see HolidaySchedule's doc for why this can only be set behind a guardian
         // PIN unlock.
         if (HolidaySchedule.isHoliday(cal)) return withinSpecialWindow()
@@ -100,7 +100,7 @@ object WorkModeSchedule {
         // 00:00..(END_HOUR-1):59. Applies every day of the week.
         if (hour >= START_HOUR || hour < END_HOUR) return true
 
-        // Extra Sunday/Wednesday window: 01:00 (inclusive) to 17:30 (exclusive).
+        // Extra Sunday/Wednesday window: 01:00 (inclusive) to 15:10 (exclusive).
         // Doesn't wrap past midnight, so it's a plain same-day range check.
         val day = cal.get(Calendar.DAY_OF_WEEK)
         if (day in SPECIAL_DAYS && withinSpecialWindow()) return true
@@ -110,7 +110,7 @@ object WorkModeSchedule {
 
     /**
      * Milliseconds from [cal] (defaults to now) until the next boundary
-     * clock-time (01:00, 05:00, 17:30, or 19:00). Used only for
+     * clock-time (01:00, 05:00, 15:10, or 19:00). Used only for
      * logging/diagnostics — the actual enforcement alarms are four fixed
      * daily clock-time alarms registered by WorkModeScheduleReceiver, not a
      * self-rescheduling "next boundary" alarm, so a missed tick can't drift

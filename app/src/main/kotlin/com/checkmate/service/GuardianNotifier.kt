@@ -355,7 +355,7 @@ object GuardianNotifier {
         val msg = "🗓️ Checkmate: weekly holiday check-in for $candidateName. Any holidays " +
                   "coming up? Mark them in the app's Settings \u2192 Work Mode \u2192 Holidays " +
                   "(guardian PIN required) — a marked holiday reduces that day's lock to " +
-                  "1:00 AM \u2013 5:30 PM only, instead of the usual ${WorkModeSchedule.LABEL} schedule."
+                  "1:00 AM \u2013 3:10 PM only, instead of the usual ${WorkModeSchedule.LABEL} schedule."
         Log.d(TAG, "Holiday prompt sent")
 
         val number = getGuardianNumber()

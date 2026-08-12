@@ -11,7 +11,7 @@ import java.util.Calendar
 
 /**
  * Fires at the four hardcoded WorkModeSchedule boundary clock-times — 01:00,
- * 05:00, 17:30, and 19:00, every day — so the forced block window is
+ * 05:00, 15:10, and 19:00, every day — so the forced block window is
  * reconciled even while the phone is idle and Checkmate's UI/accessibility
  * events aren't firing. The accessibility-service-side check in
  * AppAutomationService is the fast path during active use; this is the
@@ -19,7 +19,7 @@ import java.util.Calendar
  *
  * UPDATE: previously two alarms (19:00 start / 02:00 end). Now four, because
  * the usual window end moved to 05:00 and Sunday/Wednesday get an extra
- * 01:00-17:30 lock window. All four alarms fire every day regardless of
+ * 01:00-15:10 lock window. All four alarms fire every day regardless of
  * weekday — each one just calls WorkModeManager.evaluateSchedule(), which
  * re-reads WorkModeSchedule.isWithinScheduledWindow() against the live day
  * and hour, so a boundary firing on a day it doesn't apply to (e.g. the
