@@ -28,13 +28,53 @@ object TestmateApi {
     const val PREF_BASE_URL = "testmate_base_url"
     const val PREF_TOKEN    = "testmate_token"
 
+    // ── Base URL allow-list ──────────────────────────────────────────────────
+    // Settings → Test Platform only lets a value be saved if it passes
+    // [isAllowedBaseUrl], and [baseUrl] below re-checks it on every read — so a
+    // value written some other way (e.g. directly to SharedPrefs, or a stale
+    // value saved before this allow-list existed) can't quietly redirect
+    // Testmate API calls, which carry the access token, to an
+    // attacker-controlled host. Exactly two hosts are allowed:
+    //  1. testmate2.com, or any subdomain of it (e.g. api.testmate2.com).
+    //  2. This specific Testmate Supabase project's auth-verify endpoint —
+    //     used for the magic-link flow, not general API calls, but it's a
+    //     legitimate Testmate-owned endpoint so it's allow-listed too.
+    private const val SUPABASE_AUTH_HOST = "donhabgdgdkygcklqxdj.supabase.co"
+    private const val SUPABASE_AUTH_PATH_PREFIX = "/auth/v1/verify"
+
+    /**
+     * True if [raw] is an https URL whose host is testmate2.com (or a subdomain), or this
+     * project's Supabase auth-verify host+path. Anything else — a different domain, a bare
+     * IP, http (not https), a lookalike domain, etc. — is rejected.
+     */
+    fun isAllowedBaseUrl(raw: String): Boolean {
+        val trimmed = raw.trim().trimEnd('/')
+        if (trimmed.isBlank()) return false
+
+        val uri = try { java.net.URI(trimmed) } catch (_: Exception) { return false }
+        if (!uri.scheme.equals("https", ignoreCase = true)) return false
+        val host = uri.host?.lowercase() ?: return false
+
+        if (host == "testmate2.com" || host.endsWith(".testmate2.com")) return true
+        if (host == SUPABASE_AUTH_HOST && (uri.path ?: "").startsWith(SUPABASE_AUTH_PATH_PREFIX)) return true
+
+        return false
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    private fun baseUrl(): String? =
-        CheckmatePrefs.getString(PREF_BASE_URL, null)?.trim()?.trimEnd('/')?.takeIf { it.isNotBlank() }
+    private fun baseUrl(): String? {
+        val saved = CheckmatePrefs.getString(PREF_BASE_URL, null)?.trim()?.trimEnd('/')
+            ?.takeIf { it.isNotBlank() } ?: return null
+        if (!isAllowedBaseUrl(saved)) {
+            Log.w(TAG, "Stored Testmate base URL failed the allow-list check — refusing to use it")
+            return null
+        }
+        return saved
+    }
 
     private fun token(): String? =
         CheckmatePrefs.getString(PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }

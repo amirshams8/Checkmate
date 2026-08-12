@@ -850,6 +850,7 @@ private fun TestmateSettings() {
         mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, "") ?: "")
     }
     var baseUrlSaved by remember { mutableStateOf(false) }
+    var baseUrlError by remember { mutableStateOf<String?>(null) }
 
     var token by remember {
         mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, "") ?: "")
@@ -859,18 +860,34 @@ private fun TestmateSettings() {
 
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Testmate Base URL", fontSize = 12.sp, color = White60,
-            modifier = Modifier.padding(bottom = 6.dp))
+            modifier = Modifier.padding(bottom = 4.dp))
+        Text(
+            "Only testmate2.com (or a subdomain) or the Testmate Supabase auth link are " +
+                "accepted — anything else is rejected before it's saved.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
         OutlinedTextField(
             value         = baseUrl,
-            onValueChange = { baseUrl = it; baseUrlSaved = false },
+            onValueChange = { baseUrl = it; baseUrlSaved = false; baseUrlError = null },
             modifier      = Modifier.fillMaxWidth(),
             singleLine    = true,
-            placeholder   = { Text("https://testmate2.vercel.app", color = White30, fontSize = 13.sp) },
+            placeholder   = { Text("https://testmate2.com", color = White30, fontSize = 13.sp) },
             leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
             trailingIcon  = {
                 IconButton(onClick = {
-                    CheckmatePrefs.putString(TestmateApi.PREF_BASE_URL, baseUrl.trim())
-                    baseUrlSaved = true
+                    val candidate = baseUrl.trim()
+                    // Allow-list gate (TestmateApi.isAllowedBaseUrl) — only testmate2.com (or
+                    // a subdomain) or this project's Supabase auth-verify URL get saved. Any
+                    // other host, including a plausible-looking lookalike, is rejected here
+                    // rather than silently persisted and only failing later at request time.
+                    if (TestmateApi.isAllowedBaseUrl(candidate)) {
+                        CheckmatePrefs.putString(TestmateApi.PREF_BASE_URL, candidate)
+                        baseUrlSaved = true
+                        baseUrlError = null
+                    } else {
+                        baseUrlSaved = false
+                        baseUrlError = "Only testmate2.com or the Testmate Supabase auth link are accepted"
+                    }
                 }) {
                     Icon(
                         if (baseUrlSaved) Icons.Default.Check else Icons.Default.Save,
@@ -879,16 +896,21 @@ private fun TestmateSettings() {
                     )
                 }
             },
+            isError = baseUrlError != null,
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor   = AccentGreen,
                 unfocusedBorderColor = White30,
                 cursorColor          = AccentGreen,
                 focusedTextColor     = White90,
-                unfocusedTextColor   = White90
+                unfocusedTextColor   = White90,
+                errorBorderColor     = AccentRed
             )
         )
         if (baseUrlSaved) {
             Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
+        baseUrlError?.let {
+            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(top = 4.dp))
         }
     }
 
