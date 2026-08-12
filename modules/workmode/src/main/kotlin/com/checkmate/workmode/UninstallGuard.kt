@@ -69,6 +69,26 @@ object UninstallGuard {
     private const val MAX_FAILED_ATTEMPTS = 5
     private const val LOCKOUT_MS = 10 * 60 * 1000L
 
+    // ── Repeated-disable-attempt hard lock ──────────────────────────────────
+    // AppAutomationService's touch-blocker overlay normally only holds for a fraction of a
+    // second (just long enough for GLOBAL_ACTION_HOME to take effect). If someone keeps
+    // landing back on a guarded screen (uninstall / device-admin-disable / accessibility-
+    // disable) three times in a row, that's a deliberate, repeated attempt rather than one
+    // stray tap — this escalates the response from "bounce and briefly block" to a full
+    // screen-wide touch freeze, independent of which specific guarded screen triggered it.
+    private const val KEY_CONSEC_ATTEMPTS = "guarded_screen_consecutive_attempts"
+    private const val KEY_LAST_ATTEMPT_AT = "guarded_screen_last_attempt_at"
+
+    // A gap longer than this between attempts resets the counter — this counts a *burst* of
+    // tries ("three in a row"), not a lifetime total across days/weeks.
+    private const val CONSEC_RESET_MS = 10 * 60 * 1000L
+
+    /** Consecutive guarded-screen attempts that trigger the full-screen hard lock. */
+    const val HARD_LOCK_THRESHOLD = 3
+
+    /** How long the hard lock holds the entire screen's touch input. */
+    const val HARD_LOCK_DURATION_MS = 5 * 60 * 1000L
+
     /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
     val GUARD_KEYWORDS = listOf(
         "uninstall",
@@ -215,6 +235,10 @@ object UninstallGuard {
         return if (hashPin(pin) == stored) {
             CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
             CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
+            // A correct guardian PIN means this is a legitimate disable/uninstall flow, not
+            // tampering — clear the consecutive-attempt counter so it doesn't carry over into
+            // an unrelated future burst.
+            resetConsecutiveAttempts()
             UnlockResult.Success
         } else {
             val fails = CheckmatePrefs.getInt(KEY_FAIL_COUNT, 0) + 1
@@ -255,6 +279,29 @@ object UninstallGuard {
         if (!targetsCheckmate) return false
         val lower = visibleText.lowercase()
         return GUARD_KEYWORDS.any { lower.contains(it) }
+    }
+
+    /**
+     * Called by AppAutomationService every time a guarded screen is detected and bounced.
+     * Tracks consecutive attempts, resetting the count if the gap since the last one exceeds
+     * [CONSEC_RESET_MS] (so this measures a burst, not a lifetime total). Returns true the
+     * moment the [HARD_LOCK_THRESHOLD]-th consecutive attempt lands — the caller's signal to
+     * escalate from the normal brief touch-block to the full-screen [HARD_LOCK_DURATION_MS] lock.
+     */
+    fun recordGuardedAttempt(): Boolean {
+        val now = System.currentTimeMillis()
+        val last = CheckmatePrefs.getLong(KEY_LAST_ATTEMPT_AT, 0L)
+        val previousCount = CheckmatePrefs.getInt(KEY_CONSEC_ATTEMPTS, 0)
+        val count = if (now - last > CONSEC_RESET_MS) 1 else previousCount + 1
+        CheckmatePrefs.putInt(KEY_CONSEC_ATTEMPTS, count)
+        CheckmatePrefs.putLong(KEY_LAST_ATTEMPT_AT, now)
+        return count >= HARD_LOCK_THRESHOLD
+    }
+
+    /** Clears the consecutive-attempt counter. Called after a hard lock fires (so the next
+     *  lock requires a fresh burst) and on a successful guardian PIN unlock. */
+    fun resetConsecutiveAttempts() {
+        CheckmatePrefs.putInt(KEY_CONSEC_ATTEMPTS, 0)
     }
 
     /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */

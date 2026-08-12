@@ -315,14 +315,27 @@ class AppAutomationService : AccessibilityService() {
         }
 
         Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
-        // Extend/refresh the block to cover the Home transition itself —
-        // the pre-check block above was only sized for classification, not
-        // for GLOBAL_ACTION_HOME actually taking effect.
-        blockTouchesBriefly(POST_DETECT_BLOCK_MS)
+
+        // Three consecutive attempts (within the burst window — see UninstallGuard's
+        // CONSEC_RESET_MS) escalate from the normal brief touch-block to a full-screen,
+        // full-duration hard lock — the same touch-swallowing overlay used everywhere else in
+        // this class, just held for HARD_LOCK_DURATION_MS instead of POST_DETECT_BLOCK_MS.
+        val hardLock = UninstallGuard.recordGuardedAttempt()
+        if (hardLock) {
+            Log.w(GUARD_TAG, "3rd consecutive disable/uninstall attempt — hard-locking touch for 5 minutes")
+            blockTouchesBriefly(UninstallGuard.HARD_LOCK_DURATION_MS)
+            UninstallGuard.resetConsecutiveAttempts() // next hard lock needs a fresh burst
+        } else {
+            // Extend/refresh the block to cover the Home transition itself — the pre-check
+            // block above was only sized for classification, not for GLOBAL_ACTION_HOME
+            // actually taking effect.
+            blockTouchesBriefly(POST_DETECT_BLOCK_MS)
+        }
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
-            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, "settings_screen_blocked")
+            val reason = if (hardLock) "repeated_disable_attempt_hard_lock" else "settings_screen_blocked"
+            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, reason)
         }
     }
 

@@ -133,11 +133,82 @@ object PlanStore {
         for (i in 0..30) {
             val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
             val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
-            if (tasks.count { it.state == TaskState.DONE } == 0 && tasks.isNotEmpty()) break
+            // Fix: previously "tasks.count{DONE}==0 && tasks.isNotEmpty()" meant a day where a
+            // plan was saved with ZERO tasks (empty list) did NOT break the streak — an empty
+            // plan silently counted as a study day. No tasks in the plan means no study, same
+            // as a day with tasks that were never done, so this now breaks on either case.
+            if (tasks.count { it.state == TaskState.DONE } == 0) break
             streak++
             cal.add(Calendar.DAY_OF_YEAR, -1)
         }
         return streak
+    }
+
+    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
+
+    /**
+     * Per-day study status used by the Stats consistency calendar and by
+     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
+     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
+     * neutral/unknown state, which is what silently reading everything as 0% used to do.
+     */
+    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
+
+    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
+    fun getDayStatus(cal: Calendar): DayStudyStatus {
+        val today = Calendar.getInstance()
+        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
+            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
+        if (isFuture) return DayStudyStatus.FUTURE
+
+        val tasks = loadDay(keyForDay(cal))
+        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
+        val done = tasks.count { it.state == TaskState.DONE }
+        return when {
+            done == tasks.size -> DayStudyStatus.COMPLETE
+            done > 0            -> DayStudyStatus.PARTIAL
+            else                 -> DayStudyStatus.MISSED
+        }
+    }
+
+    /**
+     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
+     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
+     * dots per day, like a GitHub-style contribution grid).
+     */
+    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.YEAR, year)
+        cal.set(Calendar.MONTH, month)
+        cal.set(Calendar.DAY_OF_MONTH, 1)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val result = LinkedHashMap<Int, DayStudyStatus>()
+        for (d in 1..daysInMonth) {
+            cal.set(Calendar.DAY_OF_MONTH, d)
+            result[d] = getDayStatus(cal)
+        }
+        return result
+    }
+
+    /**
+     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
+     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
+     * lets the app actually notice "the student hasn't studied in N days" instead of that
+     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
+     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
+     * guardian once this crosses a threshold.
+     */
+    fun getConsecutiveMissedDays(): Int {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -1)
+        var missed = 0
+        for (i in 0 until 60) {
+            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
+            missed++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return missed
     }
 
     fun getWeekCompletionPercent(): Int {

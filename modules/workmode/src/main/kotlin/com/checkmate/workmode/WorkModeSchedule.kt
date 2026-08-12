@@ -6,21 +6,27 @@ import java.util.Calendar
  * WorkModeSchedule — the hardcoded daily Block Mode window.
  *
  * Checkmate enforces Work Mode (app + website blocking, plus the Work Mode
- * settings lock in WorkModeLockGate) every day from 19:00 (7 PM) to 05:00
- * (5 AM) the following morning — on top of whatever task-based sessions the
+ * settings lock in WorkModeLockGate) every day from 19:00 (7 PM) to 07:00
+ * (7 AM) the following morning — on top of whatever task-based sessions the
  * student starts manually.
  *
- * UPDATE: the usual hardcoded window's end was moved from 02:00 to 05:00
- * (still starts 19:00). Sunday and Wednesday additionally get a second,
- * earlier lock window — 01:00 to 17:30 — so on those two days the student
- * is locked out almost all day with only a short 17:30-19:00 gap before the
- * usual 19:00-05:00 window takes back over ("locked twice" per day).
+ * UPDATE: the usual hardcoded window's end was moved from 02:00 to 05:00,
+ * and then to 07:00 (still starts 19:00). Sunday and Wednesday additionally
+ * get a second, earlier lock window — 01:00 to 17:30 — so on those two days
+ * the student is locked out almost all day with only a short 17:30-19:00
+ * gap before the usual 19:00-07:00 window takes back over ("locked twice"
+ * per day).
  *
  * This window is intentionally a compile-time constant. There is no
  * Settings screen, SharedPrefs key, or remote config that can change it —
  * changing the hours means editing this file and shipping a new build, not
  * something reachable from the student's phone. That's deliberate: a
  * schedule the student can adjust "just this once" isn't a schedule.
+ *
+ * The ONE exception is [HolidaySchedule]: specific calendar dates a guardian
+ * has explicitly marked exempt (see that file's doc for why it's gated
+ * behind a guardian PIN unlock rather than being freely editable). Every
+ * other day, this schedule behaves exactly as before.
  */
 object WorkModeSchedule {
 
@@ -29,9 +35,9 @@ object WorkModeSchedule {
 
     /**
      * 24h clock hour the usual daily window ends, on the next calendar day
-     * (5 AM). Previously 2 AM.
+     * (7 AM). Previously 2 AM, then 5 AM.
      */
-    const val END_HOUR = 5
+    const val END_HOUR = 7
 
     /** Days that get the extra 01:00-17:30 lock window on top of the usual one. */
     private val SPECIAL_DAYS = setOf(Calendar.SUNDAY, Calendar.WEDNESDAY)
@@ -46,13 +52,16 @@ object WorkModeSchedule {
 
     /** Human-readable label for display in Settings only — not configurable from there. */
     const val LABEL =
-        "7:00 PM \u2013 5:00 AM daily (Sun & Wed also locked 1:00 AM \u2013 5:30 PM)"
+        "7:00 PM \u2013 7:00 AM daily (Sun & Wed also locked 1:00 AM \u2013 5:30 PM)"
 
     /**
      * True if [cal] (defaults to the trusted, tamper-resistant "now" — see
      * TrustedTime — NOT the raw device clock) falls inside a locked window:
-     *  - the usual 19:00-05:00 window, every day, OR
+     *  - the usual 19:00-07:00 window, every day, OR
      *  - on Sunday/Wednesday only, the extra 01:00-17:30 window.
+     *  - UNLESS [cal]'s calendar date is a guardian-marked holiday
+     *    (HolidaySchedule.isHoliday), in which case neither window applies
+     *    for that whole day.
      *
      * Deliberately does NOT default to Calendar.getInstance() (raw device
      * time) — that was spoofable by simply changing Settings > Date & time,
@@ -65,6 +74,10 @@ object WorkModeSchedule {
     fun isWithinScheduledWindow(
         cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
     ): Boolean {
+        // Guardian-marked holiday: the whole calendar day is exempt from both lock windows.
+        // See HolidaySchedule's doc for why this can only be set behind a guardian PIN unlock.
+        if (HolidaySchedule.isHoliday(cal)) return false
+
         val hour = cal.get(Calendar.HOUR_OF_DAY)
 
         // Usual window wraps past midnight: active from START_HOUR..23:59 AND

@@ -29,9 +29,11 @@ import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
+import com.checkmate.workmode.HolidaySchedule
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
 import com.checkmate.workmode.WorkModeSchedule
+import java.util.Calendar
 import kotlinx.coroutines.delay
 
 // ── Guardian lock gate for Work Mode settings ─────────────────────────────────
@@ -131,6 +133,85 @@ fun WorkModeLockGate(content: @Composable () -> Unit) {
     }
 }
 
+// ── Holidays: the one guardian-approved exception to the hardcoded lock window ────────────
+//
+// Lives behind WorkModeLockGate (same guardian-PIN gate as Blocked Apps/Websites/Focus Cycle)
+// — see HolidaySchedule's doc for why marking a holiday can't be a self-service action.
+@Composable
+private fun HolidaySettings() {
+    var holidays by remember { mutableStateOf(HolidaySchedule.getSortedHolidays()) }
+    var dateInput by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Holidays", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 4.dp))
+        Text(
+            "On a marked holiday, the ${WorkModeSchedule.LABEL} window doesn't apply for that " +
+                "whole calendar day. Every other day is unaffected.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value         = dateInput,
+                onValueChange = { if (it.length <= 10) dateInput = it; status = null },
+                modifier      = Modifier.weight(1f),
+                singleLine    = true,
+                placeholder   = { Text("DD/MM/YYYY", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Event, null, tint = White60) },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            Spacer(Modifier.width(8.dp))
+            IconButton(onClick = {
+                val parts = dateInput.split("/")
+                val cal = Calendar.getInstance()
+                val parsed = parts.size == 3 &&
+                    parts[0].toIntOrNull() != null && parts[1].toIntOrNull() != null && parts[2].toIntOrNull() != null
+                if (parsed) {
+                    cal.set(Calendar.DAY_OF_MONTH, 1) // avoid overflow when swapping month/day below
+                    cal.set(parts[2].toInt(), parts[1].toInt() - 1, parts[0].toInt())
+                    HolidaySchedule.addHoliday(cal)
+                    holidays = HolidaySchedule.getSortedHolidays()
+                    dateInput = ""
+                    status = "Holiday added"
+                } else {
+                    status = "Enter a valid DD/MM/YYYY date"
+                }
+            }) {
+                Icon(Icons.Default.Add, null, tint = AccentGreen)
+            }
+        }
+        status?.let { Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp)) }
+
+        if (holidays.isEmpty()) {
+            Text("No holidays marked.", fontSize = 11.sp, color = White30, modifier = Modifier.padding(top = 10.dp))
+        } else {
+            Spacer(Modifier.height(10.dp))
+            holidays.forEach { (key, label) ->
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(label, fontSize = 13.sp, color = White90)
+                    IconButton(onClick = {
+                        HolidaySchedule.removeHoliday(key)
+                        holidays = HolidaySchedule.getSortedHolidays()
+                    }) {
+                        Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SettingsScreen() {
     val context = LocalContext.current
@@ -171,17 +252,23 @@ fun SettingsScreen() {
         SettingSection("WORK MODE") {
             Text(
                 "Hardcoded daily block window: ${WorkModeSchedule.LABEL}. " +
-                    "This window isn't editable from the app — see your guardian to change it.",
+                    "This window isn't editable from the app — see your guardian to change it. " +
+                    "The one exception is a guardian-approved holiday, below.",
                 fontSize = 11.sp, color = White60,
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
             )
             HorizontalDivider(color = White10)
-            // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are
-            // read-only for the student while Work Mode is enforcing (an active
-            // session OR the hardcoded window) — closes the loophole where blocked
-            // apps get removed from the list mid-session. Only a guardian PIN
-            // unlock (same PIN used for uninstall protection) lifts the lock.
+            // Holidays (the only way the hardcoded schedule ever changes for a specific day),
+            // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are all
+            // read-only for the student while Work Mode is enforcing (an active session OR
+            // the hardcoded window) — closes the loophole where blocked apps get removed from
+            // the list, or a holiday gets self-approved, mid-session. Only a guardian PIN
+            // unlock (same PIN used for uninstall protection) lifts the lock. One shared gate
+            // for all of it, so unlocking once covers the whole section instead of prompting
+            // for the PIN twice.
             WorkModeLockGate {
+                HolidaySettings()
+                HorizontalDivider(color = White10)
                 FocusCycleSettings(context)
                 HorizontalDivider(color = White10)
                 SettingTile(

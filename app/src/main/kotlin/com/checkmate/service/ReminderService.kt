@@ -56,6 +56,10 @@ class ReminderService : Service() {
                 // nothing's been started by the configured hour. No-ops after the first fire
                 // each day (see ProactiveMentor.idleCheckIfNeeded's day-key guard).
                 try { ProactiveMentor.idleCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // "No tasks in plan == no study": once-daily check for a multi-day gap with
+                // no plan/completion, nudges the student and alerts the guardian. Same
+                // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
+                try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min

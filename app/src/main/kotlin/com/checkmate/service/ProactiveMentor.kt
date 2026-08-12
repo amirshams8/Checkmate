@@ -82,4 +82,37 @@ object ProactiveMentor {
         CheckmatePrefs.putString(KEY_LAST_IDLE_NUDGE_DAY, todayKey)
         Log.d(TAG, "idleCheckIfNeeded fired")
     }
+
+    // ── Consistency check ("no tasks in plan == no study") ─────────────────
+
+    private const val KEY_LAST_INACTIVITY_ALERT_DAY = "mentor_last_inactivity_alert_day"
+    private const val MISSED_DAYS_ALERT_THRESHOLD = 2
+
+    /**
+     * Call once daily (from ReminderService's existing 15-min loop, alongside
+     * idleCheckIfNeeded). Fires when PlanStore shows [MISSED_DAYS_ALERT_THRESHOLD]+
+     * consecutive days with no completed tasks — including days where no plan was ever
+     * generated, which PlanStore.getConsecutiveMissedDays() now counts as a missed day
+     * instead of silently ignoring (see PlanStore.DayStudyStatus). Previously an "empty
+     * plan" day and a "genuinely caught up, nothing left to do" day looked identical to
+     * every stat in the app; this is what makes the difference visible and actionable.
+     * Guarded to fire at most once per calendar day, same day-key pattern as
+     * idleCheckIfNeeded.
+     */
+    fun consistencyCheckIfNeeded(context: Context) {
+        val cal = Calendar.getInstance()
+        val todayKey = "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+        if (CheckmatePrefs.getString(KEY_LAST_INACTIVITY_ALERT_DAY, "") == todayKey) return
+
+        val missedDays = PlanStore.getConsecutiveMissedDays()
+        if (missedDays < MISSED_DAYS_ALERT_THRESHOLD) return
+
+        val msg = "No study recorded for $missedDays days in a row — no plan or nothing " +
+            "completed. Your guardian has been notified."
+        MentorViewModel.appendProactiveMessage(msg)
+        MentorNotifier.notify(context, msg)
+        GuardianNotifier.notifyStudyInactivity(context, missedDays)
+        CheckmatePrefs.putString(KEY_LAST_INACTIVITY_ALERT_DAY, todayKey)
+        Log.d(TAG, "consistencyCheckIfNeeded fired: missedDays=$missedDays")
+    }
 }

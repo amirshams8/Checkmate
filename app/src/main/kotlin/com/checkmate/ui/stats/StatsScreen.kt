@@ -18,7 +18,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.checkmate.planner.PlanStore
 import com.checkmate.ui.theme.*
+import java.util.Calendar
 
 @Composable
 fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewModel()) {
@@ -82,6 +84,58 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                 Text("This Week", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
                 Spacer(Modifier.height(16.dp))
                 WeeklyBarChart(state.weeklyData)
+            }
+        }
+        // ── Consistency Calendar (green/yellow/red dots per day) ──────────────
+        // "No tasks in plan" now counts as a missed (red) day, not a blank/neutral one —
+        // see PlanStore.DayStudyStatus. This is also where an irregular-study streak
+        // actually becomes visible to the student, not just implied by silence.
+        if (state.consecutiveMissedDays >= 2) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                shape    = RoundedCornerShape(14.dp),
+                color    = AccentRed.copy(alpha = 0.12f),
+                border   = BorderStroke(0.5.dp, AccentRed.copy(alpha = 0.4f))
+            ) {
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.WarningAmber, null, tint = AccentRed, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "${state.consecutiveMissedDays} days in a row with no plan or nothing completed. " +
+                            "Your guardian has been notified.",
+                        fontSize = 12.sp, color = White90
+                    )
+                }
+            }
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            shape    = RoundedCornerShape(14.dp),
+            color    = BgCard,
+            border   = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier              = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Text("Consistency", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                    Text(state.consistencyMonthLabel, fontSize = 11.sp, color = White60)
+                }
+                Spacer(Modifier.height(12.dp))
+                ConsistencyCalendar(state.consistencyMonth)
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LegendDot(AccentGreen, "Complete")
+                    Spacer(Modifier.width(14.dp))
+                    LegendDot(AccentAmber, "Partial")
+                    Spacer(Modifier.width(14.dp))
+                    LegendDot(AccentRed, "Missed")
+                }
             }
         }
         Surface(
@@ -352,6 +406,89 @@ private fun ScreenTimeBarChart(data: List<Pair<String, Int>>) {
                 Text(day, fontSize = 10.sp, color = White60, fontFamily = FontFamily.Monospace)
             }
         }
+    }
+}
+
+// ── Consistency calendar (green/yellow/red dots, GitHub-contribution-grid style) ───────────
+
+@Composable
+private fun ConsistencyCalendar(month: Map<Int, PlanStore.DayStudyStatus>) {
+    if (month.isEmpty()) return
+
+    // Figure out which weekday day 1 of the month falls on, so the grid lines up under the
+    // right weekday header instead of always starting in the Monday column.
+    val cal = Calendar.getInstance()
+    val today = cal.get(Calendar.DAY_OF_MONTH)
+    cal.set(Calendar.DAY_OF_MONTH, 1)
+    // Calendar.DAY_OF_WEEK: SUNDAY=1..SATURDAY=7. Convert to a Monday-first 0..6 offset.
+    val firstWeekday = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7
+    val daysInMonth = month.size
+
+    Column {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            listOf("M", "T", "W", "T", "F", "S", "S").forEach {
+                Text(
+                    it, fontSize = 10.sp, color = White30,
+                    modifier = Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+
+        var day = 1
+        val totalCells = firstWeekday + daysInMonth
+        val rows = (totalCells + 6) / 7
+        repeat(rows) { rowIndex ->
+            Row(modifier = Modifier.fillMaxWidth()) {
+                repeat(7) { col ->
+                    val cellIndex = rowIndex * 7 + col
+                    Box(
+                        modifier         = Modifier.weight(1f).aspectRatio(1f).padding(2.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (cellIndex >= firstWeekday && day <= daysInMonth) {
+                            val status = month[day] ?: PlanStore.DayStudyStatus.FUTURE
+                            val isToday = day == today
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(dayStatusColor(status))
+                                    .then(
+                                        if (isToday) Modifier.border(1.dp, White60, RoundedCornerShape(6.dp))
+                                        else Modifier
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "$day",
+                                    fontSize = 9.sp,
+                                    color    = if (status == PlanStore.DayStudyStatus.FUTURE) White60 else Color.Black,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                            day++
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun dayStatusColor(status: PlanStore.DayStudyStatus): Color = when (status) {
+    PlanStore.DayStudyStatus.COMPLETE -> AccentGreen
+    PlanStore.DayStudyStatus.PARTIAL  -> AccentAmber
+    PlanStore.DayStudyStatus.MISSED   -> AccentRed
+    PlanStore.DayStudyStatus.FUTURE   -> White10
+}
+
+@Composable
+private fun LegendDot(color: Color, label: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(modifier = Modifier.size(9.dp).clip(RoundedCornerShape(3.dp)).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(label, fontSize = 11.sp, color = White60)
     }
 }
 

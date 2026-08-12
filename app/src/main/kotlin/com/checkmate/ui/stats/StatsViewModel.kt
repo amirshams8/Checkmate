@@ -11,7 +11,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Locale
 import kotlin.math.roundToInt
 
 data class StatsState(
@@ -33,7 +35,13 @@ data class StatsState(
     val hasUsageAccess:       Boolean                  = true,
     val appUsageToday:        List<Pair<String, Int>>  = emptyList(), // label -> minutes
     val totalScreenMinutesToday: Int                   = 0,
-    val screenTimeHistory:    List<Pair<String, Int>>  = emptyList()  // day -> minutes
+    val screenTimeHistory:    List<Pair<String, Int>>  = emptyList(),  // day -> minutes
+    // ── Consistency calendar (green/yellow/red dots per day) ──────────────
+    val consistencyMonthLabel: String                             = "",
+    val consistencyMonth:      Map<Int, PlanStore.DayStudyStatus> = emptyMap(),
+    // "No tasks in plan == no study": consecutive days (ending yesterday) with nothing
+    // planned or nothing completed. 0 means no gap right now.
+    val consecutiveMissedDays: Int                                = 0
 )
 
 class StatsViewModel : ViewModel() {
@@ -51,6 +59,15 @@ class StatsViewModel : ViewModel() {
             val subjectData  = PlanStore.getSubjectStats()
             val ledger       = BehaviorLedger.getAttentionStats()
             val pauseStats   = PlanStore.getPauseStats()
+
+            // Consistency calendar: current month's per-day status, plus how many days in a
+            // row nothing's been studied — see PlanStore.DayStudyStatus doc for why an empty
+            // plan counts the same as a missed day here.
+            val cal = Calendar.getInstance()
+            val monthMap = PlanStore.getMonthConsistency(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH))
+            val monthLabel = SimpleDateFormat("MMMM yyyy", Locale.getDefault()).format(cal.time)
+            val missedStreak = PlanStore.getConsecutiveMissedDays()
+
             _state.update { it.copy(
                 streakDays              = streak,
                 todayCompletion         = todayPct,
@@ -62,7 +79,10 @@ class StatsViewModel : ViewModel() {
                 avgFocusMinutes         = ledger.avgFocusMinutes,
                 actualFocusMinutesToday = pauseStats.actualFocusMinutesToday,
                 avgPausesPerSession     = pauseStats.avgPausesPerSession,
-                pauseRatePercent        = pauseStats.pauseRatePercent
+                pauseRatePercent        = pauseStats.pauseRatePercent,
+                consistencyMonthLabel   = monthLabel,
+                consistencyMonth        = monthMap,
+                consecutiveMissedDays   = missedStreak
             )}
         }
     }

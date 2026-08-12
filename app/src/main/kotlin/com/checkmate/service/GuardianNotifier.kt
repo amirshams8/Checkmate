@@ -301,8 +301,13 @@ object GuardianNotifier {
      */
     fun notifyUninstallAttempt(context: Context, reason: String) {
         val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
-                  "Checkmate at ${timeNow()} on ${dateToday()}."
+        val msg = if (reason == "repeated_disable_attempt_hard_lock")
+            "🚨 Checkmate Security Alert: $candidateName tried to uninstall or disable Checkmate " +
+                "3 times in a row at ${timeNow()} on ${dateToday()}. The screen's touch input has " +
+                "been locked for 5 minutes."
+        else
+            "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
+                "Checkmate at ${timeNow()} on ${dateToday()}."
         Log.w(TAG, "Uninstall attempt: reason=$reason")
 
         val number = getGuardianNumber()
@@ -310,6 +315,29 @@ object GuardianNotifier {
             openWhatsAppAndSend(context, number, msg)
         }
 
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
+     * Fired by ProactiveMentor.consistencyCheckIfNeeded() once a gap of consecutive missed
+     * days (PlanStore.getConsecutiveMissedDays — no plan generated OR nothing completed)
+     * crosses the alert threshold. Previously nothing ever surfaced this pattern to the
+     * guardian at all — a student could go stretches with zero study and, short of manually
+     * reading the day-by-day plan history, nobody would notice.
+     */
+    fun notifyStudyInactivity(context: Context, missedDays: Int) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "⚠️ Checkmate Alert: $candidateName has gone $missedDays days in a row with no " +
+                  "study recorded — no plan generated or nothing completed — as of ${timeNow()} " +
+                  "on ${dateToday()}."
+        Log.w(TAG, "Study inactivity alert: missedDays=$missedDays")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
         if (TelegramAlertBot.getChatId() != null) {
             Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
         }
