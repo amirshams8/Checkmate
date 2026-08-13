@@ -11,9 +11,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * ProfileSyncManager — backs up/restores the one-time SETUP PROFILE (exam type,
- * exam date, study window, guardian number, TTS toggle, subjects config) to the
- * same Cloudflare Worker + KV that TaskSyncManager already uses, keyed by the
- * SAME "sync_code" the user sets in Settings → Task Sync.
+ * exam date, study window, guardian number, TTS toggle, subjects config) PLUS
+ * the blocked apps/websites lists, to the same Cloudflare Worker + KV that
+ * TaskSyncManager already uses, keyed by the SAME "sync_code" the user sets
+ * in Settings → Task Sync.
  *
  * This is deliberately NOT full multi-device account sync (see TaskSyncManager
  * for that, which mirrors today's task list live). This is a much smaller
@@ -63,6 +64,8 @@ object ProfileSyncManager {
                 put("guardian_number", CheckmatePrefs.getString("guardian_number", "") ?: "")
                 put("tts_enabled",     CheckmatePrefs.getBoolean("tts_enabled", true))
                 put("subjects_config", CheckmatePrefs.getString("subjects_config", "") ?: "")
+                put("blocked_apps",    CheckmatePrefs.getString("blocked_apps", "") ?: "")
+                put("blocked_domains", CheckmatePrefs.getString("blocked_domains", "") ?: "")
             }
             val payload = JSONObject().apply {
                 put("code", code)
@@ -108,6 +111,8 @@ object ProfileSyncManager {
             CheckmatePrefs.putString("guardian_number", profile.optString("guardian_number", ""))
             CheckmatePrefs.putBoolean("tts_enabled",    profile.optBoolean("tts_enabled", true))
             CheckmatePrefs.putString("subjects_config", profile.optString("subjects_config", ""))
+            CheckmatePrefs.putString("blocked_apps",    profile.optString("blocked_apps", ""))
+            CheckmatePrefs.putString("blocked_domains", profile.optString("blocked_domains", ""))
             Log.d(TAG, "pullProfileIfLocalEmpty: restored profile from sync code")
             true
         } catch (e: Exception) {

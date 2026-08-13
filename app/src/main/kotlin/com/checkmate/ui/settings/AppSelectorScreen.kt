@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.service.ProfileSyncManager
 import com.checkmate.ui.settings.WorkModeLockGate
 import com.checkmate.ui.theme.*
 
@@ -79,6 +80,7 @@ fun AppSelectorScreen(onBack: () -> Unit) {
         ) {
             IconButton(onClick = {
                 CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
+                if (ProfileSyncManager.isEnabled()) Thread { ProfileSyncManager.pushProfile() }.start()
                 onBack()
             }) {
                 Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
@@ -191,6 +193,7 @@ fun AppSelectorScreen(onBack: () -> Unit) {
                             blockedApps + app.packageName
                         // Persist immediately so the accessibility service sees the update
                         CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
+                        if (ProfileSyncManager.isEnabled()) Thread { ProfileSyncManager.pushProfile() }.start()
                     }
                 ) {
                     Row(

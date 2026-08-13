@@ -20,6 +20,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.service.ProfileSyncManager
 import com.checkmate.ui.settings.WorkModeLockGate
 import com.checkmate.ui.theme.*
 
@@ -42,7 +43,10 @@ fun WebsiteBlockerScreen(onBack: () -> Unit) {
     var inputError by remember { mutableStateOf("") }
     val keyboard = LocalSoftwareKeyboardController.current
 
-    fun persist() = CheckmatePrefs.putString("blocked_domains", domains.joinToString(","))
+    fun persist() {
+        CheckmatePrefs.putString("blocked_domains", domains.joinToString(","))
+        if (ProfileSyncManager.isEnabled()) Thread { ProfileSyncManager.pushProfile() }.start()
+    }
 
     fun addDomain(raw: String) {
         val clean = raw.trim().lowercase()

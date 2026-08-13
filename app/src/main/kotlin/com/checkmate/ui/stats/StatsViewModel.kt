@@ -84,6 +84,21 @@ class StatsViewModel : ViewModel() {
                 consistencyMonth        = monthMap,
                 consecutiveMissedDays   = missedStreak
             )}
+
+            // Backup the Consistency tab snapshot to the sync code (fire-and-forget,
+            // no-op with no sync code) and, if this device has no study history yet
+            // (fresh install), restore the synced snapshot instead of showing all
+            // zeros. Never overrides real local numbers — see
+            // StatsSyncManager.looksEmpty()/pullStats() docs. Screen-usage-time
+            // fields are excluded from sync entirely and untouched here.
+            withContext(Dispatchers.IO) {
+                StatsSyncManager.pushStats(_state.value)
+                if (StatsSyncManager.looksEmpty(_state.value)) {
+                    StatsSyncManager.pullStats(_state.value)?.let { restored ->
+                        _state.update { restored }
+                    }
+                }
+            }
         }
     }
 
