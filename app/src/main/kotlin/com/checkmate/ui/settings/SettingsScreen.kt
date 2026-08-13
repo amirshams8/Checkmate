@@ -27,6 +27,7 @@ import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProfileSyncManager
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
 import com.checkmate.workmode.HolidaySchedule
@@ -845,6 +846,13 @@ private fun TaskSyncSettings() {
                     else CheckmatePrefs.putString("sync_code", trimmed)
                     syncCode = trimmed
                     saved = true
+                    // Pairing this device to an existing code should restore setup
+                    // immediately rather than waiting for the next Planner screen
+                    // open. No-op (won't clobber) if this device already has a
+                    // real local setup — see pullProfileIfLocalEmpty().
+                    if (trimmed.isNotBlank()) {
+                        Thread { ProfileSyncManager.pullProfileIfLocalEmpty() }.start()
+                    }
                 }) {
                     Icon(
                         if (saved) Icons.Default.Check else Icons.Default.Save,

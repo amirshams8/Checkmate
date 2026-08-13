@@ -10,6 +10,7 @@ import com.checkmate.planner.PlanStore
 import com.checkmate.planner.PlannerState
 import com.checkmate.planner.model.SubjectConfig
 import com.checkmate.planner.model.StudyTask
+import com.checkmate.service.ProfileSyncManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -40,6 +41,25 @@ class PlannerViewModel : ViewModel() {
     init { loadSaved() }
 
     private fun loadSaved() {
+        readIntoState()
+
+        // Fresh install / new device with an existing sync_code and no local
+        // setup yet (exam date blank): restore the setup profile (exam
+        // type/date, study window, guardian number, tts, subjects) in the
+        // background instead of making the user retype it, then re-read prefs
+        // into state once the restore lands. No-op if local setup already
+        // exists or no sync_code is configured — see
+        // ProfileSyncManager.pullProfileIfLocalEmpty().
+        if (ProfileSyncManager.isEnabled() && _state.value.examDate.isBlank()) {
+            Thread {
+                if (ProfileSyncManager.pullProfileIfLocalEmpty()) {
+                    readIntoState()
+                }
+            }.start()
+        }
+    }
+
+    private fun readIntoState() {
         _state.update { s -> s.copy(
             examType       = CheckmatePrefs.getString("exam_type",       "NEET")  ?: "NEET",
             examDate       = CheckmatePrefs.getString("exam_date",       "")      ?: "",
@@ -61,31 +81,44 @@ class PlannerViewModel : ViewModel() {
     fun setExam(exam: String) {
         _state.update { it.copy(examType = exam) }
         CheckmatePrefs.putString("exam_type", exam)
+        backupProfile()
     }
 
     fun setExamDate(date: String) {
         _state.update { it.copy(examDate = date) }
         CheckmatePrefs.putString("exam_date", date)
+        backupProfile()
     }
 
     fun setStudyStart(time: String) {
         _state.update { it.copy(studyStartTime = time) }
         CheckmatePrefs.putString("study_start", time)
+        backupProfile()
     }
 
     fun setStudyEnd(time: String) {
         _state.update { it.copy(studyEndTime = time) }
         CheckmatePrefs.putString("study_end", time)
+        backupProfile()
     }
 
     fun setGuardianNumber(number: String) {
         _state.update { it.copy(guardianNumber = number) }
         CheckmatePrefs.putString("guardian_number", number)
+        backupProfile()
     }
 
     fun setTtsEnabled(enabled: Boolean) {
         _state.update { it.copy(ttsEnabled = enabled) }
         CheckmatePrefs.putBoolean("tts_enabled", enabled)
+        backupProfile()
+    }
+
+    /** Fire-and-forget backup of the setup profile via ProfileSyncManager — no-op if no sync_code. */
+    private fun backupProfile() {
+        if (ProfileSyncManager.isEnabled()) {
+            Thread { ProfileSyncManager.pushProfile() }.start()
+        }
     }
 
     fun addSubject() {
@@ -117,6 +150,7 @@ class PlannerViewModel : ViewModel() {
     private fun saveSubjects(subjects: List<SubjectConfig>) {
         val raw = subjects.joinToString(";") { "${it.name}:${it.weightage}" }
         CheckmatePrefs.putString("subjects_config", raw)
+        backupProfile()
     }
 
     fun generatePlan(context: Context) {
