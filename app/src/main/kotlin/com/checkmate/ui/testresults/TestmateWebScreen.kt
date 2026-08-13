@@ -1,9 +1,16 @@
 package com.checkmate.ui.testresults
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
+import android.content.Context
+import android.net.Uri
+import android.os.Environment
 import android.webkit.CookieManager
+import android.webkit.MimeTypeMap
+import android.webkit.URLUtil
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -30,6 +37,12 @@ import com.checkmate.ui.theme.*
  * persisted by the system WebView's cookie jar across app restarts) — not
  * the Bearer device-token flow, which is a separate, headless path used
  * only by TestResultsScreen/TestmateApi for pulling a result summary.
+ *
+ * File downloads (answer-key PDFs, exported reports, etc.) don't work out
+ * of the box in a plain WebView — the browser normally hands those off to
+ * the OS, but a WebView just silently swallows the navigation. We wire a
+ * DownloadListener to Android's DownloadManager and forward the WebView's
+ * session cookie + user agent so authenticated downloads still work.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -96,11 +109,55 @@ fun TestmateWebScreen(navController: NavController) {
                                 canGoBack = view.canGoBack()
                             }
                         }
+                        setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                            downloadFile(ctx, url, userAgent, contentDisposition, mimeType)
+                        }
                         webViewHolder[0] = this
                         loadUrl(baseUrl)
                     }
                 }
             )
         }
+    }
+}
+
+/**
+ * Hands a WebView download off to the system DownloadManager so it lands
+ * in the device's normal Downloads folder with a notification, progress
+ * bar, and retry-on-failure — same as any browser download. Cookies are
+ * copied over explicitly because DownloadManager makes its own network
+ * request outside the WebView, so it doesn't automatically inherit the
+ * WebView's session.
+ */
+private fun downloadFile(
+    context: Context,
+    url: String,
+    userAgent: String?,
+    contentDisposition: String?,
+    mimeType: String?
+) {
+    try {
+        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val cookie = CookieManager.getInstance().getCookie(url)
+        val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() }
+            ?: MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(MimeTypeMap.getFileExtensionFromUrl(url))
+            ?: "application/octet-stream"
+
+        val request = DownloadManager.Request(Uri.parse(url)).apply {
+            if (!cookie.isNullOrBlank()) addRequestHeader("cookie", cookie)
+            if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+            setMimeType(resolvedMimeType)
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            setAllowedOverMeteredNetwork(true)
+            setAllowedOverRoaming(true)
+        }
+
+        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        downloadManager.enqueue(request)
+        Toast.makeText(context, "Downloading $fileName…", Toast.LENGTH_SHORT).show()
+    } catch (e: Exception) {
+        Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
     }
 }
