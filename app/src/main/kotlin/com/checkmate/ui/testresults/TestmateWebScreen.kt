@@ -150,7 +150,6 @@ private fun downloadFile(
             setMimeType(resolvedMimeType)
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-            setAllowedOverMeteredNetwork(true)
             setAllowedOverRoaming(true)
         }
 
