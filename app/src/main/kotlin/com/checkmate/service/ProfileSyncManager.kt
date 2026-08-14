@@ -2,6 +2,7 @@ package com.checkmate.service
 
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -11,10 +12,11 @@ import java.util.concurrent.TimeUnit
 
 /**
  * ProfileSyncManager — backs up/restores the one-time SETUP PROFILE (exam type,
- * exam date, study window, guardian number, TTS toggle, subjects config) PLUS
- * the blocked apps/websites lists, to the same Cloudflare Worker + KV that
- * TaskSyncManager already uses, keyed by the SAME "sync_code" the user sets
- * in Settings → Task Sync.
+ * exam date, study window, TTS toggle, subjects config) PLUS the blocked
+ * apps/websites lists, to the same Cloudflare Worker + KV that TaskSyncManager
+ * already uses, keyed by the SAME "sync_code" the user sets in Settings →
+ * Task Sync. The guardian WhatsApp number is deliberately EXCLUDED — it
+ * stays local to each device and is never pushed or restored.
  *
  * This is deliberately NOT full multi-device account sync (see TaskSyncManager
  * for that, which mirrors today's task list live). This is a much smaller
@@ -61,11 +63,17 @@ object ProfileSyncManager {
                 put("exam_date",       CheckmatePrefs.getString("exam_date", "") ?: "")
                 put("study_start",     CheckmatePrefs.getString("study_start", "06:00") ?: "06:00")
                 put("study_end",       CheckmatePrefs.getString("study_end", "22:00") ?: "22:00")
-                put("guardian_number", CheckmatePrefs.getString("guardian_number", "") ?: "")
+                // guardian_number intentionally excluded — WhatsApp number stays local per device
                 put("tts_enabled",     CheckmatePrefs.getBoolean("tts_enabled", true))
                 put("subjects_config", CheckmatePrefs.getString("subjects_config", "") ?: "")
                 put("blocked_apps",    CheckmatePrefs.getString("blocked_apps", "") ?: "")
                 put("blocked_domains", CheckmatePrefs.getString("blocked_domains", "") ?: "")
+                // Whole Student Profile screen (ConsultationProfile) — candidate name,
+                // exam target/date, class, coaching, target/mock score, weak
+                // subjects/topics, stress/sleep/study hours, blocked time slots.
+                // Stored as ConsultationProfile's own serialized JSON, synced as one
+                // blob rather than decomposed field-by-field.
+                put("consultation_profile_json", CheckmatePrefs.getString("consultation_profile", "") ?: "")
             }
             val payload = JSONObject().apply {
                 put("code", code)
@@ -108,15 +116,50 @@ object ProfileSyncManager {
             CheckmatePrefs.putString("exam_date",       remoteExamDate)
             CheckmatePrefs.putString("study_start",     profile.optString("study_start", "06:00"))
             CheckmatePrefs.putString("study_end",       profile.optString("study_end", "22:00"))
-            CheckmatePrefs.putString("guardian_number", profile.optString("guardian_number", ""))
+            // guardian_number intentionally excluded — WhatsApp number stays local per device
             CheckmatePrefs.putBoolean("tts_enabled",    profile.optBoolean("tts_enabled", true))
             CheckmatePrefs.putString("subjects_config", profile.optString("subjects_config", ""))
             CheckmatePrefs.putString("blocked_apps",    profile.optString("blocked_apps", ""))
             CheckmatePrefs.putString("blocked_domains", profile.optString("blocked_domains", ""))
+            profile.optString("consultation_profile_json", "").takeIf { it.isNotBlank() }?.let {
+                CheckmatePrefs.putString("consultation_profile", it)
+            }
             Log.d(TAG, "pullProfileIfLocalEmpty: restored profile from sync code")
             true
         } catch (e: Exception) {
             Log.w(TAG, "pullProfileIfLocalEmpty exception: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Restores the Student Profile screen (ConsultationProfile) ONLY if this
+     * device has no local profile yet (ConsultationProfile.hasProfile() ==
+     * false) — never overwrites a profile actually filled in on this device.
+     * Returns true if a restore happened. Must be called from a background
+     * thread.
+     */
+    fun pullConsultationProfileIfEmpty(): Boolean {
+        val code = syncCode() ?: return false
+        if (ConsultationProfile.hasProfile()) return false // real local profile already exists
+
+        return try {
+            val request = Request.Builder().url("$PROFILE_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return false
+
+            val obj = JSONObject(bodyStr)
+            val remoteProfile = obj.optJSONObject("profile") ?: return false
+            val raw = remoteProfile.optString("consultation_profile_json", "")
+            if (raw.isBlank()) return false // nothing meaningful pushed yet
+
+            CheckmatePrefs.putString("consultation_profile", raw)
+            Log.d(TAG, "pullConsultationProfileIfEmpty: restored Student Profile from sync code")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "pullConsultationProfileIfEmpty exception: ${e.message}")
             false
         }
     }
