@@ -1,452 +1,224 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/AppSelectorScreen.kt =====
-package com.checkmate.ui.settings
+//===== FILE: app/src/main/kotlin/com/checkmate/service/ProfileSyncManager.kt =====
+package com.checkmate.service
 
-import android.content.Intent
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import android.util.Log
 import com.checkmate.core.CheckmatePrefs
-import com.checkmate.ui.settings.WorkModeLockGate
-import com.checkmate.ui.theme.*
+import com.checkmate.core.ConsultationProfile
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
-data class AppInfo(
-    val name:        String,
-    val packageName: String,
-    val isSystem:    Boolean
-)
+/**
+ * ProfileSyncManager — backs up/restores the one-time SETUP PROFILE (exam type,
+ * exam date, study window, TTS toggle, subjects config) PLUS the blocked
+ * apps/websites lists, to the same Cloudflare Worker + KV that TaskSyncManager
+ * already uses, keyed by the SAME "sync_code" the user sets in Settings →
+ * Task Sync. The guardian WhatsApp number is deliberately EXCLUDED — it
+ * stays local to each device and is never pushed or restored.
+ *
+ * This is deliberately NOT full multi-device account sync (see TaskSyncManager
+ * for that, which mirrors today's task list live). This is a much smaller
+ * "don't make me retype setup on a fresh install / new device" backup:
+ *   - Every profile edit pushes the current profile up (fire-and-forget,
+ *     last-write-wins, same as TaskSyncManager).
+ *   - On a FRESH install (local exam_date still blank — i.e. setup never
+ *     completed on this device) with a sync_code already configured, the next
+ *     profile screen open pulls and restores it automatically.
+ *   - Saving a sync_code in Settings also triggers an immediate pull attempt,
+ *     so pairing a second/reinstalled device to an existing code restores
+ *     setup right away instead of waiting for the next screen open.
+ *
+ * All calls are synchronous (OkHttp .execute()) — callers MUST run this off
+ * the main thread (Thread{}.start(), matching how TaskSyncManager is called
+ * elsewhere in this codebase).
+ */
+object ProfileSyncManager {
 
-@Composable
-fun AppSelectorScreen(onBack: () -> Unit) {
-    val context      = LocalContext.current
-    val pm           = context.packageManager
-    val savedBlocked = remember {
-        (CheckmatePrefs.getString("blocked_apps", "") ?: "")
-            .split(",").filter { it.isNotBlank() }.toMutableSet()
+    private const val TAG = "ProfileSyncManager"
+    private const val PROFILE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/profile"
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    private fun syncCode(): String? =
+        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
+
+    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
+    fun isEnabled(): Boolean = syncCode() != null
+
+    /**
+     * Pushes the current setup profile up under the configured sync code.
+     * No-op if no sync code is set. Must be called from a background thread.
+     */
+    fun pushProfile() {
+        val code = syncCode() ?: return
+        try {
+            val profile = JSONObject().apply {
+                put("exam_type",       CheckmatePrefs.getString("exam_type", "NEET") ?: "NEET")
+                put("exam_date",       CheckmatePrefs.getString("exam_date", "") ?: "")
+                put("study_start",     CheckmatePrefs.getString("study_start", "06:00") ?: "06:00")
+                put("study_end",       CheckmatePrefs.getString("study_end", "22:00") ?: "22:00")
+                // guardian_number intentionally excluded — WhatsApp number stays local per device
+                put("tts_enabled",     CheckmatePrefs.getBoolean("tts_enabled", true))
+                put("subjects_config", CheckmatePrefs.getString("subjects_config", "") ?: "")
+                put("blocked_apps",    CheckmatePrefs.getString("blocked_apps", "") ?: "")
+                put("blocked_domains", CheckmatePrefs.getString("blocked_domains", "") ?: "")
+                // Whole Student Profile screen (ConsultationProfile) — candidate name,
+                // exam target/date, class, coaching, target/mock score, weak
+                // subjects/topics, stress/sleep/study hours, blocked time slots.
+                // Stored as ConsultationProfile's own serialized JSON, synced as one
+                // blob rather than decomposed field-by-field.
+                put("consultation_profile_json", CheckmatePrefs.getString("consultation_profile", "") ?: "")
+            }
+            val payload = JSONObject().apply {
+                put("code", code)
+                put("updatedAt", System.currentTimeMillis())
+                put("profile", profile)
+            }
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(Request.Builder().url(PROFILE_URL).post(body).build()).execute()
+            Log.d(TAG, "pushProfile: ${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "pushProfile exception: ${e.message}")
+        }
     }
-    var blockedApps  by remember { mutableStateOf(savedBlocked.toSet()) }
-    var search       by remember { mutableStateOf("") }
-    var showSystem   by remember { mutableStateOf(false) }
 
-    // Load all apps that have a launcher entry — this includes Google/system apps
-    // (YouTube, Chrome, Gmail, etc.) while excluding headless system internals
-    // (com.android.phone, com.android.providers.* etc.) that have no UI to launch.
-    val allApps = remember {
-        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        pm.queryIntentActivities(launcherIntent, 0)
-            .map { it.activityInfo.applicationInfo }
-            .distinctBy { it.packageName }
-            .filter { it.packageName != context.packageName }
-            .map { info ->
-                AppInfo(
-                    name        = pm.getApplicationLabel(info).toString(),
-                    packageName = info.packageName,
-                    isSystem    = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                )
+    /**
+     * Restores the synced profile into CheckmatePrefs, but ONLY if this device's
+     * local setup looks unconfigured (exam_date blank) — never overwrites a setup
+     * the user has actually filled in on this device. Returns true if a restore
+     * happened. Must be called from a background thread.
+     */
+    fun pullProfileIfLocalEmpty(): Boolean {
+        val code = syncCode() ?: return false
+        val localExamDate = CheckmatePrefs.getString("exam_date", "") ?: ""
+        if (localExamDate.isNotBlank()) return false // real local setup already exists — don't clobber it
+
+        return try {
+            val request = Request.Builder().url("$PROFILE_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return false
+
+            val obj = JSONObject(bodyStr)
+            val profile = obj.optJSONObject("profile") ?: return false
+            val remoteExamDate = profile.optString("exam_date", "")
+            if (remoteExamDate.isBlank()) return false // nothing meaningful pushed yet
+
+            CheckmatePrefs.putString("exam_type",       profile.optString("exam_type", "NEET"))
+            CheckmatePrefs.putString("exam_date",       remoteExamDate)
+            CheckmatePrefs.putString("study_start",     profile.optString("study_start", "06:00"))
+            CheckmatePrefs.putString("study_end",       profile.optString("study_end", "22:00"))
+            // guardian_number intentionally excluded — WhatsApp number stays local per device
+            CheckmatePrefs.putBoolean("tts_enabled",    profile.optBoolean("tts_enabled", true))
+            CheckmatePrefs.putString("subjects_config", profile.optString("subjects_config", ""))
+            CheckmatePrefs.putString("blocked_apps",    profile.optString("blocked_apps", ""))
+            CheckmatePrefs.putString("blocked_domains", profile.optString("blocked_domains", ""))
+            profile.optString("consultation_profile_json", "").takeIf { it.isNotBlank() }?.let {
+                CheckmatePrefs.putString("consultation_profile", it)
             }
-            .sortedWith(compareBy({ it.isSystem }, { it.name }))
+            Log.d(TAG, "pullProfileIfLocalEmpty: restored profile from sync code")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "pullProfileIfLocalEmpty exception: ${e.message}")
+            false
+        }
     }
 
-    val userApps   = remember(allApps) { allApps.filter { !it.isSystem } }
-    val systemApps = remember(allApps) { allApps.filter {  it.isSystem } }
+    /**
+     * Restores the Student Profile screen (ConsultationProfile) ONLY if this
+     * device has no local profile yet (ConsultationProfile.hasProfile() ==
+     * false) — never overwrites a profile actually filled in on this device.
+     * Returns true if a restore happened. Must be called from a background
+     * thread.
+     */
+    fun pullConsultationProfileIfEmpty(): Boolean {
+        val code = syncCode() ?: return false
+        if (ConsultationProfile.hasProfile()) return false // real local profile already exists
 
-    val displayList = remember(showSystem, search, allApps) {
-        val base = if (showSystem) allApps else userApps
-        if (search.isBlank()) base
-        else base.filter { it.name.contains(search, ignoreCase = true) ||
-                           it.packageName.contains(search, ignoreCase = true) }
-    }
+        return try {
+            val request = Request.Builder().url("$PROFILE_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return false
 
-    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
+            val obj = JSONObject(bodyStr)
+            val remoteProfile = obj.optJSONObject("profile") ?: return false
+            val raw = remoteProfile.optString("consultation_profile_json", "")
+            if (raw.isBlank()) return false // nothing meaningful pushed yet
 
-        // ── Top bar ──────────────────────────────────────────────────────────
-        Row(
-            modifier          = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = {
-                CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
-                onBack()
-            }) {
-                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
-            }
-            Text("Blocked Apps", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
+            CheckmatePrefs.putString("consultation_profile", raw)
+            Log.d(TAG, "pullConsultationProfileIfEmpty: restored Student Profile from sync code")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "pullConsultationProfileIfEmpty exception: ${e.message}")
+            false
         }
-
-        // Editing is locked out while Work Mode is enforcing (active session
-        // or the hardcoded daily window) unless a guardian PIN unlock is
-        // active — this is the fix for "remove the app from the block list,
-        // then open it" mid-session. See WorkModeLockGate in SettingsScreen.kt.
-        WorkModeLockGate {
-
-        // ── Search ───────────────────────────────────────────────────────────
-        OutlinedTextField(
-            value         = search,
-            onValueChange = { search = it },
-            label         = { Text("Search apps", color = White30) },
-            modifier      = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-            singleLine    = true,
-            leadingIcon   = { Icon(Icons.Default.Search, null, tint = White60) },
-            colors        = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
-            )
-        )
-
-        Spacer(Modifier.height(8.dp))
-
-        // ── Stats + system toggle ────────────────────────────────────────────
-        Row(
-            modifier          = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                "${blockedApps.size} app(s) blocked · ${systemApps.size} system/Google apps available",
-                fontSize = 11.sp,
-                color    = White60
-            )
-        }
-
-        Spacer(Modifier.height(4.dp))
-
-        // ── Show system apps toggle ──────────────────────────────────────────
-        Row(
-            modifier          = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .clickable { showSystem = !showSystem }
-                .padding(vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column {
-                Text(
-                    "Include Google & System Apps",
-                    fontSize   = 13.sp,
-                    color      = White90,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    "YouTube, Chrome, Instagram (pre-installed), etc.",
-                    fontSize = 11.sp,
-                    color    = White60
-                )
-            }
-            Switch(
-                checked         = showSystem,
-                onCheckedChange = { showSystem = it },
-                colors          = SwitchDefaults.colors(
-                    checkedThumbColor       = AccentGreen,
-                    checkedTrackColor       = AccentGreen.copy(alpha = 0.3f),
-                    uncheckedThumbColor     = White60,
-                    uncheckedTrackColor     = White10
-                )
-            )
-        }
-
-        HorizontalDivider(color = White10, modifier = Modifier.padding(horizontal = 16.dp))
-        Spacer(Modifier.height(8.dp))
-
-        // ── App list ─────────────────────────────────────────────────────────
-        LazyColumn(
-            modifier            = Modifier.fillMaxSize(),
-            contentPadding      = PaddingValues(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            items(displayList, key = { it.packageName }) { app ->
-                val isBlocked = app.packageName in blockedApps
-                Surface(
-                    shape  = RoundedCornerShape(10.dp),
-                    color  = when {
-                        isBlocked  -> AccentRed.copy(alpha = 0.08f)
-                        app.isSystem -> BgCardAlt
-                        else       -> BgCard
-                    },
-                    border = BorderStroke(1.dp, when {
-                        isBlocked  -> AccentRed.copy(alpha = 0.4f)
-                        app.isSystem -> AccentBlue.copy(alpha = 0.2f)
-                        else       -> White10
-                    }),
-                    onClick = {
-                        blockedApps = if (isBlocked)
-                            blockedApps - app.packageName
-                        else
-                            blockedApps + app.packageName
-                        // Persist immediately so the accessibility service sees the update
-                        CheckmatePrefs.putString("blocked_apps", blockedApps.joinToString(","))
-                    }
-                ) {
-                    Row(
-                        modifier          = Modifier.fillMaxWidth().padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(app.name, fontSize = 14.sp, color = White90)
-                                if (app.isSystem) {
-                                    Spacer(Modifier.width(6.dp))
-                                    Surface(
-                                        shape = RoundedCornerShape(4.dp),
-                                        color = AccentBlue.copy(alpha = 0.15f)
-                                    ) {
-                                        Text(
-                                            "SYSTEM",
-                                            fontSize = 9.sp,
-                                            color    = AccentBlue,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                        )
-                                    }
-                                }
-                            }
-                            Text(app.packageName, fontSize = 10.sp, color = White30)
-                        }
-                        if (isBlocked) {
-                            Icon(Icons.Default.Block, null, tint = AccentRed, modifier = Modifier.size(20.dp))
-                        }
-                    }
-                }
-            }
-            item { Spacer(Modifier.height(24.dp)) }
-        }
-        } // WorkModeLockGate
     }
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/consultation/ConsultationViewModel.kt =====
+package com.checkmate.ui.consultation
 
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.TimeSlot
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.service.ProfileSyncManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/WebsiteBlockerScreen.kt =====
-package com.checkmate.ui.settings
+class ConsultationViewModel : ViewModel() {
 
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.ui.settings.WorkModeLockGate
-import com.checkmate.ui.theme.*
+    private val _profile = MutableStateFlow(ConsultationProfile.load())
+    val profile: StateFlow<ConsultationProfile> = _profile.asStateFlow()
 
-// Common distracting sites shown as quick-add chips
-private val PRESETS = listOf(
-    "youtube.com", "instagram.com", "twitter.com", "x.com",
-    "facebook.com", "reddit.com", "tiktok.com", "snapchat.com",
-    "netflix.com", "twitch.tv", "discord.com", "pinterest.com"
-)
+    private val _saved = MutableStateFlow(false)
+    val saved: StateFlow<Boolean> = _saved.asStateFlow()
 
-@Composable
-fun WebsiteBlockerScreen(onBack: () -> Unit) {
-
-    var domains by remember {
-        val saved = (CheckmatePrefs.getString("blocked_domains", "") ?: "")
-            .split(",").filter { it.isNotBlank() }.toSet()
-        mutableStateOf(saved)
-    }
-    var inputText by remember { mutableStateOf("") }
-    var inputError by remember { mutableStateOf("") }
-    val keyboard = LocalSoftwareKeyboardController.current
-
-    fun persist() = CheckmatePrefs.putString("blocked_domains", domains.joinToString(","))
-
-    fun addDomain(raw: String) {
-        val clean = raw.trim().lowercase()
-            .removePrefix("https://").removePrefix("http://")
-            .removePrefix("www.").trimEnd('/')
-        if (clean.isBlank()) { inputError = "Enter a domain"; return }
-        if (!clean.contains('.')) { inputError = "Enter a valid domain (e.g. youtube.com)"; return }
-        domains = domains + clean
-        persist()
-        inputText = ""
-        inputError = ""
-        keyboard?.hide()
-    }
-
-    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
-
-        // ── Top bar ──────────────────────────────────────────────────────────
-        Row(
-            modifier          = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = { persist(); onBack() }) {
-                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
-            }
-            Column {
-                Text("Blocked Websites", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = White90)
-                Text("Blocks domains in Chrome, Firefox, Edge + all major browsers",
-                    fontSize = 11.sp, color = White60)
-            }
-        }
-
-        // Editing is locked out while Work Mode is enforcing (active session
-        // or the hardcoded daily window) unless a guardian PIN unlock is
-        // active. See WorkModeLockGate in SettingsScreen.kt.
-        WorkModeLockGate {
-
-        // ── Add domain input ──────────────────────────────────────────────────
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            OutlinedTextField(
-                value         = inputText,
-                onValueChange = { inputText = it; inputError = "" },
-                label         = { Text("youtube.com", color = White30) },
-                placeholder   = { Text("Type a domain to block", color = White30) },
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                isError       = inputError.isNotBlank(),
-                supportingText = if (inputError.isNotBlank()) {{ Text(inputError, color = AccentRed) }} else null,
-                leadingIcon   = { Icon(Icons.Default.Language, null, tint = White60) },
-                trailingIcon  = {
-                    IconButton(onClick = { addDomain(inputText) }) {
-                        Icon(Icons.Default.Add, null, tint = AccentGreen)
-                    }
-                },
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Uri,
-                    imeAction    = ImeAction.Done
-                ),
-                keyboardActions = KeyboardActions(onDone = { addDomain(inputText) }),
-                colors        = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        // ── Quick-add preset chips ────────────────────────────────────────────
-        Text(
-            "  Quick add",
-            fontSize   = 11.sp,
-            color      = White60,
-            fontWeight = FontWeight.Bold,
-            modifier   = Modifier.padding(horizontal = 16.dp)
-        )
-        Spacer(Modifier.height(6.dp))
-        androidx.compose.foundation.lazy.LazyRow(
-            contentPadding      = PaddingValues(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            items(PRESETS) { preset ->
-                val alreadyAdded = preset in domains
-                FilterChip(
-                    selected = alreadyAdded,
-                    onClick  = {
-                        if (alreadyAdded) {
-                            domains = domains - preset; persist()
-                        } else {
-                            domains = domains + preset; persist()
-                        }
-                    },
-                    label    = { Text(preset, fontSize = 12.sp) },
-                    colors   = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor    = AccentRed.copy(alpha = 0.15f),
-                        selectedLabelColor        = AccentRed,
-                        containerColor            = BgCard,
-                        labelColor                = White60
-                    ),
-                    leadingIcon = if (alreadyAdded) {{
-                        Icon(Icons.Default.Block, null,
-                            tint = AccentRed, modifier = Modifier.size(14.dp))
-                    }} else null
-                )
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider(color = White10, modifier = Modifier.padding(horizontal = 16.dp))
-        Spacer(Modifier.height(8.dp))
-
-        // ── Active blocked list ───────────────────────────────────────────────
-        Text(
-            "  ${domains.size} domain(s) blocked",
-            fontSize = 11.sp,
-            color    = White60,
-            modifier = Modifier.padding(horizontal = 16.dp)
-        )
-        Spacer(Modifier.height(6.dp))
-
-        LazyColumn(
-            modifier            = Modifier.fillMaxSize(),
-            contentPadding      = PaddingValues(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            if (domains.isEmpty()) {
-                item {
-                    Box(
-                        modifier         = Modifier.fillMaxWidth().padding(vertical = 32.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text("No domains blocked yet", fontSize = 14.sp, color = White30)
-                    }
+    init {
+        // Fresh install / new device with an existing sync_code and no local
+        // Student Profile yet: restore it in the background instead of
+        // showing a blank form, then reload state once the restore lands.
+        // No-op (never clobbers) if a real local profile already exists —
+        // see ProfileSyncManager.pullConsultationProfileIfEmpty().
+        if (ProfileSyncManager.isEnabled() && !ConsultationProfile.hasProfile()) {
+            Thread {
+                if (ProfileSyncManager.pullConsultationProfileIfEmpty()) {
+                    _profile.value = ConsultationProfile.load()
                 }
-            } else {
-                items(domains.sorted(), key = { it }) { domain ->
-                    Surface(
-                        shape  = RoundedCornerShape(10.dp),
-                        color  = AccentRed.copy(alpha = 0.06f),
-                        border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.3f))
-                    ) {
-                        Row(
-                            modifier          = Modifier.fillMaxWidth().padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.Language, null,
-                                tint     = AccentRed.copy(alpha = 0.7f),
-                                modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(10.dp))
-                            Text(domain, fontSize = 14.sp, color = White90, modifier = Modifier.weight(1f))
-                            IconButton(
-                                onClick  = { domains = domains - domain; persist() },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(Icons.Default.Close, null,
-                                    tint = White30, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    }
-                }
-            }
-            item { Spacer(Modifier.height(24.dp)) }
+            }.start()
         }
-        } // WorkModeLockGate
     }
+
+    fun update(block: (ConsultationProfile) -> ConsultationProfile) {
+        _profile.update(block)
+    }
+
+    fun save(context: Context) {
+        ConsultationProfile.save(_profile.value)
+        _saved.value = true
+        CheckmateTTS.speak(context, "Profile saved. Generating your first smart plan.")
+        if (ProfileSyncManager.isEnabled()) {
+            Thread { ProfileSyncManager.pushProfile() }.start()
+        }
+    }
+
+    fun addBlockedSlot(slot: TimeSlot) = _profile.update { it.copy(blockedSlots = it.blockedSlots + slot) }
+    fun removeBlockedSlot(index: Int)  = _profile.update { it.copy(blockedSlots = it.blockedSlots.toMutableList().also { l -> l.removeAt(index) }) }
 }
 
 
