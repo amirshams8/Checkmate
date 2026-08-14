@@ -94,6 +94,16 @@ object ProfileSyncManager {
      * local setup looks unconfigured (exam_date blank) — never overwrites a setup
      * the user has actually filled in on this device. Returns true if a restore
      * happened. Must be called from a background thread.
+     *
+     * FIX: blocked_apps / blocked_domains are now only written when the remote
+     * value is actually non-blank. Previously these were written unconditionally
+     * with profile.optString(key, ""), which meant that any account whose synced
+     * profile predates this field being added (or which simply never set a
+     * block list on another device) would silently wipe out this device's local
+     * block list on restore — killing the distraction guard, since
+     * WorkModeManager.getBlockedApps()/getBlockedDomains() read straight from
+     * these same prefs keys. Same guard pattern already used for
+     * consultation_profile_json below is now applied here too.
      */
     fun pullProfileIfLocalEmpty(): Boolean {
         val code = syncCode() ?: return false
@@ -119,8 +129,14 @@ object ProfileSyncManager {
             // guardian_number intentionally excluded — WhatsApp number stays local per device
             CheckmatePrefs.putBoolean("tts_enabled",    profile.optBoolean("tts_enabled", true))
             CheckmatePrefs.putString("subjects_config", profile.optString("subjects_config", ""))
-            CheckmatePrefs.putString("blocked_apps",    profile.optString("blocked_apps", ""))
-            CheckmatePrefs.putString("blocked_domains", profile.optString("blocked_domains", ""))
+            // Guarded: never stomp a local block list with blank just because the
+            // synced copy doesn't have one yet (see fix note in kdoc above).
+            profile.optString("blocked_apps", "").takeIf { it.isNotBlank() }?.let {
+                CheckmatePrefs.putString("blocked_apps", it)
+            }
+            profile.optString("blocked_domains", "").takeIf { it.isNotBlank() }?.let {
+                CheckmatePrefs.putString("blocked_domains", it)
+            }
             profile.optString("consultation_profile_json", "").takeIf { it.isNotBlank() }?.let {
                 CheckmatePrefs.putString("consultation_profile", it)
             }
