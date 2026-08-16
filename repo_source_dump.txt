@@ -154,7 +154,10 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── PlanStore.kt
 │   │   │   │   │   │   │   │   ├── PlannerState.kt
 │   │   │   │   │   │   │   │   ├── intervention
+│   │   │   │   │   │   │   │   │   ├── InterventionDatabase.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionIntent.kt
+│   │   │   │   │   │   │   │   │   ├── InterventionState.kt
+│   │   │   │   │   │   │   │   │   ├── InterventionTransaction.kt
 │   │   │   │   │   │   │   │   │   ├── PolicyValidator.kt
 │   │   │   │   │   │   │   │   ├── model
 │   │   │   │   │   │   │   │   │   ├── StudyTask.kt
@@ -12361,6 +12364,11 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
+    // Added: Room's annotation processor was wired via `annotationProcessor` below, which
+    // only runs on Java sources — it was never actually processing @Entity/@Dao on Kotlin
+    // classes (harmless before, since no Room entities existed yet; not harmless now that
+    // InterventionTransaction/InterventionTransactionDao exist).
+    id("org.jetbrains.kotlin.kapt")
 }
 android {
     namespace  = "com.checkmate.planner"
@@ -12379,7 +12387,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
-    annotationProcessor("androidx.room:room-compiler:2.6.1")
+    // Changed from annotationProcessor(...) — see kapt plugin note above.
+    kapt("androidx.room:room-compiler:2.6.1")
     // Added for PolicyValidator's policy test matrix (Proactive Execution Engine step 1/2).
     // No testImplementation("junit:...") existed anywhere in the project despite
     // ExampleUnitTest.kt importing org.junit — added explicitly rather than assuming a
@@ -13164,6 +13173,43 @@ data class PlannerState(
 )
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+/**
+ * Proactive Execution Engine — Step 3 (Blueprint Part One, §4).
+ *
+ * Standalone singleton, same shape as a typical Room setup — deliberately not wired into
+ * CheckmateApp.onCreate() yet. Nothing calls InterventionDatabase.getInstance() until the
+ * Task Escrow (step 4) and ActionExecutor (step 5) exist to actually create/update rows,
+ * so wiring it into app startup now would be speculative.
+ */
+@Database(entities = [InterventionTransaction::class], version = 1, exportSchema = false)
+abstract class InterventionDatabase : RoomDatabase() {
+
+    abstract fun interventionTransactionDao(): InterventionTransactionDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: InterventionDatabase? = null
+
+        fun getInstance(context: Context): InterventionDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    InterventionDatabase::class.java,
+                    "checkmate_intervention.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionIntent.kt =====
 package com.checkmate.planner.intervention
 
@@ -13253,6 +13299,167 @@ enum class RejectionReason {
 sealed class PolicyResult {
     data class Permitted(val action: PermittedAction) : PolicyResult()
     data class Rejected(val reason: RejectionReason, val detail: String) : PolicyResult()
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionState.kt =====
+package com.checkmate.planner.intervention
+
+/**
+ * Proactive Execution Engine — Step 3 (Blueprint Part One, §3-4).
+ *
+ * The Intervention FSM's states. The "happy path" chain is IDLE -> ... -> COMPLETED;
+ * the remaining constants are the failure/exit paths (§3) — an intervention can land on
+ * any of these directly from an earlier state rather than always passing through
+ * COMPLETED. [TERMINAL_STATES] is what "resolved" means for the core invariant: no
+ * intervention may remain indefinitely in an intermediate state.
+ */
+enum class InterventionState {
+    IDLE,
+    TRIGGERED,
+    PROMPTED,
+    WAITING_FOR_RESPONSE,
+    NEGOTIATING,
+    INTENT_RECEIVED,
+    POLICY_VALIDATED,
+    ACTION_EXECUTED,
+    OUTCOME_RECORDED,
+    COMPLETED,
+
+    // ── Failure / exit paths (Blueprint §3) ──
+    USER_IGNORED,
+    USER_ABORTED,
+    TTL_EXPIRED,
+    NETWORK_FALLBACK,
+    LLM_INVALID,
+    POLICY_REJECTED,
+    EXECUTION_FAILED;
+
+    companion object {
+        /** A transaction sitting in any of these has resolved — reconciliation (§4) only
+         *  needs to act on transactions NOT in this set. */
+        val TERMINAL_STATES: Set<InterventionState> = setOf(
+            COMPLETED, USER_IGNORED, USER_ABORTED, TTL_EXPIRED,
+            NETWORK_FALLBACK, LLM_INVALID, POLICY_REJECTED, EXECUTION_FAILED
+        )
+    }
+
+    val isTerminal: Boolean get() = this in TERMINAL_STATES
+}
+
+/**
+ * Proactive Trigger Engine's signal types (Blueprint §2). Persisted on the transaction
+ * so the Outcome Ledger (a later step) can later ask "which trigger types actually lead
+ * to completed interventions." The Trigger Engine itself (§2, build step 7) isn't built
+ * yet — this enum exists now only so InterventionTransaction has a real, closed type for
+ * triggerType rather than a free-text column.
+ */
+enum class InterventionTriggerType {
+    SCHEDULED_START_APPROACHING,
+    TASK_NOT_STARTED,
+    LATE_START,
+    REPEATED_SKIPS,
+    DISTRACTION_DETECTED,
+    LONG_INACTIVITY,
+    AVAILABLE_TIME_CHANGED,
+    SESSION_ENDED,
+    UPCOMING_TEST,
+    BACKLOG_RISK,
+    REPEATED_INTERVENTION_FAILURE
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTransaction.kt =====
+package com.checkmate.planner.intervention
+
+import androidx.room.ColumnInfo
+import androidx.room.Dao
+import androidx.room.Entity
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.TypeConverter
+import androidx.room.TypeConverters
+import androidx.room.Update
+import java.util.UUID
+
+/**
+ * Proactive Execution Engine — Step 3 (Blueprint Part One, §4).
+ *
+ * "We rejected using SharedPreferences as the primary source of truth for the FSM."
+ * This is that dedicated Room entity. If the process dies mid-negotiation, this row is
+ * what survives — a Worker/receiver restart (a later build step) reads back any
+ * non-terminal transaction and reconciles it, instead of the negotiation silently
+ * vanishing.
+ *
+ * [llmIntentJson] and [approvedActionJson] are kept as plain nullable text — an audit
+ * trail of what the LLM proposed and what PolicyValidator actually permitted, not a
+ * round-trippable object. LlmIntent/PermittedAction aren't wired for polymorphic
+ * kotlinx.serialization yet (PermittedAction is a sealed class with per-case fields),
+ * and reconciliation as described in §4 only needs currentState/expiresAt/taskId to
+ * resume the FSM — it doesn't need to replay the exact killed LLM response. Wiring these
+ * two columns for full deserialization can happen if/when something actually needs to
+ * read them back as typed objects.
+ */
+@Entity(tableName = "intervention_transactions")
+@TypeConverters(InterventionConverters::class)
+data class InterventionTransaction(
+    @PrimaryKey
+    val transactionId: String = UUID.randomUUID().toString(),
+    val taskId: String,
+    val currentState: InterventionState,
+    val triggerType: InterventionTriggerType,
+    val createdAt: Long,
+    val expiresAt: Long,
+    @ColumnInfo(defaultValue = "0")
+    val attemptCount: Int = 0,
+    val llmIntentJson: String? = null,
+    val approvedActionJson: String? = null,
+    val studentResponse: String? = null,
+    val outcome: String? = null,
+    val failureReason: String? = null
+)
+
+object InterventionConverters {
+    @TypeConverter
+    fun fromState(state: InterventionState): String = state.name
+
+    @TypeConverter
+    fun toState(value: String): InterventionState = InterventionState.valueOf(value)
+
+    @TypeConverter
+    fun fromTriggerType(type: InterventionTriggerType): String = type.name
+
+    @TypeConverter
+    fun toTriggerType(value: String): InterventionTriggerType = InterventionTriggerType.valueOf(value)
+}
+
+@Dao
+interface InterventionTransactionDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(transaction: InterventionTransaction)
+
+    @Update
+    suspend fun update(transaction: InterventionTransaction)
+
+    @Query("SELECT * FROM intervention_transactions WHERE transactionId = :transactionId")
+    suspend fun getById(transactionId: String): InterventionTransaction?
+
+    /** Most recent transaction for a task, regardless of state — used to check whether a
+     *  task is currently under Task Escrow (a later build step). */
+    @Query("SELECT * FROM intervention_transactions WHERE taskId = :taskId ORDER BY createdAt DESC LIMIT 1")
+    suspend fun getLatestForTask(taskId: String): InterventionTransaction?
+
+    /** Reconciliation query (§4): every transaction not yet resolved. Pass
+     *  [InterventionState.TERMINAL_STATES] so this file doesn't need to duplicate that
+     *  set. Intended to run once from BootReceiver / a WorkManager reconciliation job. */
+    @Query("SELECT * FROM intervention_transactions WHERE currentState NOT IN (:terminalStates)")
+    suspend fun getUnfinished(terminalStates: List<InterventionState>): List<InterventionTransaction>
+
+    @Query("SELECT * FROM intervention_transactions ORDER BY createdAt DESC LIMIT :limit")
+    suspend fun getRecent(limit: Int): List<InterventionTransaction>
 }
 
 
