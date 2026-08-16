@@ -153,9 +153,19 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── FreeSlotCalculator.kt
 │   │   │   │   │   │   │   │   ├── PlanStore.kt
 │   │   │   │   │   │   │   │   ├── PlannerState.kt
+│   │   │   │   │   │   │   │   ├── intervention
+│   │   │   │   │   │   │   │   │   ├── InterventionIntent.kt
+│   │   │   │   │   │   │   │   │   ├── PolicyValidator.kt
 │   │   │   │   │   │   │   │   ├── model
 │   │   │   │   │   │   │   │   │   ├── StudyTask.kt
 │   │   │   │   │   │   │   │   │   ├── SubjectConfig.kt
+│   │   │   ├── test
+│   │   │   │   ├── kotlin
+│   │   │   │   │   ├── com
+│   │   │   │   │   │   ├── checkmate
+│   │   │   │   │   │   │   ├── planner
+│   │   │   │   │   │   │   │   ├── intervention
+│   │   │   │   │   │   │   │   │   ├── PolicyValidatorTest.kt
 │   ├── psyche
 │   │   ├── build.gradle.kts
 │   │   ├── src
@@ -12370,6 +12380,11 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     annotationProcessor("androidx.room:room-compiler:2.6.1")
+    // Added for PolicyValidator's policy test matrix (Proactive Execution Engine step 1/2).
+    // No testImplementation("junit:...") existed anywhere in the project despite
+    // ExampleUnitTest.kt importing org.junit — added explicitly rather than assuming a
+    // root-level convention plugin supplies it.
+    testImplementation("junit:junit:4.13.2")
 }
 
 
@@ -13149,6 +13164,243 @@ data class PlannerState(
 )
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionIntent.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Proactive Execution Engine — Step 1 (Blueprint Part One, §9-11).
+ *
+ * Structured LLM intents. The AI Mentor never mutates app state directly — it produces
+ * one of these, which [PolicyValidator] then validates into a [PermittedAction] (or
+ * rejects). This file intentionally keeps the intent schema narrow: there is no
+ * UNLOCK_DEVICE / DISABLE_GUARDIAN / REMOVE_WORKMODE case anywhere in
+ * [InterventionIntentType] — those aren't rejected by a rule, they're simply not
+ * representable. If raw LLM output claims one of those (or anything else outside this
+ * enum), [LlmIntent.parseIntentType] returns null and PolicyValidator treats it as
+ * unrecognized.
+ */
+enum class InterventionIntentType {
+    START_TASK,
+    REDUCE_DURATION,
+    RESCHEDULE_TASK,
+    KEEP_PLAN,
+    TAKE_SHORT_BREAK,
+    REQUEST_CLARIFICATION,
+    NO_ACTION,
+    REQUEST_GUARDIAN
+}
+
+/**
+ * Untrusted, LLM-produced. [parameters] holds the per-intent fields the LLM was asked to
+ * fill in — PolicyValidator looks up known keys per intent type and rejects anything it
+ * can't parse. Expected keys:
+ *   REDUCE_DURATION  -> "newDurationMinutes" (Int as String)
+ *   RESCHEDULE_TASK  -> "newScheduledStartTime" ("HH:mm", 24h)
+ *   TAKE_SHORT_BREAK -> "minutes" (Int as String)
+ *   all others       -> unused
+ */
+data class LlmIntent(
+    val speech: String,
+    val intentType: InterventionIntentType?,
+    val targetTaskId: String? = null,
+    val parameters: Map<String, String> = emptyMap()
+) {
+    companion object {
+        /** Maps a raw string from LLM JSON output onto the closed schema above, or null
+         *  if it doesn't match — including anything naming a protected action. */
+        fun parseIntentType(raw: String?): InterventionIntentType? =
+            raw?.let { r -> InterventionIntentType.entries.find { it.name == r.trim() } }
+    }
+}
+
+/** Snapshot of the state PolicyValidator needs. Assembled by the caller (Context
+ *  Builder, later) — PolicyValidator itself never touches Context/DB/network/clock APIs
+ *  beyond what's passed in here, so it stays a pure function for unit testing. */
+data class PolicyState(
+    val task: StudyTask?,
+    val nowMillis: Long = System.currentTimeMillis()
+)
+
+/** What the [PolicyValidator] permits the ActionExecutor to actually perform. Every case
+ *  here corresponds 1:1 to a deterministic, idempotent operation the Executor knows how
+ *  to run (Blueprint §13) — PermittedAction never carries anything the Executor can't
+ *  safely apply twice. */
+sealed class PermittedAction {
+    data class ReduceDuration(val taskId: String, val newDurationMinutes: Int) : PermittedAction()
+    data class RescheduleTask(val taskId: String, val newScheduledStartTime: String) : PermittedAction()
+    data class StartTask(val taskId: String) : PermittedAction()
+    data class ShortBreak(val minutes: Int) : PermittedAction()
+    object KeepPlan : PermittedAction()
+    object RequestClarification : PermittedAction()
+    object RequestGuardian : PermittedAction()
+    object NoAction : PermittedAction()
+}
+
+enum class RejectionReason {
+    UNRECOGNIZED_INTENT,
+    UNKNOWN_TASK_ID,
+    TASK_NOT_ACTIVE_STATE,
+    NEGATIVE_OR_ZERO_DURATION,
+    DURATION_TOO_SHORT,
+    DURATION_NOT_A_REDUCTION,
+    BREAK_TOO_LONG,
+    INVALID_RESCHEDULE_TIME,
+    MALFORMED_INTENT
+}
+
+sealed class PolicyResult {
+    data class Permitted(val action: PermittedAction) : PolicyResult()
+    data class Rejected(val reason: RejectionReason, val detail: String) : PolicyResult()
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PolicyValidator.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.TaskState
+import java.time.Instant
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeParseException
+
+/**
+ * Proactive Execution Engine — Step 1 (Blueprint Part One, §10-11).
+ *
+ * "AI recommends. Code decides." PolicyValidator is the only thing standing between an
+ * LLM-produced [LlmIntent] and an actually-permitted mutation. It receives no Android
+ * Context, no network access, no LLM, no UI, no SharedPreferences — everything it needs
+ * comes in through [PolicyState]. That's deliberate: it makes this module trivially and
+ * aggressively unit-testable (see PolicyValidatorTest's policy test matrix), and it means
+ * the boundary that actually protects the app can be reasoned about and tested in
+ * isolation from everything else in the pipeline.
+ *
+ * PolicyValidator never talks the LLM out of anything — it either maps an intent onto a
+ * [PermittedAction] the deterministic ActionExecutor (a later build step) knows how to
+ * run, or it rejects it with a reason. There is no path from here to a protected action
+ * (device unlock, disabling the guardian, removing WorkMode) because no such action is
+ * representable in [InterventionIntentType] to begin with.
+ */
+object PolicyValidator {
+
+    /** Below this, a "reduced session" isn't meaningfully different from abandoning the
+     *  task — matches the blueprint's "no negative/degenerate durations" invariant. */
+    const val MIN_DURATION_MINUTES = 5
+
+    /** Blueprint §11 example: "15-minute break -> permitted, 4-hour break -> rejected."
+     *  Picked to comfortably permit that example while still capping well short of
+     *  a session-length break. */
+    const val MAX_BREAK_MINUTES = 30
+
+    private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
+
+    fun validate(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val type = intent.intentType
+            ?: return reject(RejectionReason.UNRECOGNIZED_INTENT, "intentType did not match the closed schema")
+
+        return when (type) {
+            InterventionIntentType.START_TASK          -> validateStartTask(state)
+            InterventionIntentType.REDUCE_DURATION      -> validateReduceDuration(intent, state)
+            InterventionIntentType.RESCHEDULE_TASK       -> validateRescheduleTask(intent, state)
+            InterventionIntentType.TAKE_SHORT_BREAK      -> validateShortBreak(intent)
+            InterventionIntentType.KEEP_PLAN             -> PolicyResult.Permitted(PermittedAction.KeepPlan)
+            InterventionIntentType.REQUEST_CLARIFICATION -> PolicyResult.Permitted(PermittedAction.RequestClarification)
+            InterventionIntentType.NO_ACTION             -> PolicyResult.Permitted(PermittedAction.NoAction)
+            // Escalation to a human guardian is never blocked by policy — see Blueprint §12:
+            // genuine emergencies route through the guardian override protocol, not AI judgment.
+            InterventionIntentType.REQUEST_GUARDIAN      -> PolicyResult.Permitted(PermittedAction.RequestGuardian)
+        }
+    }
+
+    private fun validateStartTask(state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.PAUSED) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, expected PENDING or PAUSED"
+            )
+        }
+        return PolicyResult.Permitted(PermittedAction.StartTask(task.id))
+    }
+
+    private fun validateReduceDuration(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, cannot reduce a task that isn't pending/active"
+            )
+        }
+
+        val raw = intent.parameters["newDurationMinutes"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newDurationMinutes")
+        val newDuration = raw.toIntOrNull()
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "newDurationMinutes '$raw' is not an integer")
+
+        if (newDuration <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "newDurationMinutes=$newDuration")
+        }
+        if (newDuration < MIN_DURATION_MINUTES) {
+            return reject(
+                RejectionReason.DURATION_TOO_SHORT,
+                "newDurationMinutes=$newDuration below minimum $MIN_DURATION_MINUTES"
+            )
+        }
+        if (newDuration >= task.durationMinutes) {
+            return reject(
+                RejectionReason.DURATION_NOT_A_REDUCTION,
+                "newDurationMinutes=$newDuration is not less than current ${task.durationMinutes}"
+            )
+        }
+        return PolicyResult.Permitted(PermittedAction.ReduceDuration(task.id, newDuration))
+    }
+
+    private fun validateRescheduleTask(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+
+        val raw = intent.parameters["newScheduledStartTime"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newScheduledStartTime")
+        if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
+        }
+
+        val newTime = try {
+            LocalTime.parse(raw)
+        } catch (e: DateTimeParseException) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' failed to parse: ${e.message}")
+        }
+
+        val nowTime = Instant.ofEpochMilli(state.nowMillis).atZone(ZoneId.systemDefault()).toLocalTime()
+        if (!newTime.isAfter(nowTime)) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not later than current time $nowTime")
+        }
+
+        return PolicyResult.Permitted(PermittedAction.RescheduleTask(task.id, raw))
+    }
+
+    private fun validateShortBreak(intent: LlmIntent): PolicyResult {
+        val raw = intent.parameters["minutes"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing minutes")
+        val minutes = raw.toIntOrNull()
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "minutes '$raw' is not an integer")
+
+        if (minutes <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "minutes=$minutes")
+        }
+        if (minutes > MAX_BREAK_MINUTES) {
+            return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
+        }
+        return PolicyResult.Permitted(PermittedAction.ShortBreak(minutes))
+    }
+
+    private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/model/StudyTask.kt =====
 package com.checkmate.planner.model
 
@@ -13209,6 +13461,260 @@ data class SubjectConfig(
 
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/model/SubjectConfig.kt =====
 // Already defined inside StudyTask.kt above — no separate file needed.
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/PolicyValidatorTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.time.LocalTime
+import java.time.ZoneId
+
+/**
+ * Proactive Execution Engine — Step 2 (Blueprint Part One, §11 / §26 build sequence).
+ * The policy test matrix. Pure JVM unit tests — PolicyValidator has no Android
+ * dependency, so none of this needs Robolectric or an instrumented test.
+ */
+class PolicyValidatorTest {
+
+    private fun pendingTask(durationMinutes: Int = 90, state: TaskState = TaskState.PENDING) = StudyTask(
+        subject = "Physics",
+        topic = "Electrostatics",
+        durationMinutes = durationMinutes,
+        state = state
+    )
+
+    private fun stateAt(hour: Int, minute: Int, task: StudyTask?): PolicyState {
+        val zone = ZoneId.systemDefault()
+        val today = java.time.LocalDate.now(zone)
+        val millis = java.time.ZonedDateTime.of(today, LocalTime.of(hour, minute), zone)
+            .toInstant().toEpochMilli()
+        return PolicyState(task = task, nowMillis = millis)
+    }
+
+    // ── Blueprint §11 worked examples ───────────────────────────────────────
+
+    @Test
+    fun `REDUCE_DURATION with valid smaller duration is permitted`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "Reducing to 35 minutes.",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.ReduceDuration
+        assertEquals(35, action.newDurationMinutes)
+    }
+
+    @Test
+    fun `negative duration is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "-10")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
+    }
+
+    @Test
+    fun `unknown task id is rejected`() {
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = "does-not-exist",
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
+    }
+
+    @Test
+    fun `UNLOCK_DEVICE is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("UNLOCK_DEVICE")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `DISABLE_GUARDIAN is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("DISABLE_GUARDIAN")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `REMOVE_WORKMODE is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("REMOVE_WORKMODE")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `15 minute break is permitted`() {
+        val intent = LlmIntent(
+            speech = "Take 15.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            parameters = mapOf("minutes" to "15")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `4 hour break is rejected`() {
+        val intent = LlmIntent(
+            speech = "Take 240.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            parameters = mapOf("minutes" to "240")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.BREAK_TOO_LONG)
+    }
+
+    // ── Additional coverage beyond the blueprint's worked examples ─────────
+
+    @Test
+    fun `reduce duration below minimum is rejected`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "2")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
+    }
+
+    @Test
+    fun `reduce duration that is not actually smaller is rejected`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "120")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.DURATION_NOT_A_REDUCTION)
+    }
+
+    @Test
+    fun `reduce duration on a DONE task is rejected`() {
+        val task = pendingTask(durationMinutes = 90, state = TaskState.DONE)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
+    }
+
+    @Test
+    fun `reduce duration with malformed number is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "soon")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `start task on a PENDING task is permitted`() {
+        val task = pendingTask(state = TaskState.PENDING)
+        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `start task on an already ACTIVE task is rejected`() {
+        val task = pendingTask(state = TaskState.ACTIVE)
+        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
+    }
+
+    @Test
+    fun `reschedule to a valid future time is permitted`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "20:00")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `reschedule to a time in the past is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "18:00")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
+    }
+
+    @Test
+    fun `reschedule with malformed time string is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "8pm")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
+    }
+
+    @Test
+    fun `KEEP_PLAN NO_ACTION REQUEST_CLARIFICATION and REQUEST_GUARDIAN are always permitted`() {
+        listOf(
+            InterventionIntentType.KEEP_PLAN,
+            InterventionIntentType.NO_ACTION,
+            InterventionIntentType.REQUEST_CLARIFICATION,
+            InterventionIntentType.REQUEST_GUARDIAN
+        ).forEach { type ->
+            val intent = LlmIntent(speech = "x", intentType = type)
+            val result = PolicyValidator.validate(intent, PolicyState(task = null))
+            assertTrue("$type should be permitted", result is PolicyResult.Permitted)
+        }
+    }
+
+    private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
+        assertTrue("expected Rejected but was $result", result is PolicyResult.Rejected)
+        assertEquals(reason, (result as PolicyResult.Rejected).reason)
+    }
+}
 
 
 //===== FILE: modules/psyche/build.gradle.kts =====
