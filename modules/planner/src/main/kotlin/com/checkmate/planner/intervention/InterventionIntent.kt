@@ -1,0 +1,89 @@
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Proactive Execution Engine — Step 1 (Blueprint Part One, §9-11).
+ *
+ * Structured LLM intents. The AI Mentor never mutates app state directly — it produces
+ * one of these, which [PolicyValidator] then validates into a [PermittedAction] (or
+ * rejects). This file intentionally keeps the intent schema narrow: there is no
+ * UNLOCK_DEVICE / DISABLE_GUARDIAN / REMOVE_WORKMODE case anywhere in
+ * [InterventionIntentType] — those aren't rejected by a rule, they're simply not
+ * representable. If raw LLM output claims one of those (or anything else outside this
+ * enum), [LlmIntent.parseIntentType] returns null and PolicyValidator treats it as
+ * unrecognized.
+ */
+enum class InterventionIntentType {
+    START_TASK,
+    REDUCE_DURATION,
+    RESCHEDULE_TASK,
+    KEEP_PLAN,
+    TAKE_SHORT_BREAK,
+    REQUEST_CLARIFICATION,
+    NO_ACTION,
+    REQUEST_GUARDIAN
+}
+
+/**
+ * Untrusted, LLM-produced. [parameters] holds the per-intent fields the LLM was asked to
+ * fill in — PolicyValidator looks up known keys per intent type and rejects anything it
+ * can't parse. Expected keys:
+ *   REDUCE_DURATION  -> "newDurationMinutes" (Int as String)
+ *   RESCHEDULE_TASK  -> "newScheduledStartTime" ("HH:mm", 24h)
+ *   TAKE_SHORT_BREAK -> "minutes" (Int as String)
+ *   all others       -> unused
+ */
+data class LlmIntent(
+    val speech: String,
+    val intentType: InterventionIntentType?,
+    val targetTaskId: String? = null,
+    val parameters: Map<String, String> = emptyMap()
+) {
+    companion object {
+        /** Maps a raw string from LLM JSON output onto the closed schema above, or null
+         *  if it doesn't match — including anything naming a protected action. */
+        fun parseIntentType(raw: String?): InterventionIntentType? =
+            raw?.let { r -> InterventionIntentType.entries.find { it.name == r.trim() } }
+    }
+}
+
+/** Snapshot of the state PolicyValidator needs. Assembled by the caller (Context
+ *  Builder, later) — PolicyValidator itself never touches Context/DB/network/clock APIs
+ *  beyond what's passed in here, so it stays a pure function for unit testing. */
+data class PolicyState(
+    val task: StudyTask?,
+    val nowMillis: Long = System.currentTimeMillis()
+)
+
+/** What the [PolicyValidator] permits the ActionExecutor to actually perform. Every case
+ *  here corresponds 1:1 to a deterministic, idempotent operation the Executor knows how
+ *  to run (Blueprint §13) — PermittedAction never carries anything the Executor can't
+ *  safely apply twice. */
+sealed class PermittedAction {
+    data class ReduceDuration(val taskId: String, val newDurationMinutes: Int) : PermittedAction()
+    data class RescheduleTask(val taskId: String, val newScheduledStartTime: String) : PermittedAction()
+    data class StartTask(val taskId: String) : PermittedAction()
+    data class ShortBreak(val minutes: Int) : PermittedAction()
+    object KeepPlan : PermittedAction()
+    object RequestClarification : PermittedAction()
+    object RequestGuardian : PermittedAction()
+    object NoAction : PermittedAction()
+}
+
+enum class RejectionReason {
+    UNRECOGNIZED_INTENT,
+    UNKNOWN_TASK_ID,
+    TASK_NOT_ACTIVE_STATE,
+    NEGATIVE_OR_ZERO_DURATION,
+    DURATION_TOO_SHORT,
+    DURATION_NOT_A_REDUCTION,
+    BREAK_TOO_LONG,
+    INVALID_RESCHEDULE_TIME,
+    MALFORMED_INTENT
+}
+
+sealed class PolicyResult {
+    data class Permitted(val action: PermittedAction) : PolicyResult()
+    data class Rejected(val reason: RejectionReason, val detail: String) : PolicyResult()
+}

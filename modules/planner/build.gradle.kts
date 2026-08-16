@@ -21,4 +21,9 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     annotationProcessor("androidx.room:room-compiler:2.6.1")
+    // Added for PolicyValidator's policy test matrix (Proactive Execution Engine step 1/2).
+    // No testImplementation("junit:...") existed anywhere in the project despite
+    // ExampleUnitTest.kt importing org.junit — added explicitly rather than assuming a
+    // root-level convention plugin supplies it.
+    testImplementation("junit:junit:4.13.2")
 }
