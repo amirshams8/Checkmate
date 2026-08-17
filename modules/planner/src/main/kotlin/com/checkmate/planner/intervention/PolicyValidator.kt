@@ -18,10 +18,10 @@ import java.time.format.DateTimeParseException
  * isolation from everything else in the pipeline.
  *
  * PolicyValidator never talks the LLM out of anything — it either maps an intent onto a
- * [PermittedAction] the deterministic ActionExecutor (a later build step) knows how to
- * run, or it rejects it with a reason. There is no path from here to a protected action
- * (device unlock, disabling the guardian, removing WorkMode) because no such action is
- * representable in [InterventionIntentType] to begin with.
+ * [PermittedAction] the deterministic ActionExecutor knows how to run, or it rejects it
+ * with a reason. There is no path from here to a protected action (device unlock,
+ * disabling the guardian, removing WorkMode) because no such action is representable in
+ * [InterventionIntentType] to begin with.
  */
 object PolicyValidator {
 
@@ -44,7 +44,10 @@ object PolicyValidator {
             InterventionIntentType.START_TASK          -> validateStartTask(state)
             InterventionIntentType.REDUCE_DURATION      -> validateReduceDuration(intent, state)
             InterventionIntentType.RESCHEDULE_TASK       -> validateRescheduleTask(intent, state)
-            InterventionIntentType.TAKE_SHORT_BREAK      -> validateShortBreak(intent)
+            // Amended in step 5: a break has to pause a specific task, so it now goes
+            // through the same task-presence/state checks as every other task-scoped
+            // intent instead of being validated in isolation.
+            InterventionIntentType.TAKE_SHORT_BREAK      -> validateShortBreak(intent, state)
             InterventionIntentType.KEEP_PLAN             -> PolicyResult.Permitted(PermittedAction.KeepPlan)
             InterventionIntentType.REQUEST_CLARIFICATION -> PolicyResult.Permitted(PermittedAction.RequestClarification)
             InterventionIntentType.NO_ACTION             -> PolicyResult.Permitted(PermittedAction.NoAction)
@@ -123,7 +126,16 @@ object PolicyValidator {
         return PolicyResult.Permitted(PermittedAction.RescheduleTask(task.id, raw))
     }
 
-    private fun validateShortBreak(intent: LlmIntent): PolicyResult {
+    private fun validateShortBreak(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, cannot take a break on a task that isn't pending/active"
+            )
+        }
+
         val raw = intent.parameters["minutes"]
             ?: return reject(RejectionReason.MALFORMED_INTENT, "missing minutes")
         val minutes = raw.toIntOrNull()
@@ -135,7 +147,7 @@ object PolicyValidator {
         if (minutes > MAX_BREAK_MINUTES) {
             return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
         }
-        return PolicyResult.Permitted(PermittedAction.ShortBreak(minutes))
+        return PolicyResult.Permitted(PermittedAction.ShortBreak(task.id, minutes))
     }
 
     private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)

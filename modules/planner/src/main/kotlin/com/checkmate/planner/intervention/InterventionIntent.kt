@@ -31,7 +31,9 @@ enum class InterventionIntentType {
  * can't parse. Expected keys:
  *   REDUCE_DURATION  -> "newDurationMinutes" (Int as String)
  *   RESCHEDULE_TASK  -> "newScheduledStartTime" ("HH:mm", 24h)
- *   TAKE_SHORT_BREAK -> "minutes" (Int as String)
+ *   TAKE_SHORT_BREAK -> "minutes" (Int as String) — also requires targetTaskId/state.task,
+ *                       same as every other task-scoped intent (see step 5 amendment: a
+ *                       break has to pause a specific task, so it can't be task-less).
  *   all others       -> unused
  */
 data class LlmIntent(
@@ -64,7 +66,9 @@ sealed class PermittedAction {
     data class ReduceDuration(val taskId: String, val newDurationMinutes: Int) : PermittedAction()
     data class RescheduleTask(val taskId: String, val newScheduledStartTime: String) : PermittedAction()
     data class StartTask(val taskId: String) : PermittedAction()
-    data class ShortBreak(val minutes: Int) : PermittedAction()
+    /** Amended in step 5: needs taskId — pausing "something" isn't executable, pausing
+     *  a specific task is (PlanStore.pauseTask requires one). */
+    data class ShortBreak(val taskId: String, val minutes: Int) : PermittedAction()
     object KeepPlan : PermittedAction()
     object RequestClarification : PermittedAction()
     object RequestGuardian : PermittedAction()

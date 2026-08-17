@@ -75,13 +75,31 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
     /** COMMIT (§5): the intervention concluded with an action taken. Idempotent — calling
      *  this again (or calling [abort] afterward) on the same transaction is a no-op. */
     suspend fun commit(transactionId: String, outcome: String? = null): EscrowReleaseResult =
-        resolve(transactionId, InterventionState.COMPLETED, outcome = outcome)
+        resolveAs(transactionId, InterventionState.COMPLETED, outcome = outcome)
 
-    /** ABORT (§5): the intervention concluded without acting on the task (e.g. the student
-     *  dismissed it, or a later step's negotiation failed cleanly). Idempotent, same as
-     *  [commit]. */
+    /** ABORT (§5): the intervention concluded without acting on the task because the
+     *  *student* declined/dismissed it. Idempotent, same as [commit]. Distinct from a
+     *  system-side execution failure — see [resolveAs]. */
     suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
-        resolve(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
+        resolveAs(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
+
+    /**
+     * General resolution entry point for any terminal [InterventionState] — added in step
+     * 5. [commit]/[abort] cover the two most common cases, but ActionExecutor also needs
+     * to resolve into EXECUTION_FAILED specifically when a permitted mutation can no
+     * longer be applied (e.g. task state changed between validation and execution). That's
+     * a different fact than USER_ABORTED (the student declined) or TTL_EXPIRED (nobody
+     * responded in time), and the Outcome Ledger (a later step) needs to tell them apart.
+     */
+    suspend fun resolveAs(
+        transactionId: String,
+        terminalState: InterventionState,
+        outcome: String? = null,
+        failureReason: String? = null
+    ): EscrowReleaseResult {
+        require(terminalState.isTerminal) { "resolveAs requires a terminal state, got $terminalState" }
+        return resolve(transactionId, terminalState, outcome, failureReason)
+    }
 
     /**
      * Explicit TTL check for one transaction, independent of [acquire]'s inline reclaim —

@@ -101,24 +101,43 @@ class PolicyValidatorTest {
 
     @Test
     fun `15 minute break is permitted`() {
+        // Amended in step 5: TAKE_SHORT_BREAK now requires a task (PlanStore.pauseTask
+        // needs one to actually pause), so this needs PolicyState.task set.
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "Take 15.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            targetTaskId = task.id,
+            parameters = mapOf("minutes" to "15")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.ShortBreak
+        assertEquals(task.id, action.taskId)
+    }
+
+    @Test
+    fun `4 hour break is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "Take 240.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            targetTaskId = task.id,
+            parameters = mapOf("minutes" to "240")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.BREAK_TOO_LONG)
+    }
+
+    @Test
+    fun `short break on a task with no task in PolicyState is rejected`() {
         val intent = LlmIntent(
             speech = "Take 15.",
             intentType = InterventionIntentType.TAKE_SHORT_BREAK,
             parameters = mapOf("minutes" to "15")
         )
         val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertTrue(result is PolicyResult.Permitted)
-    }
-
-    @Test
-    fun `4 hour break is rejected`() {
-        val intent = LlmIntent(
-            speech = "Take 240.",
-            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
-            parameters = mapOf("minutes" to "240")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.BREAK_TOO_LONG)
+        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
     }
 
     // ── Additional coverage beyond the blueprint's worked examples ─────────
