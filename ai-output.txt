@@ -3,10 +3,6 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
-    // Added: Room's annotation processor was wired via `annotationProcessor` below, which
-    // only runs on Java sources — it was never actually processing @Entity/@Dao on Kotlin
-    // classes (harmless before, since no Room entities existed yet; not harmless now that
-    // InterventionTransaction/InterventionTransactionDao exist).
     id("org.jetbrains.kotlin.kapt")
 }
 android {
@@ -26,209 +22,519 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
-    // Changed from annotationProcessor(...) — see kapt plugin note above.
     kapt("androidx.room:room-compiler:2.6.1")
-    // Added for PolicyValidator's policy test matrix (Proactive Execution Engine step 1/2).
-    // No testImplementation("junit:...") existed anywhere in the project despite
-    // ExampleUnitTest.kt importing org.junit — added explicitly rather than assuming a
-    // root-level convention plugin supplies it.
     testImplementation("junit:junit:4.13.2")
+    // Added for TaskEscrow's concurrency tests (Proactive Execution Engine step 4) — runs
+    // suspend test functions via runTest(); version matched to the existing
+    // kotlinx-coroutines-android dependency above.
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
 
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionState.kt =====
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskEscrow.kt =====
 package com.checkmate.planner.intervention
 
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
+
 /**
- * Proactive Execution Engine — Step 3 (Blueprint Part One, §3-4).
+ * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6).
  *
- * The Intervention FSM's states. The "happy path" chain is IDLE -> ... -> COMPLETED;
- * the remaining constants are the failure/exit paths (§3) — an intervention can land on
- * any of these directly from an earlier state rather than always passing through
- * COMPLETED. [TERMINAL_STATES] is what "resolved" means for the core invariant: no
- * intervention may remain indefinitely in an intermediate state.
+ * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
+ * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
+ * owns the task until it reaches COMMIT or ABORT" (§5). This deliberately does NOT touch
+ * [com.checkmate.planner.model.TaskState] or [com.checkmate.planner.PlanStore] — there is
+ * no NEGOTIATING case added to TaskState, because that enum is matched exhaustively across
+ * the UI layer (HomeScreen/HomeViewModel/etc.) and adding a case there is a much wider,
+ * riskier change than this step calls for. Escrow ownership is entirely a property of the
+ * transaction table from step 3: a task is under escrow iff `dao.getLatestForTask(taskId)`
+ * is non-null and non-terminal. Callers that need to gate task-mutation UI on escrow can
+ * check that via [isUnderEscrow] without StudyTask ever knowing escrow exists.
+ *
+ * Atomicity: this is a single-process Android app, not a multi-process one, so the actual
+ * correctness boundary is in-process mutual exclusion, not a Room `@Transaction`/SQLite
+ * isolation level. Every entry point below funnels through [withTaskLock], which holds a
+ * per-taskId [Mutex] for the duration of its read-then-write. Two concurrent acquire()
+ * calls for the same task always serialize through that Mutex, so exactly one observes
+ * "no existing escrow" and wins; the other sees the transaction the winner just wrote and
+ * gets [EscrowAcquireResult.AlreadyHeld]. The lock map itself is never persisted — that's
+ * fine, because after a real process death there's no second in-process caller left to
+ * race against; the surviving [InterventionTransaction] row is instead picked up by
+ * [reconcileUnfinished] (or reclaimed inline by the next [acquire] call for that task).
  */
-enum class InterventionState {
-    IDLE,
-    TRIGGERED,
-    PROMPTED,
-    WAITING_FOR_RESPONSE,
-    NEGOTIATING,
-    INTENT_RECEIVED,
-    POLICY_VALIDATED,
-    ACTION_EXECUTED,
-    OUTCOME_RECORDED,
-    COMPLETED,
+class TaskEscrow(private val dao: InterventionTransactionDao) {
 
-    // ── Failure / exit paths (Blueprint §3) ──
-    USER_IGNORED,
-    USER_ABORTED,
-    TTL_EXPIRED,
-    NETWORK_FALLBACK,
-    LLM_INVALID,
-    POLICY_REJECTED,
-    EXECUTION_FAILED;
+    private val taskLocks = ConcurrentHashMap<String, Mutex>()
 
-    companion object {
-        /** A transaction sitting in any of these has resolved — reconciliation (§4) only
-         *  needs to act on transactions NOT in this set. */
-        val TERMINAL_STATES: Set<InterventionState> = setOf(
-            COMPLETED, USER_IGNORED, USER_ABORTED, TTL_EXPIRED,
-            NETWORK_FALLBACK, LLM_INVALID, POLICY_REJECTED, EXECUTION_FAILED
+    /**
+     * Attempts to acquire escrow for [taskId]. Succeeds and creates a new NEGOTIATING
+     * transaction unless one already exists and is both non-terminal AND still within its
+     * TTL. A non-terminal transaction found past its TTL is treated as abandoned — reclaimed
+     * (marked TTL_EXPIRED) in the same locked section, and acquisition then proceeds. This
+     * is what makes expiry deterministic even if no reconciliation job has run yet: the very
+     * next acquire() attempt for that task will not be blocked by a stale escrow forever.
+     */
+    suspend fun acquire(
+        taskId: String,
+        triggerType: InterventionTriggerType,
+        now: Long = System.currentTimeMillis(),
+        ttlMillis: Long = DEFAULT_TTL_MILLIS
+    ): EscrowAcquireResult = withTaskLock(taskId) {
+        val existing = dao.getLatestForTask(taskId)
+        if (existing != null && !existing.currentState.isTerminal) {
+            if (now < existing.expiresAt) {
+                return@withTaskLock EscrowAcquireResult.AlreadyHeld(existing)
+            }
+            // Past TTL and nobody released it — reclaim before proceeding.
+            dao.update(
+                existing.copy(
+                    currentState = InterventionState.TTL_EXPIRED,
+                    failureReason = "TTL expired before release; reclaimed by acquire()"
+                )
+            )
+        }
+
+        val transaction = InterventionTransaction(
+            taskId = taskId,
+            currentState = InterventionState.NEGOTIATING,
+            triggerType = triggerType,
+            createdAt = now,
+            expiresAt = now + ttlMillis
         )
+        dao.upsert(transaction)
+        EscrowAcquireResult.Acquired(transaction)
     }
 
-    val isTerminal: Boolean get() = this in TERMINAL_STATES
-}
+    /** COMMIT (§5): the intervention concluded with an action taken. Idempotent — calling
+     *  this again (or calling [abort] afterward) on the same transaction is a no-op. */
+    suspend fun commit(transactionId: String, outcome: String? = null): EscrowReleaseResult =
+        resolve(transactionId, InterventionState.COMPLETED, outcome = outcome)
 
-/**
- * Proactive Trigger Engine's signal types (Blueprint §2). Persisted on the transaction
- * so the Outcome Ledger (a later step) can later ask "which trigger types actually lead
- * to completed interventions." The Trigger Engine itself (§2, build step 7) isn't built
- * yet — this enum exists now only so InterventionTransaction has a real, closed type for
- * triggerType rather than a free-text column.
- */
-enum class InterventionTriggerType {
-    SCHEDULED_START_APPROACHING,
-    TASK_NOT_STARTED,
-    LATE_START,
-    REPEATED_SKIPS,
-    DISTRACTION_DETECTED,
-    LONG_INACTIVITY,
-    AVAILABLE_TIME_CHANGED,
-    SESSION_ENDED,
-    UPCOMING_TEST,
-    BACKLOG_RISK,
-    REPEATED_INTERVENTION_FAILURE
-}
+    /** ABORT (§5): the intervention concluded without acting on the task (e.g. the student
+     *  dismissed it, or a later step's negotiation failed cleanly). Idempotent, same as
+     *  [commit]. */
+    suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
+        resolve(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
 
+    /**
+     * Explicit TTL check for one transaction, independent of [acquire]'s inline reclaim —
+     * for a reconciliation job (a later step) that wants to sweep expired escrows without
+     * also trying to acquire a new one. Deterministic and idempotent: calling it again after
+     * it has already expired (or already resolved by commit/abort) a transaction is a safe
+     * no-op.
+     */
+    suspend fun expireIfPastTtl(
+        transactionId: String,
+        now: Long = System.currentTimeMillis()
+    ): EscrowExpiryResult {
+        val current = dao.getById(transactionId) ?: return EscrowExpiryResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExpiryResult.NotFound
+            when {
+                fresh.currentState.isTerminal -> EscrowExpiryResult.AlreadyResolved
+                now < fresh.expiresAt -> EscrowExpiryResult.NotYetExpired
+                else -> {
+                    dao.update(
+                        fresh.copy(
+                            currentState = InterventionState.TTL_EXPIRED,
+                            failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
+                        )
+                    )
+                    EscrowExpiryResult.Expired
+                }
+            }
+        }
+    }
 
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTransaction.kt =====
-package com.checkmate.planner.intervention
+    /**
+     * Reconciliation (§4): "Process dies -> Room remains -> Worker/receiver restarts ->
+     * unfinished transaction discovered -> FSM reconciles it." Intended to run once after
+     * process restart (from BootReceiver, or a WorkManager job — wiring that trigger point
+     * is a later step; this only provides the sweep itself). Every unfinished transaction
+     * past its TTL is expired; anything unfinished but still within TTL is left alone and
+     * returned so the caller can decide what to do with a live, still-valid negotiation
+     * that survived the restart.
+     */
+    suspend fun reconcileUnfinished(now: Long = System.currentTimeMillis()): ReconciliationResult {
+        val unfinished = dao.getUnfinished(InterventionState.TERMINAL_STATES.toList())
+        val expired = mutableListOf<InterventionTransaction>()
+        val stillLive = mutableListOf<InterventionTransaction>()
+        for (transaction in unfinished) {
+            when (expireIfPastTtl(transaction.transactionId, now)) {
+                is EscrowExpiryResult.Expired -> expired += transaction.copy(currentState = InterventionState.TTL_EXPIRED)
+                is EscrowExpiryResult.NotYetExpired -> stillLive += transaction
+                // Resolved by a concurrent caller between the query above and this check,
+                // or the row vanished — either way it's no longer this sweep's concern.
+                is EscrowExpiryResult.AlreadyResolved, is EscrowExpiryResult.NotFound -> Unit
+            }
+        }
+        return ReconciliationResult(expiredTransactions = expired, stillLiveTransactions = stillLive)
+    }
 
-import androidx.room.ColumnInfo
-import androidx.room.Dao
-import androidx.room.Entity
-import androidx.room.Insert
-import androidx.room.OnConflictStrategy
-import androidx.room.PrimaryKey
-import androidx.room.Query
-import androidx.room.TypeConverter
-import androidx.room.TypeConverters
-import androidx.room.Update
-import java.util.UUID
+    /** True iff [taskId] currently has a non-terminal transaction — i.e. is under escrow
+     *  and should not be independently mutated/started elsewhere. */
+    suspend fun isUnderEscrow(taskId: String): Boolean {
+        val existing = dao.getLatestForTask(taskId) ?: return false
+        return !existing.currentState.isTerminal
+    }
 
-/**
- * Proactive Execution Engine — Step 3 (Blueprint Part One, §4).
- *
- * "We rejected using SharedPreferences as the primary source of truth for the FSM."
- * This is that dedicated Room entity. If the process dies mid-negotiation, this row is
- * what survives — a Worker/receiver restart (a later build step) reads back any
- * non-terminal transaction and reconciles it, instead of the negotiation silently
- * vanishing.
- *
- * [llmIntentJson] and [approvedActionJson] are kept as plain nullable text — an audit
- * trail of what the LLM proposed and what PolicyValidator actually permitted, not a
- * round-trippable object. LlmIntent/PermittedAction aren't wired for polymorphic
- * kotlinx.serialization yet (PermittedAction is a sealed class with per-case fields),
- * and reconciliation as described in §4 only needs currentState/expiresAt/taskId to
- * resume the FSM — it doesn't need to replay the exact killed LLM response. Wiring these
- * two columns for full deserialization can happen if/when something actually needs to
- * read them back as typed objects.
- */
-@Entity(tableName = "intervention_transactions")
-@TypeConverters(InterventionConverters::class)
-data class InterventionTransaction(
-    @PrimaryKey
-    val transactionId: String = UUID.randomUUID().toString(),
-    val taskId: String,
-    val currentState: InterventionState,
-    val triggerType: InterventionTriggerType,
-    val createdAt: Long,
-    val expiresAt: Long,
-    @ColumnInfo(defaultValue = "0")
-    val attemptCount: Int = 0,
-    val llmIntentJson: String? = null,
-    val approvedActionJson: String? = null,
-    val studentResponse: String? = null,
-    val outcome: String? = null,
-    val failureReason: String? = null
-)
+    private suspend fun resolve(
+        transactionId: String,
+        state: InterventionState,
+        outcome: String? = null,
+        failureReason: String? = null
+    ): EscrowReleaseResult {
+        val current = dao.getById(transactionId) ?: return EscrowReleaseResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowReleaseResult.NotFound
+            if (fresh.currentState.isTerminal) return@withTaskLock EscrowReleaseResult.AlreadyResolved
+            dao.update(fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason))
+            EscrowReleaseResult.Released
+        }
+    }
 
-object InterventionConverters {
-    @TypeConverter
-    fun fromState(state: InterventionState): String = state.name
-
-    @TypeConverter
-    fun toState(value: String): InterventionState = InterventionState.valueOf(value)
-
-    @TypeConverter
-    fun fromTriggerType(type: InterventionTriggerType): String = type.name
-
-    @TypeConverter
-    fun toTriggerType(value: String): InterventionTriggerType = InterventionTriggerType.valueOf(value)
-}
-
-@Dao
-interface InterventionTransactionDao {
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(transaction: InterventionTransaction)
-
-    @Update
-    suspend fun update(transaction: InterventionTransaction)
-
-    @Query("SELECT * FROM intervention_transactions WHERE transactionId = :transactionId")
-    suspend fun getById(transactionId: String): InterventionTransaction?
-
-    /** Most recent transaction for a task, regardless of state — used to check whether a
-     *  task is currently under Task Escrow (a later build step). */
-    @Query("SELECT * FROM intervention_transactions WHERE taskId = :taskId ORDER BY createdAt DESC LIMIT 1")
-    suspend fun getLatestForTask(taskId: String): InterventionTransaction?
-
-    /** Reconciliation query (§4): every transaction not yet resolved. Pass
-     *  [InterventionState.TERMINAL_STATES] so this file doesn't need to duplicate that
-     *  set. Intended to run once from BootReceiver / a WorkManager reconciliation job. */
-    @Query("SELECT * FROM intervention_transactions WHERE currentState NOT IN (:terminalStates)")
-    suspend fun getUnfinished(terminalStates: List<InterventionState>): List<InterventionTransaction>
-
-    @Query("SELECT * FROM intervention_transactions ORDER BY createdAt DESC LIMIT :limit")
-    suspend fun getRecent(limit: Int): List<InterventionTransaction>
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
-package com.checkmate.planner.intervention
-
-import android.content.Context
-import androidx.room.Database
-import androidx.room.Room
-import androidx.room.RoomDatabase
-
-/**
- * Proactive Execution Engine — Step 3 (Blueprint Part One, §4).
- *
- * Standalone singleton, same shape as a typical Room setup — deliberately not wired into
- * CheckmateApp.onCreate() yet. Nothing calls InterventionDatabase.getInstance() until the
- * Task Escrow (step 4) and ActionExecutor (step 5) exist to actually create/update rows,
- * so wiring it into app startup now would be speculative.
- */
-@Database(entities = [InterventionTransaction::class], version = 1, exportSchema = false)
-abstract class InterventionDatabase : RoomDatabase() {
-
-    abstract fun interventionTransactionDao(): InterventionTransactionDao
+    private suspend fun <T> withTaskLock(taskId: String, block: suspend () -> T): T {
+        val mutex = taskLocks.getOrPut(taskId) { Mutex() }
+        return mutex.withLock { block() }
+    }
 
     companion object {
-        @Volatile
-        private var INSTANCE: InterventionDatabase? = null
+        /** Blueprint §6 example TTL. */
+        const val DEFAULT_TTL_MILLIS = 60_000L
+    }
+}
 
-        fun getInstance(context: Context): InterventionDatabase =
-            INSTANCE ?: synchronized(this) {
-                INSTANCE ?: Room.databaseBuilder(
-                    context.applicationContext,
-                    InterventionDatabase::class.java,
-                    "checkmate_intervention.db"
-                ).build().also { INSTANCE = it }
-            }
+sealed class EscrowAcquireResult {
+    data class Acquired(val transaction: InterventionTransaction) : EscrowAcquireResult()
+    data class AlreadyHeld(val existing: InterventionTransaction) : EscrowAcquireResult()
+}
+
+sealed class EscrowReleaseResult {
+    object Released : EscrowReleaseResult()
+    /** Idempotency case: already COMPLETED/ABORTED/EXPIRED/etc. — commit()/abort() called
+     *  twice, or called after TTL already resolved it first. Not an error. */
+    object AlreadyResolved : EscrowReleaseResult()
+    object NotFound : EscrowReleaseResult()
+}
+
+sealed class EscrowExpiryResult {
+    object Expired : EscrowExpiryResult()
+    object AlreadyResolved : EscrowExpiryResult()
+    object NotYetExpired : EscrowExpiryResult()
+    object NotFound : EscrowExpiryResult()
+}
+
+data class ReconciliationResult(
+    val expiredTransactions: List<InterventionTransaction>,
+    val stillLiveTransactions: List<InterventionTransaction>
+)
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/FakeInterventionTransactionDao.kt =====
+package com.checkmate.planner.intervention
+
+/**
+ * In-memory stand-in for [InterventionTransactionDao] used only by [TaskEscrowTest]. The
+ * project has no Robolectric/instrumented-test setup, so real Room can't run as a plain
+ * JVM unit test; TaskEscrow only depends on the DAO interface (not on Room or Context)
+ * specifically so this substitution is possible. [transactionsById] is exposed and mutable
+ * from outside so tests can construct two independent [TaskEscrow] instances that share
+ * the same backing store — that's what simulates "the process died and restarted, but the
+ * underlying (Room) database survived."
+ */
+class FakeInterventionTransactionDao(
+    val transactionsById: MutableMap<String, InterventionTransaction> = mutableMapOf()
+) : InterventionTransactionDao {
+
+    override suspend fun upsert(transaction: InterventionTransaction) {
+        transactionsById[transaction.transactionId] = transaction
+    }
+
+    override suspend fun update(transaction: InterventionTransaction) {
+        transactionsById[transaction.transactionId] = transaction
+    }
+
+    override suspend fun getById(transactionId: String): InterventionTransaction? =
+        transactionsById[transactionId]
+
+    override suspend fun getLatestForTask(taskId: String): InterventionTransaction? =
+        transactionsById.values
+            .filter { it.taskId == taskId }
+            .maxByOrNull { it.createdAt }
+
+    override suspend fun getUnfinished(terminalStates: List<InterventionState>): List<InterventionTransaction> =
+        transactionsById.values.filter { it.currentState !in terminalStates }
+
+    override suspend fun getRecent(limit: Int): List<InterventionTransaction> =
+        transactionsById.values.sortedByDescending { it.createdAt }.take(limit)
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/TaskEscrowTest.kt =====
+package com.checkmate.planner.intervention
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6). Covers atomic
+ * acquisition under concurrency, commit/abort idempotency, deterministic TTL expiry, and
+ * process-death reconciliation. LLM/voice/ActionExecutor are not involved anywhere here —
+ * this is exercising TaskEscrow in isolation, as scoped.
+ */
+class TaskEscrowTest {
+
+    private val taskId = "task-1"
+
+    // ── Acquisition ──────────────────────────────────────────────────────
+
+    @Test
+    fun `acquire succeeds when no existing escrow`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        val result = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+        assertTrue(result is EscrowAcquireResult.Acquired)
+        val tx = (result as EscrowAcquireResult.Acquired).transaction
+        assertEquals(InterventionState.NEGOTIATING, tx.currentState)
+        assertEquals(taskId, tx.taskId)
+    }
+
+    @Test
+    fun `acquire is denied while a non-expired escrow is already held`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
+
+        val second = escrow.acquire(taskId, InterventionTriggerType.DISTRACTION_DETECTED, now = 1_500L)
+        assertTrue(second is EscrowAcquireResult.AlreadyHeld)
+    }
+
+    @Test
+    fun `acquire reclaims an escrow past its TTL and succeeds`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val first = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+        val firstId = (first as EscrowAcquireResult.Acquired).transaction.transactionId
+
+        // now = 2_000 is well past expiresAt = 1_500 for the first transaction.
+        val second = escrow.acquire(taskId, InterventionTriggerType.REPEATED_SKIPS, now = 2_000L)
+        assertTrue(second is EscrowAcquireResult.Acquired)
+
+        val reclaimed = dao.getById(firstId)
+        assertEquals(InterventionState.TTL_EXPIRED, reclaimed?.currentState)
+    }
+
+    @Test
+    fun `concurrent acquisition for the same task yields exactly one winner`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        val attempts = 10
+
+        val results = (1..attempts).map { i ->
+            async { escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L + i) }
+        }.awaitAll()
+
+        val acquired = results.filterIsInstance<EscrowAcquireResult.Acquired>()
+        val denied = results.filterIsInstance<EscrowAcquireResult.AlreadyHeld>()
+        assertEquals(1, acquired.size)
+        assertEquals(attempts - 1, denied.size)
+    }
+
+    @Test
+    fun `concurrent acquisition for different tasks does not contend`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        val taskIds = (1..5).map { "task-$it" }
+
+        val results = taskIds.map { id ->
+            async { escrow.acquire(id, InterventionTriggerType.LATE_START, now = 1_000L) }
+        }.awaitAll()
+
+        assertTrue(results.all { it is EscrowAcquireResult.Acquired })
+    }
+
+    // ── Commit / abort ───────────────────────────────────────────────────
+
+    @Test
+    fun `commit resolves the transaction to COMPLETED`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.commit(tx.transactionId, outcome = "Session started, 35 min")
+        assertEquals(EscrowReleaseResult.Released, result)
+        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `abort resolves the transaction to USER_ABORTED`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.abort(tx.transactionId, reason = "Student dismissed the prompt")
+        assertEquals(EscrowReleaseResult.Released, result)
+        assertEquals(InterventionState.USER_ABORTED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `commit is idempotent when called twice`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.commit(tx.transactionId, outcome = "first")
+        val secondCall = escrow.commit(tx.transactionId, outcome = "second")
+
+        assertEquals(EscrowReleaseResult.AlreadyResolved, secondCall)
+        // The original resolution is untouched by the redundant second call.
+        assertEquals("first", dao.getById(tx.transactionId)?.outcome)
+    }
+
+    @Test
+    fun `abort after commit is idempotent and does not override the resolution`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.commit(tx.transactionId, outcome = "Session started")
+        val abortAfterCommit = escrow.abort(tx.transactionId, reason = "too late")
+
+        assertEquals(EscrowReleaseResult.AlreadyResolved, abortAfterCommit)
+        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `commit on an unknown transaction returns NotFound`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        assertEquals(EscrowReleaseResult.NotFound, escrow.commit("does-not-exist"))
+    }
+
+    @Test
+    fun `escrow releases after commit, allowing a new acquisition for the same task`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        escrow.commit(tx.transactionId)
+
+        assertFalse(escrow.isUnderEscrow(taskId))
+        val second = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 2_000L)
+        assertTrue(second is EscrowAcquireResult.Acquired)
+    }
+
+    // ── Deterministic expiry ────────────────────────────────────────────
+
+    @Test
+    fun `expireIfPastTtl is a no-op before the TTL elapses`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.expireIfPastTtl(tx.transactionId, now = 1_500L)
+        assertEquals(EscrowExpiryResult.NotYetExpired, result)
+        assertEquals(InterventionState.NEGOTIATING, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `expireIfPastTtl expires a transaction once the TTL has elapsed`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.expireIfPastTtl(tx.transactionId, now = 2_000L)
+        assertEquals(EscrowExpiryResult.Expired, result)
+        assertEquals(InterventionState.TTL_EXPIRED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `expireIfPastTtl on an already-resolved transaction is idempotent`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+        escrow.commit(tx.transactionId)
+
+        val result = escrow.expireIfPastTtl(tx.transactionId, now = 2_000L)
+        assertEquals(EscrowExpiryResult.AlreadyResolved, result)
+        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `expireIfPastTtl on an unknown transaction returns NotFound`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        assertEquals(EscrowExpiryResult.NotFound, escrow.expireIfPastTtl("does-not-exist", now = 2_000L))
+    }
+
+    // ── Process death / reconciliation ──────────────────────────────────
+
+    @Test
+    fun `reconcileUnfinished expires past-TTL transactions and leaves live ones alone`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val stale = (escrow.acquire("task-stale", InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+        val live = (escrow.acquire("task-live", InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.reconcileUnfinished(now = 2_000L)
+
+        assertEquals(1, result.expiredTransactions.size)
+        assertEquals(stale.transactionId, result.expiredTransactions.first().transactionId)
+        assertEquals(1, result.stillLiveTransactions.size)
+        assertEquals(live.transactionId, result.stillLiveTransactions.first().transactionId)
+        assertEquals(InterventionState.TTL_EXPIRED, dao.getById(stale.transactionId)?.currentState)
+        assertEquals(InterventionState.NEGOTIATING, dao.getById(live.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a fresh TaskEscrow instance over the same backing store reconciles a surviving transaction`() = runTest {
+        // Simulates process death: instance A acquires escrow but never gets to commit()
+        // or abort() before the process is killed. The backing store (a stand-in for the
+        // Room database, which survives process death) is shared with instance B, which
+        // has a brand-new (empty) in-process Mutex map — exactly what happens on restart.
+        val sharedStore = mutableMapOf<String, InterventionTransaction>()
+        val dao = FakeInterventionTransactionDao(sharedStore)
+        val instanceA = TaskEscrow(dao)
+        val tx = (instanceA.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+        // instanceA "dies" here — never calls commit()/abort().
+
+        val instanceB = TaskEscrow(FakeInterventionTransactionDao(sharedStore))
+        assertTrue(instanceB.isUnderEscrow(taskId))
+
+        val reconciliation = instanceB.reconcileUnfinished(now = 2_000L)
+        assertEquals(1, reconciliation.expiredTransactions.size)
+        assertEquals(tx.transactionId, reconciliation.expiredTransactions.first().transactionId)
+
+        assertFalse(instanceB.isUnderEscrow(taskId))
+        val reAcquired = instanceB.acquire(taskId, InterventionTriggerType.LATE_START, now = 2_100L)
+        assertTrue(reAcquired is EscrowAcquireResult.Acquired)
+    }
+
+    @Test
+    fun `a fresh TaskEscrow instance over the same backing store leaves a still-live transaction untouched`() = runTest {
+        val sharedStore = mutableMapOf<String, InterventionTransaction>()
+        val dao = FakeInterventionTransactionDao(sharedStore)
+        val instanceA = TaskEscrow(dao)
+        val tx = (instanceA.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        // instanceA "dies" here, well within the TTL window.
+
+        val instanceB = TaskEscrow(FakeInterventionTransactionDao(sharedStore))
+        val reconciliation = instanceB.reconcileUnfinished(now = 1_500L)
+
+        assertTrue(reconciliation.expiredTransactions.isEmpty())
+        assertEquals(1, reconciliation.stillLiveTransactions.size)
+        assertEquals(tx.transactionId, reconciliation.stillLiveTransactions.first().transactionId)
+        assertTrue(instanceB.isUnderEscrow(taskId))
     }
 }
