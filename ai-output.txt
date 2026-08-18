@@ -1,1078 +1,210 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionIntent.kt =====
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionFallback.kt =====
 package com.checkmate.planner.intervention
 
+import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Proactive Execution Engine — Step 1 (Blueprint Part One, §9-11).
+ * Proactive Execution Engine — Step 6 (Blueprint Part One, §14, §25 principle 2).
  *
- * Structured LLM intents. The AI Mentor never mutates app state directly — it produces
- * one of these, which [PolicyValidator] then validates into a [PermittedAction] (or
- * rejects). This file intentionally keeps the intent schema narrow: there is no
- * UNLOCK_DEVICE / DISABLE_GUARDIAN / REMOVE_WORKMODE case anywhere in
- * [InterventionIntentType] — those aren't rejected by a rule, they're simply not
- * representable. If raw LLM output claims one of those (or anything else outside this
- * enum), [LlmIntent.parseIntentType] returns null and PolicyValidator treats it as
- * unrecognized.
- */
-enum class InterventionIntentType {
-    START_TASK,
-    REDUCE_DURATION,
-    RESCHEDULE_TASK,
-    KEEP_PLAN,
-    TAKE_SHORT_BREAK,
-    REQUEST_CLARIFICATION,
-    NO_ACTION,
-    REQUEST_GUARDIAN
-}
-
-/**
- * Untrusted, LLM-produced. [parameters] holds the per-intent fields the LLM was asked to
- * fill in — PolicyValidator looks up known keys per intent type and rejects anything it
- * can't parse. Expected keys:
- *   REDUCE_DURATION  -> "newDurationMinutes" (Int as String)
- *   RESCHEDULE_TASK  -> "newScheduledStartTime" ("HH:mm", 24h)
- *   TAKE_SHORT_BREAK -> "minutes" (Int as String) — also requires targetTaskId/state.task,
- *                       same as every other task-scoped intent (see step 5 amendment: a
- *                       break has to pause a specific task, so it can't be task-less).
- *   all others       -> unused
- */
-data class LlmIntent(
-    val speech: String,
-    val intentType: InterventionIntentType?,
-    val targetTaskId: String? = null,
-    val parameters: Map<String, String> = emptyMap()
-) {
-    companion object {
-        /** Maps a raw string from LLM JSON output onto the closed schema above, or null
-         *  if it doesn't match — including anything naming a protected action. */
-        fun parseIntentType(raw: String?): InterventionIntentType? =
-            raw?.let { r -> InterventionIntentType.entries.find { it.name == r.trim() } }
-    }
-}
-
-/** Snapshot of the state PolicyValidator needs. Assembled by the caller (Context
- *  Builder, later) — PolicyValidator itself never touches Context/DB/network/clock APIs
- *  beyond what's passed in here, so it stays a pure function for unit testing. */
-data class PolicyState(
-    val task: StudyTask?,
-    val nowMillis: Long = System.currentTimeMillis()
-)
-
-/** What the [PolicyValidator] permits the ActionExecutor to actually perform. Every case
- *  here corresponds 1:1 to a deterministic, idempotent operation the Executor knows how
- *  to run (Blueprint §13) — PermittedAction never carries anything the Executor can't
- *  safely apply twice. */
-sealed class PermittedAction {
-    data class ReduceDuration(val taskId: String, val newDurationMinutes: Int) : PermittedAction()
-    data class RescheduleTask(val taskId: String, val newScheduledStartTime: String) : PermittedAction()
-    data class StartTask(val taskId: String) : PermittedAction()
-    /** Amended in step 5: needs taskId — pausing "something" isn't executable, pausing
-     *  a specific task is (PlanStore.pauseTask requires one). */
-    data class ShortBreak(val taskId: String, val minutes: Int) : PermittedAction()
-    object KeepPlan : PermittedAction()
-    object RequestClarification : PermittedAction()
-    object RequestGuardian : PermittedAction()
-    object NoAction : PermittedAction()
-}
-
-enum class RejectionReason {
-    UNRECOGNIZED_INTENT,
-    UNKNOWN_TASK_ID,
-    TASK_NOT_ACTIVE_STATE,
-    NEGATIVE_OR_ZERO_DURATION,
-    DURATION_TOO_SHORT,
-    DURATION_NOT_A_REDUCTION,
-    BREAK_TOO_LONG,
-    INVALID_RESCHEDULE_TIME,
-    MALFORMED_INTENT
-}
-
-sealed class PolicyResult {
-    data class Permitted(val action: PermittedAction) : PolicyResult()
-    data class Rejected(val reason: RejectionReason, val detail: String) : PolicyResult()
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PolicyValidator.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.TaskState
-import java.time.Instant
-import java.time.LocalTime
-import java.time.ZoneId
-import java.time.format.DateTimeParseException
-
-/**
- * Proactive Execution Engine — Step 1 (Blueprint Part One, §10-11).
+ * "The internet must never become Checkmate's single point of failure." [attemptLlm] wraps
+ * an LLM call with a short, intervention-specific timeout — deliberately not a change to
+ * [LlmGateway]'s own client timeouts, which other callers (e.g. AdaptivePlanner's plan
+ * generation) reasonably rely on being longer. [strictReminderIntent] is the deterministic
+ * fallback itself: a fixed, non-LLM response that still goes through PolicyValidator like
+ * any other intent (§14's own diagram routes STRICT_REMINDER through PolicyValidator, not
+ * around it) — the policy boundary doesn't get to be softer just because nothing chose to
+ * be clever here.
  *
- * "AI recommends. Code decides." PolicyValidator is the only thing standing between an
- * LLM-produced [LlmIntent] and an actually-permitted mutation. It receives no Android
- * Context, no network access, no LLM, no UI, no SharedPreferences — everything it needs
- * comes in through [PolicyState]. That's deliberate: it makes this module trivially and
- * aggressively unit-testable (see PolicyValidatorTest's policy test matrix), and it means
- * the boundary that actually protects the app can be reasoned about and tested in
- * isolation from everything else in the pipeline.
- *
- * PolicyValidator never talks the LLM out of anything — it either maps an intent onto a
- * [PermittedAction] the deterministic ActionExecutor knows how to run, or it rejects it
- * with a reason. There is no path from here to a protected action (device unlock,
- * disabling the guardian, removing WorkMode) because no such action is representable in
- * [InterventionIntentType] to begin with.
+ * Structured LLM intent parsing (turning a real LLM response into a validated [LlmIntent])
+ * is step 11, not yet built. Until it exists, there is nothing safe to do with even a
+ * successful LLM response — no parser to trust it through — so [InterventionDecisionMaker]
+ * always resolves via the deterministic path below for now. [attemptLlm] is still exercised
+ * on the LLM path (rather than skipped) so the timeout/failure detection this step is
+ * actually about is real and tested today, not deferred to step 11 along with the parser.
  */
-object PolicyValidator {
+object InterventionFallback {
 
-    /** Below this, a "reduced session" isn't meaningfully different from abandoning the
-     *  task — matches the blueprint's "no negative/degenerate durations" invariant. */
-    const val MIN_DURATION_MINUTES = 5
-
-    /** Blueprint §11 example: "15-minute break -> permitted, 4-hour break -> rejected."
-     *  Picked to comfortably permit that example while still capping well short of
-     *  a session-length break. */
-    const val MAX_BREAK_MINUTES = 30
-
-    private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
-
-    fun validate(intent: LlmIntent, state: PolicyState): PolicyResult {
-        val type = intent.intentType
-            ?: return reject(RejectionReason.UNRECOGNIZED_INTENT, "intentType did not match the closed schema")
-
-        return when (type) {
-            InterventionIntentType.START_TASK          -> validateStartTask(state)
-            InterventionIntentType.REDUCE_DURATION      -> validateReduceDuration(intent, state)
-            InterventionIntentType.RESCHEDULE_TASK       -> validateRescheduleTask(intent, state)
-            // Amended in step 5: a break has to pause a specific task, so it now goes
-            // through the same task-presence/state checks as every other task-scoped
-            // intent instead of being validated in isolation.
-            InterventionIntentType.TAKE_SHORT_BREAK      -> validateShortBreak(intent, state)
-            InterventionIntentType.KEEP_PLAN             -> PolicyResult.Permitted(PermittedAction.KeepPlan)
-            InterventionIntentType.REQUEST_CLARIFICATION -> PolicyResult.Permitted(PermittedAction.RequestClarification)
-            InterventionIntentType.NO_ACTION             -> PolicyResult.Permitted(PermittedAction.NoAction)
-            // Escalation to a human guardian is never blocked by policy — see Blueprint §12:
-            // genuine emergencies route through the guardian override protocol, not AI judgment.
-            InterventionIntentType.REQUEST_GUARDIAN      -> PolicyResult.Permitted(PermittedAction.RequestGuardian)
-        }
-    }
-
-    private fun validateStartTask(state: PolicyState): PolicyResult {
-        val task = state.task
-            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
-        if (task.state != TaskState.PENDING && task.state != TaskState.PAUSED) {
-            return reject(
-                RejectionReason.TASK_NOT_ACTIVE_STATE,
-                "task ${task.id} is ${task.state}, expected PENDING or PAUSED"
-            )
-        }
-        return PolicyResult.Permitted(PermittedAction.StartTask(task.id))
-    }
-
-    private fun validateReduceDuration(intent: LlmIntent, state: PolicyState): PolicyResult {
-        val task = state.task
-            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
-        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
-            return reject(
-                RejectionReason.TASK_NOT_ACTIVE_STATE,
-                "task ${task.id} is ${task.state}, cannot reduce a task that isn't pending/active"
-            )
-        }
-
-        val raw = intent.parameters["newDurationMinutes"]
-            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newDurationMinutes")
-        val newDuration = raw.toIntOrNull()
-            ?: return reject(RejectionReason.MALFORMED_INTENT, "newDurationMinutes '$raw' is not an integer")
-
-        if (newDuration <= 0) {
-            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "newDurationMinutes=$newDuration")
-        }
-        if (newDuration < MIN_DURATION_MINUTES) {
-            return reject(
-                RejectionReason.DURATION_TOO_SHORT,
-                "newDurationMinutes=$newDuration below minimum $MIN_DURATION_MINUTES"
-            )
-        }
-        if (newDuration >= task.durationMinutes) {
-            return reject(
-                RejectionReason.DURATION_NOT_A_REDUCTION,
-                "newDurationMinutes=$newDuration is not less than current ${task.durationMinutes}"
-            )
-        }
-        return PolicyResult.Permitted(PermittedAction.ReduceDuration(task.id, newDuration))
-    }
-
-    private fun validateRescheduleTask(intent: LlmIntent, state: PolicyState): PolicyResult {
-        val task = state.task
-            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
-
-        val raw = intent.parameters["newScheduledStartTime"]
-            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newScheduledStartTime")
-        if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
-            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
-        }
-
-        val newTime = try {
-            LocalTime.parse(raw)
-        } catch (e: DateTimeParseException) {
-            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' failed to parse: ${e.message}")
-        }
-
-        val nowTime = Instant.ofEpochMilli(state.nowMillis).atZone(ZoneId.systemDefault()).toLocalTime()
-        if (!newTime.isAfter(nowTime)) {
-            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not later than current time $nowTime")
-        }
-
-        return PolicyResult.Permitted(PermittedAction.RescheduleTask(task.id, raw))
-    }
-
-    private fun validateShortBreak(intent: LlmIntent, state: PolicyState): PolicyResult {
-        val task = state.task
-            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
-        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
-            return reject(
-                RejectionReason.TASK_NOT_ACTIVE_STATE,
-                "task ${task.id} is ${task.state}, cannot take a break on a task that isn't pending/active"
-            )
-        }
-
-        val raw = intent.parameters["minutes"]
-            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing minutes")
-        val minutes = raw.toIntOrNull()
-            ?: return reject(RejectionReason.MALFORMED_INTENT, "minutes '$raw' is not an integer")
-
-        if (minutes <= 0) {
-            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "minutes=$minutes")
-        }
-        if (minutes > MAX_BREAK_MINUTES) {
-            return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
-        }
-        return PolicyResult.Permitted(PermittedAction.ShortBreak(task.id, minutes))
-    }
-
-    private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)
-}
-
-
-//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/PolicyValidatorTest.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-import java.time.LocalTime
-import java.time.ZoneId
-
-/**
- * Proactive Execution Engine — Step 2 (Blueprint Part One, §11 / §26 build sequence).
- * The policy test matrix. Pure JVM unit tests — PolicyValidator has no Android
- * dependency, so none of this needs Robolectric or an instrumented test.
- */
-class PolicyValidatorTest {
-
-    private fun pendingTask(durationMinutes: Int = 90, state: TaskState = TaskState.PENDING) = StudyTask(
-        subject = "Physics",
-        topic = "Electrostatics",
-        durationMinutes = durationMinutes,
-        state = state
-    )
-
-    private fun stateAt(hour: Int, minute: Int, task: StudyTask?): PolicyState {
-        val zone = ZoneId.systemDefault()
-        val today = java.time.LocalDate.now(zone)
-        val millis = java.time.ZonedDateTime.of(today, LocalTime.of(hour, minute), zone)
-            .toInstant().toEpochMilli()
-        return PolicyState(task = task, nowMillis = millis)
-    }
-
-    // ── Blueprint §11 worked examples ───────────────────────────────────────
-
-    @Test
-    fun `REDUCE_DURATION with valid smaller duration is permitted`() {
-        val task = pendingTask(durationMinutes = 90)
-        val intent = LlmIntent(
-            speech = "Reducing to 35 minutes.",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "35")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertTrue(result is PolicyResult.Permitted)
-        val action = (result as PolicyResult.Permitted).action as PermittedAction.ReduceDuration
-        assertEquals(35, action.newDurationMinutes)
-    }
-
-    @Test
-    fun `negative duration is rejected`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "-10")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
-    }
-
-    @Test
-    fun `unknown task id is rejected`() {
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = "does-not-exist",
-            parameters = mapOf("newDurationMinutes" to "35")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
-    }
-
-    @Test
-    fun `UNLOCK_DEVICE is not representable and is rejected as unrecognized`() {
-        val intentType = LlmIntent.parseIntentType("UNLOCK_DEVICE")
-        assertEquals(null, intentType)
-        val intent = LlmIntent(speech = "x", intentType = intentType)
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
-    }
-
-    @Test
-    fun `DISABLE_GUARDIAN is not representable and is rejected as unrecognized`() {
-        val intentType = LlmIntent.parseIntentType("DISABLE_GUARDIAN")
-        assertEquals(null, intentType)
-        val intent = LlmIntent(speech = "x", intentType = intentType)
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
-    }
-
-    @Test
-    fun `REMOVE_WORKMODE is not representable and is rejected as unrecognized`() {
-        val intentType = LlmIntent.parseIntentType("REMOVE_WORKMODE")
-        assertEquals(null, intentType)
-        val intent = LlmIntent(speech = "x", intentType = intentType)
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
-    }
-
-    @Test
-    fun `15 minute break is permitted`() {
-        // Amended in step 5: TAKE_SHORT_BREAK now requires a task (PlanStore.pauseTask
-        // needs one to actually pause), so this needs PolicyState.task set.
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "Take 15.",
-            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
-            targetTaskId = task.id,
-            parameters = mapOf("minutes" to "15")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertTrue(result is PolicyResult.Permitted)
-        val action = (result as PolicyResult.Permitted).action as PermittedAction.ShortBreak
-        assertEquals(task.id, action.taskId)
-    }
-
-    @Test
-    fun `4 hour break is rejected`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "Take 240.",
-            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
-            targetTaskId = task.id,
-            parameters = mapOf("minutes" to "240")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.BREAK_TOO_LONG)
-    }
-
-    @Test
-    fun `short break on a task with no task in PolicyState is rejected`() {
-        val intent = LlmIntent(
-            speech = "Take 15.",
-            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
-            parameters = mapOf("minutes" to "15")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = null))
-        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
-    }
-
-    // ── Additional coverage beyond the blueprint's worked examples ─────────
-
-    @Test
-    fun `reduce duration below minimum is rejected`() {
-        val task = pendingTask(durationMinutes = 90)
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "2")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
-    }
-
-    @Test
-    fun `reduce duration that is not actually smaller is rejected`() {
-        val task = pendingTask(durationMinutes = 90)
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "120")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.DURATION_NOT_A_REDUCTION)
-    }
-
-    @Test
-    fun `reduce duration on a DONE task is rejected`() {
-        val task = pendingTask(durationMinutes = 90, state = TaskState.DONE)
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "35")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
-    }
-
-    @Test
-    fun `reduce duration with malformed number is rejected`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.REDUCE_DURATION,
-            targetTaskId = task.id,
-            parameters = mapOf("newDurationMinutes" to "soon")
-        )
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
-    }
-
-    @Test
-    fun `start task on a PENDING task is permitted`() {
-        val task = pendingTask(state = TaskState.PENDING)
-        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertTrue(result is PolicyResult.Permitted)
-    }
-
-    @Test
-    fun `start task on an already ACTIVE task is rejected`() {
-        val task = pendingTask(state = TaskState.ACTIVE)
-        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
-        val result = PolicyValidator.validate(intent, PolicyState(task = task))
-        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
-    }
-
-    @Test
-    fun `reschedule to a valid future time is permitted`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.RESCHEDULE_TASK,
-            targetTaskId = task.id,
-            parameters = mapOf("newScheduledStartTime" to "20:00")
-        )
-        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
-        assertTrue(result is PolicyResult.Permitted)
-    }
-
-    @Test
-    fun `reschedule to a time in the past is rejected`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.RESCHEDULE_TASK,
-            targetTaskId = task.id,
-            parameters = mapOf("newScheduledStartTime" to "18:00")
-        )
-        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
-        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
-    }
-
-    @Test
-    fun `reschedule with malformed time string is rejected`() {
-        val task = pendingTask()
-        val intent = LlmIntent(
-            speech = "x",
-            intentType = InterventionIntentType.RESCHEDULE_TASK,
-            targetTaskId = task.id,
-            parameters = mapOf("newScheduledStartTime" to "8pm")
-        )
-        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
-        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
-    }
-
-    @Test
-    fun `KEEP_PLAN NO_ACTION REQUEST_CLARIFICATION and REQUEST_GUARDIAN are always permitted`() {
-        listOf(
-            InterventionIntentType.KEEP_PLAN,
-            InterventionIntentType.NO_ACTION,
-            InterventionIntentType.REQUEST_CLARIFICATION,
-            InterventionIntentType.REQUEST_GUARDIAN
-        ).forEach { type ->
-            val intent = LlmIntent(speech = "x", intentType = type)
-            val result = PolicyValidator.validate(intent, PolicyState(task = null))
-            assertTrue("$type should be permitted", result is PolicyResult.Permitted)
-        }
-    }
-
-    private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
-        assertTrue("expected Rejected but was $result", result is PolicyResult.Rejected)
-        assertEquals(reason, (result as PolicyResult.Rejected).reason)
-    }
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskEscrow.kt =====
-package com.checkmate.planner.intervention
-
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.ConcurrentHashMap
-
-/**
- * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6).
- *
- * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
- * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
- * owns the task until it reaches COMMIT or ABORT" (§5). This deliberately does NOT touch
- * [com.checkmate.planner.model.TaskState] or [com.checkmate.planner.PlanStore] — there is
- * no NEGOTIATING case added to TaskState, because that enum is matched exhaustively across
- * the UI layer (HomeScreen/HomeViewModel/etc.) and adding a case there is a much wider,
- * riskier change than this step calls for. Escrow ownership is entirely a property of the
- * transaction table from step 3: a task is under escrow iff `dao.getLatestForTask(taskId)`
- * is non-null and non-terminal. Callers that need to gate task-mutation UI on escrow can
- * check that via [isUnderEscrow] without StudyTask ever knowing escrow exists.
- *
- * Atomicity: this is a single-process Android app, not a multi-process one, so the actual
- * correctness boundary is in-process mutual exclusion, not a Room `@Transaction`/SQLite
- * isolation level. Every entry point below funnels through [withTaskLock], which holds a
- * per-taskId [Mutex] for the duration of its read-then-write. Two concurrent acquire()
- * calls for the same task always serialize through that Mutex, so exactly one observes
- * "no existing escrow" and wins; the other sees the transaction the winner just wrote and
- * gets [EscrowAcquireResult.AlreadyHeld]. The lock map itself is never persisted — that's
- * fine, because after a real process death there's no second in-process caller left to
- * race against; the surviving [InterventionTransaction] row is instead picked up by
- * [reconcileUnfinished] (or reclaimed inline by the next [acquire] call for that task).
- */
-class TaskEscrow(private val dao: InterventionTransactionDao) {
-
-    private val taskLocks = ConcurrentHashMap<String, Mutex>()
+    /** Blueprint §14/§18: "3-second timeout." */
+    const val DEFAULT_LLM_TIMEOUT_MILLIS = 3_000L
 
     /**
-     * Attempts to acquire escrow for [taskId]. Succeeds and creates a new NEGOTIATING
-     * transaction unless one already exists and is both non-terminal AND still within its
-     * TTL. A non-terminal transaction found past its TTL is treated as abandoned — reclaimed
-     * (marked TTL_EXPIRED) in the same locked section, and acquisition then proceeds. This
-     * is what makes expiry deterministic even if no reconciliation job has run yet: the very
-     * next acquire() attempt for that task will not be blocked by a stale escrow forever.
+     * Attempts an LLM call with a hard timeout. Returns null on timeout, on a blank
+     * response, or on any failure LlmGateway itself already collapses to "" (missing API
+     * key, HTTP error, exception — see LlmGateway.complete's own doc). Callers should treat
+     * null uniformly as "the LLM path did not produce anything usable in time."
+     *
+     * [llmCall] defaults to the real [LlmGateway.complete] and is only overridden in tests,
+     * so this doesn't need Robolectric/instrumented tests to verify timeout behavior — a
+     * fake that suspends past the timeout exercises the exact same withTimeoutOrNull path
+     * the production call goes through.
      */
-    suspend fun acquire(
-        taskId: String,
-        triggerType: InterventionTriggerType,
-        now: Long = System.currentTimeMillis(),
-        ttlMillis: Long = DEFAULT_TTL_MILLIS
-    ): EscrowAcquireResult = withTaskLock(taskId) {
-        val existing = dao.getLatestForTask(taskId)
-        if (existing != null && !existing.currentState.isTerminal) {
-            if (now < existing.expiresAt) {
-                return@withTaskLock EscrowAcquireResult.AlreadyHeld(existing)
-            }
-            // Past TTL and nobody released it — reclaim before proceeding.
-            dao.update(
-                existing.copy(
-                    currentState = InterventionState.TTL_EXPIRED,
-                    failureReason = "TTL expired before release; reclaimed by acquire()"
-                )
-            )
-        }
-
-        val transaction = InterventionTransaction(
-            taskId = taskId,
-            currentState = InterventionState.NEGOTIATING,
-            triggerType = triggerType,
-            createdAt = now,
-            expiresAt = now + ttlMillis
-        )
-        dao.upsert(transaction)
-        EscrowAcquireResult.Acquired(transaction)
-    }
-
-    /** COMMIT (§5): the intervention concluded with an action taken. Idempotent — calling
-     *  this again (or calling [abort] afterward) on the same transaction is a no-op. */
-    suspend fun commit(transactionId: String, outcome: String? = null): EscrowReleaseResult =
-        resolveAs(transactionId, InterventionState.COMPLETED, outcome = outcome)
-
-    /** ABORT (§5): the intervention concluded without acting on the task because the
-     *  *student* declined/dismissed it. Idempotent, same as [commit]. Distinct from a
-     *  system-side execution failure — see [resolveAs]. */
-    suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
-        resolveAs(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
-
-    /**
-     * General resolution entry point for any terminal [InterventionState] — added in step
-     * 5. [commit]/[abort] cover the two most common cases, but ActionExecutor also needs
-     * to resolve into EXECUTION_FAILED specifically when a permitted mutation can no
-     * longer be applied (e.g. task state changed between validation and execution). That's
-     * a different fact than USER_ABORTED (the student declined) or TTL_EXPIRED (nobody
-     * responded in time), and the Outcome Ledger (a later step) needs to tell them apart.
-     */
-    suspend fun resolveAs(
-        transactionId: String,
-        terminalState: InterventionState,
-        outcome: String? = null,
-        failureReason: String? = null
-    ): EscrowReleaseResult {
-        require(terminalState.isTerminal) { "resolveAs requires a terminal state, got $terminalState" }
-        return resolve(transactionId, terminalState, outcome, failureReason)
+    suspend fun attemptLlm(
+        prompt: String,
+        systemPrompt: String = "",
+        timeoutMillis: Long = DEFAULT_LLM_TIMEOUT_MILLIS,
+        llmCall: suspend (String, String) -> String = LlmGateway::complete
+    ): String? {
+        val result = withTimeoutOrNull(timeoutMillis) { llmCall(prompt, systemPrompt) }
+        return result?.takeIf { it.isNotBlank() }
     }
 
     /**
-     * Explicit TTL check for one transaction, independent of [acquire]'s inline reclaim —
-     * for a reconciliation job (a later step) that wants to sweep expired escrows without
-     * also trying to acquire a new one. Deterministic and idempotent: calling it again after
-     * it has already expired (or already resolved by commit/abort) a transaction is a safe
-     * no-op.
+     * The deterministic STRICT_REMINDER (§14's own worked example). Always a START_TASK
+     * intent — the fallback's whole purpose is to get the student moving on what was
+     * already planned, not to negotiate or reduce scope; negotiation is the AI Mentor's
+     * job once it exists.
      */
-    suspend fun expireIfPastTtl(
-        transactionId: String,
-        now: Long = System.currentTimeMillis()
-    ): EscrowExpiryResult {
-        val current = dao.getById(transactionId) ?: return EscrowExpiryResult.NotFound
-        return withTaskLock(current.taskId) {
-            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExpiryResult.NotFound
-            when {
-                fresh.currentState.isTerminal -> EscrowExpiryResult.AlreadyResolved
-                now < fresh.expiresAt -> EscrowExpiryResult.NotYetExpired
-                else -> {
-                    dao.update(
-                        fresh.copy(
-                            currentState = InterventionState.TTL_EXPIRED,
-                            failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
-                        )
-                    )
-                    EscrowExpiryResult.Expired
-                }
-            }
+    fun strictReminderIntent(task: StudyTask, lateMinutes: Int): LlmIntent {
+        val speech = if (lateMinutes > 0) {
+            "You're $lateMinutes minutes late. Start ${task.topic} now. " +
+                "I'll adjust the remaining schedule afterward."
+        } else {
+            "It's time to start ${task.topic}."
         }
-    }
-
-    /**
-     * Reconciliation (§4): "Process dies -> Room remains -> Worker/receiver restarts ->
-     * unfinished transaction discovered -> FSM reconciles it." Intended to run once after
-     * process restart (from BootReceiver, or a WorkManager job — wiring that trigger point
-     * is a later step; this only provides the sweep itself). Every unfinished transaction
-     * past its TTL is expired; anything unfinished but still within TTL is left alone and
-     * returned so the caller can decide what to do with a live, still-valid negotiation
-     * that survived the restart.
-     */
-    suspend fun reconcileUnfinished(now: Long = System.currentTimeMillis()): ReconciliationResult {
-        val unfinished = dao.getUnfinished(InterventionState.TERMINAL_STATES.toList())
-        val expired = mutableListOf<InterventionTransaction>()
-        val stillLive = mutableListOf<InterventionTransaction>()
-        for (transaction in unfinished) {
-            when (expireIfPastTtl(transaction.transactionId, now)) {
-                is EscrowExpiryResult.Expired -> expired += transaction.copy(currentState = InterventionState.TTL_EXPIRED)
-                is EscrowExpiryResult.NotYetExpired -> stillLive += transaction
-                // Resolved by a concurrent caller between the query above and this check,
-                // or the row vanished — either way it's no longer this sweep's concern.
-                is EscrowExpiryResult.AlreadyResolved, is EscrowExpiryResult.NotFound -> Unit
-            }
-        }
-        return ReconciliationResult(expiredTransactions = expired, stillLiveTransactions = stillLive)
-    }
-
-    /** True iff [taskId] currently has a non-terminal transaction — i.e. is under escrow
-     *  and should not be independently mutated/started elsewhere. */
-    suspend fun isUnderEscrow(taskId: String): Boolean {
-        val existing = dao.getLatestForTask(taskId) ?: return false
-        return !existing.currentState.isTerminal
-    }
-
-    private suspend fun resolve(
-        transactionId: String,
-        state: InterventionState,
-        outcome: String? = null,
-        failureReason: String? = null
-    ): EscrowReleaseResult {
-        val current = dao.getById(transactionId) ?: return EscrowReleaseResult.NotFound
-        return withTaskLock(current.taskId) {
-            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowReleaseResult.NotFound
-            if (fresh.currentState.isTerminal) return@withTaskLock EscrowReleaseResult.AlreadyResolved
-            dao.update(fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason))
-            EscrowReleaseResult.Released
-        }
-    }
-
-    private suspend fun <T> withTaskLock(taskId: String, block: suspend () -> T): T {
-        val mutex = taskLocks.getOrPut(taskId) { Mutex() }
-        return mutex.withLock { block() }
-    }
-
-    companion object {
-        /** Blueprint §6 example TTL. */
-        const val DEFAULT_TTL_MILLIS = 60_000L
+        return LlmIntent(
+            speech = speech,
+            intentType = InterventionIntentType.START_TASK,
+            targetTaskId = task.id
+        )
     }
 }
-
-sealed class EscrowAcquireResult {
-    data class Acquired(val transaction: InterventionTransaction) : EscrowAcquireResult()
-    data class AlreadyHeld(val existing: InterventionTransaction) : EscrowAcquireResult()
-}
-
-sealed class EscrowReleaseResult {
-    object Released : EscrowReleaseResult()
-    /** Idempotency case: already COMPLETED/ABORTED/EXPIRED/etc. — commit()/abort() called
-     *  twice, or called after TTL already resolved it first. Not an error. */
-    object AlreadyResolved : EscrowReleaseResult()
-    object NotFound : EscrowReleaseResult()
-}
-
-sealed class EscrowExpiryResult {
-    object Expired : EscrowExpiryResult()
-    object AlreadyResolved : EscrowExpiryResult()
-    object NotYetExpired : EscrowExpiryResult()
-    object NotFound : EscrowExpiryResult()
-}
-
-data class ReconciliationResult(
-    val expiredTransactions: List<InterventionTransaction>,
-    val stillLiveTransactions: List<InterventionTransaction>
-)
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskMutator.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.StudyTask
 
 /**
- * Proactive Execution Engine — Step 5 (Blueprint Part One, §13).
- *
- * Seam between [ActionExecutor] and PlanStore's real mutation surface. Exists purely so
- * ActionExecutorTest can run as a plain JVM unit test against a fake, instead of needing
- * PlanStore's actual CheckmatePrefs-backed (Android SharedPreferences) storage — same
- * reasoning as InterventionTransactionDao/FakeInterventionTransactionDao in step 3.
- * [PlanStoreTaskMutator] is the real production implementation, wired to the exact
- * functions PlanStore already exposes — this interface deliberately adds no new
- * capability PlanStore doesn't already have.
+ * Orchestrates one intervention decision: try the LLM within budget (if asked to at all),
+ * then resolve deterministically either way, through PolicyValidator and ActionExecutor —
+ * never around them. Owns nothing about escrow lifecycle itself beyond resolving
+ * POLICY_REJECTED directly (ActionExecutor already resolves every other outcome as part of
+ * [ActionExecutor.execute]); the transaction must already be acquired via [TaskEscrow]
+ * before this is called.
  */
-interface TaskMutator {
-    fun findTask(taskId: String): StudyTask?
-
-    /** For a PENDING task. See [ActionExecutor] for why PAUSED uses [resumeTask] instead. */
-    fun startTask(taskId: String)
-
-    /** For a PAUSED task — preserves totalPausedMs accounting, unlike [startTask]. */
-    fun resumeTask(taskId: String, resumedAt: Long)
-
-    fun pauseTask(taskId: String, pausedAt: Long)
-
-    fun reduceDuration(taskId: String, newDurationMinutes: Int)
-
-    fun rescheduleTask(taskId: String, newScheduledStartTime: String)
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PlanStoreTaskMutator.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-
-/**
- * Proactive Execution Engine — Step 5. Production [TaskMutator] — thin adapter over
- * PlanStore's existing mutation functions. Adds no new PlanStore functions: START_TASK on
- * a PENDING task maps to [PlanStore.setTaskActive], START_TASK on a PAUSED task maps to
- * [PlanStore.resumeTask] instead, so totalPausedMs accounting stays correct — see
- * [ActionExecutor] for why that distinction has to be made at execution time using live
- * task state, not baked into the action at validation time.
- *
- * Not wired into app startup / DI anywhere yet — nothing constructs [ActionExecutor] with
- * this in production code yet either. That wiring (and the Trigger Engine that would
- * actually call ActionExecutor) is a later step.
- */
-class PlanStoreTaskMutator : TaskMutator {
-
-    override fun findTask(taskId: String): StudyTask? =
-        PlanStore.todayTasks.value.find { it.id == taskId }
-
-    override fun startTask(taskId: String) {
-        PlanStore.setTaskActive(taskId)
-    }
-
-    override fun resumeTask(taskId: String, resumedAt: Long) {
-        PlanStore.resumeTask(taskId, resumedAt)
-    }
-
-    override fun pauseTask(taskId: String, pausedAt: Long) {
-        PlanStore.pauseTask(taskId, pausedAt)
-    }
-
-    override fun reduceDuration(taskId: String, newDurationMinutes: Int) {
-        PlanStore.updateTaskDuration(taskId, newDurationMinutes)
-    }
-
-    override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
-        PlanStore.updateTaskSchedule(taskId, newScheduledStartTime)
-    }
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/ActionExecutor.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.TaskState
-
-/**
- * Proactive Execution Engine — Step 5 (Blueprint Part One, §13).
- *
- * "The Executor is the only component allowed to actually mutate application state."
- * ActionExecutor takes a [PermittedAction] — something PolicyValidator already approved —
- * and applies it through [TaskMutator], then resolves the owning [InterventionTransaction]
- * via [TaskEscrow] so escrow is always released exactly once execution is done, success or
- * failure. LLM, voice, and the Trigger Engine are not wired to this yet — nothing calls
- * ActionExecutor from production code in this step.
- *
- * Idempotency (§13: "the application should not create two sessions or mutate the plan
- * twice") has two layers here:
- *  1. Primary guard — [execute] first checks whether [transactionId]'s transaction is
- *     already terminal. A duplicate delivery of an already-resolved transaction is a
- *     cheap no-op ([ExecutionOutcome.TransactionAlreadyResolved]) before any mutation is
- *     attempted at all.
- *  2. Defensive guard — each `applyX` function re-reads the *live* task via [TaskMutator]
- *     and compares against what the action would produce, rather than trusting that the
- *     [PolicyState] snapshot PolicyValidator validated against is still current. This is
- *     also what makes START_TASK correct for a task that's since become PAUSED vs. still
- *     PENDING: PolicyValidator permits START_TASK for either, but only ActionExecutor,
- *     looking at the live task right before mutating, knows whether that means
- *     [TaskMutator.startTask] or [TaskMutator.resumeTask].
- */
-class ActionExecutor(
-    private val transactionDao: InterventionTransactionDao,
+class InterventionDecisionMaker(
     private val taskEscrow: TaskEscrow,
-    private val taskMutator: TaskMutator
+    private val actionExecutor: ActionExecutor
 ) {
-
-    suspend fun execute(
+    suspend fun decideAndExecute(
         transactionId: String,
-        action: PermittedAction,
-        now: Long = System.currentTimeMillis()
-    ): ExecutionOutcome {
-        val transaction = transactionDao.getById(transactionId)
-            ?: return ExecutionOutcome.TransactionNotFound
-
-        if (transaction.currentState.isTerminal) {
-            return ExecutionOutcome.TransactionAlreadyResolved
+        task: StudyTask,
+        lateMinutes: Int,
+        now: Long = System.currentTimeMillis(),
+        llmPrompt: String? = null,
+        llmSystemPrompt: String = "",
+        llmTimeoutMillis: Long = InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS,
+        llmCall: suspend (String, String) -> String = LlmGateway::complete
+    ): DecisionOutcome {
+        if (llmPrompt != null) {
+            // Result intentionally unused for now — see InterventionFallback's class doc.
+            InterventionFallback.attemptLlm(llmPrompt, llmSystemPrompt, llmTimeoutMillis, llmCall)
         }
+        val usedFallback = true
 
-        val outcome = applyAction(action, now)
+        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes)
+        val policyState = PolicyState(task = task, nowMillis = now)
 
-        when (outcome) {
-            is ExecutionOutcome.Applied,
-            is ExecutionOutcome.NoOpAlreadyApplied,
-            is ExecutionOutcome.NotApplicable ->
-                taskEscrow.commit(transactionId, outcome = describe(outcome))
-
-            is ExecutionOutcome.RequiresGuardianEscalation ->
-                // Recognized outcome, but this step does not call GuardianNotifier —
-                // that integration wasn't inspected/requested for this increment. The
-                // transaction still resolves so it doesn't sit open indefinitely.
-                taskEscrow.commit(transactionId, outcome = "Escalated to guardian (notifier not yet wired)")
-
-            is ExecutionOutcome.Failed ->
-                taskEscrow.resolveAs(transactionId, InterventionState.EXECUTION_FAILED, failureReason = outcome.reason)
-
-            ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound ->
-                Unit // unreachable here — both are returned above, before applyAction runs.
-        }
-
-        return outcome
-    }
-
-    private fun applyAction(action: PermittedAction, now: Long): ExecutionOutcome = when (action) {
-        is PermittedAction.StartTask -> applyStartTask(action, now)
-        is PermittedAction.ReduceDuration -> applyReduceDuration(action)
-        is PermittedAction.RescheduleTask -> applyRescheduleTask(action)
-        is PermittedAction.ShortBreak -> applyShortBreak(action, now)
-        PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification ->
-            ExecutionOutcome.NotApplicable(action)
-        PermittedAction.RequestGuardian -> ExecutionOutcome.RequiresGuardianEscalation
-    }
-
-    private fun applyStartTask(action: PermittedAction.StartTask, now: Long): ExecutionOutcome {
-        val task = taskMutator.findTask(action.taskId)
-            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
-        return when (task.state) {
-            TaskState.ACTIVE -> ExecutionOutcome.NoOpAlreadyApplied(action)
-            TaskState.PAUSED -> {
-                taskMutator.resumeTask(action.taskId, now)
-                ExecutionOutcome.Applied(action)
+        return when (val result = PolicyValidator.validate(intent, policyState)) {
+            is PolicyResult.Permitted -> {
+                val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                DecisionOutcome.Executed(executionOutcome, usedFallback)
             }
-            TaskState.PENDING -> {
-                taskMutator.startTask(action.taskId)
-                ExecutionOutcome.Applied(action)
+            is PolicyResult.Rejected -> {
+                taskEscrow.resolveAs(
+                    transactionId,
+                    InterventionState.POLICY_REJECTED,
+                    failureReason = result.detail
+                )
+                DecisionOutcome.PolicyRejected(result.reason, result.detail, usedFallback)
             }
-            TaskState.DONE, TaskState.SKIPPED ->
-                ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
         }
-    }
-
-    private fun applyReduceDuration(action: PermittedAction.ReduceDuration): ExecutionOutcome {
-        val task = taskMutator.findTask(action.taskId)
-            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
-        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
-            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
-        }
-        if (task.durationMinutes == action.newDurationMinutes) {
-            return ExecutionOutcome.NoOpAlreadyApplied(action)
-        }
-        taskMutator.reduceDuration(action.taskId, action.newDurationMinutes)
-        return ExecutionOutcome.Applied(action)
-    }
-
-    private fun applyRescheduleTask(action: PermittedAction.RescheduleTask): ExecutionOutcome {
-        val task = taskMutator.findTask(action.taskId)
-            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
-        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
-            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
-        }
-        if (task.scheduledStartTime == action.newScheduledStartTime) {
-            return ExecutionOutcome.NoOpAlreadyApplied(action)
-        }
-        taskMutator.rescheduleTask(action.taskId, action.newScheduledStartTime)
-        return ExecutionOutcome.Applied(action)
-    }
-
-    private fun applyShortBreak(action: PermittedAction.ShortBreak, now: Long): ExecutionOutcome {
-        val task = taskMutator.findTask(action.taskId)
-            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
-        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
-            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
-        }
-        if (task.state == TaskState.PAUSED) {
-            return ExecutionOutcome.NoOpAlreadyApplied(action)
-        }
-        // Note: [action.minutes] is not persisted anywhere — PlanStore.pauseTask only
-        // records pausedAt/pauseCount, not an intended break length. Actually waking the
-        // student back up after `minutes` (an alarm, a notification) is scheduling
-        // behavior that belongs to the Trigger Engine (a later step), not the Executor.
-        taskMutator.pauseTask(action.taskId, now)
-        return ExecutionOutcome.Applied(action)
-    }
-
-    private fun describe(outcome: ExecutionOutcome): String = when (outcome) {
-        is ExecutionOutcome.Applied -> "Applied ${outcome.action::class.simpleName}"
-        is ExecutionOutcome.NoOpAlreadyApplied -> "No-op — ${outcome.action::class.simpleName} already in effect"
-        is ExecutionOutcome.NotApplicable -> "${outcome.action::class.simpleName} — no task mutation required"
-        else -> outcome.toString()
     }
 }
 
-sealed class ExecutionOutcome {
-    data class Applied(val action: PermittedAction) : ExecutionOutcome()
-    data class NoOpAlreadyApplied(val action: PermittedAction) : ExecutionOutcome()
-    /** KeepPlan / NoAction / RequestClarification — by design, nothing to mutate. */
-    data class NotApplicable(val action: PermittedAction) : ExecutionOutcome()
-    /** RequestGuardian — recognized, but not wired to GuardianNotifier in this step. */
-    object RequiresGuardianEscalation : ExecutionOutcome()
-    /** The live task no longer supports this action — state changed (or the task was
-     *  deleted) between PolicyValidator's snapshot and execution. Resolves the
-     *  transaction as EXECUTION_FAILED, not USER_ABORTED. */
-    data class Failed(val action: PermittedAction, val reason: String) : ExecutionOutcome()
-    /** Duplicate delivery of a transaction that already resolved — see class doc. */
-    object TransactionAlreadyResolved : ExecutionOutcome()
-    object TransactionNotFound : ExecutionOutcome()
+sealed class DecisionOutcome {
+    data class Executed(val executionOutcome: ExecutionOutcome, val usedFallback: Boolean) : DecisionOutcome()
+    data class PolicyRejected(val reason: RejectionReason, val detail: String, val usedFallback: Boolean) : DecisionOutcome()
 }
 
 
-//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/FakeTaskMutator.kt =====
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/InterventionFallbackTest.kt =====
 package com.checkmate.planner.intervention
 
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
-
-/**
- * In-memory [TaskMutator] for [ActionExecutorTest] — mirrors PlanStore's real mutation
- * semantics (including the totalPausedMs accounting [resumeTask] does) closely enough to
- * exercise ActionExecutor's branching without touching Android SharedPreferences.
- */
-class FakeTaskMutator(seed: List<StudyTask> = emptyList()) : TaskMutator {
-
-    private val tasks: MutableMap<String, StudyTask> = seed.associateBy { it.id }.toMutableMap()
-
-    fun currentState(taskId: String): StudyTask? = tasks[taskId]
-
-    override fun findTask(taskId: String): StudyTask? = tasks[taskId]
-
-    override fun startTask(taskId: String) {
-        tasks[taskId] = tasks.getValue(taskId).copy(state = TaskState.ACTIVE)
-    }
-
-    override fun resumeTask(taskId: String, resumedAt: Long) {
-        val task = tasks.getValue(taskId)
-        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
-        tasks[taskId] = task.copy(
-            state = TaskState.ACTIVE,
-            pausedAt = null,
-            totalPausedMs = task.totalPausedMs + elapsed
-        )
-    }
-
-    override fun pauseTask(taskId: String, pausedAt: Long) {
-        val task = tasks.getValue(taskId)
-        tasks[taskId] = task.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = task.pauseCount + 1)
-    }
-
-    override fun reduceDuration(taskId: String, newDurationMinutes: Int) {
-        tasks[taskId] = tasks.getValue(taskId).copy(durationMinutes = newDurationMinutes)
-    }
-
-    override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
-        tasks[taskId] = tasks.getValue(taskId).copy(scheduledStartTime = newScheduledStartTime)
-    }
-}
-
-
-//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/ActionExecutorTest.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Proactive Execution Engine — Step 5 (Blueprint Part One, §13). LLM/voice/the Trigger
- * Engine are not involved anywhere here — ActionExecutor is exercised directly against
- * PermittedActions, as scoped.
+ * Proactive Execution Engine — Step 6 (Blueprint Part One, §14). Nothing here touches a
+ * real network or Robolectric — [InterventionFallback.attemptLlm] takes an injectable
+ * llmCall precisely so timeout behavior is testable as a plain JVM test. runTest's virtual
+ * time scheduler advances through delay() automatically, so the "LLM never responds in
+ * time" tests below don't actually wait 3 real seconds.
  */
-class ActionExecutorTest {
+class InterventionFallbackTest {
 
-    private fun task(
-        state: TaskState = TaskState.PENDING,
-        durationMinutes: Int = 90,
-        scheduledStartTime: String? = null,
-        pausedAt: Long? = null,
-        totalPausedMs: Long = 0L
-    ) = StudyTask(
-        subject = "Physics",
-        topic = "Electrostatics",
-        durationMinutes = durationMinutes,
-        state = state,
-        scheduledStartTime = scheduledStartTime,
-        pausedAt = pausedAt,
-        totalPausedMs = totalPausedMs
-    )
+    // ── attemptLlm ───────────────────────────────────────────────────────
+
+    @Test
+    fun `attemptLlm returns the response when it arrives within budget`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            timeoutMillis = 3_000L,
+            llmCall = { _, _ -> "structured response" }
+        )
+        assertEquals("structured response", result)
+    }
+
+    @Test
+    fun `attemptLlm returns null when the call does not resolve within the timeout`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            timeoutMillis = 3_000L,
+            llmCall = { _, _ -> delay(10_000L); "too late" }
+        )
+        assertNull(result)
+    }
+
+    @Test
+    fun `attemptLlm returns null for a blank response, matching LlmGateway's failure contract`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            llmCall = { _, _ -> "" }
+        )
+        assertNull(result)
+    }
+
+    // ── strictReminderIntent ─────────────────────────────────────────────
+
+    @Test
+    fun `strictReminderIntent mentions lateness when late`() {
+        val task = StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90)
+        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes = 8)
+        assertEquals(InterventionIntentType.START_TASK, intent.intentType)
+        assertEquals(task.id, intent.targetTaskId)
+        assertTrue(intent.speech.contains("8 minutes late"))
+        assertTrue(intent.speech.contains("Electrostatics"))
+    }
+
+    @Test
+    fun `strictReminderIntent has a plain prompt when not late`() {
+        val task = StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90)
+        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes = 0)
+        assertTrue(!intent.speech.contains("late"))
+        assertTrue(intent.speech.contains("Electrostatics"))
+    }
+
+    // ── InterventionDecisionMaker ────────────────────────────────────────
 
     private class Fixture(task: StudyTask) {
         val dao = FakeInterventionTransactionDao()
         val escrow = TaskEscrow(dao)
         val mutator = FakeTaskMutator(listOf(task))
         val executor = ActionExecutor(dao, escrow, mutator)
+        val decisionMaker = InterventionDecisionMaker(escrow, executor)
         val taskId = task.id
 
         suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
@@ -1080,204 +212,83 @@ class ActionExecutorTest {
                     as EscrowAcquireResult.Acquired).transaction
     }
 
-    // ── START_TASK ───────────────────────────────────────────────────────
+    private fun pendingTask(state: TaskState = TaskState.PENDING) =
+        StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90, state = state)
 
     @Test
-    fun `start task on PENDING applies and completes the transaction`() = runTest {
-        val f = Fixture(task(state = TaskState.PENDING))
+    fun `deterministic-only path (no LLM attempted) starts the task`() = runTest {
+        val f = Fixture(pendingTask())
         val tx = f.acquire()
 
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 8
+        )
 
-        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertTrue(outcome is DecisionOutcome.Executed)
+        val executed = outcome as DecisionOutcome.Executed
+        assertTrue(executed.executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(executed.usedFallback)
         assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
         assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
     }
 
     @Test
-    fun `start task on PAUSED resumes instead of restarting, preserving pause accounting`() = runTest {
-        val f = Fixture(task(state = TaskState.PAUSED, pausedAt = 1_000L, totalPausedMs = 2_000L))
-        val tx = f.acquire(now = 5_000L)
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId), now = 5_000L)
-
-        assertTrue(outcome is ExecutionOutcome.Applied)
-        val result = f.mutator.currentState(f.taskId)
-        assertEquals(TaskState.ACTIVE, result?.state)
-        assertEquals(null, result?.pausedAt)
-        // 2_000 (already accumulated) + 4_000 (5_000 - 1_000 elapsed since pausedAt)
-        assertEquals(6_000L, result?.totalPausedMs)
-    }
-
-    @Test
-    fun `start task on already ACTIVE is a no-op but still completes the transaction`() = runTest {
-        val f = Fixture(task(state = TaskState.ACTIVE))
+    fun `LLM timeout still resolves deterministically via the fallback path`() = runTest {
+        val f = Fixture(pendingTask())
         val tx = f.acquire()
 
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmTimeoutMillis = 3_000L,
+            llmCall = { _, _ -> delay(10_000L); "never arrives in time" }
+        )
 
-        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
-        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+        assertTrue(outcome is DecisionOutcome.Executed)
+        assertTrue((outcome as DecisionOutcome.Executed).executionOutcome is ExecutionOutcome.Applied)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
     }
 
     @Test
-    fun `start task on a DONE task fails and resolves EXECUTION_FAILED`() = runTest {
-        val f = Fixture(task(state = TaskState.DONE))
+    fun `LLM responding successfully still resolves via the deterministic path today`() = runTest {
+        // Step 11 (structured LLM intent parsing) doesn't exist yet — even a fast, valid
+        // LLM response has no parser to be trusted through, so this must still fall back.
+        val f = Fixture(pendingTask())
         val tx = f.acquire()
 
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ -> """{"intentType":"REDUCE_DURATION"}""" }
+        )
 
-        assertTrue(outcome is ExecutionOutcome.Failed)
-        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+        assertTrue(outcome is DecisionOutcome.Executed)
+        assertTrue((outcome as DecisionOutcome.Executed).executionOutcome is ExecutionOutcome.Applied)
+        // Still a START_TASK outcome (the deterministic reminder), not a REDUCE_DURATION —
+        // proves the unparsed LLM text was not acted on.
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(90, f.mutator.currentState(f.taskId)?.durationMinutes)
     }
 
-    // ── REDUCE_DURATION ──────────────────────────────────────────────────
-
     @Test
-    fun `reduce duration applies and completes the transaction`() = runTest {
-        val f = Fixture(task(durationMinutes = 90))
+    fun `a task in a non-startable state is rejected by policy and resolves POLICY_REJECTED`() = runTest {
+        val f = Fixture(pendingTask(state = TaskState.ACTIVE))
         val tx = f.acquire()
 
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5
+        )
 
-        assertTrue(outcome is ExecutionOutcome.Applied)
-        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
-        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `reduce duration to the same value already in effect is a no-op`() = runTest {
-        val f = Fixture(task(durationMinutes = 35))
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
-
-        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
-    }
-
-    // ── RESCHEDULE_TASK ──────────────────────────────────────────────────
-
-    @Test
-    fun `reschedule applies and completes the transaction`() = runTest {
-        val f = Fixture(task(scheduledStartTime = "19:00"))
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RescheduleTask(f.taskId, "20:00"))
-
-        assertTrue(outcome is ExecutionOutcome.Applied)
-        assertEquals("20:00", f.mutator.currentState(f.taskId)?.scheduledStartTime)
-    }
-
-    @Test
-    fun `reschedule to the same time already in effect is a no-op`() = runTest {
-        val f = Fixture(task(scheduledStartTime = "20:00"))
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RescheduleTask(f.taskId, "20:00"))
-
-        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
-    }
-
-    // ── TAKE_SHORT_BREAK ─────────────────────────────────────────────────
-
-    @Test
-    fun `short break on PENDING pauses the task and completes the transaction`() = runTest {
-        val f = Fixture(task(state = TaskState.PENDING))
-        val tx = f.acquire(now = 3_000L)
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15), now = 3_000L)
-
-        assertTrue(outcome is ExecutionOutcome.Applied)
-        val result = f.mutator.currentState(f.taskId)
-        assertEquals(TaskState.PAUSED, result?.state)
-        assertEquals(3_000L, result?.pausedAt)
-    }
-
-    @Test
-    fun `short break on an already PAUSED task is a no-op`() = runTest {
-        val f = Fixture(task(state = TaskState.PAUSED, pausedAt = 1_000L))
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15))
-
-        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
-    }
-
-    @Test
-    fun `short break on a DONE task fails and resolves EXECUTION_FAILED`() = runTest {
-        val f = Fixture(task(state = TaskState.DONE))
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15))
-
-        assertTrue(outcome is ExecutionOutcome.Failed)
-        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
-    }
-
-    // ── Non-mutating actions ─────────────────────────────────────────────
-
-    @Test
-    fun `KEEP_PLAN NO_ACTION and REQUEST_CLARIFICATION do not touch the task but do complete`() = runTest {
-        listOf(PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification)
-            .forEach { action ->
-                val f = Fixture(task(durationMinutes = 90, scheduledStartTime = "19:00"))
-                val tx = f.acquire()
-                val before = f.mutator.currentState(f.taskId)
-
-                val outcome = f.executor.execute(tx.transactionId, action)
-
-                assertTrue("$action should be NotApplicable", outcome is ExecutionOutcome.NotApplicable)
-                assertEquals(before, f.mutator.currentState(f.taskId))
-                assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
-            }
-    }
-
-    @Test
-    fun `REQUEST_GUARDIAN is recognized and completes without mutating the task`() = runTest {
-        val f = Fixture(task())
-        val tx = f.acquire()
-        val before = f.mutator.currentState(f.taskId)
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RequestGuardian)
-
-        assertTrue(outcome is ExecutionOutcome.RequiresGuardianEscalation)
-        assertEquals(before, f.mutator.currentState(f.taskId))
-        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
-    }
-
-    // ── Duplicate delivery / transaction lookup (Blueprint §13) ─────────
-
-    @Test
-    fun `duplicate delivery of an already-resolved transaction does not mutate the task twice`() = runTest {
-        val f = Fixture(task(durationMinutes = 90))
-        val tx = f.acquire()
-
-        val first = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
-        assertTrue(first is ExecutionOutcome.Applied)
-        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
-
-        // Same transactionId delivered again — e.g. a retried WorkManager job.
-        val second = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
-        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
-        // Still 35 — not reduced again, and no error either.
-        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
-    }
-
-    @Test
-    fun `executing an unknown transaction id returns TransactionNotFound`() = runTest {
-        val f = Fixture(task())
-        val outcome = f.executor.execute("does-not-exist", PermittedAction.StartTask(f.taskId))
-        assertEquals(ExecutionOutcome.TransactionNotFound, outcome)
-    }
-
-    @Test
-    fun `task deleted between validation and execution fails cleanly`() = runTest {
-        val f = Fixture(task())
-        val tx = f.acquire()
-
-        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask("some-other-task-id"))
-
-        assertTrue(outcome is ExecutionOutcome.Failed)
-        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+        assertTrue(outcome is DecisionOutcome.PolicyRejected)
+        assertEquals(RejectionReason.TASK_NOT_ACTIVE_STATE, (outcome as DecisionOutcome.PolicyRejected).reason)
+        assertEquals(InterventionState.POLICY_REJECTED, f.dao.getById(tx.transactionId)?.currentState)
     }
 }
