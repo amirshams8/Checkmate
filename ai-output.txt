@@ -1,1272 +1,985 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionNotificationGateway.kt =====
-package com.checkmate.planner.intervention
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/stt/CheckmateSTT.kt =====
+package com.checkmate.core.stt
 
 import android.content.Context
-import com.checkmate.planner.model.StudyTask
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.Locale
 
 /**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16).
+ * Proactive Execution Engine — Step 10 (Blueprint Part One, §16's "Talk to Checkmate" —
+ * flagged by Step 9's InterventionNotifier but left unbuilt until now).
  *
- * "Proactive does not mean Checkmate can freely pop an Activity over whatever the user is
- * doing... Default interaction should be: Trigger -> High-quality notification / heads-up
- * -> User interaction -> Voice session." This is the seam [InterventionTriggerWorker] calls
- * instead of resolving a NEGOTIATING transaction immediately through the deterministic
- * fallback. Same shape as this codebase's existing DistractionGuard.listener /
- * UninstallGuard.listener pattern (see CheckmateApp.onCreate): an interface owned by the
- * module that needs to call out (planner), implemented and wired by the module that can
- * actually build the notification — which has to be `app`, since a heads-up notification
- * with tap actions needs NotificationManager/PendingIntent/BroadcastReceiver, AND because
- * building the richest possible notification text means pulling in psyche's ContextBuilder
- * (Step 8) — planner cannot see modules/psyche (psyche depends on planner, not the reverse;
- * see Step 8's own note on this), so only `app` sees both sides at once.
+ * Thin wrapper around Android's on-device [SpeechRecognizer]. No cloud STT vendor is wired
+ * here — mirrors [com.checkmate.core.tts.CheckmateTTS]'s own "free platform default, no
+ * required paid dependency" posture (that file's ElevenLabs path is an opt-in upgrade on
+ * top of Android TextToSpeech, not a replacement for it). RECORD_AUDIO is already declared
+ * in the manifest and requested at MainActivity startup — this step needed nothing new
+ * there.
  *
- * [InterventionNotificationBridge] is the settable holder — set once from
- * CheckmateApp.onCreate(), read by [InterventionTriggerWorker] on every run. If nothing has
- * set [InterventionNotificationBridge.gateway] (e.g. a plain JVM unit test, or any future
- * build variant that doesn't want the notification path), the worker falls back to exactly
- * the deterministic-fallback-only behavior it had before this step — offline-first (§14)
- * extends to "gateway-absent-first" too: the trigger engine must keep working even if the
- * one thing that can show a notification was never wired.
+ * A class, not a singleton object like CheckmateTTS — a SpeechRecognizer instance is
+ * single-session state (each `startListening()` either resolves via onResults/onError or is
+ * cancelled), and the negotiation screen this exists for needs its own lifecycle-scoped
+ * instance rather than a process-wide singleton other unrelated screens could silently
+ * interfere with.
+ *
+ * Must be constructed and driven from the main thread — that's a hard SpeechRecognizer
+ * requirement, not a choice made here. [NegotiationViewModel] only ever calls this from
+ * Compose's main-thread callbacks, so this class does no threading of its own.
  */
-interface InterventionNotificationGateway {
-    /**
-     * Called once per fired trigger, right after escrow is acquired. Implementations are
-     * expected to show a user-facing prompt (heads-up notification, per §16) and return
-     * immediately — resolution of the transaction happens later, out of band, when the
-     * student taps a notification action (or the TTL lapses and
-     * [TaskEscrow.expireIfPastTtl]/reconciliation cleans it up).
-     *
-     * Returning [PromptDispatchResult.UNAVAILABLE] (e.g. POST_NOTIFICATIONS not granted)
-     * tells the worker to fall back to the deterministic path immediately instead of leaving
-     * the transaction to expire silently with nothing ever shown to the student.
-     */
-    suspend fun promptStudent(
-        context: Context,
-        transactionId: String,
-        task: StudyTask,
-        lateMinutes: Int,
-        now: Long
-    ): PromptDispatchResult
-}
+class CheckmateSTT(private val context: Context) {
 
-enum class PromptDispatchResult { SHOWN, UNAVAILABLE }
+    private var recognizer: SpeechRecognizer? = null
 
-object InterventionNotificationBridge {
-    /** Blueprint §16's notification is a new "waiting for a human to glance at their phone"
-     *  step — materially longer than [TaskEscrow.DEFAULT_TTL_MILLIS] (60s, sized for an
-     *  active voice negotiation per §6's own example, not for a notification that might sit
-     *  unread for a few minutes). 5 minutes matches the notifier's own snooze duration so
-     *  "Snooze 5 min" always has a live, non-expired transaction to extend against. */
-    const val PROMPT_TTL_MILLIS = 5 * 60_000L
+    private val _state = MutableStateFlow(SttUiState())
+    val state: StateFlow<SttUiState> = _state.asStateFlow()
 
-    @Volatile
-    var gateway: InterventionNotificationGateway? = null
-}
+    fun isAvailable(): Boolean = SpeechRecognizer.isRecognitionAvailable(context)
 
+    fun startListening() {
+        if (!isAvailable()) {
+            _state.value = _state.value.copy(error = "Speech recognition not available on this device")
+            return
+        }
+        // Defensive: never leave a previous session's recognizer half-torn-down before
+        // starting a new one — createSpeechRecognizer() while one is already listening is
+        // the most common source of silent ERROR_RECOGNIZER_BUSY reports.
+        stopListening()
 
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTriggerWorker.kt =====
-package com.checkmate.planner.intervention
-
-import android.content.Context
-import androidx.work.CoroutineWorker
-import androidx.work.WorkerParameters
-import com.checkmate.planner.PlanStore
-
-/**
- * Proactive Execution Engine — Step 7 (build), amended in Step 9 (Blueprint Part One, §2,
- * §16).
- *
- * "It does not 'constantly run an AI.' It evaluates deterministic signals." Each run walks
- * today's tasks, asks [TriggerEvaluator] whether any fire, and for each one that does —
- * acquires escrow and hands the student a chance to respond before anything is decided for
- * them.
- *
- * Step 9 changes what happens after escrow is acquired. Previously this worker resolved
- * every fired trigger immediately and silently through [InterventionDecisionMaker]'s
- * deterministic fallback (STRICT_REMINDER -> START_TASK), with nothing ever shown to the
- * student — a gap flagged when Step 8 (Context Builder) was built but not yet wired to
- * anything. Now, if [InterventionNotificationBridge.gateway] is wired (from `app`, since
- * planner cannot itself show a notification or reach psyche's ContextBuilder — see that
- * interface's own doc), the worker prompts the student instead and stops there for this
- * task; the transaction stays NEGOTIATING and is resolved later, out of band, by
- * `app`'s InterventionActionReceiver (a tap) or by TTL expiry/reconciliation (silence). If
- * no gateway is wired, or the gateway reports it couldn't show anything (e.g. notification
- * permission denied), this falls back to exactly the old behavior — the deterministic path
- * is never allowed to become unreachable just because the notification layer exists now.
- *
- * Escrow's TTL is widened to [InterventionNotificationBridge.PROMPT_TTL_MILLIS] whenever a
- * gateway is wired, since the 60-second [TaskEscrow.DEFAULT_TTL_MILLIS] default was sized
- * for an active voice negotiation (§6), not for "waits until the student glances at their
- * phone." Without a gateway, escrow still uses the original 60-second default, since nothing
- * is waiting on human attention in that path.
- *
- * Deliberately relies on [TaskEscrow.acquire]'s own atomic check rather than calling
- * [TaskEscrow.isUnderEscrow] first — a separate pre-check would be a second DB read with a
- * race window between it and the acquire call; acquire() already returns AlreadyHeld
- * safely if something else (a concurrent run, or a manually-triggered intervention) beat
- * this one to it.
- */
-class InterventionTriggerWorker(
-    context: Context,
-    params: WorkerParameters
-) : CoroutineWorker(context, params) {
-
-    override suspend fun doWork(): Result {
-        val dao = InterventionDatabase.getInstance(applicationContext).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        val gateway = InterventionNotificationBridge.gateway
-        val now = System.currentTimeMillis()
-
-        PlanStore.todayTasks.value.forEach { task ->
-            val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
-
-            val ttlMillis = if (gateway != null) {
-                InterventionNotificationBridge.PROMPT_TTL_MILLIS
-            } else {
-                TaskEscrow.DEFAULT_TTL_MILLIS
+        val r = SpeechRecognizer.createSpeechRecognizer(context)
+        recognizer = r
+        r.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                Log.d(TAG, "Ready for speech")
+                _state.value = _state.value.copy(isListening = true, error = null)
             }
-            val acquired = escrow.acquire(task.id, signal.triggerType, now, ttlMillis)
-            if (acquired !is EscrowAcquireResult.Acquired) return@forEach
 
-            val dispatched = gateway?.promptStudent(
-                context = applicationContext,
-                transactionId = acquired.transaction.transactionId,
-                task = task,
-                lateMinutes = signal.lateMinutes,
-                now = now
-            )
+            override fun onBeginningOfSpeech() = Unit
 
-            if (dispatched != PromptDispatchResult.SHOWN) {
-                // No gateway wired, or the gateway couldn't show anything — resolve
-                // immediately through the deterministic fallback, same as before this step,
-                // rather than leaving the transaction to sit until TTL expiry with nothing
-                // ever having been shown to the student.
-                decisionMaker.decideAndExecute(
-                    transactionId = acquired.transaction.transactionId,
-                    task = task,
-                    lateMinutes = signal.lateMinutes,
-                    now = now
-                )
+            override fun onRmsChanged(rmsdB: Float) {
+                _state.value = _state.value.copy(rmsDb = rmsdB)
             }
-            // dispatched == SHOWN: transaction intentionally left NEGOTIATING here.
-        }
 
-        return Result.success()
-    }
-}
+            override fun onBufferReceived(buffer: ByteArray?) = Unit
 
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskEscrow.kt =====
-package com.checkmate.planner.intervention
-
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.ConcurrentHashMap
-
-/**
- * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6), amended in Step 9 (§16
- * "Snooze 5 min" — see [extend]).
- *
- * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
- * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
- * owns the task until it reaches COMMIT or ABORT" (§5). This deliberately does NOT touch
- * [com.checkmate.planner.model.TaskState] or [com.checkmate.planner.PlanStore] — there is
- * no NEGOTIATING case added to TaskState, because that enum is matched exhaustively across
- * the UI layer (HomeScreen/HomeViewModel/etc.) and adding a case there is a much wider,
- * riskier change than this step calls for. Escrow ownership is entirely a property of the
- * transaction table from step 3: a task is under escrow iff `dao.getLatestForTask(taskId)`
- * is non-null and non-terminal. Callers that need to gate task-mutation UI on escrow can
- * check that via [isUnderEscrow] without StudyTask ever knowing escrow exists.
- *
- * Atomicity: this is a single-process Android app, not a multi-process one, so the actual
- * correctness boundary is in-process mutual exclusion, not a Room `@Transaction`/SQLite
- * isolation level. Every entry point below funnels through [withTaskLock], which holds a
- * per-taskId [Mutex] for the duration of its read-then-write. Two concurrent acquire()
- * calls for the same task always serialize through that Mutex, so exactly one observes
- * "no existing escrow" and wins; the other sees the transaction the winner just wrote and
- * gets [EscrowAcquireResult.AlreadyHeld]. The lock map itself is never persisted — that's
- * fine, because after a real process death there's no second in-process caller left to
- * race against; the surviving [InterventionTransaction] row is instead picked up by
- * [reconcileUnfinished] (or reclaimed inline by the next [acquire] call for that task).
- */
-class TaskEscrow(private val dao: InterventionTransactionDao) {
-
-    private val taskLocks = ConcurrentHashMap<String, Mutex>()
-
-    /**
-     * Attempts to acquire escrow for [taskId]. Succeeds and creates a new NEGOTIATING
-     * transaction unless one already exists and is both non-terminal AND still within its
-     * TTL. A non-terminal transaction found past its TTL is treated as abandoned — reclaimed
-     * (marked TTL_EXPIRED) in the same locked section, and acquisition then proceeds. This
-     * is what makes expiry deterministic even if no reconciliation job has run yet: the very
-     * next acquire() attempt for that task will not be blocked by a stale escrow forever.
-     */
-    suspend fun acquire(
-        taskId: String,
-        triggerType: InterventionTriggerType,
-        now: Long = System.currentTimeMillis(),
-        ttlMillis: Long = DEFAULT_TTL_MILLIS
-    ): EscrowAcquireResult = withTaskLock(taskId) {
-        val existing = dao.getLatestForTask(taskId)
-        if (existing != null && !existing.currentState.isTerminal) {
-            if (now < existing.expiresAt) {
-                return@withTaskLock EscrowAcquireResult.AlreadyHeld(existing)
+            override fun onEndOfSpeech() {
+                _state.value = _state.value.copy(isListening = false)
             }
-            // Past TTL and nobody released it — reclaim before proceeding.
-            dao.update(
-                existing.copy(
-                    currentState = InterventionState.TTL_EXPIRED,
-                    failureReason = "TTL expired before release; reclaimed by acquire()"
-                )
-            )
-        }
 
-        val transaction = InterventionTransaction(
-            taskId = taskId,
-            currentState = InterventionState.NEGOTIATING,
-            triggerType = triggerType,
-            createdAt = now,
-            expiresAt = now + ttlMillis
-        )
-        dao.upsert(transaction)
-        EscrowAcquireResult.Acquired(transaction)
-    }
-
-    /** COMMIT (§5): the intervention concluded with an action taken. Idempotent — calling
-     *  this again (or calling [abort] afterward) on the same transaction is a no-op. */
-    suspend fun commit(transactionId: String, outcome: String? = null): EscrowReleaseResult =
-        resolveAs(transactionId, InterventionState.COMPLETED, outcome = outcome)
-
-    /** ABORT (§5): the intervention concluded without acting on the task because the
-     *  *student* declined/dismissed it. Idempotent, same as [commit]. Distinct from a
-     *  system-side execution failure — see [resolveAs]. */
-    suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
-        resolveAs(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
-
-    /**
-     * Step 9 (§16 "Snooze 5 min"): extends a still-live NEGOTIATING transaction's TTL
-     * without resolving it — unlike [commit]/[abort]/[resolveAs], this deliberately does
-     * NOT touch [InterventionTransaction.currentState]. A snooze is the student saying "not
-     * yet, ask me again later," not a decision the FSM has reached, so the transaction stays
-     * exactly where it was; escrow is not released, so nothing else can start/mutate the
-     * task in the meantime either. [additionalMillis] is added to `max(current expiresAt,
-     * now)` rather than just `now + additionalMillis`, so calling this before the previous
-     * deadline has passed extends from the existing deadline instead of ever shortening it.
-     *
-     * Idempotent-safe the same way [resolve] is: if the transaction already resolved (by
-     * TTL, or a concurrent notification-action tap) between the notification tap and this
-     * call, this is a no-op that reports [EscrowExtendResult.AlreadyResolved] rather than
-     * reviving a dead transaction.
-     */
-    suspend fun extend(
-        transactionId: String,
-        additionalMillis: Long,
-        now: Long = System.currentTimeMillis()
-    ): EscrowExtendResult {
-        val current = dao.getById(transactionId) ?: return EscrowExtendResult.NotFound
-        return withTaskLock(current.taskId) {
-            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExtendResult.NotFound
-            if (fresh.currentState.isTerminal) return@withTaskLock EscrowExtendResult.AlreadyResolved
-            val newExpiry = maxOf(fresh.expiresAt, now) + additionalMillis
-            dao.update(fresh.copy(expiresAt = newExpiry))
-            EscrowExtendResult.Extended(newExpiry)
-        }
-    }
-
-    /**
-     * General resolution entry point for any terminal [InterventionState] — added in step
-     * 5. [commit]/[abort] cover the two most common cases, but ActionExecutor also needs
-     * to resolve into EXECUTION_FAILED specifically when a permitted mutation can no
-     * longer be applied (e.g. task state changed between validation and execution). That's
-     * a different fact than USER_ABORTED (the student declined) or TTL_EXPIRED (nobody
-     * responded in time), and the Outcome Ledger (a later step) needs to tell them apart.
-     */
-    suspend fun resolveAs(
-        transactionId: String,
-        terminalState: InterventionState,
-        outcome: String? = null,
-        failureReason: String? = null
-    ): EscrowReleaseResult {
-        require(terminalState.isTerminal) { "resolveAs requires a terminal state, got $terminalState" }
-        return resolve(transactionId, terminalState, outcome, failureReason)
-    }
-
-    /**
-     * Explicit TTL check for one transaction, independent of [acquire]'s inline reclaim —
-     * for a reconciliation job (a later step) that wants to sweep expired escrows without
-     * also trying to acquire a new one. Deterministic and idempotent: calling it again after
-     * it has already expired (or already resolved by commit/abort) a transaction is a safe
-     * no-op.
-     */
-    suspend fun expireIfPastTtl(
-        transactionId: String,
-        now: Long = System.currentTimeMillis()
-    ): EscrowExpiryResult {
-        val current = dao.getById(transactionId) ?: return EscrowExpiryResult.NotFound
-        return withTaskLock(current.taskId) {
-            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExpiryResult.NotFound
-            when {
-                fresh.currentState.isTerminal -> EscrowExpiryResult.AlreadyResolved
-                now < fresh.expiresAt -> EscrowExpiryResult.NotYetExpired
-                else -> {
-                    dao.update(
-                        fresh.copy(
-                            currentState = InterventionState.TTL_EXPIRED,
-                            failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
-                        )
-                    )
-                    EscrowExpiryResult.Expired
-                }
+            override fun onError(error: Int) {
+                val message = describeError(error)
+                Log.w(TAG, "STT error $error: $message")
+                _state.value = _state.value.copy(isListening = false, error = message)
             }
-        }
-    }
 
-    /**
-     * Reconciliation (§4): "Process dies -> Room remains -> Worker/receiver restarts ->
-     * unfinished transaction discovered -> FSM reconciles it." Intended to run once after
-     * process restart (from BootReceiver, or a WorkManager job — wiring that trigger point
-     * is a later step; this only provides the sweep itself). Every unfinished transaction
-     * past its TTL is expired; anything unfinished but still within TTL is left alone and
-     * returned so the caller can decide what to do with a live, still-valid negotiation
-     * that survived the restart.
-     */
-    suspend fun reconcileUnfinished(now: Long = System.currentTimeMillis()): ReconciliationResult {
-        val unfinished = dao.getUnfinished(InterventionState.TERMINAL_STATES.toList())
-        val expired = mutableListOf<InterventionTransaction>()
-        val stillLive = mutableListOf<InterventionTransaction>()
-        for (transaction in unfinished) {
-            when (expireIfPastTtl(transaction.transactionId, now)) {
-                is EscrowExpiryResult.Expired -> expired += transaction.copy(currentState = InterventionState.TTL_EXPIRED)
-                is EscrowExpiryResult.NotYetExpired -> stillLive += transaction
-                // Resolved by a concurrent caller between the query above and this check,
-                // or the row vanished — either way it's no longer this sweep's concern.
-                is EscrowExpiryResult.AlreadyResolved, is EscrowExpiryResult.NotFound -> Unit
+            override fun onResults(results: Bundle?) {
+                val text = results
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                _state.value = _state.value.copy(isListening = false, finalText = text, partialText = "")
             }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val text = partialResults
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()
+                if (text != null) _state.value = _state.value.copy(partialText = text)
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) = Unit
+        })
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
-        return ReconciliationResult(expiredTransactions = expired, stillLiveTransactions = stillLive)
+        _state.value = _state.value.copy(finalText = null, partialText = "", error = null)
+        r.startListening(intent)
     }
 
-    /** True iff [taskId] currently has a non-terminal transaction — i.e. is under escrow
-     *  and should not be independently mutated/started elsewhere. */
-    suspend fun isUnderEscrow(taskId: String): Boolean {
-        val existing = dao.getLatestForTask(taskId) ?: return false
-        return !existing.currentState.isTerminal
-    }
-
-    private suspend fun resolve(
-        transactionId: String,
-        state: InterventionState,
-        outcome: String? = null,
-        failureReason: String? = null
-    ): EscrowReleaseResult {
-        val current = dao.getById(transactionId) ?: return EscrowReleaseResult.NotFound
-        return withTaskLock(current.taskId) {
-            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowReleaseResult.NotFound
-            if (fresh.currentState.isTerminal) return@withTaskLock EscrowReleaseResult.AlreadyResolved
-            dao.update(fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason))
-            EscrowReleaseResult.Released
+    fun stopListening() {
+        recognizer?.let {
+            try { it.stopListening() } catch (e: Exception) { Log.w(TAG, "stopListening failed: ${e.message}") }
+            try { it.destroy() } catch (e: Exception) { Log.w(TAG, "destroy failed: ${e.message}") }
         }
+        recognizer = null
+        _state.value = _state.value.copy(isListening = false)
     }
 
-    private suspend fun <T> withTaskLock(taskId: String, block: suspend () -> T): T {
-        val mutex = taskLocks.getOrPut(taskId) { Mutex() }
-        return mutex.withLock { block() }
+    /** Clears a consumed final transcript so it isn't re-acted-on if the state flow is
+     *  re-observed (e.g. after a config change) before the next `startListening()` call. */
+    fun consumeFinalText() {
+        _state.value = _state.value.copy(finalText = null)
+    }
+
+    private fun describeError(code: Int): String = when (code) {
+        SpeechRecognizer.ERROR_NO_MATCH -> "Didn't catch that — try again"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission needed"
+        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network error"
+        SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy — try again"
+        SpeechRecognizer.ERROR_CLIENT -> "Speech recognition client error"
+        else -> "Speech recognition error ($code)"
     }
 
     companion object {
-        /** Blueprint §6 example TTL. */
-        const val DEFAULT_TTL_MILLIS = 60_000L
+        private const val TAG = "CheckmateSTT"
     }
 }
 
-sealed class EscrowAcquireResult {
-    data class Acquired(val transaction: InterventionTransaction) : EscrowAcquireResult()
-    data class AlreadyHeld(val existing: InterventionTransaction) : EscrowAcquireResult()
-}
-
-sealed class EscrowReleaseResult {
-    object Released : EscrowReleaseResult()
-    /** Idempotency case: already COMPLETED/ABORTED/EXPIRED/etc. — commit()/abort() called
-     *  twice, or called after TTL already resolved it first. Not an error. */
-    object AlreadyResolved : EscrowReleaseResult()
-    object NotFound : EscrowReleaseResult()
-}
-
-sealed class EscrowExpiryResult {
-    object Expired : EscrowExpiryResult()
-    object AlreadyResolved : EscrowExpiryResult()
-    object NotYetExpired : EscrowExpiryResult()
-    object NotFound : EscrowExpiryResult()
-}
-
-/** Result of [TaskEscrow.extend] — step 9's snooze support. */
-sealed class EscrowExtendResult {
-    data class Extended(val newExpiresAt: Long) : EscrowExtendResult()
-    object AlreadyResolved : EscrowExtendResult()
-    object NotFound : EscrowExtendResult()
-}
-
-data class ReconciliationResult(
-    val expiredTransactions: List<InterventionTransaction>,
-    val stillLiveTransactions: List<InterventionTransaction>
+data class SttUiState(
+    val isListening: Boolean = false,
+    val partialText: String = "",
+    val finalText: String? = null,
+    val rmsDb: Float = 0f,
+    val error: String? = null
 )
 
 
-//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/TaskEscrowTest.kt =====
-package com.checkmate.planner.intervention
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
+package com.checkmate.ui.negotiation
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.test.runTest
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-/**
- * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6). Covers atomic
- * acquisition under concurrency, commit/abort idempotency, deterministic TTL expiry, and
- * process-death reconciliation. LLM/voice/ActionExecutor are not involved anywhere here —
- * this is exercising TaskEscrow in isolation, as scoped.
- */
-class TaskEscrowTest {
-
-    private val taskId = "task-1"
-
-    // ── Acquisition ──────────────────────────────────────────────────────
-
-    @Test
-    fun `acquire succeeds when no existing escrow`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        val result = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-        assertTrue(result is EscrowAcquireResult.Acquired)
-        val tx = (result as EscrowAcquireResult.Acquired).transaction
-        assertEquals(InterventionState.NEGOTIATING, tx.currentState)
-        assertEquals(taskId, tx.taskId)
-    }
-
-    @Test
-    fun `acquire is denied while a non-expired escrow is already held`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
-
-        val second = escrow.acquire(taskId, InterventionTriggerType.DISTRACTION_DETECTED, now = 1_500L)
-        assertTrue(second is EscrowAcquireResult.AlreadyHeld)
-    }
-
-    @Test
-    fun `acquire reclaims an escrow past its TTL and succeeds`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val first = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
-        val firstId = (first as EscrowAcquireResult.Acquired).transaction.transactionId
-
-        // now = 2_000 is well past expiresAt = 1_500 for the first transaction.
-        val second = escrow.acquire(taskId, InterventionTriggerType.REPEATED_SKIPS, now = 2_000L)
-        assertTrue(second is EscrowAcquireResult.Acquired)
-
-        val reclaimed = dao.getById(firstId)
-        assertEquals(InterventionState.TTL_EXPIRED, reclaimed?.currentState)
-    }
-
-    @Test
-    fun `concurrent acquisition for the same task yields exactly one winner`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        val attempts = 10
-
-        val results = (1..attempts).map { i ->
-            async { escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L + i) }
-        }.awaitAll()
-
-        val acquired = results.filterIsInstance<EscrowAcquireResult.Acquired>()
-        val denied = results.filterIsInstance<EscrowAcquireResult.AlreadyHeld>()
-        assertEquals(1, acquired.size)
-        assertEquals(attempts - 1, denied.size)
-    }
-
-    @Test
-    fun `concurrent acquisition for different tasks does not contend`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        val taskIds = (1..5).map { "task-$it" }
-
-        val results = taskIds.map { id ->
-            async { escrow.acquire(id, InterventionTriggerType.LATE_START, now = 1_000L) }
-        }.awaitAll()
-
-        assertTrue(results.all { it is EscrowAcquireResult.Acquired })
-    }
-
-    // ── Commit / abort ───────────────────────────────────────────────────
-
-    @Test
-    fun `commit resolves the transaction to COMPLETED`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.commit(tx.transactionId, outcome = "Session started, 35 min")
-        assertEquals(EscrowReleaseResult.Released, result)
-        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `abort resolves the transaction to USER_ABORTED`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.abort(tx.transactionId, reason = "Student dismissed the prompt")
-        assertEquals(EscrowReleaseResult.Released, result)
-        assertEquals(InterventionState.USER_ABORTED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `commit is idempotent when called twice`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        escrow.commit(tx.transactionId, outcome = "first")
-        val secondCall = escrow.commit(tx.transactionId, outcome = "second")
-
-        assertEquals(EscrowReleaseResult.AlreadyResolved, secondCall)
-        // The original resolution is untouched by the redundant second call.
-        assertEquals("first", dao.getById(tx.transactionId)?.outcome)
-    }
-
-    @Test
-    fun `abort after commit is idempotent and does not override the resolution`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        escrow.commit(tx.transactionId, outcome = "Session started")
-        val abortAfterCommit = escrow.abort(tx.transactionId, reason = "too late")
-
-        assertEquals(EscrowReleaseResult.AlreadyResolved, abortAfterCommit)
-        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `commit on an unknown transaction returns NotFound`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        assertEquals(EscrowReleaseResult.NotFound, escrow.commit("does-not-exist"))
-    }
-
-    @Test
-    fun `escrow releases after commit, allowing a new acquisition for the same task`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-        escrow.commit(tx.transactionId)
-
-        assertFalse(escrow.isUnderEscrow(taskId))
-        val second = escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 2_000L)
-        assertTrue(second is EscrowAcquireResult.Acquired)
-    }
-
-    // ── Deterministic expiry ────────────────────────────────────────────
-
-    @Test
-    fun `expireIfPastTtl is a no-op before the TTL elapses`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.expireIfPastTtl(tx.transactionId, now = 1_500L)
-        assertEquals(EscrowExpiryResult.NotYetExpired, result)
-        assertEquals(InterventionState.NEGOTIATING, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `expireIfPastTtl expires a transaction once the TTL has elapsed`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.expireIfPastTtl(tx.transactionId, now = 2_000L)
-        assertEquals(EscrowExpiryResult.Expired, result)
-        assertEquals(InterventionState.TTL_EXPIRED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `expireIfPastTtl on an already-resolved transaction is idempotent`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
-                as EscrowAcquireResult.Acquired).transaction
-        escrow.commit(tx.transactionId)
-
-        val result = escrow.expireIfPastTtl(tx.transactionId, now = 2_000L)
-        assertEquals(EscrowExpiryResult.AlreadyResolved, result)
-        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `expireIfPastTtl on an unknown transaction returns NotFound`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        assertEquals(EscrowExpiryResult.NotFound, escrow.expireIfPastTtl("does-not-exist", now = 2_000L))
-    }
-
-    // ── Process death / reconciliation ──────────────────────────────────
-
-    @Test
-    fun `reconcileUnfinished expires past-TTL transactions and leaves live ones alone`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val stale = (escrow.acquire("task-stale", InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
-                as EscrowAcquireResult.Acquired).transaction
-        val live = (escrow.acquire("task-live", InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.reconcileUnfinished(now = 2_000L)
-
-        assertEquals(1, result.expiredTransactions.size)
-        assertEquals(stale.transactionId, result.expiredTransactions.first().transactionId)
-        assertEquals(1, result.stillLiveTransactions.size)
-        assertEquals(live.transactionId, result.stillLiveTransactions.first().transactionId)
-        assertEquals(InterventionState.TTL_EXPIRED, dao.getById(stale.transactionId)?.currentState)
-        assertEquals(InterventionState.NEGOTIATING, dao.getById(live.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `a fresh TaskEscrow instance over the same backing store reconciles a surviving transaction`() = runTest {
-        // Simulates process death: instance A acquires escrow but never gets to commit()
-        // or abort() before the process is killed. The backing store (a stand-in for the
-        // Room database, which survives process death) is shared with instance B, which
-        // has a brand-new (empty) in-process Mutex map — exactly what happens on restart.
-        val sharedStore = mutableMapOf<String, InterventionTransaction>()
-        val dao = FakeInterventionTransactionDao(sharedStore)
-        val instanceA = TaskEscrow(dao)
-        val tx = (instanceA.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
-                as EscrowAcquireResult.Acquired).transaction
-        // instanceA "dies" here — never calls commit()/abort().
-
-        val instanceB = TaskEscrow(FakeInterventionTransactionDao(sharedStore))
-        assertTrue(instanceB.isUnderEscrow(taskId))
-
-        val reconciliation = instanceB.reconcileUnfinished(now = 2_000L)
-        assertEquals(1, reconciliation.expiredTransactions.size)
-        assertEquals(tx.transactionId, reconciliation.expiredTransactions.first().transactionId)
-
-        assertFalse(instanceB.isUnderEscrow(taskId))
-        val reAcquired = instanceB.acquire(taskId, InterventionTriggerType.LATE_START, now = 2_100L)
-        assertTrue(reAcquired is EscrowAcquireResult.Acquired)
-    }
-
-    @Test
-    fun `a fresh TaskEscrow instance over the same backing store leaves a still-live transaction untouched`() = runTest {
-        val sharedStore = mutableMapOf<String, InterventionTransaction>()
-        val dao = FakeInterventionTransactionDao(sharedStore)
-        val instanceA = TaskEscrow(dao)
-        val tx = (instanceA.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 60_000L)
-                as EscrowAcquireResult.Acquired).transaction
-        // instanceA "dies" here, well within the TTL window.
-
-        val instanceB = TaskEscrow(FakeInterventionTransactionDao(sharedStore))
-        val reconciliation = instanceB.reconcileUnfinished(now = 1_500L)
-
-        assertTrue(reconciliation.expiredTransactions.isEmpty())
-        assertEquals(1, reconciliation.stillLiveTransactions.size)
-        assertEquals(tx.transactionId, reconciliation.stillLiveTransactions.first().transactionId)
-        assertTrue(instanceB.isUnderEscrow(taskId))
-    }
-
-    // ── Snooze extension (Step 9, §16 "Snooze 5 min") ───────────────────
-
-    @Test
-    fun `extend pushes expiresAt forward without changing state`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 300_000L)
-                as EscrowAcquireResult.Acquired).transaction
-
-        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
-
-        assertTrue(result is EscrowExtendResult.Extended)
-        val stored = dao.getById(tx.transactionId)
-        assertEquals(InterventionState.NEGOTIATING, stored?.currentState)
-        assertEquals((result as EscrowExtendResult.Extended).newExpiresAt, stored?.expiresAt)
-        assertTrue(stored!!.expiresAt > tx.expiresAt)
-    }
-
-    @Test
-    fun `extend on an already-resolved transaction returns AlreadyResolved and does not revive it`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
-                as EscrowAcquireResult.Acquired).transaction
-        escrow.commit(tx.transactionId, outcome = "Session started")
-
-        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
-
-        assertEquals(EscrowExtendResult.AlreadyResolved, result)
-        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
-    }
-
-    @Test
-    fun `extend on an unknown transaction returns NotFound`() = runTest {
-        val escrow = TaskEscrow(FakeInterventionTransactionDao())
-        assertEquals(EscrowExtendResult.NotFound, escrow.extend("does-not-exist", additionalMillis = 300_000L, now = 1_500L))
-    }
-
-    @Test
-    fun `extend from a snoozed deadline still in the future extends from the existing deadline, not from now`() = runTest {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 300_000L)
-                as EscrowAcquireResult.Acquired).transaction
-        // expiresAt = 301_000. Extending at now=1_500 (well before expiry) should add on top
-        // of the existing deadline, not restart a fresh 300_000ms window from now=1_500.
-        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
-
-        assertTrue(result is EscrowExtendResult.Extended)
-        assertEquals(tx.expiresAt + 300_000L, (result as EscrowExtendResult.Extended).newExpiresAt)
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionNotifier.kt =====
-package com.checkmate.service
-
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.os.Build
-import android.util.Log
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import com.checkmate.MainActivity
-import com.checkmate.core.stopwatch.NotificationPermissionHelper
-import com.checkmate.planner.intervention.InterventionNotificationGateway
-import com.checkmate.planner.intervention.PromptDispatchResult
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.psyche.intervention.ContextBuilder
-
-/**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16).
- *
- * The production [InterventionNotificationGateway] — the piece [com.checkmate.planner.intervention.InterventionTriggerWorker]
- * (modules/planner) cannot itself be, since it needs NotificationManager/PendingIntent
- * (Android framework, fine for planner) AND psyche's ContextBuilder (modules/psyche, which
- * planner cannot depend on — see the gateway interface's own doc for why). Only `app` sees
- * both sides, so this lives here and is wired from CheckmateApp.onCreate() via
- * InterventionNotificationBridge.gateway, the same settable-listener pattern this codebase
- * already uses for DistractionGuard.listener / UninstallGuard.listener.
- *
- * "Checkmate should earn the user's attention, not hijack the screen constantly" (§16) —
- * this is a plain heads-up NotificationCompat notification, never a full-screen intent.
- * Three actions, exactly as worked-example'd in §16: Start / Talk to Checkmate / Snooze.
- * Kept in its own channel (`intervention_channel`), separate from MentorNotifier's
- * `mentor_channel` (one-shot Mentor commentary, IMPORTANCE_DEFAULT) and ReminderService's
- * always-on `reminder_channel` (deliberately IMPORTANCE_LOW/quiet, "Monitoring tasks…") —
- * this one needs IMPORTANCE_HIGH to actually heads-up, and mixing that into either existing
- * channel would either mute this or make the other noisy.
- *
- * Context Builder (Step 8) was fully built and tested but genuinely unreachable from
- * production code until this step gave it a caller — this is that caller. [ContextBuilder.build]
- * runs even though nothing downstream parses its output into an LLM prompt yet (Structured
- * LLM intents are Step 11) — its immediate, non-speculative use today is enriching the
- * notification body itself (recent skip rate, streak), which needed exactly the "structured
- * reality snapshot" Step 8 already produces. This reads only fields Step 8 actually
- * populated — nothing here fabricates the three fields that step's own doc left out
- * (upcoming test / available time / recent distraction).
- */
-object InterventionNotifier : InterventionNotificationGateway {
-
-    private const val TAG = "InterventionNotifier"
-    private const val CHANNEL_ID = "intervention_channel"
-    private const val CHANNEL_NAME = "Study Prompts"
-
-    const val ACTION_START = "com.checkmate.intervention.START"
-    const val ACTION_SNOOZE = "com.checkmate.intervention.SNOOZE"
-
-    const val EXTRA_TRANSACTION_ID = "transaction_id"
-    const val EXTRA_TASK_ID = "task_id"
-    const val EXTRA_LATE_MINUTES = "late_minutes"
-
-    /** Blueprint §16: "Snooze 5 min." Also the amount [InterventionActionReceiver] extends
-     *  the escrow TTL by, and the delay before [InterventionSnoozeAlarmReceiver] re-fires
-     *  this same notification — all three have to agree, or a snoozed prompt could
-     *  reappear after its own (extended) escrow had already expired, or vice versa. */
-    const val SNOOZE_MILLIS = 5 * 60_000L
-
-    override suspend fun promptStudent(
-        context: Context,
-        transactionId: String,
-        task: StudyTask,
-        lateMinutes: Int,
-        now: Long
-    ): PromptDispatchResult = show(context, transactionId, task, lateMinutes, now)
-
-    /**
-     * Split out from [promptStudent] (the [InterventionNotificationGateway] entry point) so
-     * [InterventionSnoozeAlarmReceiver] can re-show the exact same notification after a
-     * snooze without going through the gateway seam again — the transaction this re-prompt
-     * belongs to already exists (extended, not re-created, by
-     * [InterventionActionReceiver.handleSnooze]), so re-entering via the trigger worker's
-     * path would be the wrong call site entirely.
-     */
-    fun show(
-        context: Context,
-        transactionId: String,
-        task: StudyTask,
-        lateMinutes: Int,
-        now: Long
-    ): PromptDispatchResult {
-        if (!NotificationPermissionHelper.isPermissionGranted(context)) {
-            Log.w(TAG, "POST_NOTIFICATIONS not granted — cannot prompt for $transactionId")
-            return PromptDispatchResult.UNAVAILABLE
-        }
-        createChannel(context)
-
-        // Best-effort: BehaviorLedger/TodayContext are Android-Context-free singletons
-        // (initialized once via CheckmatePrefs.init, same as every other object here), so
-        // this can't fail on missing Context — but wrapped defensively anyway, matching
-        // this codebase's existing runCatching-around-behavioral-reads style (see
-        // MainActivity's overlay/mic permission calls), so a notification still gets shown
-        // even if the behavioral summary genuinely can't be computed right now.
-        val context7d = runCatching { ContextBuilder.build(task, lateMinutes, now) }.getOrNull()
-
-        val title = if (lateMinutes > 0) {
-            "${task.subject} — $lateMinutes min late"
-        } else {
-            "${task.subject} is scheduled now"
-        }
-        val bodyLines = mutableListOf("${task.topic} was due to start.")
-        if (context7d != null) {
-            if (context7d.recentSkipRatePercent > 0) {
-                bodyLines += "Recent skip rate: ${context7d.recentSkipRatePercent}%."
-            }
-            if (context7d.streakDays > 0) {
-                bodyLines += "Streak: ${context7d.streakDays}d — don't break it."
-            }
-        }
-        val body = bodyLines.joinToString(" ")
-
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setAutoCancel(true)
-            .setContentIntent(talkPendingIntent(context, transactionId, task.id, lateMinutes))
-            .addAction(
-                0, "Start",
-                actionPendingIntent(context, ACTION_START, transactionId, task.id, lateMinutes, requestCode(transactionId, 1))
-            )
-            .addAction(0, "Talk to Checkmate", talkPendingIntent(context, transactionId, task.id, lateMinutes))
-            .addAction(
-                0, "Snooze 5 min",
-                actionPendingIntent(context, ACTION_SNOOZE, transactionId, task.id, lateMinutes, requestCode(transactionId, 3))
-            )
-            .build()
-
-        NotificationManagerCompat.from(context).notify(notificationId(transactionId), notification)
-        Log.d(TAG, "Prompted for $transactionId (${task.subject} — ${task.topic}, ${lateMinutes}min late)")
-        return PromptDispatchResult.SHOWN
-    }
-
-    fun cancel(context: Context, transactionId: String) {
-        NotificationManagerCompat.from(context).cancel(notificationId(transactionId))
-    }
-
-    private fun actionPendingIntent(
-        context: Context,
-        action: String,
-        transactionId: String,
-        taskId: String,
-        lateMinutes: Int,
-        requestCode: Int
-    ): PendingIntent {
-        val intent = Intent(context, InterventionActionReceiver::class.java).apply {
-            this.action = action
-            putExtra(EXTRA_TRANSACTION_ID, transactionId)
-            putExtra(EXTRA_TASK_ID, taskId)
-            putExtra(EXTRA_LATE_MINUTES, lateMinutes)
-        }
-        return PendingIntent.getBroadcast(
-            context, requestCode, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    /**
-     * "Talk to Checkmate" (and tapping the notification body) opens MainActivity with the
-     * transaction id attached. STT/TTS conversational layer is Step 10 — not built yet — so
-     * today this just brings the app to the foreground; MainActivity does not currently read
-     * [EXTRA_TRANSACTION_ID] out of its intent. Passing it through now rather than dropping
-     * it means Step 10 doesn't have to touch this notification-building code at all when it
-     * lands — same "flagging, not forcing" posture already used for Step 8's Context Builder
-     * before this step gave it a caller.
-     */
-    private fun talkPendingIntent(
-        context: Context,
-        transactionId: String,
-        taskId: String,
-        lateMinutes: Int
-    ): PendingIntent {
-        val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra(EXTRA_TRANSACTION_ID, transactionId)
-            putExtra(EXTRA_TASK_ID, taskId)
-            putExtra(EXTRA_LATE_MINUTES, lateMinutes)
-        }
-        return PendingIntent.getActivity(
-            context, requestCode(transactionId, 2), intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    /** Stable per-transaction notification id — [transactionId] is a UUID string;
-     *  hashCode() collisions are astronomically unlikely, and worst case only mean two
-     *  unrelated prompts share one notification slot rather than any correctness issue
-     *  (the underlying InterventionTransaction rows are never conflated). */
-    private fun notificationId(transactionId: String): Int = transactionId.hashCode()
-
-    /** PendingIntent request codes must be distinct per (transaction, action) pair, or
-     *  FLAG_UPDATE_CURRENT would silently overwrite one action's intent with another's for
-     *  the same transaction. [slot] disambiguates Start(1)/Talk(2)/Snooze(3) for one
-     *  transactionId. */
-    private fun requestCode(transactionId: String, slot: Int): Int =
-        transactionId.hashCode() * 10 + slot
-
-    private fun createChannel(context: Context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Checkmate proactive study prompts — late or missed tasks"
-            }
-            (context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(channel)
-        }
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionActionReceiver.kt =====
-package com.checkmate.service
-
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.stt.CheckmateSTT
+import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
+import com.checkmate.planner.intervention.InterventionFallback
 import com.checkmate.planner.intervention.PlanStoreTaskMutator
 import com.checkmate.planner.intervention.TaskEscrow
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.psyche.intervention.ContextBuilder
+import com.checkmate.psyche.intervention.InterventionContext
+import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.InterventionSnoozeAlarmReceiver
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+data class NegotiationMessage(val role: String, val content: String)
+
+enum class NegotiationResolution { NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING }
+
+data class NegotiationUiState(
+    val loading: Boolean = true,
+    val task: StudyTask? = null,
+    val context: InterventionContext? = null,
+    val messages: List<NegotiationMessage> = emptyList(),
+    val isSending: Boolean = false,
+    val isListening: Boolean = false,
+    val sttAvailable: Boolean = true,
+    val sttError: String? = null,
+    val inputText: String = "",
+    val resolution: NegotiationResolution = NegotiationResolution.NONE
+)
+
 /**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16).
+ * Proactive Execution Engine — Step 10 (Blueprint Part One, §8-9, §16's "Talk to Checkmate").
  *
- * Handles the "Start" and "Snooze 5 min" notification actions built by [InterventionNotifier].
- * "Talk to Checkmate" is not handled here — it's a plain [android.app.PendingIntent.getActivity]
- * straight to MainActivity (see [InterventionNotifier]), since it has nothing to resolve on
- * its own yet; Step 10 (STT/TTS) is what will eventually turn that tap into a real
- * negotiation.
+ * This is what a tap on "Talk to Checkmate" (or the notification body) now actually opens
+ * into — [InterventionNotifier]'s own doc comment on `talkPendingIntent` flagged this exact
+ * gap: "today this just brings the app to the foreground; MainActivity does not currently
+ * read EXTRA_TRANSACTION_ID out of its intent." This ViewModel is the consumer that closes
+ * that gap, reusing [InterventionNotifier.EXTRA_TRANSACTION_ID]/`EXTRA_TASK_ID`/
+ * `EXTRA_LATE_MINUTES` exactly as InterventionNotifier already attaches them.
  *
- * BroadcastReceiver.onReceive is synchronous and Room/TaskEscrow are suspend APIs, so this
- * follows the standard goAsync() + coroutine pattern (a PendingResult is held open until the
- * coroutine finishes) rather than InterventionReconciliation's fire-and-forget module-scope
- * launch — a receiver's process can be killed as soon as onReceive returns unless goAsync()
- * says otherwise, which fire-and-forget alone doesn't guarantee.
+ * IMPORTANT SCOPE BOUNDARY — matches [InterventionFallback]'s own doc comment almost word
+ * for word: Structured LLM intents (Step 11) are not built yet. The back-and-forth here —
+ * student speaks or types, [InterventionFallback.attemptLlm] (→ LlmGateway) replies,
+ * [CheckmateTTS] speaks it back — is genuinely conversational, but nothing parses what the
+ * LLM says into an executable decision, because that parser doesn't exist yet. The only
+ * things that actually resolve this transaction are the three explicit actions below
+ * ([onStart], [onSnooze], [onDismiss]) — they reuse exactly the same
+ * [InterventionDecisionMaker] / [TaskEscrow] construction [InterventionActionReceiver]
+ * already uses for the notification's own "Start"/"Snooze" buttons, not a second parallel
+ * execution path. Talking to Checkmate today is advisory, on purpose — it doesn't (and
+ * shouldn't, until Step 11's parser exists to validate it) let the LLM decide anything on
+ * its own. The system prompt below tells the LLM this explicitly, so it doesn't imply to
+ * the student that saying something out loud has already changed the plan.
  */
-class InterventionActionReceiver : BroadcastReceiver() {
+class NegotiationViewModel : ViewModel() {
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val _state = MutableStateFlow(NegotiationUiState())
+    val state: StateFlow<NegotiationUiState> = _state.asStateFlow()
 
-    override fun onReceive(context: Context, intent: Intent) {
-        val transactionId = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID) ?: return
-        val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID) ?: return
-        val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
-        val action = intent.action
-        val appContext = context.applicationContext
+    private var stt: CheckmateSTT? = null
+    private var initialized = false
 
-        InterventionNotifier.cancel(appContext, transactionId)
+    /** Idempotent on purpose — Compose may recompose/re-enter this call across
+     *  configuration changes; only the first call for this ViewModel instance should do
+     *  the DB read + opening TTS utterance. */
+    fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (initialized) return
+        initialized = true
 
-        val pendingResult = goAsync()
-        scope.launch {
-            try {
-                when (action) {
-                    InterventionNotifier.ACTION_START -> handleStart(appContext, transactionId, taskId, lateMinutes)
-                    InterventionNotifier.ACTION_SNOOZE -> handleSnooze(appContext, transactionId, taskId, lateMinutes)
-                    else -> Log.w(TAG, "Unrecognized intervention action: $action")
+        val sttInstance = CheckmateSTT(context.applicationContext)
+        stt = sttInstance
+        _state.update { it.copy(sttAvailable = sttInstance.isAvailable()) }
+
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val transaction = dao.getById(transactionId)
+            if (transaction == null || transaction.currentState.isTerminal) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.ALREADY_RESOLVED) }
+                return@launch
+            }
+
+            val task = PlanStore.todayTasks.value.find { it.id == taskId }
+            if (task == null) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.TASK_MISSING) }
+                return@launch
+            }
+
+            // Same best-effort posture InterventionNotifier already uses around
+            // ContextBuilder.build — a missing behavioral summary shouldn't block the
+            // conversation from opening at all.
+            val ctx = runCatching { ContextBuilder.build(task, lateMinutes) }.getOrNull()
+
+            // The opening line is the exact same deterministic STRICT_REMINDER speech the
+            // no-gateway fallback (and the notification's "Start" action) would use — this
+            // conversation is layered on top of that reality, not a different story.
+            val opening = InterventionFallback.strictReminderIntent(task, lateMinutes).speech
+
+            _state.update {
+                it.copy(
+                    loading = false,
+                    task = task,
+                    context = ctx,
+                    messages = listOf(NegotiationMessage("assistant", opening))
+                )
+            }
+            CheckmateTTS.speak(context, opening)
+
+            // Runs for the lifetime of this ViewModel — a final transcript from voice input
+            // becomes a sent message through exactly the same path as the text field's send
+            // button (see the private send() overload below).
+            launch {
+                sttInstance.state.collect { s ->
+                    _state.update { it.copy(isListening = s.isListening, sttError = s.error) }
+                    val finalText = s.finalText
+                    if (!finalText.isNullOrBlank()) {
+                        sttInstance.consumeFinalText()
+                        send(context, finalText)
+                    }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed handling $action for $transactionId", e)
-            } finally {
-                pendingResult.finish()
             }
         }
     }
 
-    /**
-     * Student tapped "Start". Resolves through the same deterministic STRICT_REMINDER ->
-     * START_TASK -> PolicyValidator -> ActionExecutor path the no-gateway fallback already
-     * uses (Blueprint §14/§25 principle 2 — the LLM has no execution path yet regardless of
-     * how the student got here) rather than mutating PlanStore directly, so there is exactly
-     * one place ("what happens when we decide to start this task") for both the seen and
-     * unseen paths to share.
-     */
-    private suspend fun handleStart(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val task = PlanStore.todayTasks.value.find { it.id == taskId }
-        if (task == null) {
-            Log.w(TAG, "Start tapped for $transactionId but task $taskId no longer exists")
-            return
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun startListening() {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.startListening()
+    }
+
+    fun stopListening() {
+        stt?.stopListening()
+    }
+
+    /** Text-field send button entry point. */
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank()) return
+        _state.update { it.copy(inputText = "") }
+        send(context, text)
+    }
+
+    /** Shared entry point for both the text field and a completed voice transcript. */
+    private fun send(context: Context, text: String) {
+        if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        val ctx = _state.value.context
+
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
+
+        viewModelScope.launch {
+            val systemPrompt = buildSystemPrompt(task, ctx)
+            val history = buildHistoryForLlm()
+            // A longer budget than InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS (3s) on
+            // purpose: that 3s default is sized for a silent background decision the
+            // student never sees waiting happen (§14/§18). This is the opposite case — the
+            // student is watching an active screen and knows a reply is coming, so it's
+            // worth waiting longer for a real answer before falling back.
+            val reply = InterventionFallback.attemptLlm(
+                prompt = history,
+                systemPrompt = systemPrompt,
+                timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
+            ) ?: "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below."
+
+            _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", reply), isSending = false) }
+            CheckmateTTS.speak(context, reply)
         }
+    }
+
+    /**
+     * Student tapped "Start". Resolves through the identical deterministic
+     * STRICT_REMINDER -> START_TASK -> PolicyValidator -> ActionExecutor path
+     * [InterventionActionReceiver.handleStart] already uses for the notification's own
+     * "Start" button — there is exactly one place "what happens when we decide to start
+     * this task" lives, regardless of whether the student tapped a notification action or
+     * talked their way here.
+     */
+    fun onStart(context: Context, transactionId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            decisionMaker.decideAndExecute(
+                transactionId = transactionId,
+                task = task,
+                lateMinutes = lateMinutes
+            )
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
+        }
+    }
+
+    /** Same TaskEscrow.extend() + re-notify alarm as
+     *  [InterventionActionReceiver.handleSnooze] — see that method's doc for why this
+     *  doesn't re-run TriggerEvaluator or re-acquire escrow. */
+    fun onSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val escrow = TaskEscrow(dao)
+            val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
+            if (result is EscrowExtendResult.Extended) {
+                InterventionSnoozeAlarmReceiver.scheduleRenotify(
+                    context.applicationContext, transactionId, taskId, lateMinutes
+                )
+            }
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.SNOOZED) }
+        }
+    }
+
+    /** USER_ABORTED (§3) — the student declined via the conversation screen rather than
+     *  ignoring the notification (USER_IGNORED) or running out the TTL. */
+    fun onDismiss(context: Context, transactionId: String) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val escrow = TaskEscrow(dao)
+            escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
+        }
+    }
+
+    private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
         val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
         val escrow = TaskEscrow(dao)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        decisionMaker.decideAndExecute(
-            transactionId = transactionId,
-            task = task,
-            lateMinutes = lateMinutes
-        )
-        Log.d(TAG, "Start handled for $transactionId")
+        return escrow to InterventionDecisionMaker(escrow, executor)
     }
 
-    /**
-     * Student tapped "Snooze 5 min". Extends the live escrow (see [TaskEscrow.extend]'s doc
-     * for why this doesn't touch currentState) and schedules a one-shot re-notification —
-     * does NOT re-run [com.checkmate.planner.intervention.TriggerEvaluator] or re-acquire
-     * escrow, since the transaction this belongs to is still live and already owns the task.
-     */
-    private suspend fun handleSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
-        if (result !is EscrowExtendResult.Extended) {
-            Log.w(TAG, "Snooze for $transactionId did not extend (state: $result) — not rescheduling")
-            return
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(12)
+        return msgs.joinToString("\n") { m ->
+            if (m.role == "user") "Student: ${m.content}" else "Mentor: ${m.content}"
         }
-        InterventionSnoozeAlarmReceiver.scheduleRenotify(context, transactionId, taskId, lateMinutes)
-        Log.d(TAG, "Snoozed $transactionId until ${result.newExpiresAt}")
+    }
+
+    private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
+        appendLine("You are Checkmate's AI Mentor, talking with a student about ${task.subject} — ${task.topic},")
+        appendLine("which is late or off-plan right now. Be direct, warm, and brief — 1 to 3 sentences. This is")
+        appendLine("a spoken conversation, not an essay.")
+        appendLine("You cannot change the plan yourself. If the student wants a shorter session, a break, or a")
+        appendLine("reschedule, acknowledge what they said honestly, but tell them to use the Start / Snooze 5m /")
+        appendLine("Dismiss buttons on screen to actually act on it — never claim you've already changed anything,")
+        appendLine("since nothing you say here executes on its own yet.")
+        if (ctx != null) {
+            appendLine()
+            appendLine(ctx.toPromptText())
+        }
+    }.trim()
+
+    override fun onCleared() {
+        super.onCleared()
+        stt?.stopListening()
     }
 
     companion object {
-        private const val TAG = "InterventionActionRx"
+        private const val CONVERSATION_LLM_TIMEOUT_MILLIS = 12_000L
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionSnoozeAlarmReceiver.kt =====
-package com.checkmate.service
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationScreen.kt =====
+package com.checkmate.ui.negotiation
 
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.util.Log
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.planner.model.TaskState
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.ui.theme.*
+import kotlinx.coroutines.delay
 
 /**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16 "Snooze 5 min").
- *
- * Fired once, [InterventionNotifier.SNOOZE_MILLIS] after a student taps "Snooze" — re-shows
- * the exact same prompt rather than treating the snoozed moment as a fresh trigger.
- * Deliberately does NOT go through [com.checkmate.planner.intervention.TriggerEvaluator] or
- * [com.checkmate.planner.intervention.TaskEscrow.acquire] again: the transaction this
- * re-notification belongs to already exists — extended, not re-created, by
- * [InterventionActionReceiver.handleSnooze] — so re-acquiring here would either collide with
- * that live escrow (AlreadyHeld) or, worse, risk a second transaction for the same task.
- *
- * Re-checks both the transaction's live state and the task's live state before re-notifying,
- * so a task the student already started/completed some other way in the intervening 5
- * minutes (e.g. opened the app directly and hit Start on HomeScreen) doesn't get re-prompted
- * for no reason — same "recheck live state right before acting" posture ActionExecutor
- * already uses for idempotency.
+ * Proactive Execution Engine — Step 10 (Blueprint Part One, §16's "Talk to Checkmate").
+ * See [NegotiationViewModel]'s class doc for the scope boundary this screen honors: the
+ * conversation shown here is advisory (Step 11's structured-intent parser doesn't exist
+ * yet) — only the Start / Snooze 5m / Dismiss buttons actually resolve the transaction.
  */
-class InterventionSnoozeAlarmReceiver : BroadcastReceiver() {
+@Composable
+fun NegotiationScreen(
+    navController: NavController,
+    transactionId: String,
+    taskId: String,
+    lateMinutes: Int,
+    vm: NegotiationViewModel = viewModel()
+) {
+    val state by vm.state.collectAsState()
+    val context = LocalContext.current
+    val listState = rememberLazyListState()
 
-    override fun onReceive(context: Context, intent: Intent) {
-        val transactionId = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID) ?: return
-        val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID) ?: return
-        val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
-        val appContext = context.applicationContext
+    LaunchedEffect(transactionId) {
+        vm.init(context, transactionId, taskId, lateMinutes)
+    }
 
-        val pendingResult = goAsync()
-        scope.launch {
-            try {
-                renotify(appContext, transactionId, taskId, lateMinutes)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed re-notifying $transactionId after snooze", e)
-            } finally {
-                pendingResult.finish()
-            }
+    LaunchedEffect(state.messages.size) {
+        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    }
+
+    // A resolved outcome (Started/Snoozed/Dismissed/etc.) is shown briefly, then this
+    // screen closes itself — there's nothing further to negotiate once the transaction
+    // has resolved.
+    LaunchedEffect(state.resolution) {
+        if (state.resolution != NegotiationResolution.NONE) {
+            delay(1200)
+            navController.popBackStack()
         }
     }
 
-    private suspend fun renotify(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val transaction = dao.getById(transactionId)
-        if (transaction == null || transaction.currentState.isTerminal) {
-            Log.d(TAG, "Snoozed transaction $transactionId already resolved — not re-notifying")
-            return
-        }
-        val task = PlanStore.todayTasks.value.find { it.id == taskId }
-        if (task == null || task.state != TaskState.PENDING) {
-            Log.d(TAG, "Task $taskId no longer PENDING (or gone) — not re-notifying for $transactionId")
-            return
-        }
-        InterventionNotifier.show(context, transactionId, task, lateMinutes, System.currentTimeMillis())
-    }
-
-    companion object {
-        private const val TAG = "InterventionSnoozeRx"
-        private const val REQUEST_CODE_BASE = 90_000
-
-        private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-        /**
-         * Uses setExactAndAllowWhileIdle rather than GuardianNotifier's setRepeating pattern
-         * — this is a single one-shot 5-minutes-from-now alarm per snooze, not a recurring
-         * daily/weekly schedule, and it needs to still fire even if the device enters Doze in
-         * the meantime (a student who snoozes and then locks their phone for the full 5
-         * minutes is the common case, not an edge case). SCHEDULE_EXACT_ALARM is already
-         * declared in the manifest for this app's other exact-timing needs.
-         */
-        fun scheduleRenotify(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(context, InterventionSnoozeAlarmReceiver::class.java).apply {
-                putExtra(InterventionNotifier.EXTRA_TRANSACTION_ID, transactionId)
-                putExtra(InterventionNotifier.EXTRA_TASK_ID, taskId)
-                putExtra(InterventionNotifier.EXTRA_LATE_MINUTES, lateMinutes)
+    Column(modifier = Modifier.fillMaxSize().background(BgDark).imePadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = White60)
             }
-            val pi = PendingIntent.getBroadcast(
-                context, requestCode(transactionId), intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            am.setExactAndAllowWhileIdle(
-                AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + InterventionNotifier.SNOOZE_MILLIS,
-                pi
-            )
-            Log.d(TAG, "Re-notify alarm set for $transactionId in ${InterventionNotifier.SNOOZE_MILLIS}ms")
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    state.task?.let { "${it.subject} — ${it.topic}" } ?: "Talk to Checkmate",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = White90
+                )
+                if (lateMinutes > 0) {
+                    Text("$lateMinutes min late", fontSize = 11.sp, color = AccentAmber)
+                }
+            }
+            Icon(Icons.Default.Psychology, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+        }
+        HorizontalDivider(color = White10, thickness = 0.5.dp)
+
+        if (state.loading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = AccentGreen)
+            }
+            return@Column
         }
 
-        private fun requestCode(transactionId: String): Int =
-            REQUEST_CODE_BASE + (transactionId.hashCode() % 10_000)
+        state.context?.let { ctx ->
+            if (ctx.recentSkipRatePercent > 0 || ctx.streakDays > 0) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (ctx.recentSkipRatePercent > 0) {
+                        ContextChip("Skip rate ${ctx.recentSkipRatePercent}%", AccentAmber)
+                    }
+                    if (ctx.streakDays > 0) {
+                        ContextChip("Streak ${ctx.streakDays}d", AccentGreen)
+                    }
+                }
+            }
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(state.messages) { msg -> NegotiationBubble(msg) }
+            if (state.isSending) {
+                item {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                        Surface(
+                            shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
+                            color = BgCard,
+                            border = BorderStroke(0.5.dp, White10)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("thinking…", fontSize = 13.sp, color = White60)
+                            }
+                        }
+                    }
+                }
+            }
+            if (state.resolution != NegotiationResolution.NONE) {
+                item {
+                    Text(
+                        resolutionLabel(state.resolution),
+                        fontSize = 12.sp,
+                        color = White60,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                    )
+                }
+            }
+        }
+
+        state.sttError?.let {
+            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+        }
+
+        HorizontalDivider(color = White10, thickness = 0.5.dp)
+
+        val actionsEnabled = state.resolution == NegotiationResolution.NONE
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { vm.onStart(context, transactionId, lateMinutes) },
+                enabled = actionsEnabled,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = Color.Black),
+                modifier = Modifier.weight(1f)
+            ) { Text("Start", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+
+            OutlinedButton(
+                onClick = { vm.onSnooze(context, transactionId, taskId, lateMinutes) },
+                enabled = actionsEnabled,
+                modifier = Modifier.weight(1f)
+            ) { Text("Snooze 5m", fontSize = 12.sp, color = White90) }
+
+            OutlinedButton(
+                onClick = { vm.onDismiss(context, transactionId) },
+                enabled = actionsEnabled,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                modifier = Modifier.weight(1f)
+            ) { Text("Dismiss", fontSize = 12.sp) }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedTextField(
+                value = state.inputText,
+                onValueChange = vm::setInput,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Say or type your response…", color = White30, fontSize = 13.sp) },
+                singleLine = false,
+                maxLines = 3,
+                enabled = actionsEnabled,
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor = AccentGreen,
+                    focusedTextColor = White90,
+                    unfocusedTextColor = White90
+                )
+            )
+            if (state.sttAvailable) {
+                FloatingActionButton(
+                    onClick = { if (state.isListening) vm.stopListening() else vm.startListening() },
+                    containerColor = if (state.isListening) AccentRed else BgCardAlt,
+                    contentColor = if (state.isListening) Color.White else AccentGreen,
+                    modifier = Modifier.size(46.dp)
+                ) {
+                    Icon(
+                        if (state.isListening) Icons.Default.MicOff else Icons.Default.Mic,
+                        contentDescription = if (state.isListening) "Stop listening" else "Start listening",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            FloatingActionButton(
+                onClick = { vm.send(context) },
+                containerColor = AccentGreen,
+                contentColor = Color.Black,
+                modifier = Modifier.size(46.dp)
+            ) {
+                Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContextChip(label: String, color: Color) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = color.copy(alpha = 0.15f),
+        border = BorderStroke(0.5.dp, color.copy(alpha = 0.4f))
+    ) {
+        Text(label, fontSize = 11.sp, color = color, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+    }
+}
+
+private fun resolutionLabel(r: NegotiationResolution): String = when (r) {
+    NegotiationResolution.STARTED -> "✓ Started — closing…"
+    NegotiationResolution.SNOOZED -> "Snoozed 5 minutes — closing…"
+    NegotiationResolution.DISMISSED -> "Dismissed — closing…"
+    NegotiationResolution.ALREADY_RESOLVED -> "This prompt was already handled — closing…"
+    NegotiationResolution.TASK_MISSING -> "This task no longer exists — closing…"
+    NegotiationResolution.NONE -> ""
+}
+
+@Composable
+private fun NegotiationBubble(msg: NegotiationMessage) {
+    val isUser = msg.role == "user"
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(
+                topStart = if (isUser) 14.dp else 4.dp,
+                topEnd = if (isUser) 4.dp else 14.dp,
+                bottomStart = 14.dp,
+                bottomEnd = 14.dp
+            ),
+            color = if (isUser) AccentGreen.copy(alpha = 0.15f) else BgCard,
+            border = BorderStroke(0.5.dp, if (isUser) AccentGreen.copy(alpha = 0.3f) else White10),
+            modifier = Modifier.widthIn(max = 300.dp)
+        ) {
+            Text(
+                text = msg.content,
+                fontSize = 14.sp,
+                color = White90,
+                lineHeight = 20.sp,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            )
+        }
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
+//===== FILE: app/src/main/kotlin/com/checkmate/MainActivity.kt =====
 package com.checkmate
 
-import android.app.Application
-import android.content.Context
-import com.checkmate.core.CheckmatePrefs
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.Surface
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import com.checkmate.core.CheckmateState
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.intervention.InterventionNotificationBridge
-import com.checkmate.planner.intervention.InterventionReconciliation
-import com.checkmate.planner.intervention.InterventionTriggerScheduler
-import com.checkmate.service.GuardianNotifier
+import com.checkmate.core.stopwatch.NotificationPermissionHelper
 import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.DistractionListener
-import com.checkmate.workmode.ScrollGuard
-import com.checkmate.workmode.UninstallAlertListener
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeScheduleReceiver
+import com.checkmate.ui.home.HomeViewModel
+import com.checkmate.ui.main.MainScreen
+import com.checkmate.ui.main.PendingNegotiation
+import com.checkmate.ui.theme.CheckmateTheme
+import kotlinx.coroutines.launch
 
-class CheckmateApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        CheckmatePrefs.init(this)
-        CheckmateState.init(this)
-        CheckmateTTS.init(this)
+class MainActivity : ComponentActivity() {
 
-        // Reconcile Work Mode with the hardcoded daily schedule (usual
-        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
-        // Sunday/Wednesday) and re-arm the four daily boundary alarms
-        // (AlarmManager repeating alarms don't survive a reboot, hence also
-        // doing this in BootReceiver). This must run after
-        // CheckmateState.init() above.
-        WorkModeManager.init(this)
-        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
-        GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
-        // worker's KV for the on-demand "usage" command (see worker.js).
-        GuardianNotifier.scheduleUsageReports(this)
-        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
-        // guardian report via WhatsApp + Telegram. Previously never
-        // scheduled anywhere, which is why the weekly report never sent.
-        GuardianNotifier.scheduleWeeklyReport(this)
-        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+    companion object {
+        private const val REQUEST_CODE_OVERLAY = 1001
+        private const val REQUEST_CODE_MIC     = 1002
+    }
 
-        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
-        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
-        // where a worker run could find InterventionNotificationBridge.gateway still null
-        // and silently fall back to the deterministic path when a notification was actually
-        // intended. InterventionNotifier is `app`'s implementation — the only module that
-        // can see both Android's NotificationManager and psyche's ContextBuilder at once
-        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
-        InterventionNotificationBridge.gateway = InterventionNotifier
+    private lateinit var homeViewModel: HomeViewModel
 
-        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
-        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
-        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
-        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
-        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
-        // reconciliation call added to BootReceiver below.
-        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
-        InterventionReconciliation.runAtStartup(this)
+    private val projectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            // Pass the raw resultCode + data directly to the ViewModel.
+            // The ViewModel will forward them into AttentionCycleService's intent,
+            // so getMediaProjection() is called only AFTER startForeground() runs.
+            homeViewModel.onProjectionGranted(
+                applicationContext,
+                result.resultCode,
+                result.data
+            )
+        } else {
+            homeViewModel.onProjectionDenied(applicationContext)
+        }
+    }
 
-        // Wire real screenshot capture via MediaProjection into DistractionGuard
-        // (and ScrollGuard, which reuses the same listener/pipeline for its
-        // "scroll" kind — see ScrollGuard.kt)
-        val distractionListener = object : DistractionListener {
-            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                Thread {
-                    val uri = ScreenCaptureManager.capture(context)
-                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
-                }.start()
-                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
-                // the guardian-facing alert above — this is student-facing, not parent-facing.
-                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        CheckmateState.init(applicationContext)
+
+        homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
+
+        lifecycleScope.launch {
+            homeViewModel.requestProjection.collect {
+                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                projectionLauncher.launch(mgr.createScreenCaptureIntent())
             }
         }
-        DistractionGuard.listener = distractionListener
-        ScrollGuard.listener = distractionListener
 
-        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
-        // (via :workmode's UninstallGuard) into GuardianNotifier.
-        UninstallGuard.listener = object : UninstallAlertListener {
-            override fun onGuardedScreenBlocked(context: Context, reason: String) {
-                Thread {
-                    GuardianNotifier.notifyUninstallAttempt(context, reason)
-                }.start()
+        if (NotificationPermissionHelper.shouldRequestPermission(this)) {
+            NotificationPermissionHelper.requestPermission(this)
+        }
+        requestOverlayPermissionIfNeeded()
+        requestMicPermissionIfNeeded()
+
+        // Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Read the
+        // three extras InterventionNotifier's talkPendingIntent() already attaches (has done
+        // so since Step 9 — see that method's own doc comment on why nothing consumed them
+        // until now). removeExtra() immediately after reading so a later onCreate() from an
+        // Activity recreation (e.g. rotation) with the same Intent doesn't re-trigger
+        // navigation into the negotiation screen a second time.
+        val pendingNegotiation = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
+            ?.let { transactionId ->
+                val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID)
+                val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
+                taskId?.let { PendingNegotiation(transactionId, it, lateMinutes) }
+            }
+        intent.removeExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
+        intent.removeExtra(InterventionNotifier.EXTRA_TASK_ID)
+        intent.removeExtra(InterventionNotifier.EXTRA_LATE_MINUTES)
+
+        setContent {
+            CheckmateTheme {
+                Surface {
+                    MainScreen(homeViewModel = homeViewModel, pendingNegotiation = pendingNegotiation)
+                }
+            }
+        }
+    }
+
+    private fun requestMicPermissionIfNeeded() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE_MIC
+            )
+        }
+    }
+
+    private fun requestOverlayPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Grant overlay permission for attention timer", Toast.LENGTH_LONG).show()
+            startActivityForResult(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                REQUEST_CODE_OVERLAY
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == NotificationPermissionHelper.REQUEST_CODE_POST_NOTIFICATIONS) {
+            if (!NotificationPermissionHelper.isPermissionGranted(this)) {
+                Toast.makeText(this, "Notification permission needed for reminders", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/main/MainScreen.kt =====
+package com.checkmate.ui.main
+
+import androidx.compose.animation.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
+import androidx.navigation.NavController
+import androidx.navigation.NavType
+import androidx.navigation.compose.*
+import androidx.navigation.navArgument
+import com.checkmate.ui.home.HomeScreen
+import com.checkmate.ui.home.HomeViewModel
+import com.checkmate.ui.mentor.MentorScreen
+import com.checkmate.ui.negotiation.NegotiationScreen
+import com.checkmate.ui.planner.PlannerScreen
+import com.checkmate.ui.planner.DailyCheckInScreen
+import com.checkmate.ui.planner.CoachingPlannerScreen
+import com.checkmate.ui.consultation.ConsultationScreen
+import com.checkmate.ui.stats.StatsScreen
+import com.checkmate.ui.settings.SettingsScreen
+import com.checkmate.ui.testresults.TestResultsScreen
+import com.checkmate.ui.testresults.TestmateWebScreen
+import com.checkmate.ui.theme.*
+
+sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
+    object Home     : Screen("home",     "Today",   Icons.Default.CheckCircle)
+    object Planner  : Screen("planner",  "Plan",    Icons.Default.CalendarMonth)
+    object Mentor   : Screen("mentor",   "Mentor",  Icons.Default.Psychology)
+    object Stats    : Screen("stats",    "Stats",   Icons.Default.BarChart)
+    object Settings : Screen("settings", "Settings",Icons.Default.Settings)
+}
+
+/**
+ * Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Carries the
+ * three extras MainActivity read off the launching Intent (originally attached by
+ * InterventionNotifier.talkPendingIntent) down into this composable as a one-shot
+ * navigation event, rather than MainScreen reaching back up into Activity/Intent state
+ * itself.
+ */
+data class PendingNegotiation(val transactionId: String, val taskId: String, val lateMinutes: Int)
+
+@Composable
+fun MainScreen(homeViewModel: HomeViewModel, pendingNegotiation: PendingNegotiation? = null) {
+    val navController = rememberNavController()
+    val items = listOf(Screen.Home, Screen.Planner, Screen.Mentor, Screen.Stats, Screen.Settings)
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route
+
+    val bottomNavRoutes = items.map { it.route }
+    val showBottomNav   = currentRoute in bottomNavRoutes
+
+    // Fires once per non-null pendingNegotiation value — MainActivity only supplies a
+    // non-null value on the onCreate() call that actually consumed a fresh "Talk to
+    // Checkmate" intent (it removeExtra()s immediately after reading), so this won't
+    // re-fire on ordinary recomposition.
+    LaunchedEffect(pendingNegotiation) {
+        pendingNegotiation?.let { p ->
+            navController.navigate("negotiation/${p.transactionId}/${p.taskId}/${p.lateMinutes}")
+        }
+    }
+
+    Scaffold(
+        containerColor = BgDark,
+        bottomBar = {
+            if (showBottomNav) {
+                NavigationBar(
+                    containerColor = BgCard,
+                    tonalElevation = 0.dp
+                ) {
+                    items.forEach { screen ->
+                        NavigationBarItem(
+                            selected = currentRoute == screen.route,
+                            onClick  = {
+                                navController.navigate(screen.route) {
+                                    popUpTo(navController.graph.startDestinationId) { saveState = true }
+                                    launchSingleTop = true
+                                    restoreState    = true
+                                }
+                            },
+                            icon  = { Icon(screen.icon, contentDescription = screen.label) },
+                            label = { Text(screen.label) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor   = AccentGreen,
+                                selectedTextColor   = AccentGreen,
+                                unselectedIconColor = White30,
+                                unselectedTextColor = White30,
+                                indicatorColor      = White10
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    ) { padding ->
+        NavHost(
+            navController    = navController,
+            startDestination = Screen.Home.route,
+            modifier         = Modifier.padding(padding)
+        ) {
+            // Main tabs
+            composable(Screen.Home.route)     { HomeScreen(navController, vm = homeViewModel) }
+            composable(Screen.Planner.route)  { PlannerScreen(navController) }
+            composable(Screen.Mentor.route)   { MentorScreen() }
+            composable(Screen.Stats.route)    { StatsScreen(navController) }
+            composable(Screen.Settings.route) { SettingsScreen() }
+
+            // Blueprint 6 new routes
+            composable("consultation")   { ConsultationScreen(navController) }
+            composable("daily_checkin")  { DailyCheckInScreen(navController) }
+            composable("coaching_plan")  { CoachingPlannerScreen(navController) }
+
+            // Testmate integration (Phase 6)
+            composable("test_results")  { TestResultsScreen(navController) }
+            composable("test_web")      { TestmateWebScreen(navController) }
+
+            // Proactive Execution Engine — Step 10 (Blueprint §16): the conversational
+            // negotiation screen. transactionId/taskId are UUID strings (no '/' characters),
+            // so plain path-segment interpolation above is safe without URL-encoding.
+            composable(
+                route = "negotiation/{transactionId}/{taskId}/{lateMinutes}",
+                arguments = listOf(
+                    navArgument("transactionId") { type = NavType.StringType },
+                    navArgument("taskId") { type = NavType.StringType },
+                    navArgument("lateMinutes") { type = NavType.IntType }
+                )
+            ) { backStackEntry ->
+                val args = backStackEntry.arguments
+                NegotiationScreen(
+                    navController = navController,
+                    transactionId = args?.getString("transactionId").orEmpty(),
+                    taskId        = args?.getString("taskId").orEmpty(),
+                    lateMinutes   = args?.getInt("lateMinutes") ?: 0
+                )
             }
         }
     }
@@ -1309,6 +1022,13 @@ class CheckmateApp : Application() {
     <queries>
         <package android:name="com.whatsapp" />
         <package android:name="com.termux" />
+        <!-- Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"):
+             package-visibility declaration so SpeechRecognizer.isRecognitionAvailable()
+             (CheckmateSTT) can actually see the on-device recognition service on
+             API 30+ (targetSdk 35 here) instead of always reporting unavailable. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
     </queries>
 
     <application
@@ -1455,7 +1175,8 @@ class CheckmateApp : Application() {
         <!-- Proactive Execution Engine (step 9, Blueprint §16): handles the "Start" /
              "Snooze 5 min" actions on InterventionNotifier's heads-up notification.
              "Talk to Checkmate" goes straight to MainActivity instead (no receiver needed
-             for that one — see InterventionNotifier). -->
+             for that one — see InterventionNotifier). As of step 10, MainActivity now
+             actually reads the transaction id it's handed and opens NegotiationScreen. -->
         <receiver android:name="com.checkmate.service.InterventionActionReceiver"
             android:exported="false" />
 
@@ -1475,4 +1196,3 @@ class CheckmateApp : Application() {
 
     </application>
 </manifest>
-
