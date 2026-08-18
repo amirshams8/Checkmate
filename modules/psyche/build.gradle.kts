@@ -19,4 +19,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    // Added for ContextBuilderTest (Proactive Execution Engine step 8) — same gap noted
+    // in modules/planner previously: no testImplementation("junit:...") existed here
+    // either. ContextBuilder itself is fully synchronous, so no coroutines-test needed.
+    testImplementation("junit:junit:4.13.2")
 }
