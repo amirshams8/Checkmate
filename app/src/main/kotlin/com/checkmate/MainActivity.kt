@@ -20,8 +20,10 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.stopwatch.NotificationPermissionHelper
+import com.checkmate.service.InterventionNotifier
 import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.main.MainScreen
+import com.checkmate.ui.main.PendingNegotiation
 import com.checkmate.ui.theme.CheckmateTheme
 import kotlinx.coroutines.launch
 
@@ -70,10 +72,26 @@ class MainActivity : ComponentActivity() {
         requestOverlayPermissionIfNeeded()
         requestMicPermissionIfNeeded()
 
+        // Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Read the
+        // three extras InterventionNotifier's talkPendingIntent() already attaches (has done
+        // so since Step 9 — see that method's own doc comment on why nothing consumed them
+        // until now). removeExtra() immediately after reading so a later onCreate() from an
+        // Activity recreation (e.g. rotation) with the same Intent doesn't re-trigger
+        // navigation into the negotiation screen a second time.
+        val pendingNegotiation = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
+            ?.let { transactionId ->
+                val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID)
+                val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
+                taskId?.let { PendingNegotiation(transactionId, it, lateMinutes) }
+            }
+        intent.removeExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
+        intent.removeExtra(InterventionNotifier.EXTRA_TASK_ID)
+        intent.removeExtra(InterventionNotifier.EXTRA_LATE_MINUTES)
+
         setContent {
             CheckmateTheme {
                 Surface {
-                    MainScreen(homeViewModel = homeViewModel)
+                    MainScreen(homeViewModel = homeViewModel, pendingNegotiation = pendingNegotiation)
                 }
             }
         }

@@ -11,10 +11,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
+import androidx.navigation.NavType
 import androidx.navigation.compose.*
+import androidx.navigation.navArgument
 import com.checkmate.ui.home.HomeScreen
 import com.checkmate.ui.home.HomeViewModel
 import com.checkmate.ui.mentor.MentorScreen
+import com.checkmate.ui.negotiation.NegotiationScreen
 import com.checkmate.ui.planner.PlannerScreen
 import com.checkmate.ui.planner.DailyCheckInScreen
 import com.checkmate.ui.planner.CoachingPlannerScreen
@@ -33,8 +36,17 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     object Settings : Screen("settings", "Settings",Icons.Default.Settings)
 }
 
+/**
+ * Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Carries the
+ * three extras MainActivity read off the launching Intent (originally attached by
+ * InterventionNotifier.talkPendingIntent) down into this composable as a one-shot
+ * navigation event, rather than MainScreen reaching back up into Activity/Intent state
+ * itself.
+ */
+data class PendingNegotiation(val transactionId: String, val taskId: String, val lateMinutes: Int)
+
 @Composable
-fun MainScreen(homeViewModel: HomeViewModel) {
+fun MainScreen(homeViewModel: HomeViewModel, pendingNegotiation: PendingNegotiation? = null) {
     val navController = rememberNavController()
     val items = listOf(Screen.Home, Screen.Planner, Screen.Mentor, Screen.Stats, Screen.Settings)
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -42,6 +54,16 @@ fun MainScreen(homeViewModel: HomeViewModel) {
 
     val bottomNavRoutes = items.map { it.route }
     val showBottomNav   = currentRoute in bottomNavRoutes
+
+    // Fires once per non-null pendingNegotiation value — MainActivity only supplies a
+    // non-null value on the onCreate() call that actually consumed a fresh "Talk to
+    // Checkmate" intent (it removeExtra()s immediately after reading), so this won't
+    // re-fire on ordinary recomposition.
+    LaunchedEffect(pendingNegotiation) {
+        pendingNegotiation?.let { p ->
+            navController.navigate("negotiation/${p.transactionId}/${p.taskId}/${p.lateMinutes}")
+        }
+    }
 
     Scaffold(
         containerColor = BgDark,
@@ -96,6 +118,26 @@ fun MainScreen(homeViewModel: HomeViewModel) {
             // Testmate integration (Phase 6)
             composable("test_results")  { TestResultsScreen(navController) }
             composable("test_web")      { TestmateWebScreen(navController) }
+
+            // Proactive Execution Engine — Step 10 (Blueprint §16): the conversational
+            // negotiation screen. transactionId/taskId are UUID strings (no '/' characters),
+            // so plain path-segment interpolation above is safe without URL-encoding.
+            composable(
+                route = "negotiation/{transactionId}/{taskId}/{lateMinutes}",
+                arguments = listOf(
+                    navArgument("transactionId") { type = NavType.StringType },
+                    navArgument("taskId") { type = NavType.StringType },
+                    navArgument("lateMinutes") { type = NavType.IntType }
+                )
+            ) { backStackEntry ->
+                val args = backStackEntry.arguments
+                NegotiationScreen(
+                    navController = navController,
+                    transactionId = args?.getString("transactionId").orEmpty(),
+                    taskId        = args?.getString("taskId").orEmpty(),
+                    lateMinutes   = args?.getInt("lateMinutes") ?: 0
+                )
+            }
         }
     }
 }
