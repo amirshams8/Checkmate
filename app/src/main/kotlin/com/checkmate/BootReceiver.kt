@@ -7,6 +7,7 @@ import android.os.Build
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
+import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.TelegramAlertBot
 import com.checkmate.workmode.WorkModeManager
@@ -42,6 +43,13 @@ class BootReceiver : BroadcastReceiver() {
         WorkModeManager.init(context)
         WorkModeScheduleReceiver.scheduleDailyAlarms(context)
         Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
+
+        // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
+        // non-terminal by the process that just died (Blueprint §4). No equivalent call
+        // is needed for InterventionTriggerScheduler's periodic work here — WorkManager
+        // persists and reschedules that itself after reboot, unlike the AlarmManager
+        // schedules above.
+        InterventionReconciliation.runAtStartup(context)
 
         val inSafeMode = context.packageManager.isSafeMode
         if (inSafeMode && TelegramAlertBot.getChatId() != null) {

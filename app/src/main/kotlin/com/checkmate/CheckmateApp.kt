@@ -5,6 +5,8 @@ import android.content.Context
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
@@ -40,6 +42,15 @@ class CheckmateApp : Application() {
         // scheduled anywhere, which is why the weekly report never sent.
         GuardianNotifier.scheduleWeeklyReport(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+
+        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
+        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
+        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
+        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
+        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
+        // reconciliation call added to BootReceiver below.
+        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
+        InterventionReconciliation.runAtStartup(this)
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
         // (and ScrollGuard, which reuses the same listener/pipeline for its

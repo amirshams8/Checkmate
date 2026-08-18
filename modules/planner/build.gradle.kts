@@ -22,9 +22,13 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     kapt("androidx.room:room-compiler:2.6.1")
+    // Added for the Proactive Trigger Engine (step 7) — no WorkManager dependency
+    // existed anywhere in the project before this; everything else here uses
+    // AlarmManager. This is a deliberate blueprint choice (§2): WorkManager for durable
+    // periodic evaluation, AlarmManager reserved for precise per-task timing (not yet
+    // built — see InterventionTriggerScheduler's doc comment on why it needs no
+    // BootReceiver re-arming, unlike this app's existing AlarmManager schedules).
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
     testImplementation("junit:junit:4.13.2")
-    // Added for TaskEscrow's concurrency tests (Proactive Execution Engine step 4) — runs
-    // suspend test functions via runTest(); version matched to the existing
-    // kotlinx-coroutines-android dependency above.
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
