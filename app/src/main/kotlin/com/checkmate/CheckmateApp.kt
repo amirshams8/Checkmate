@@ -5,9 +5,11 @@ import android.content.Context
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionNotificationBridge
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
@@ -42,6 +44,15 @@ class CheckmateApp : Application() {
         // scheduled anywhere, which is why the weekly report never sent.
         GuardianNotifier.scheduleWeeklyReport(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+
+        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
+        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
+        // where a worker run could find InterventionNotificationBridge.gateway still null
+        // and silently fall back to the deterministic path when a notification was actually
+        // intended. InterventionNotifier is `app`'s implementation — the only module that
+        // can see both Android's NotificationManager and psyche's ContextBuilder at once
+        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
+        InterventionNotificationBridge.gateway = InterventionNotifier
 
         // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
         // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike

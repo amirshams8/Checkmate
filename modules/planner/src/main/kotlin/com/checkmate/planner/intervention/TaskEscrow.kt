@@ -5,7 +5,8 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6).
+ * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6), amended in Step 9 (§16
+ * "Snooze 5 min" — see [extend]).
  *
  * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
  * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
@@ -82,6 +83,36 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
      *  system-side execution failure — see [resolveAs]. */
     suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
         resolveAs(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
+
+    /**
+     * Step 9 (§16 "Snooze 5 min"): extends a still-live NEGOTIATING transaction's TTL
+     * without resolving it — unlike [commit]/[abort]/[resolveAs], this deliberately does
+     * NOT touch [InterventionTransaction.currentState]. A snooze is the student saying "not
+     * yet, ask me again later," not a decision the FSM has reached, so the transaction stays
+     * exactly where it was; escrow is not released, so nothing else can start/mutate the
+     * task in the meantime either. [additionalMillis] is added to `max(current expiresAt,
+     * now)` rather than just `now + additionalMillis`, so calling this before the previous
+     * deadline has passed extends from the existing deadline instead of ever shortening it.
+     *
+     * Idempotent-safe the same way [resolve] is: if the transaction already resolved (by
+     * TTL, or a concurrent notification-action tap) between the notification tap and this
+     * call, this is a no-op that reports [EscrowExtendResult.AlreadyResolved] rather than
+     * reviving a dead transaction.
+     */
+    suspend fun extend(
+        transactionId: String,
+        additionalMillis: Long,
+        now: Long = System.currentTimeMillis()
+    ): EscrowExtendResult {
+        val current = dao.getById(transactionId) ?: return EscrowExtendResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExtendResult.NotFound
+            if (fresh.currentState.isTerminal) return@withTaskLock EscrowExtendResult.AlreadyResolved
+            val newExpiry = maxOf(fresh.expiresAt, now) + additionalMillis
+            dao.update(fresh.copy(expiresAt = newExpiry))
+            EscrowExtendResult.Extended(newExpiry)
+        }
+    }
 
     /**
      * General resolution entry point for any terminal [InterventionState] — added in step
@@ -207,6 +238,13 @@ sealed class EscrowExpiryResult {
     object AlreadyResolved : EscrowExpiryResult()
     object NotYetExpired : EscrowExpiryResult()
     object NotFound : EscrowExpiryResult()
+}
+
+/** Result of [TaskEscrow.extend] — step 9's snooze support. */
+sealed class EscrowExtendResult {
+    data class Extended(val newExpiresAt: Long) : EscrowExtendResult()
+    object AlreadyResolved : EscrowExtendResult()
+    object NotFound : EscrowExtendResult()
 }
 
 data class ReconciliationResult(

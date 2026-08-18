@@ -263,4 +263,56 @@ class TaskEscrowTest {
         assertEquals(tx.transactionId, reconciliation.stillLiveTransactions.first().transactionId)
         assertTrue(instanceB.isUnderEscrow(taskId))
     }
+
+    // ── Snooze extension (Step 9, §16 "Snooze 5 min") ───────────────────
+
+    @Test
+    fun `extend pushes expiresAt forward without changing state`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 300_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
+
+        assertTrue(result is EscrowExtendResult.Extended)
+        val stored = dao.getById(tx.transactionId)
+        assertEquals(InterventionState.NEGOTIATING, stored?.currentState)
+        assertEquals((result as EscrowExtendResult.Extended).newExpiresAt, stored?.expiresAt)
+        assertTrue(stored!!.expiresAt > tx.expiresAt)
+    }
+
+    @Test
+    fun `extend on an already-resolved transaction returns AlreadyResolved and does not revive it`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        escrow.commit(tx.transactionId, outcome = "Session started")
+
+        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
+
+        assertEquals(EscrowExtendResult.AlreadyResolved, result)
+        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `extend on an unknown transaction returns NotFound`() = runTest {
+        val escrow = TaskEscrow(FakeInterventionTransactionDao())
+        assertEquals(EscrowExtendResult.NotFound, escrow.extend("does-not-exist", additionalMillis = 300_000L, now = 1_500L))
+    }
+
+    @Test
+    fun `extend from a snoozed deadline still in the future extends from the existing deadline, not from now`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 300_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        // expiresAt = 301_000. Extending at now=1_500 (well before expiry) should add on top
+        // of the existing deadline, not restart a fresh 300_000ms window from now=1_500.
+        val result = escrow.extend(tx.transactionId, additionalMillis = 300_000L, now = 1_500L)
+
+        assertTrue(result is EscrowExtendResult.Extended)
+        assertEquals(tx.expiresAt + 300_000L, (result as EscrowExtendResult.Extended).newExpiresAt)
+    }
 }
