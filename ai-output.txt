@@ -1,130 +1,468 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionFallback.kt =====
+//===== FILE: modules/planner/build.gradle.kts =====
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.kotlin.kapt")
+}
+android {
+    namespace  = "com.checkmate.planner"
+    compileSdk = 35
+    defaultConfig { minSdk = 26; targetSdk = 35 }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation(project(":modules:core"))
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    kapt("androidx.room:room-compiler:2.6.1")
+    // Added for the Proactive Trigger Engine (step 7) — no WorkManager dependency
+    // existed anywhere in the project before this; everything else here uses
+    // AlarmManager. This is a deliberate blueprint choice (§2): WorkManager for durable
+    // periodic evaluation, AlarmManager reserved for precise per-task timing (not yet
+    // built — see InterventionTriggerScheduler's doc comment on why it needs no
+    // BootReceiver re-arming, unlike this app's existing AlarmManager schedules).
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TriggerEvaluator.kt =====
 package com.checkmate.planner.intervention
 
-import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
-import kotlinx.coroutines.withTimeoutOrNull
+import com.checkmate.planner.model.TaskState
+import java.time.Duration
+import java.time.Instant
+import java.time.LocalTime
+import java.time.ZoneId
 
 /**
- * Proactive Execution Engine — Step 6 (Blueprint Part One, §14, §25 principle 2).
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §2).
  *
- * "The internet must never become Checkmate's single point of failure." [attemptLlm] wraps
- * an LLM call with a short, intervention-specific timeout — deliberately not a change to
- * [LlmGateway]'s own client timeouts, which other callers (e.g. AdaptivePlanner's plan
- * generation) reasonably rely on being longer. [strictReminderIntent] is the deterministic
- * fallback itself: a fixed, non-LLM response that still goes through PolicyValidator like
- * any other intent (§14's own diagram routes STRICT_REMINDER through PolicyValidator, not
- * around it) — the policy boundary doesn't get to be softer just because nothing chose to
- * be clever here.
- *
- * Structured LLM intent parsing (turning a real LLM response into a validated [LlmIntent])
- * is step 11, not yet built. Until it exists, there is nothing safe to do with even a
- * successful LLM response — no parser to trust it through — so [InterventionDecisionMaker]
- * always resolves via the deterministic path below for now. [attemptLlm] is still exercised
- * on the LLM path (rather than skipped) so the timeout/failure detection this step is
- * actually about is real and tested today, not deferred to step 11 along with the parser.
+ * The event detector. Deliberately scoped to the two signals derivable from a
+ * [StudyTask] alone — TASK_NOT_STARTED and LATE_START — since those are the only two of
+ * §2's eleven listed signals this codebase currently has grounded data for. The other
+ * nine (distraction detected, repeated skips, backlog risk, upcoming test, etc.) need
+ * BehaviorLedger/TodayContext, which hasn't been read this session; adding them here on
+ * a guess would be exactly the kind of unread-source assumption to avoid. [evaluate] is
+ * a pure function, no Android/DB/network dependency, same testability posture as
+ * PolicyValidator.
  */
-object InterventionFallback {
+object TriggerEvaluator {
 
-    /** Blueprint §14/§18: "3-second timeout." */
-    const val DEFAULT_LLM_TIMEOUT_MILLIS = 3_000L
+    /** Below this, "N minutes late" isn't worth interrupting the student for yet. */
+    const val NOT_STARTED_THRESHOLD_MINUTES = 5
+
+    /** Past this, TASK_NOT_STARTED escalates to LATE_START. */
+    const val LATE_ESCALATION_THRESHOLD_MINUTES = 10
+
+    data class TriggerSignal(val triggerType: InterventionTriggerType, val lateMinutes: Int)
 
     /**
-     * Attempts an LLM call with a hard timeout. Returns null on timeout, on a blank
-     * response, or on any failure LlmGateway itself already collapses to "" (missing API
-     * key, HTTP error, exception — see LlmGateway.complete's own doc). Callers should treat
-     * null uniformly as "the LLM path did not produce anything usable in time."
-     *
-     * [llmCall] defaults to the real [LlmGateway.complete] and is only overridden in tests,
-     * so this doesn't need Robolectric/instrumented tests to verify timeout behavior — a
-     * fake that suspends past the timeout exercises the exact same withTimeoutOrNull path
-     * the production call goes through.
+     * Returns a fired signal, or null if nothing should trigger right now. Only PENDING
+     * tasks with a parseable "HH:mm" [StudyTask.scheduledStartTime] are considered — a
+     * task that's ACTIVE/PAUSED/DONE/SKIPPED, or has no schedule at all, has nothing for
+     * this signal to detect.
      */
-    suspend fun attemptLlm(
-        prompt: String,
-        systemPrompt: String = "",
-        timeoutMillis: Long = DEFAULT_LLM_TIMEOUT_MILLIS,
-        // Was `= LlmGateway::complete` — a suspend function *reference* as a default
-        // parameter value isn't supported by this Kotlin compiler config ("Unsupported
-        // [suspend function calls in a context of default parameter value]"). A lambda
-        // wrapping the same call compiles fine and is behaviorally identical.
-        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
-    ): String? {
-        val result = withTimeoutOrNull(timeoutMillis) { llmCall(prompt, systemPrompt) }
-        return result?.takeIf { it.isNotBlank() }
+    fun evaluate(task: StudyTask, nowMillis: Long = System.currentTimeMillis()): TriggerSignal? {
+        if (task.state != TaskState.PENDING) return null
+        val scheduled = task.scheduledStartTime?.let(::parseTimeOrNull) ?: return null
+
+        val nowTime = Instant.ofEpochMilli(nowMillis).atZone(ZoneId.systemDefault()).toLocalTime()
+        val lateMinutes = Duration.between(scheduled, nowTime).toMinutes().toInt()
+        if (lateMinutes < NOT_STARTED_THRESHOLD_MINUTES) return null
+
+        val triggerType = if (lateMinutes >= LATE_ESCALATION_THRESHOLD_MINUTES) {
+            InterventionTriggerType.LATE_START
+        } else {
+            InterventionTriggerType.TASK_NOT_STARTED
+        }
+        return TriggerSignal(triggerType, lateMinutes)
     }
 
-    /**
-     * The deterministic STRICT_REMINDER (§14's own worked example). Always a START_TASK
-     * intent — the fallback's whole purpose is to get the student moving on what was
-     * already planned, not to negotiate or reduce scope; negotiation is the AI Mentor's
-     * job once it exists.
-     */
-    fun strictReminderIntent(task: StudyTask, lateMinutes: Int): LlmIntent {
-        val speech = if (lateMinutes > 0) {
-            "You're $lateMinutes minutes late. Start ${task.topic} now. " +
-                "I'll adjust the remaining schedule afterward."
-        } else {
-            "It's time to start ${task.topic}."
+    private fun parseTimeOrNull(raw: String): LocalTime? =
+        try {
+            LocalTime.parse(raw)
+        } catch (e: Exception) {
+            null
         }
-        return LlmIntent(
-            speech = speech,
-            intentType = InterventionIntentType.START_TASK,
-            targetTaskId = task.id
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/TriggerEvaluatorTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZonedDateTime
+
+class TriggerEvaluatorTest {
+
+    private fun millisAt(hour: Int, minute: Int): Long {
+        val zone = ZoneId.systemDefault()
+        return ZonedDateTime.of(LocalDate.now(zone), LocalTime.of(hour, minute), zone)
+            .toInstant().toEpochMilli()
+    }
+
+    private fun task(
+        scheduledStartTime: String? = "19:00",
+        state: TaskState = TaskState.PENDING
+    ) = StudyTask(
+        subject = "Physics",
+        topic = "Electrostatics",
+        durationMinutes = 90,
+        state = state,
+        scheduledStartTime = scheduledStartTime
+    )
+
+    @Test
+    fun `no signal before the scheduled time`() {
+        val result = TriggerEvaluator.evaluate(task(), now(18, 55))
+        assertNull(result)
+    }
+
+    @Test
+    fun `no signal within the grace window right after scheduled time`() {
+        val result = TriggerEvaluator.evaluate(task(), now(19, 3))
+        assertNull(result)
+    }
+
+    @Test
+    fun `TASK_NOT_STARTED fires once past the threshold`() {
+        val result = TriggerEvaluator.evaluate(task(), now(19, 5))
+        assertEquals(InterventionTriggerType.TASK_NOT_STARTED, result?.triggerType)
+        assertEquals(5, result?.lateMinutes)
+    }
+
+    @Test
+    fun `LATE_START fires once past the escalation threshold`() {
+        val result = TriggerEvaluator.evaluate(task(), now(19, 12))
+        assertEquals(InterventionTriggerType.LATE_START, result?.triggerType)
+        assertEquals(12, result?.lateMinutes)
+    }
+
+    @Test
+    fun `no signal for a task that is already ACTIVE`() {
+        val result = TriggerEvaluator.evaluate(task(state = TaskState.ACTIVE), now(19, 30))
+        assertNull(result)
+    }
+
+    @Test
+    fun `no signal for a task that is DONE`() {
+        val result = TriggerEvaluator.evaluate(task(state = TaskState.DONE), now(19, 30))
+        assertNull(result)
+    }
+
+    @Test
+    fun `no signal for a task with no scheduled start time`() {
+        val result = TriggerEvaluator.evaluate(task(scheduledStartTime = null), now(19, 30))
+        assertNull(result)
+    }
+
+    @Test
+    fun `no signal for an unparseable scheduled start time`() {
+        val result = TriggerEvaluator.evaluate(task(scheduledStartTime = "not-a-time"), now(19, 30))
+        assertNull(result)
+    }
+
+    private fun now(hour: Int, minute: Int) = millisAt(hour, minute)
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTriggerWorker.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.checkmate.planner.PlanStore
+
+/**
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §2).
+ *
+ * "It does not 'constantly run an AI.' It evaluates deterministic signals." Each run walks
+ * today's tasks, asks [TriggerEvaluator] whether any fire, and for each one that does —
+ * acquires escrow and hands it to [InterventionDecisionMaker]. AI Mentor / Context Builder
+ * (steps 8/11) aren't wired yet, so every intervention this worker drives goes through the
+ * deterministic fallback path only, same as every other step built so far — this worker
+ * doesn't change that, it just supplies the "when" that was missing before it existed.
+ *
+ * Deliberately relies on [TaskEscrow.acquire]'s own atomic check rather than calling
+ * [TaskEscrow.isUnderEscrow] first — a separate pre-check would be a second DB read with a
+ * race window between it and the acquire call; acquire() already returns AlreadyHeld
+ * safely if something else (a concurrent run, or a manually-triggered intervention) beat
+ * this one to it.
+ */
+class InterventionTriggerWorker(
+    context: Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val dao = InterventionDatabase.getInstance(applicationContext).interventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+        val decisionMaker = InterventionDecisionMaker(escrow, executor)
+        val now = System.currentTimeMillis()
+
+        PlanStore.todayTasks.value.forEach { task ->
+            val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
+
+            val acquired = escrow.acquire(task.id, signal.triggerType, now)
+            if (acquired !is EscrowAcquireResult.Acquired) return@forEach
+
+            decisionMaker.decideAndExecute(
+                transactionId = acquired.transaction.transactionId,
+                task = task,
+                lateMinutes = signal.lateMinutes,
+                now = now
+            )
+        }
+
+        return Result.success()
+    }
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTriggerScheduler.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import androidx.work.BackoffPolicy
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import java.util.concurrent.TimeUnit
+
+/**
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §2).
+ *
+ * "WorkManager -> durable background evaluation." Unlike this codebase's existing
+ * AlarmManager-based schedules (GuardianNotifier's reports, WorkModeScheduleReceiver),
+ * this does NOT need re-arming in BootReceiver: WorkManager persists enqueued periodic
+ * work in its own database and reschedules itself after reboot automatically. Call
+ * [schedulePeriodicEvaluation] once from CheckmateApp.onCreate() with
+ * ExistingPeriodicWorkPolicy.KEEP so repeated app starts don't reset the schedule.
+ */
+object InterventionTriggerScheduler {
+
+    private const val UNIQUE_WORK_NAME = "checkmate_intervention_trigger_evaluation"
+
+    /** WorkManager enforces a 15-minute floor on periodic work — this is that floor. */
+    const val EVALUATION_INTERVAL_MINUTES = 15L
+
+    fun schedulePeriodicEvaluation(context: Context) {
+        val request = PeriodicWorkRequestBuilder<InterventionTriggerWorker>(
+            EVALUATION_INTERVAL_MINUTES, TimeUnit.MINUTES
+        )
+            .setBackoffCriteria(BackoffPolicy.LINEAR, 1, TimeUnit.MINUTES)
+            .build()
+
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            UNIQUE_WORK_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            request
         )
     }
+
+    fun cancel(context: Context) {
+        WorkManager.getInstance(context).cancelUniqueWork(UNIQUE_WORK_NAME)
+    }
 }
 
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionReconciliation.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
 /**
- * Orchestrates one intervention decision: try the LLM within budget (if asked to at all),
- * then resolve deterministically either way, through PolicyValidator and ActionExecutor —
- * never around them. Owns nothing about escrow lifecycle itself beyond resolving
- * POLICY_REJECTED directly (ActionExecutor already resolves every other outcome as part of
- * [ActionExecutor.execute]); the transaction must already be acquired via [TaskEscrow]
- * before this is called.
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §4).
+ *
+ * "Process dies -> Room remains -> Worker/receiver restarts -> unfinished transaction
+ * discovered -> FSM reconciles it." This is that sweep. Call from both
+ * CheckmateApp.onCreate() and BootReceiver — mirrors this codebase's existing
+ * WorkModeManager.init() pattern of running the same reconciliation logic from both entry
+ * points, since either can be the first code to run after a restart. Fire-and-forget by
+ * design (like CheckmateApp's existing `Thread { ... }.start()` calls for guardian
+ * alerts) — nothing in either caller's synchronous startup path should block on this.
  */
-class InterventionDecisionMaker(
-    private val taskEscrow: TaskEscrow,
-    private val actionExecutor: ActionExecutor
-) {
-    suspend fun decideAndExecute(
-        transactionId: String,
-        task: StudyTask,
-        lateMinutes: Int,
-        now: Long = System.currentTimeMillis(),
-        llmPrompt: String? = null,
-        llmSystemPrompt: String = "",
-        llmTimeoutMillis: Long = InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS,
-        // Same fix as InterventionFallback.attemptLlm above.
-        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
-    ): DecisionOutcome {
-        if (llmPrompt != null) {
-            // Result intentionally unused for now — see InterventionFallback's class doc.
-            InterventionFallback.attemptLlm(llmPrompt, llmSystemPrompt, llmTimeoutMillis, llmCall)
+object InterventionReconciliation {
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    fun runAtStartup(context: Context) {
+        scope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            TaskEscrow(dao).reconcileUnfinished()
         }
-        val usedFallback = true
+    }
+}
 
-        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes)
-        val policyState = PolicyState(task = task, nowMillis = now)
 
-        return when (val result = PolicyValidator.validate(intent, policyState)) {
-            is PolicyResult.Permitted -> {
-                val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
-                DecisionOutcome.Executed(executionOutcome, usedFallback)
+//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
+package com.checkmate
+
+import android.app.Application
+import android.content.Context
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.planner.intervention.InterventionTriggerScheduler
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.UninstallAlertListener
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
+
+class CheckmateApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        CheckmatePrefs.init(this)
+        CheckmateState.init(this)
+        CheckmateTTS.init(this)
+
+        // Reconcile Work Mode with the hardcoded daily schedule (usual
+        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
+        // Sunday/Wednesday) and re-arm the four daily boundary alarms
+        // (AlarmManager repeating alarms don't survive a reboot, hence also
+        // doing this in BootReceiver). This must run after
+        // CheckmateState.init() above.
+        WorkModeManager.init(this)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
+        GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
+        // worker's KV for the on-demand "usage" command (see worker.js).
+        GuardianNotifier.scheduleUsageReports(this)
+        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
+        // guardian report via WhatsApp + Telegram. Previously never
+        // scheduled anywhere, which is why the weekly report never sent.
+        GuardianNotifier.scheduleWeeklyReport(this)
+        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+
+        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
+        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
+        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
+        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
+        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
+        // reconciliation call added to BootReceiver below.
+        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
+        InterventionReconciliation.runAtStartup(this)
+
+        // Wire real screenshot capture via MediaProjection into DistractionGuard
+        // (and ScrollGuard, which reuses the same listener/pipeline for its
+        // "scroll" kind — see ScrollGuard.kt)
+        val distractionListener = object : DistractionListener {
+            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
+                Thread {
+                    val uri = ScreenCaptureManager.capture(context)
+                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
+                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
+                // the guardian-facing alert above — this is student-facing, not parent-facing.
+                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
             }
-            is PolicyResult.Rejected -> {
-                taskEscrow.resolveAs(
-                    transactionId,
-                    InterventionState.POLICY_REJECTED,
-                    failureReason = result.detail
-                )
-                DecisionOutcome.PolicyRejected(result.reason, result.detail, usedFallback)
+        }
+        DistractionGuard.listener = distractionListener
+        ScrollGuard.listener = distractionListener
+
+        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
+        // (via :workmode's UninstallGuard) into GuardianNotifier.
+        UninstallGuard.listener = object : UninstallAlertListener {
+            override fun onGuardedScreenBlocked(context: Context, reason: String) {
+                Thread {
+                    GuardianNotifier.notifyUninstallAttempt(context, reason)
+                }.start()
             }
         }
     }
 }
 
-sealed class DecisionOutcome {
-    data class Executed(val executionOutcome: ExecutionOutcome, val usedFallback: Boolean) : DecisionOutcome()
-    data class PolicyRejected(val reason: RejectionReason, val detail: String, val usedFallback: Boolean) : DecisionOutcome()
+
+//===== FILE: app/src/main/kotlin/com/checkmate/BootReceiver.kt =====
+package com.checkmate
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.TelegramAlertBot
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
+
+/**
+ * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
+ * reports, weekly report) are cancelled on reboot; this puts them back so
+ * guardian reporting survives a restart instead of silently going quiet.
+ *
+ * Also fires a one-time "device rebooted" note to the guardian when the
+ * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
+ * watchdog and (on some OEMs) the device admin lock entirely, which is the
+ * one uninstall path this app genuinely cannot block. Surfacing it is the
+ * next best thing: the guardian at least finds out it happened.
+ */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        CheckmatePrefs.init(context)
+        CheckmateState.init(context)
+        GuardianNotifier.scheduleEndOfDaySummary(context)
+        GuardianNotifier.scheduleUsageReports(context)
+        // Previously missing — the weekly report alarm was never scheduled
+        // anywhere, including here, which was part of why it never fired.
+        GuardianNotifier.scheduleWeeklyReport(context)
+
+        // Re-arm Work Mode's hardcoded schedule: reconcile immediately (in
+        // case the reboot landed mid-window) and re-register the four daily
+        // boundary alarms, since AlarmManager repeating alarms are cleared
+        // on reboot just like the guardian-reporting ones above.
+        WorkModeManager.init(context)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(context)
+        Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
+
+        // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
+        // non-terminal by the process that just died (Blueprint §4). No equivalent call
+        // is needed for InterventionTriggerScheduler's periodic work here — WorkManager
+        // persists and reschedules that itself after reboot, unlike the AlarmManager
+        // schedules above.
+        InterventionReconciliation.runAtStartup(context)
+
+        val inSafeMode = context.packageManager.isSafeMode
+        if (inSafeMode && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifySafeModeBoot(context)
+            }.start()
+        }
+    }
 }
