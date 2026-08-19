@@ -126,9 +126,10 @@ class InterventionFallbackTest {
     }
 
     @Test
-    fun `LLM responding successfully still resolves via the deterministic path today`() = runTest {
-        // Step 11 (structured LLM intent parsing) doesn't exist yet — even a fast, valid
-        // LLM response has no parser to be trusted through, so this must still fall back.
+    fun `an LLM response missing required fields still falls back deterministically`() = runTest {
+        // Step 11: LlmIntentParser now exists, but a response that doesn't match the closed
+        // schema (here: no "speech") is still unparseable, so this must still fall back —
+        // parse failure and "no response at all" are handled identically.
         val f = Fixture(pendingTask())
         val tx = f.acquire()
 
@@ -142,10 +143,161 @@ class InterventionFallbackTest {
 
         assertTrue(outcome is DecisionOutcome.Executed)
         assertTrue((outcome as DecisionOutcome.Executed).executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(outcome.usedFallback)
         // Still a START_TASK outcome (the deterministic reminder), not a REDUCE_DURATION —
-        // proves the unparsed LLM text was not acted on.
+        // proves the malformed LLM text was not acted on.
         assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
         assertEquals(90, f.mutator.currentState(f.taskId)?.durationMinutes)
+    }
+
+    @Test
+    fun `a well-formed LLM response is now actually trusted through the parser`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ ->
+                """{"speech": "Let's do 30 minutes instead.", "intentType": "REDUCE_DURATION",
+                    "parameters": {"newDurationMinutes": "30"}}"""
+            }
+        )
+
+        assertTrue(outcome is DecisionOutcome.Executed)
+        val executed = outcome as DecisionOutcome.Executed
+        assertTrue(executed.executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(!executed.usedFallback)
+        assertEquals("Let's do 30 minutes instead.", executed.speech)
+        assertEquals(30, f.mutator.currentState(f.taskId)?.durationMinutes)
+        // Not started — this was a duration reduction, not a start.
+        assertEquals(TaskState.PENDING, f.mutator.currentState(f.taskId)?.state)
+    }
+
+    @Test
+    fun `a well-formed but policy-rejected LLM response is not silently downgraded to fallback`() = runTest {
+        // A 4-hour break parses fine but PolicyValidator rejects it (BREAK_TOO_LONG) — this
+        // must surface as PolicyRejected, not quietly re-resolve via the strict reminder.
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ ->
+                """{"speech": "Take four hours off.", "intentType": "TAKE_SHORT_BREAK",
+                    "parameters": {"minutes": "240"}}"""
+            }
+        )
+
+        assertTrue(outcome is DecisionOutcome.PolicyRejected)
+        assertEquals(RejectionReason.BREAK_TOO_LONG, (outcome as DecisionOutcome.PolicyRejected).reason)
+        assertTrue(!outcome.usedFallback)
+        assertEquals(TaskState.PENDING, f.mutator.currentState(f.taskId)?.state)
+    }
+
+    // ── attemptConversationalTurn ───────────────────────────────────────
+
+    @Test
+    fun `conversational turn with no LLM response does not touch the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = null
+        )
+
+        assertEquals(ConversationalOutcome.LlmUnavailable, outcome)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `conversational turn with unparseable response does not touch the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = "not json"
+        )
+
+        assertEquals(ConversationalOutcome.UnparseableResponse, outcome)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `REQUEST_CLARIFICATION does not execute or resolve the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "How long do you have right now?", "intentType": "REQUEST_CLARIFICATION"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Continue)
+        assertEquals("How long do you have right now?", (outcome as ConversationalOutcome.Continue).speech)
+        // Still open — NOT committed, unlike ActionExecutor's NotApplicable branch would do.
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `NO_ACTION does not execute or resolve the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Got it, take your time.", "intentType": "NO_ACTION"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Continue)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a decisive intent in conversation executes and resolves the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Starting now.", "intentType": "START_TASK"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Decided)
+        assertTrue((outcome as ConversationalOutcome.Decided).executionOutcome is ExecutionOutcome.Applied)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a policy-rejected intent in conversation leaves the transaction open to keep negotiating`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Take four hours off.", "intentType": "TAKE_SHORT_BREAK",
+                "parameters": {"minutes": "240"}}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Rejected)
+        assertEquals(RejectionReason.BREAK_TOO_LONG, (outcome as ConversationalOutcome.Rejected).reason)
+        // Unlike decideAndExecute's Rejected branch, a conversational rejection does NOT
+        // resolve the transaction — the student gets to try again in the same conversation.
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
     }
 
     @Test

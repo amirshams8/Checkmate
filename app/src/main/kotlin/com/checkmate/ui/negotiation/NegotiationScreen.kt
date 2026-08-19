@@ -29,10 +29,12 @@ import com.checkmate.ui.theme.*
 import kotlinx.coroutines.delay
 
 /**
- * Proactive Execution Engine — Step 10 (Blueprint Part One, §16's "Talk to Checkmate").
- * See [NegotiationViewModel]'s class doc for the scope boundary this screen honors: the
- * conversation shown here is advisory (Step 11's structured-intent parser doesn't exist
- * yet) — only the Start / Snooze 5m / Dismiss buttons actually resolve the transaction.
+ * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §16's "Talk to
+ * Checkmate"). See [NegotiationViewModel]'s class doc: the Start / Snooze 5m / Dismiss
+ * buttons still always resolve the transaction unconditionally, but as of Step 11 the
+ * conversation itself can now also resolve it — a decisive intent parsed from the
+ * student's own words (e.g. "reduce this to 30 minutes") runs through the same
+ * PolicyValidator/ActionExecutor pipeline and closes the screen exactly like a button tap.
  */
 @Composable
 fun NegotiationScreen(
@@ -248,6 +250,9 @@ private fun resolutionLabel(r: NegotiationResolution): String = when (r) {
     NegotiationResolution.DISMISSED -> "Dismissed — closing…"
     NegotiationResolution.ALREADY_RESOLVED -> "This prompt was already handled — closing…"
     NegotiationResolution.TASK_MISSING -> "This task no longer exists — closing…"
+    // Step 11: reached when the conversation itself (not a button) resolved things via a
+    // REDUCE_DURATION/RESCHEDULE_TASK/TAKE_SHORT_BREAK/KEEP_PLAN/REQUEST_GUARDIAN intent.
+    NegotiationResolution.PLAN_ADJUSTED -> "✓ Updated — closing…"
     NegotiationResolution.NONE -> ""
 }
 

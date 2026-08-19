@@ -7,10 +7,13 @@ import com.checkmate.core.stt.CheckmateSTT
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.ConversationalOutcome
 import com.checkmate.planner.intervention.EscrowExtendResult
+import com.checkmate.planner.intervention.ExecutionOutcome
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
 import com.checkmate.planner.intervention.InterventionFallback
+import com.checkmate.planner.intervention.PermittedAction
 import com.checkmate.planner.intervention.PlanStoreTaskMutator
 import com.checkmate.planner.intervention.TaskEscrow
 import com.checkmate.planner.model.StudyTask
@@ -26,7 +29,14 @@ import kotlinx.coroutines.launch
 
 data class NegotiationMessage(val role: String, val content: String)
 
-enum class NegotiationResolution { NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING }
+enum class NegotiationResolution {
+    NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING,
+    // Step 11: any conversational decision other than STARTED — REDUCE_DURATION,
+    // RESCHEDULE_TASK, TAKE_SHORT_BREAK, KEEP_PLAN, or REQUEST_GUARDIAN all land here.
+    // The negotiation screen doesn't need to distinguish between them to close itself —
+    // the assistant's last chat bubble already says what happened in plain language.
+    PLAN_ADJUSTED
+}
 
 data class NegotiationUiState(
     val loading: Boolean = true,
@@ -42,28 +52,23 @@ data class NegotiationUiState(
 )
 
 /**
- * Proactive Execution Engine — Step 10 (Blueprint Part One, §8-9, §16's "Talk to Checkmate").
+ * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §8-11, §16's
+ * "Talk to Checkmate").
  *
- * This is what a tap on "Talk to Checkmate" (or the notification body) now actually opens
- * into — [InterventionNotifier]'s own doc comment on `talkPendingIntent` flagged this exact
- * gap: "today this just brings the app to the foreground; MainActivity does not currently
- * read EXTRA_TRANSACTION_ID out of its intent." This ViewModel is the consumer that closes
- * that gap, reusing [InterventionNotifier.EXTRA_TRANSACTION_ID]/`EXTRA_TASK_ID`/
- * `EXTRA_LATE_MINUTES` exactly as InterventionNotifier already attaches them.
+ * This is what a tap on "Talk to Checkmate" (or the notification body) opens into.
  *
- * IMPORTANT SCOPE BOUNDARY — matches [InterventionFallback]'s own doc comment almost word
- * for word: Structured LLM intents (Step 11) are not built yet. The back-and-forth here —
- * student speaks or types, [InterventionFallback.attemptLlm] (→ LlmGateway) replies,
- * [CheckmateTTS] speaks it back — is genuinely conversational, but nothing parses what the
- * LLM says into an executable decision, because that parser doesn't exist yet. The only
- * things that actually resolve this transaction are the three explicit actions below
- * ([onStart], [onSnooze], [onDismiss]) — they reuse exactly the same
- * [InterventionDecisionMaker] / [TaskEscrow] construction [InterventionActionReceiver]
- * already uses for the notification's own "Start"/"Snooze" buttons, not a second parallel
- * execution path. Talking to Checkmate today is advisory, on purpose — it doesn't (and
- * shouldn't, until Step 11's parser exists to validate it) let the LLM decide anything on
- * its own. The system prompt below tells the LLM this explicitly, so it doesn't imply to
- * the student that saying something out loud has already changed the plan.
+ * STEP 11 UPDATE: the scope boundary this class's doc used to describe — "nothing parses
+ * what the LLM says into an executable decision, because that parser doesn't exist yet" —
+ * no longer holds. [send] now runs every reply through
+ * [InterventionDecisionMaker.attemptConversationalTurn], which parses the raw LLM response
+ * via [com.checkmate.planner.intervention.LlmIntentParser] and, for a genuinely decisive
+ * intent, validates it through PolicyValidator and applies it through ActionExecutor — the
+ * exact same pipeline [onStart] already used for the notification's own button. Most turns
+ * still don't execute anything (a clarifying question, small talk, a rejected suggestion) —
+ * see [InterventionDecisionMaker.attemptConversationalTurn]'s own doc for why those
+ * deliberately leave the transaction open rather than resolving it. [onStart]/[onSnooze]/
+ * [onDismiss] remain the three buttons that resolve things unconditionally, unrelated to
+ * whatever the conversation is doing.
  */
 class NegotiationViewModel : ViewModel() {
 
@@ -73,12 +78,17 @@ class NegotiationViewModel : ViewModel() {
     private var stt: CheckmateSTT? = null
     private var initialized = false
 
+    // Step 11: send() needs this to call attemptConversationalTurn, and previously nothing
+    // retained it after init() beyond the local scope of the initial DB read.
+    private var currentTransactionId: String? = null
+
     /** Idempotent on purpose — Compose may recompose/re-enter this call across
      *  configuration changes; only the first call for this ViewModel instance should do
      *  the DB read + opening TTS utterance. */
     fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
         if (initialized) return
         initialized = true
+        currentTransactionId = transactionId
 
         val sttInstance = CheckmateSTT(context.applicationContext)
         stt = sttInstance
@@ -153,10 +163,21 @@ class NegotiationViewModel : ViewModel() {
         send(context, text)
     }
 
-    /** Shared entry point for both the text field and a completed voice transcript. */
+    /**
+     * Shared entry point for both the text field and a completed voice transcript.
+     *
+     * Step 11: this now asks the LLM for a structured intent (not just conversational
+     * text), runs the raw response through [InterventionDecisionMaker.attemptConversationalTurn],
+     * and reacts to whichever [ConversationalOutcome] comes back. The LLM call itself still
+     * goes through [InterventionFallback.attemptLlm] directly (rather than letting
+     * attemptConversationalTurn call it) so this function keeps ownership of the timeout
+     * budget and the raw string, exactly as before — attemptConversationalTurn only takes
+     * over from "here's what the model said" onward.
+     */
     private fun send(context: Context, text: String) {
         if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
         val task = _state.value.task ?: return
+        val transactionId = currentTransactionId ?: return
         val ctx = _state.value.context
 
         _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
@@ -169,15 +190,59 @@ class NegotiationViewModel : ViewModel() {
             // student never sees waiting happen (§14/§18). This is the opposite case — the
             // student is watching an active screen and knows a reply is coming, so it's
             // worth waiting longer for a real answer before falling back.
-            val reply = InterventionFallback.attemptLlm(
+            val raw = InterventionFallback.attemptLlm(
                 prompt = history,
                 systemPrompt = systemPrompt,
                 timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
-            ) ?: "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below."
+            )
 
-            _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", reply), isSending = false) }
-            CheckmateTTS.speak(context, reply)
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            when (val outcome = decisionMaker.attemptConversationalTurn(transactionId, task, raw)) {
+                ConversationalOutcome.LlmUnavailable ->
+                    reply(context, "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below.")
+
+                ConversationalOutcome.UnparseableResponse ->
+                    reply(context, "Sorry, I didn't quite catch that — could you say it a different way?")
+
+                is ConversationalOutcome.Continue ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Rejected ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Decided -> {
+                    InterventionNotifier.cancel(context.applicationContext, transactionId)
+                    _state.update {
+                        it.copy(
+                            messages = it.messages + NegotiationMessage("assistant", outcome.speech),
+                            isSending = false,
+                            resolution = resolutionFor(outcome.executionOutcome)
+                        )
+                    }
+                    CheckmateTTS.speak(context, outcome.speech)
+                }
+            }
         }
+    }
+
+    private fun reply(context: Context, text: String) {
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", text), isSending = false) }
+        CheckmateTTS.speak(context, text)
+    }
+
+    /** Maps a resolved conversational turn onto the same [NegotiationResolution] the
+     *  button-driven paths use, so the screen's existing "show a label, then close" flow
+     *  (see NegotiationScreen's LaunchedEffect on state.resolution) needs no special case
+     *  for how the resolution was reached. */
+    private fun resolutionFor(outcome: ExecutionOutcome): NegotiationResolution = when (outcome) {
+        is ExecutionOutcome.Applied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NoOpAlreadyApplied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NotApplicable -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.RequiresGuardianEscalation -> NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.Failed -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound -> NegotiationResolution.ALREADY_RESOLVED
     }
 
     /**
@@ -252,14 +317,40 @@ class NegotiationViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Step 11: this now asks for a strict JSON [com.checkmate.planner.intervention.LlmIntent]
+     * instead of free conversational text — "speech" carries what previously was the whole
+     * response. The intentType/parameters vocabulary listed here must stay in lockstep with
+     * [com.checkmate.planner.intervention.InterventionIntentType] and what
+     * [com.checkmate.planner.intervention.PolicyValidator] actually reads out of
+     * `parameters` — if a new intent type or parameter key is ever added there, it needs to
+     * be documented in this prompt too, or the model will never produce it.
+     */
     private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
-        appendLine("You are Checkmate's AI Mentor, talking with a student about ${task.subject} — ${task.topic},")
-        appendLine("which is late or off-plan right now. Be direct, warm, and brief — 1 to 3 sentences. This is")
-        appendLine("a spoken conversation, not an essay.")
-        appendLine("You cannot change the plan yourself. If the student wants a shorter session, a break, or a")
-        appendLine("reschedule, acknowledge what they said honestly, but tell them to use the Start / Snooze 5m /")
-        appendLine("Dismiss buttons on screen to actually act on it — never claim you've already changed anything,")
-        appendLine("since nothing you say here executes on its own yet.")
+        appendLine("You are Checkmate's AI Mentor, negotiating with a student about ${task.subject} — ${task.topic}")
+        appendLine("(current planned duration: ${task.durationMinutes} minutes), which is late or off-plan right now.")
+        appendLine()
+        appendLine("Respond with ONLY a single JSON object — no markdown code fences, no text before or after it —")
+        appendLine("in exactly this shape:")
+        appendLine("""{"speech": "...", "intentType": "...", "targetTaskId": "${task.id}", "parameters": {}}""")
+        appendLine()
+        appendLine("\"speech\" is what you actually say to the student out loud: direct, warm, brief (1-3 sentences),")
+        appendLine("a spoken reply, not an essay. Never claim you've already changed the plan in \"speech\" — describe")
+        appendLine("what you're recommending. A separate policy layer decides what's actually permitted (for example,")
+        appendLine("it will reject breaks longer than 30 minutes), and only that layer's decision, not your words,")
+        appendLine("changes anything.")
+        appendLine()
+        appendLine("\"intentType\" must be exactly one of:")
+        appendLine("  START_TASK            student is ready to begin right now")
+        appendLine("  REDUCE_DURATION       wants a shorter session — parameters: {\"newDurationMinutes\": \"<int>\"}")
+        appendLine("  RESCHEDULE_TASK       wants to move the start time — parameters: {\"newScheduledStartTime\": \"HH:mm\"}")
+        appendLine("  TAKE_SHORT_BREAK      needs a short break first — parameters: {\"minutes\": \"<int, 30 max>\"}")
+        appendLine("  KEEP_PLAN             no change needed, the plan as scheduled stands")
+        appendLine("  REQUEST_CLARIFICATION you need more information before recommending anything")
+        appendLine("  NO_ACTION             just talking/acknowledging, nothing to decide yet")
+        appendLine("  REQUEST_GUARDIAN      this needs a real person (guardian), not you")
+        appendLine()
+        appendLine("Omit \"parameters\" (or leave it {}) for any intentType that doesn't list one above.")
         if (ctx != null) {
             appendLine()
             appendLine(ctx.toPromptText())
