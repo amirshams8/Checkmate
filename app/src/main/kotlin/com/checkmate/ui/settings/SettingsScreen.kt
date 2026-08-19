@@ -25,6 +25,7 @@ import androidx.compose.runtime.LaunchedEffect
 import com.checkmate.admin.CheckmateDeviceAdminReceiver
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.llm.LlmGateway
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ProfileSyncManager
@@ -605,8 +606,24 @@ private fun FocusCycleSettings(context: Context) {
 }
 
 // ── LLM Provider Settings ─────────────────────────────────────────────────────
+//
+// VibeBuild (added): a single top-level chip fronting VibeBuild's gateway
+// (base URL stored in prefs, see LlmGateway's doc comment on why it's not
+// hardcoded) with a model sub-picker underneath — gpt-5.5-pro (routed through
+// VibeBuild's OpenAI-compatible path) or claude-fable-5 (routed through its
+// Anthropic-compatible path). One API key covers both, since it's a single
+// VibeBuild token, not separate OpenAI/Anthropic keys. Claude and OpenRouter's
+// existing direct-API code paths in LlmGateway are untouched — VibeBuild is
+// additive, not a replacement of that architecture.
 
-private val LLM_PROVIDERS = listOf("Groq", "Claude", "Gemini", "OpenRouter")
+private val LLM_PROVIDERS = listOf("Groq", "VibeBuild", "Gemini", "OpenRouter")
+
+private data class VibeBuildModelOption(val id: String, val label: String)
+
+private val VIBEBUILD_MODEL_OPTIONS = listOf(
+    VibeBuildModelOption(LlmGateway.VibeBuildModels.GPT_5_5_PRO, "GPT-5.5 Pro"),
+    VibeBuildModelOption(LlmGateway.VibeBuildModels.CLAUDE_FABLE_5, "Claude Fable 5")
+)
 
 @Composable
 private fun LlmProviderSettings(context: Context) {
@@ -648,6 +665,93 @@ private fun LlmProviderSettings(context: Context) {
         }
     }
 
+    // VibeBuild model sub-picker — only shown when VibeBuild is the active provider
+    if (selectedProvider == "VibeBuild") {
+        HorizontalDivider(color = White10)
+        var selectedModel by remember {
+            mutableStateOf(
+                CheckmatePrefs.getString("llm_vibebuild_model", LlmGateway.VibeBuildModels.GPT_5_5_PRO)
+                    ?: LlmGateway.VibeBuildModels.GPT_5_5_PRO
+            )
+        }
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("VibeBuild Model", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VIBEBUILD_MODEL_OPTIONS.forEach { option ->
+                    val selected = option.id == selectedModel
+                    FilterChip(
+                        selected = selected,
+                        onClick  = {
+                            selectedModel = option.id
+                            CheckmatePrefs.putString("llm_vibebuild_model", option.id)
+                        },
+                        label    = { Text(option.label, fontSize = 12.sp) },
+                        colors   = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentGreen,
+                            selectedLabelColor     = BgDark
+                        )
+                    )
+                }
+            }
+            Text(
+                if (selectedModel == LlmGateway.VibeBuildModels.CLAUDE_FABLE_5)
+                    "Routed through VibeBuild's Anthropic-compatible path — verify against a real response before relying on it."
+                else
+                    "Routed through VibeBuild's OpenAI-compatible path.",
+                fontSize = 10.sp, color = White30,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+
+        HorizontalDivider(color = White10)
+
+        // Base URL override — vibebuild.pro is not an independently verified partner
+        // domain, so this is editable rather than hardcoded (see LlmGateway doc).
+        var vibeBaseUrl by remember {
+            mutableStateOf(CheckmatePrefs.getString("llm_vibebuild_base_url", "") ?: "")
+        }
+        var vibeBaseUrlSaved by remember { mutableStateOf(false) }
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("VibeBuild Base URL (optional)", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                "Leave blank to use https://vibebuild.pro. Override here if it moves or you're pointing at a different gateway.",
+                fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+            )
+            OutlinedTextField(
+                value         = vibeBaseUrl,
+                onValueChange = { vibeBaseUrl = it; vibeBaseUrlSaved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("https://vibebuild.pro", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString("llm_vibebuild_base_url", vibeBaseUrl.trim())
+                        vibeBaseUrlSaved = true
+                    }) {
+                        Icon(
+                            if (vibeBaseUrlSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (vibeBaseUrlSaved) AccentGreen else White60
+                        )
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (vibeBaseUrlSaved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+
     HorizontalDivider(color = White10)
 
     // API key field for the currently selected provider
@@ -657,8 +761,11 @@ private fun LlmProviderSettings(context: Context) {
         var saved   by remember { mutableStateOf(false) }
 
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Text("$selectedProvider API Key", fontSize = 12.sp, color = White60,
-                modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                if (selectedProvider == "VibeBuild") "VibeBuild Token" else "$selectedProvider API Key",
+                fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
             OutlinedTextField(
                 value         = currentKey.value,
                 onValueChange = { currentKey.value = it; saved = false },
