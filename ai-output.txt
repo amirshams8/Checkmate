@@ -10,6 +10,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -34,11 +35,17 @@ import java.util.concurrent.TimeUnit
  *          OpenAI models (gpt-5.x, o3, o4) don't accept sampling temperature at all.
  *          callOpenAiCompatible() now omits it for those models instead of always sending 0.7.
  *
- * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently. The Bearer auth header on
- *          callVibeBuildAnthropic() was an unverified guess (see prior comment). It now tries
- *          Bearer first and automatically retries with native Anthropic-style x-api-key on a
- *          401/403, logging both attempts' HTTP code + body so a real failure is diagnosable
- *          from logcat instead of just looking like a dead response.
+ * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently — two stacked bugs, both
+ *          confirmed via live curl:
+ *          1. Auth: the Bearer guess was wrong for this route — CONFIRMED via curl that
+ *             VibeBuild's /proxy/anthropic route requires native Anthropic-style "x-api-key",
+ *             not "Authorization: Bearer". callVibeBuildAnthropic() now sends x-api-key directly.
+ *          2. Parsing: Fable 5 returns extended-thinking output, so content[0] is a
+ *             {"type":"thinking",...} block with no "text" key — content[1] is the actual
+ *             {"type":"text","text":"..."} block. The old code always read content[0], which
+ *             threw on Fable 5 responses and got swallowed by the catch block into "". Both
+ *             callClaude() and callVibeBuildAnthropic() now scan the content array for the
+ *             first block with type=="text" instead of assuming index 0.
  */
 object LlmGateway {
 
@@ -61,6 +68,20 @@ object LlmGateway {
 
     private fun supportsTemperature(model: String): Boolean =
         REASONING_MODEL_PREFIXES.none { model.startsWith(it) }
+
+    // FIX 1.5: Anthropic-style responses can lead with a {"type":"thinking",...} block
+    // (extended thinking) before the {"type":"text","text":"..."} block. Always scan for
+    // the first text block instead of assuming content[0] — assuming index 0 silently broke
+    // Fable 5 responses since thinking blocks have no "text" key.
+    private fun firstTextBlock(content: JSONArray): String {
+        for (i in 0 until content.length()) {
+            val block = content.getJSONObject(i)
+            if (block.optString("type") == "text") {
+                return block.getString("text").trim()
+            }
+        }
+        throw JSONException("No content block with type=text found")
+    }
 
     suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
         val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
@@ -167,7 +188,7 @@ object LlmGateway {
                 return ""
             }
             val json = JSONObject(bodyStr)
-            json.getJSONArray("content").getJSONObject(0).getString("text").trim()
+            firstTextBlock(json.getJSONArray("content"))
         } catch (e: Exception) {
             Log.e(TAG, "Claude call failed: ${e.message}")
             ""
@@ -179,51 +200,38 @@ object LlmGateway {
      * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
      * schema) since VibeBuild fronts the Anthropic API rather than translating it.
      *
-     * FIX 1.5: auth header was a one-way guess (Bearer only) and failures collapsed to "".
-     * Now tries "Authorization: Bearer $apiKey" first; if that comes back 401/403, retries
-     * once with native Anthropic-style "x-api-key" before giving up. Both attempts log their
-     * HTTP code + response body, so if it's still empty after this, logcat will show the
-     * actual upstream rejection reason instead of a silent dead end.
+     * FIX 1.5: CONFIRMED via live curl against this exact route that VibeBuild requires
+     * native Anthropic-style "x-api-key" — "Authorization: Bearer" (which works on the
+     * OpenAI route) gets a flat 401 here. Also, Fable 5 responses lead with a "thinking"
+     * content block before the "text" block, so parsing now scans for the first
+     * type=="text" block via firstTextBlock() instead of assuming content[0].
      */
     private fun callVibeBuildAnthropic(
         prompt: String, system: String, apiKey: String, baseUrl: String, model: String
     ): String {
-        val url = "$baseUrl/proxy/anthropic/v1/messages"
-
-        fun buildBody() = JSONObject().apply {
+        val body = JSONObject().apply {
             put("model", model)
             put("max_tokens", 512)
             if (system.isNotBlank()) put("system", system)
             put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
         }.toString().toRequestBody("application/json".toMediaType())
 
-        fun attempt(authHeaderName: String, authHeaderValue: String) =
-            client.newCall(
-                Request.Builder()
-                    .url(url)
-                    .addHeader(authHeaderName, authHeaderValue)
-                    .addHeader("anthropic-version", "2023-06-01")
-                    .addHeader("Content-Type", "application/json")
-                    .post(buildBody())
-                    .build()
-            ).execute()
+        val req = Request.Builder()
+            .url("$baseUrl/proxy/anthropic/v1/messages")
+            .addHeader("x-api-key", apiKey)
+            .addHeader("anthropic-version", "2023-06-01")
+            .addHeader("Content-Type", "application/json")
+            .post(body).build()
 
         return try {
-            var resp    = attempt("Authorization", "Bearer $apiKey")
-            var bodyStr = resp.body?.string() ?: "{}"
-
-            if (!resp.isSuccessful && (resp.code == 401 || resp.code == 403)) {
-                Log.w(TAG, "VibeBuild/Anthropic Bearer auth rejected (HTTP ${resp.code}) model=$model — retrying with x-api-key")
-                resp    = attempt("x-api-key", apiKey)
-                bodyStr = resp.body?.string() ?: "{}"
-            }
-
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
             if (!resp.isSuccessful) {
                 Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
                 return ""
             }
             val json = JSONObject(bodyStr)
-            json.getJSONArray("content").getJSONObject(0).getString("text").trim()
+            firstTextBlock(json.getJSONArray("content"))
         } catch (e: Exception) {
             Log.e(TAG, "VibeBuild/Anthropic call failed: ${e.message}")
             ""
