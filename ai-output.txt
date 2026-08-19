@@ -1,1198 +1,1429 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/stt/CheckmateSTT.kt =====
-package com.checkmate.core.stt
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/llm/LlmGateway.kt =====
+package com.checkmate.core.llm
 
-import android.content.Context
-import android.content.Intent
-import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Log
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import java.util.Locale
+import com.checkmate.core.CheckmatePrefs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 /**
- * Proactive Execution Engine — Step 10 (Blueprint Part One, §16's "Talk to Checkmate" —
- * flagged by Step 9's InterventionNotifier but left unbuilt until now).
+ * Unified LLM gateway supporting OpenRouter, Groq, Claude, Gemini, and VibeBuild.
+ * FIX 1.4: Changed Groq model from deprecated "llama3-8b-8192" to "llama-3.1-8b-instant".
+ * FIX 1.4: Added HTTP status check + response body logging on failure so errors are
+ *           visible in logcat instead of silently returning empty string.
  *
- * Thin wrapper around Android's on-device [SpeechRecognizer]. No cloud STT vendor is wired
- * here — mirrors [com.checkmate.core.tts.CheckmateTTS]'s own "free platform default, no
- * required paid dependency" posture (that file's ElevenLabs path is an opt-in upgrade on
- * top of Android TextToSpeech, not a replacement for it). RECORD_AUDIO is already declared
- * in the manifest and requested at MainActivity startup — this step needed nothing new
- * there.
- *
- * A class, not a singleton object like CheckmateTTS — a SpeechRecognizer instance is
- * single-session state (each `startListening()` either resolves via onResults/onError or is
- * cancelled), and the negotiation screen this exists for needs its own lifecycle-scoped
- * instance rather than a process-wide singleton other unrelated screens could silently
- * interfere with.
- *
- * Must be constructed and driven from the main thread — that's a hard SpeechRecognizer
- * requirement, not a choice made here. [NegotiationViewModel] only ever calls this from
- * Compose's main-thread callbacks, so this class does no threading of its own.
+ * VibeBuild (added): a third-party gateway (https://vibebuild.pro) fronting both an
+ * OpenAI-compatible route (/proxy/openai) and an Anthropic-compatible route
+ * (/proxy/anthropic) behind a single VibeBuild token. NOTE: this domain is not an
+ * Anthropic- or OpenAI-published partner — it hasn't been independently verified as
+ * trustworthy, only as reachable. The base URL is stored in prefs (not hardcoded) so
+ * it can be repointed without a rebuild if it turns out to be unreliable. The OpenAI
+ * route reuses the existing callOpenAiCompatible() request shape (confirmed working
+ * against gpt-5.5-pro). The Anthropic route (callVibeBuildAnthropic) reuses callClaude()'s
+ * request body shape but with a Bearer auth header instead of x-api-key, mirroring the
+ * confirmed OpenAI-route auth — this half has NOT been confirmed against a real
+ * claude-fable-5 response and should be verified before being relied on.
  */
-class CheckmateSTT(private val context: Context) {
+object LlmGateway {
 
-    private var recognizer: SpeechRecognizer? = null
+    private const val TAG = "LlmGateway"
 
-    private val _state = MutableStateFlow(SttUiState())
-    val state: StateFlow<SttUiState> = _state.asStateFlow()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
 
-    fun isAvailable(): Boolean = SpeechRecognizer.isRecognitionAvailable(context)
+    object VibeBuildModels {
+        const val GPT_5_5_PRO    = "gpt-5.5-pro"
+        const val CLAUDE_FABLE_5 = "claude-fable-5"
+    }
 
-    fun startListening() {
-        if (!isAvailable()) {
-            _state.value = _state.value.copy(error = "Speech recognition not available on this device")
-            return
+    private const val VIBEBUILD_DEFAULT_BASE_URL = "https://vibebuild.pro"
+
+    suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
+        val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
+        val apiKey   = CheckmatePrefs.getString("llm_key_${provider.lowercase()}", null)
+
+        if (apiKey.isNullOrBlank()) {
+            Log.w(TAG, "No API key for $provider — returning empty (rule-based fallback will handle)")
+            return@withContext ""
         }
-        // Defensive: never leave a previous session's recognizer half-torn-down before
-        // starting a new one — createSpeechRecognizer() while one is already listening is
-        // the most common source of silent ERROR_RECOGNIZER_BUSY reports.
-        stopListening()
 
-        val r = SpeechRecognizer.createSpeechRecognizer(context)
-        recognizer = r
-        r.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                Log.d(TAG, "Ready for speech")
-                _state.value = _state.value.copy(isListening = true, error = null)
-            }
-
-            override fun onBeginningOfSpeech() = Unit
-
-            override fun onRmsChanged(rmsdB: Float) {
-                _state.value = _state.value.copy(rmsDb = rmsdB)
-            }
-
-            override fun onBufferReceived(buffer: ByteArray?) = Unit
-
-            override fun onEndOfSpeech() {
-                _state.value = _state.value.copy(isListening = false)
-            }
-
-            override fun onError(error: Int) {
-                val message = describeError(error)
-                Log.w(TAG, "STT error $error: $message")
-                _state.value = _state.value.copy(isListening = false, error = message)
-            }
-
-            override fun onResults(results: Bundle?) {
-                val text = results
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                _state.value = _state.value.copy(isListening = false, finalText = text, partialText = "")
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-                val text = partialResults
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                if (text != null) _state.value = _state.value.copy(partialText = text)
-            }
-
-            override fun onEvent(eventType: Int, params: Bundle?) = Unit
-        })
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
-        }
-        _state.value = _state.value.copy(finalText = null, partialText = "", error = null)
-        r.startListening(intent)
-    }
-
-    fun stopListening() {
-        recognizer?.let {
-            try { it.stopListening() } catch (e: Exception) { Log.w(TAG, "stopListening failed: ${e.message}") }
-            try { it.destroy() } catch (e: Exception) { Log.w(TAG, "destroy failed: ${e.message}") }
-        }
-        recognizer = null
-        _state.value = _state.value.copy(isListening = false)
-    }
-
-    /** Clears a consumed final transcript so it isn't re-acted-on if the state flow is
-     *  re-observed (e.g. after a config change) before the next `startListening()` call. */
-    fun consumeFinalText() {
-        _state.value = _state.value.copy(finalText = null)
-    }
-
-    private fun describeError(code: Int): String = when (code) {
-        SpeechRecognizer.ERROR_NO_MATCH -> "Didn't catch that — try again"
-        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission needed"
-        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network error"
-        SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy — try again"
-        SpeechRecognizer.ERROR_CLIENT -> "Speech recognition client error"
-        else -> "Speech recognition error ($code)"
-    }
-
-    companion object {
-        private const val TAG = "CheckmateSTT"
-    }
-}
-
-data class SttUiState(
-    val isListening: Boolean = false,
-    val partialText: String = "",
-    val finalText: String? = null,
-    val rmsDb: Float = 0f,
-    val error: String? = null
-)
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
-package com.checkmate.ui.negotiation
-
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.stt.CheckmateSTT
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.ActionExecutor
-import com.checkmate.planner.intervention.EscrowExtendResult
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.planner.intervention.InterventionDecisionMaker
-import com.checkmate.planner.intervention.InterventionFallback
-import com.checkmate.planner.intervention.PlanStoreTaskMutator
-import com.checkmate.planner.intervention.TaskEscrow
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.psyche.intervention.ContextBuilder
-import com.checkmate.psyche.intervention.InterventionContext
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.InterventionSnoozeAlarmReceiver
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-
-data class NegotiationMessage(val role: String, val content: String)
-
-enum class NegotiationResolution { NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING }
-
-data class NegotiationUiState(
-    val loading: Boolean = true,
-    val task: StudyTask? = null,
-    val context: InterventionContext? = null,
-    val messages: List<NegotiationMessage> = emptyList(),
-    val isSending: Boolean = false,
-    val isListening: Boolean = false,
-    val sttAvailable: Boolean = true,
-    val sttError: String? = null,
-    val inputText: String = "",
-    val resolution: NegotiationResolution = NegotiationResolution.NONE
-)
-
-/**
- * Proactive Execution Engine — Step 10 (Blueprint Part One, §8-9, §16's "Talk to Checkmate").
- *
- * This is what a tap on "Talk to Checkmate" (or the notification body) now actually opens
- * into — [InterventionNotifier]'s own doc comment on `talkPendingIntent` flagged this exact
- * gap: "today this just brings the app to the foreground; MainActivity does not currently
- * read EXTRA_TRANSACTION_ID out of its intent." This ViewModel is the consumer that closes
- * that gap, reusing [InterventionNotifier.EXTRA_TRANSACTION_ID]/`EXTRA_TASK_ID`/
- * `EXTRA_LATE_MINUTES` exactly as InterventionNotifier already attaches them.
- *
- * IMPORTANT SCOPE BOUNDARY — matches [InterventionFallback]'s own doc comment almost word
- * for word: Structured LLM intents (Step 11) are not built yet. The back-and-forth here —
- * student speaks or types, [InterventionFallback.attemptLlm] (→ LlmGateway) replies,
- * [CheckmateTTS] speaks it back — is genuinely conversational, but nothing parses what the
- * LLM says into an executable decision, because that parser doesn't exist yet. The only
- * things that actually resolve this transaction are the three explicit actions below
- * ([onStart], [onSnooze], [onDismiss]) — they reuse exactly the same
- * [InterventionDecisionMaker] / [TaskEscrow] construction [InterventionActionReceiver]
- * already uses for the notification's own "Start"/"Snooze" buttons, not a second parallel
- * execution path. Talking to Checkmate today is advisory, on purpose — it doesn't (and
- * shouldn't, until Step 11's parser exists to validate it) let the LLM decide anything on
- * its own. The system prompt below tells the LLM this explicitly, so it doesn't imply to
- * the student that saying something out loud has already changed the plan.
- */
-class NegotiationViewModel : ViewModel() {
-
-    private val _state = MutableStateFlow(NegotiationUiState())
-    val state: StateFlow<NegotiationUiState> = _state.asStateFlow()
-
-    private var stt: CheckmateSTT? = null
-    private var initialized = false
-
-    /** Idempotent on purpose — Compose may recompose/re-enter this call across
-     *  configuration changes; only the first call for this ViewModel instance should do
-     *  the DB read + opening TTS utterance. */
-    fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        if (initialized) return
-        initialized = true
-
-        val sttInstance = CheckmateSTT(context.applicationContext)
-        stt = sttInstance
-        _state.update { it.copy(sttAvailable = sttInstance.isAvailable()) }
-
-        viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val transaction = dao.getById(transactionId)
-            if (transaction == null || transaction.currentState.isTerminal) {
-                _state.update { it.copy(loading = false, resolution = NegotiationResolution.ALREADY_RESOLVED) }
-                return@launch
-            }
-
-            val task = PlanStore.todayTasks.value.find { it.id == taskId }
-            if (task == null) {
-                _state.update { it.copy(loading = false, resolution = NegotiationResolution.TASK_MISSING) }
-                return@launch
-            }
-
-            // Same best-effort posture InterventionNotifier already uses around
-            // ContextBuilder.build — a missing behavioral summary shouldn't block the
-            // conversation from opening at all.
-            val ctx = runCatching { ContextBuilder.build(task, lateMinutes) }.getOrNull()
-
-            // The opening line is the exact same deterministic STRICT_REMINDER speech the
-            // no-gateway fallback (and the notification's "Start" action) would use — this
-            // conversation is layered on top of that reality, not a different story.
-            val opening = InterventionFallback.strictReminderIntent(task, lateMinutes).speech
-
-            _state.update {
-                it.copy(
-                    loading = false,
-                    task = task,
-                    context = ctx,
-                    messages = listOf(NegotiationMessage("assistant", opening))
-                )
-            }
-            CheckmateTTS.speak(context, opening)
-
-            // Runs for the lifetime of this ViewModel — a final transcript from voice input
-            // becomes a sent message through exactly the same path as the text field's send
-            // button (see the private send() overload below).
-            launch {
-                sttInstance.state.collect { s ->
-                    _state.update { it.copy(isListening = s.isListening, sttError = s.error) }
-                    val finalText = s.finalText
-                    if (!finalText.isNullOrBlank()) {
-                        sttInstance.consumeFinalText()
-                        send(context, finalText)
-                    }
+        return@withContext when (provider) {
+            "Claude"      -> callClaude(prompt, systemPrompt, apiKey)
+            "Gemini"      -> callGemini(prompt, systemPrompt, apiKey)
+            "Groq"        -> callOpenAiCompatible(
+                prompt, systemPrompt, apiKey,
+                "https://api.groq.com/openai/v1/chat/completions",
+                // FIX: "llama3-8b-8192" was deprecated by Groq → HTTP 400/404 → silent empty return
+                // → AdaptivePlanner always fell back to ruleBasedPlan() → vague tasks
+                "llama-3.1-8b-instant"
+            )
+            "OpenRouter"  -> callOpenAiCompatible(
+                prompt, systemPrompt, apiKey,
+                "https://openrouter.ai/api/v1/chat/completions",
+                "mistralai/mistral-7b-instruct:free"
+            )
+            "VibeBuild"   -> {
+                val model = CheckmatePrefs.getString("llm_vibebuild_model", VibeBuildModels.GPT_5_5_PRO)
+                    ?: VibeBuildModels.GPT_5_5_PRO
+                val baseUrl = (CheckmatePrefs.getString("llm_vibebuild_base_url", null)
+                    ?.trim()?.takeIf { it.isNotBlank() } ?: VIBEBUILD_DEFAULT_BASE_URL)
+                    .trimEnd('/')
+                when (model) {
+                    VibeBuildModels.CLAUDE_FABLE_5 ->
+                        callVibeBuildAnthropic(prompt, systemPrompt, apiKey, baseUrl, model)
+                    else ->
+                        callOpenAiCompatible(
+                            prompt, systemPrompt, apiKey,
+                            "$baseUrl/proxy/openai/v1/chat/completions",
+                            model
+                        )
                 }
             }
+            else          -> ""
         }
     }
 
-    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+    private fun callOpenAiCompatible(
+        prompt: String, system: String, apiKey: String, url: String, model: String
+    ): String {
+        val messages = JSONArray().apply {
+            if (system.isNotBlank()) put(JSONObject().put("role", "system").put("content", system))
+            put(JSONObject().put("role", "user").put("content", prompt))
+        }
+        val body = JSONObject().apply {
+            put("model", model)
+            put("messages", messages)
+            put("max_tokens", 512)
+            put("temperature", 0.7)
+        }.toString().toRequestBody("application/json".toMediaType())
 
-    fun startListening() {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.startListening()
+        val req = Request.Builder().url(url)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(body).build()
+
+        return try {
+            val resp     = client.newCall(req).execute()
+            val bodyStr  = resp.body?.string() ?: "{}"
+            // FIX: previously body was consumed before status check — error JSON was lost
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "OpenAI-compat HTTP ${resp.code} for model=$model url=$url body=$bodyStr")
+                return ""
+            }
+            val json = JSONObject(bodyStr)
+            json.getJSONArray("choices").getJSONObject(0)
+                .getJSONObject("message").getString("content").trim()
+        } catch (e: Exception) {
+            Log.e(TAG, "OpenAI-compat call failed: ${e.message}")
+            ""
+        }
     }
 
-    fun stopListening() {
-        stt?.stopListening()
-    }
+    private fun callClaude(prompt: String, system: String, apiKey: String): String {
+        val body = JSONObject().apply {
+            put("model", "claude-3-haiku-20240307")
+            put("max_tokens", 512)
+            if (system.isNotBlank()) put("system", system)
+            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+        }.toString().toRequestBody("application/json".toMediaType())
 
-    /** Text-field send button entry point. */
-    fun send(context: Context) {
-        val text = _state.value.inputText.trim()
-        if (text.isBlank()) return
-        _state.update { it.copy(inputText = "") }
-        send(context, text)
-    }
+        val req = Request.Builder()
+            .url("https://api.anthropic.com/v1/messages")
+            .addHeader("x-api-key", apiKey)
+            .addHeader("anthropic-version", "2023-06-01")
+            .addHeader("Content-Type", "application/json")
+            .post(body).build()
 
-    /** Shared entry point for both the text field and a completed voice transcript. */
-    private fun send(context: Context, text: String) {
-        if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
-        val task = _state.value.task ?: return
-        val ctx = _state.value.context
-
-        _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
-
-        viewModelScope.launch {
-            val systemPrompt = buildSystemPrompt(task, ctx)
-            val history = buildHistoryForLlm()
-            // A longer budget than InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS (3s) on
-            // purpose: that 3s default is sized for a silent background decision the
-            // student never sees waiting happen (§14/§18). This is the opposite case — the
-            // student is watching an active screen and knows a reply is coming, so it's
-            // worth waiting longer for a real answer before falling back.
-            val reply = InterventionFallback.attemptLlm(
-                prompt = history,
-                systemPrompt = systemPrompt,
-                timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
-            ) ?: "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below."
-
-            _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", reply), isSending = false) }
-            CheckmateTTS.speak(context, reply)
+        return try {
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Claude HTTP ${resp.code} body=$bodyStr")
+                return ""
+            }
+            val json = JSONObject(bodyStr)
+            json.getJSONArray("content").getJSONObject(0).getString("text").trim()
+        } catch (e: Exception) {
+            Log.e(TAG, "Claude call failed: ${e.message}")
+            ""
         }
     }
 
     /**
-     * Student tapped "Start". Resolves through the identical deterministic
-     * STRICT_REMINDER -> START_TASK -> PolicyValidator -> ActionExecutor path
-     * [InterventionActionReceiver.handleStart] already uses for the notification's own
-     * "Start" button — there is exactly one place "what happens when we decide to start
-     * this task" lives, regardless of whether the student tapped a notification action or
-     * talked their way here.
+     * VibeBuild's Anthropic-compatible route (/proxy/anthropic). Reuses callClaude()'s
+     * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
+     * schema) since VibeBuild fronts the Anthropic API rather than translating it. Auth uses
+     * "Authorization: Bearer $apiKey" — matching the pattern confirmed working on VibeBuild's
+     * OpenAI route — rather than Anthropic's native "x-api-key", since this is a gateway
+     * token, not a real Anthropic key. UNVERIFIED against a live response — if VibeBuild
+     * actually expects x-api-key passthrough instead, this will need a one-line header swap.
+     * Kept as its own function (not folded into callClaude) because the auth header and URL
+     * differ, and future VibeBuild-specific quirks (rate-limit headers, error shape) shouldn't
+     * leak into the direct-to-Anthropic path.
      */
-    fun onStart(context: Context, transactionId: String, lateMinutes: Int) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        val task = _state.value.task ?: return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
-            decisionMaker.decideAndExecute(
-                transactionId = transactionId,
-                task = task,
-                lateMinutes = lateMinutes
-            )
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
-        }
-    }
+    private fun callVibeBuildAnthropic(
+        prompt: String, system: String, apiKey: String, baseUrl: String, model: String
+    ): String {
+        val body = JSONObject().apply {
+            put("model", model)
+            put("max_tokens", 512)
+            if (system.isNotBlank()) put("system", system)
+            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+        }.toString().toRequestBody("application/json".toMediaType())
 
-    /** Same TaskEscrow.extend() + re-notify alarm as
-     *  [InterventionActionReceiver.handleSnooze] — see that method's doc for why this
-     *  doesn't re-run TriggerEvaluator or re-acquire escrow. */
-    fun onSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val escrow = TaskEscrow(dao)
-            val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
-            if (result is EscrowExtendResult.Extended) {
-                InterventionSnoozeAlarmReceiver.scheduleRenotify(
-                    context.applicationContext, transactionId, taskId, lateMinutes
-                )
+        val req = Request.Builder()
+            .url("$baseUrl/proxy/anthropic/v1/messages")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("anthropic-version", "2023-06-01")
+            .addHeader("Content-Type", "application/json")
+            .post(body).build()
+
+        return try {
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
+                return ""
             }
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.SNOOZED) }
+            val json = JSONObject(bodyStr)
+            json.getJSONArray("content").getJSONObject(0).getString("text").trim()
+        } catch (e: Exception) {
+            Log.e(TAG, "VibeBuild/Anthropic call failed: ${e.message}")
+            ""
         }
     }
 
-    /** USER_ABORTED (§3) — the student declined via the conversation screen rather than
-     *  ignoring the notification (USER_IGNORED) or running out the TTL. */
-    fun onDismiss(context: Context, transactionId: String) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val escrow = TaskEscrow(dao)
-            escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
-        }
-    }
+    private fun callGemini(prompt: String, system: String, apiKey: String): String {
+        val fullPrompt = if (system.isNotBlank()) "$system\n\n$prompt" else prompt
+        val body = JSONObject().apply {
+            put("contents", JSONArray().put(
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", fullPrompt)))
+            ))
+        }.toString().toRequestBody("application/json".toMediaType())
 
-    private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        return escrow to InterventionDecisionMaker(escrow, executor)
-    }
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$apiKey"
+        val req = Request.Builder().url(url)
+            .addHeader("Content-Type", "application/json")
+            .post(body).build()
 
-    private fun buildHistoryForLlm(): String {
-        val msgs = _state.value.messages.takeLast(12)
-        return msgs.joinToString("\n") { m ->
-            if (m.role == "user") "Student: ${m.content}" else "Mentor: ${m.content}"
-        }
-    }
-
-    private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
-        appendLine("You are Checkmate's AI Mentor, talking with a student about ${task.subject} — ${task.topic},")
-        appendLine("which is late or off-plan right now. Be direct, warm, and brief — 1 to 3 sentences. This is")
-        appendLine("a spoken conversation, not an essay.")
-        appendLine("You cannot change the plan yourself. If the student wants a shorter session, a break, or a")
-        appendLine("reschedule, acknowledge what they said honestly, but tell them to use the Start / Snooze 5m /")
-        appendLine("Dismiss buttons on screen to actually act on it — never claim you've already changed anything,")
-        appendLine("since nothing you say here executes on its own yet.")
-        if (ctx != null) {
-            appendLine()
-            appendLine(ctx.toPromptText())
-        }
-    }.trim()
-
-    override fun onCleared() {
-        super.onCleared()
-        stt?.stopListening()
-    }
-
-    companion object {
-        private const val CONVERSATION_LLM_TIMEOUT_MILLIS = 12_000L
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationScreen.kt =====
-package com.checkmate.ui.negotiation
-
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MicOff
-import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavController
-import com.checkmate.ui.theme.*
-import kotlinx.coroutines.delay
-
-/**
- * Proactive Execution Engine — Step 10 (Blueprint Part One, §16's "Talk to Checkmate").
- * See [NegotiationViewModel]'s class doc for the scope boundary this screen honors: the
- * conversation shown here is advisory (Step 11's structured-intent parser doesn't exist
- * yet) — only the Start / Snooze 5m / Dismiss buttons actually resolve the transaction.
- */
-@Composable
-fun NegotiationScreen(
-    navController: NavController,
-    transactionId: String,
-    taskId: String,
-    lateMinutes: Int,
-    vm: NegotiationViewModel = viewModel()
-) {
-    val state by vm.state.collectAsState()
-    val context = LocalContext.current
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(transactionId) {
-        vm.init(context, transactionId, taskId, lateMinutes)
-    }
-
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
-    }
-
-    // A resolved outcome (Started/Snoozed/Dismissed/etc.) is shown briefly, then this
-    // screen closes itself — there's nothing further to negotiate once the transaction
-    // has resolved.
-    LaunchedEffect(state.resolution) {
-        if (state.resolution != NegotiationResolution.NONE) {
-            delay(1200)
-            navController.popBackStack()
-        }
-    }
-
-    Column(modifier = Modifier.fillMaxSize().background(BgDark).imePadding()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = White60)
+        return try {
+            val resp    = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
+                return ""
             }
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    state.task?.let { "${it.subject} — ${it.topic}" } ?: "Talk to Checkmate",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = White90
-                )
-                if (lateMinutes > 0) {
-                    Text("$lateMinutes min late", fontSize = 11.sp, color = AccentAmber)
-                }
-            }
-            Icon(Icons.Default.Psychology, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(8.dp))
-        }
-        HorizontalDivider(color = White10, thickness = 0.5.dp)
-
-        if (state.loading) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = AccentGreen)
-            }
-            return@Column
-        }
-
-        state.context?.let { ctx ->
-            if (ctx.recentSkipRatePercent > 0 || ctx.streakDays > 0) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    if (ctx.recentSkipRatePercent > 0) {
-                        ContextChip("Skip rate ${ctx.recentSkipRatePercent}%", AccentAmber)
-                    }
-                    if (ctx.streakDays > 0) {
-                        ContextChip("Streak ${ctx.streakDays}d", AccentGreen)
-                    }
-                }
-            }
-        }
-
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(state.messages) { msg -> NegotiationBubble(msg) }
-            if (state.isSending) {
-                item {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                        Surface(
-                            shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
-                            color = BgCard,
-                            border = BorderStroke(0.5.dp, White10)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
-                                Spacer(Modifier.width(8.dp))
-                                Text("thinking…", fontSize = 13.sp, color = White60)
-                            }
-                        }
-                    }
-                }
-            }
-            if (state.resolution != NegotiationResolution.NONE) {
-                item {
-                    Text(
-                        resolutionLabel(state.resolution),
-                        fontSize = 12.sp,
-                        color = White60,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-                    )
-                }
-            }
-        }
-
-        state.sttError?.let {
-            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
-        }
-
-        HorizontalDivider(color = White10, thickness = 0.5.dp)
-
-        val actionsEnabled = state.resolution == NegotiationResolution.NONE
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { vm.onStart(context, transactionId, lateMinutes) },
-                enabled = actionsEnabled,
-                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = Color.Black),
-                modifier = Modifier.weight(1f)
-            ) { Text("Start", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
-
-            OutlinedButton(
-                onClick = { vm.onSnooze(context, transactionId, taskId, lateMinutes) },
-                enabled = actionsEnabled,
-                modifier = Modifier.weight(1f)
-            ) { Text("Snooze 5m", fontSize = 12.sp, color = White90) }
-
-            OutlinedButton(
-                onClick = { vm.onDismiss(context, transactionId) },
-                enabled = actionsEnabled,
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
-                modifier = Modifier.weight(1f)
-            ) { Text("Dismiss", fontSize = 12.sp) }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedTextField(
-                value = state.inputText,
-                onValueChange = vm::setInput,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Say or type your response…", color = White30, fontSize = 13.sp) },
-                singleLine = false,
-                maxLines = 3,
-                enabled = actionsEnabled,
-                shape = RoundedCornerShape(14.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor = AccentGreen,
-                    focusedTextColor = White90,
-                    unfocusedTextColor = White90
-                )
-            )
-            if (state.sttAvailable) {
-                FloatingActionButton(
-                    onClick = { if (state.isListening) vm.stopListening() else vm.startListening() },
-                    containerColor = if (state.isListening) AccentRed else BgCardAlt,
-                    contentColor = if (state.isListening) Color.White else AccentGreen,
-                    modifier = Modifier.size(46.dp)
-                ) {
-                    Icon(
-                        if (state.isListening) Icons.Default.MicOff else Icons.Default.Mic,
-                        contentDescription = if (state.isListening) "Stop listening" else "Start listening",
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-            }
-            FloatingActionButton(
-                onClick = { vm.send(context) },
-                containerColor = AccentGreen,
-                contentColor = Color.Black,
-                modifier = Modifier.size(46.dp)
-            ) {
-                Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
-            }
-        }
-    }
-}
-
-@Composable
-private fun ContextChip(label: String, color: Color) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = color.copy(alpha = 0.15f),
-        border = BorderStroke(0.5.dp, color.copy(alpha = 0.4f))
-    ) {
-        Text(label, fontSize = 11.sp, color = color, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
-    }
-}
-
-private fun resolutionLabel(r: NegotiationResolution): String = when (r) {
-    NegotiationResolution.STARTED -> "✓ Started — closing…"
-    NegotiationResolution.SNOOZED -> "Snoozed 5 minutes — closing…"
-    NegotiationResolution.DISMISSED -> "Dismissed — closing…"
-    NegotiationResolution.ALREADY_RESOLVED -> "This prompt was already handled — closing…"
-    NegotiationResolution.TASK_MISSING -> "This task no longer exists — closing…"
-    NegotiationResolution.NONE -> ""
-}
-
-@Composable
-private fun NegotiationBubble(msg: NegotiationMessage) {
-    val isUser = msg.role == "user"
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
-    ) {
-        Surface(
-            shape = RoundedCornerShape(
-                topStart = if (isUser) 14.dp else 4.dp,
-                topEnd = if (isUser) 4.dp else 14.dp,
-                bottomStart = 14.dp,
-                bottomEnd = 14.dp
-            ),
-            color = if (isUser) AccentGreen.copy(alpha = 0.15f) else BgCard,
-            border = BorderStroke(0.5.dp, if (isUser) AccentGreen.copy(alpha = 0.3f) else White10),
-            modifier = Modifier.widthIn(max = 300.dp)
-        ) {
-            Text(
-                text = msg.content,
-                fontSize = 14.sp,
-                color = White90,
-                lineHeight = 20.sp,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-            )
+            val json = JSONObject(bodyStr)
+            json.getJSONArray("candidates").getJSONObject(0)
+                .getJSONObject("content")
+                .getJSONArray("parts").getJSONObject(0)
+                .getString("text").trim()
+        } catch (e: Exception) {
+            Log.e(TAG, "Gemini call failed: ${e.message}")
+            ""
         }
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/MainActivity.kt =====
-package com.checkmate
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/settings/SettingsScreen.kt =====
+package com.checkmate.ui.settings
 
-import android.Manifest
-import android.app.Activity
+import android.app.admin.DevicePolicyManager
+import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.media.projection.MediaProjectionManager
 import android.net.Uri
-import android.os.Build
-import android.os.Bundle
 import android.provider.Settings
-import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.Surface
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.lifecycleScope
-import com.checkmate.core.CheckmateState
-import com.checkmate.core.stopwatch.NotificationPermissionHelper
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.ui.home.HomeViewModel
-import com.checkmate.ui.main.MainScreen
-import com.checkmate.ui.main.PendingNegotiation
-import com.checkmate.ui.theme.CheckmateTheme
-import kotlinx.coroutines.launch
-
-class MainActivity : ComponentActivity() {
-
-    companion object {
-        private const val REQUEST_CODE_OVERLAY = 1001
-        private const val REQUEST_CODE_MIC     = 1002
-    }
-
-    private lateinit var homeViewModel: HomeViewModel
-
-    private val projectionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            // Pass the raw resultCode + data directly to the ViewModel.
-            // The ViewModel will forward them into AttentionCycleService's intent,
-            // so getMediaProjection() is called only AFTER startForeground() runs.
-            homeViewModel.onProjectionGranted(
-                applicationContext,
-                result.resultCode,
-                result.data
-            )
-        } else {
-            homeViewModel.onProjectionDenied(applicationContext)
-        }
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        CheckmateState.init(applicationContext)
-
-        homeViewModel = ViewModelProvider(this)[HomeViewModel::class.java]
-
-        lifecycleScope.launch {
-            homeViewModel.requestProjection.collect {
-                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                projectionLauncher.launch(mgr.createScreenCaptureIntent())
-            }
-        }
-
-        if (NotificationPermissionHelper.shouldRequestPermission(this)) {
-            NotificationPermissionHelper.requestPermission(this)
-        }
-        requestOverlayPermissionIfNeeded()
-        requestMicPermissionIfNeeded()
-
-        // Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Read the
-        // three extras InterventionNotifier's talkPendingIntent() already attaches (has done
-        // so since Step 9 — see that method's own doc comment on why nothing consumed them
-        // until now). removeExtra() immediately after reading so a later onCreate() from an
-        // Activity recreation (e.g. rotation) with the same Intent doesn't re-trigger
-        // navigation into the negotiation screen a second time.
-        val pendingNegotiation = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
-            ?.let { transactionId ->
-                val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID)
-                val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
-                taskId?.let { PendingNegotiation(transactionId, it, lateMinutes) }
-            }
-        intent.removeExtra(InterventionNotifier.EXTRA_TRANSACTION_ID)
-        intent.removeExtra(InterventionNotifier.EXTRA_TASK_ID)
-        intent.removeExtra(InterventionNotifier.EXTRA_LATE_MINUTES)
-
-        setContent {
-            CheckmateTheme {
-                Surface {
-                    MainScreen(homeViewModel = homeViewModel, pendingNegotiation = pendingNegotiation)
-                }
-            }
-        }
-    }
-
-    private fun requestMicPermissionIfNeeded() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_CODE_MIC
-            )
-        }
-    }
-
-    private fun requestOverlayPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Grant overlay permission for attention timer", Toast.LENGTH_LONG).show()
-            startActivityForResult(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
-                REQUEST_CODE_OVERLAY
-            )
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == NotificationPermissionHelper.REQUEST_CODE_POST_NOTIFICATIONS) {
-            if (!NotificationPermissionHelper.isPermissionGranted(this)) {
-                Toast.makeText(this, "Notification permission needed for reminders", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/main/MainScreen.kt =====
-package com.checkmate.ui.main
-
-import androidx.compose.animation.*
-import androidx.compose.foundation.background
+import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import androidx.navigation.NavController
-import androidx.navigation.NavType
-import androidx.navigation.compose.*
-import androidx.navigation.navArgument
-import com.checkmate.ui.home.HomeScreen
-import com.checkmate.ui.home.HomeViewModel
-import com.checkmate.ui.mentor.MentorScreen
-import com.checkmate.ui.negotiation.NegotiationScreen
-import com.checkmate.ui.planner.PlannerScreen
-import com.checkmate.ui.planner.DailyCheckInScreen
-import com.checkmate.ui.planner.CoachingPlannerScreen
-import com.checkmate.ui.consultation.ConsultationScreen
-import com.checkmate.ui.stats.StatsScreen
-import com.checkmate.ui.settings.SettingsScreen
-import com.checkmate.ui.testresults.TestResultsScreen
-import com.checkmate.ui.testresults.TestmateWebScreen
+import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.LaunchedEffect
+import com.checkmate.admin.CheckmateDeviceAdminReceiver
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ProfileSyncManager
+import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
+import com.checkmate.workmode.HolidaySchedule
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeSchedule
+import java.util.Calendar
+import kotlinx.coroutines.delay
 
-sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
-    object Home     : Screen("home",     "Today",   Icons.Default.CheckCircle)
-    object Planner  : Screen("planner",  "Plan",    Icons.Default.CalendarMonth)
-    object Mentor   : Screen("mentor",   "Mentor",  Icons.Default.Psychology)
-    object Stats    : Screen("stats",    "Stats",   Icons.Default.BarChart)
-    object Settings : Screen("settings", "Settings",Icons.Default.Settings)
-}
-
-/**
- * Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"). Carries the
- * three extras MainActivity read off the launching Intent (originally attached by
- * InterventionNotifier.talkPendingIntent) down into this composable as a one-shot
- * navigation event, rather than MainScreen reaching back up into Activity/Intent state
- * itself.
- */
-data class PendingNegotiation(val transactionId: String, val taskId: String, val lateMinutes: Int)
-
+// ── Guardian lock gate for Work Mode settings ─────────────────────────────────
+//
+// Wraps any Work Mode-related settings (Blocked Apps, Blocked Websites, the
+// Focus Cycle toggles) that must not be editable by the student while
+// blocking is enforced — either because a focus session is running or
+// because the hardcoded 19:00-02:00 window (WorkModeSchedule) is live.
+// Shows a PIN-unlock prompt instead of [content] until a correct guardian
+// PIN is entered, reusing UninstallGuard's existing PIN/hash/lockout flow
+// so there's still exactly one PIN, and the student never sees it either
+// way.
 @Composable
-fun MainScreen(homeViewModel: HomeViewModel, pendingNegotiation: PendingNegotiation? = null) {
-    val navController = rememberNavController()
-    val items = listOf(Screen.Home, Screen.Planner, Screen.Mentor, Screen.Stats, Screen.Settings)
-    val navBackStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = navBackStackEntry?.destination?.route
+fun WorkModeLockGate(content: @Composable () -> Unit) {
+    val context = LocalContext.current
 
-    val bottomNavRoutes = items.map { it.route }
-    val showBottomNav   = currentRoute in bottomNavRoutes
-
-    // Fires once per non-null pendingNegotiation value — MainActivity only supplies a
-    // non-null value on the onCreate() call that actually consumed a fresh "Talk to
-    // Checkmate" intent (it removeExtra()s immediately after reading), so this won't
-    // re-fire on ordinary recomposition.
-    LaunchedEffect(pendingNegotiation) {
-        pendingNegotiation?.let { p ->
-            navController.navigate("negotiation/${p.transactionId}/${p.taskId}/${p.lateMinutes}")
+    // Poll every second - settingsLocked() depends on wall-clock time (the
+    // schedule) and on UninstallGuard's unlock-window expiry, neither of
+    // which trigger recomposition on their own.
+    var tick by remember { mutableStateOf(0L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            tick = System.currentTimeMillis()
         }
     }
+    val locked = remember(tick) { WorkModeManager.settingsLocked() }
 
-    Scaffold(
-        containerColor = BgDark,
-        bottomBar = {
-            if (showBottomNav) {
-                NavigationBar(
-                    containerColor = BgCard,
-                    tonalElevation = 0.dp
+    if (!locked) {
+        content()
+        return
+    }
+
+    var pin by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    var statusColor by remember { mutableStateOf(AccentRed) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Lock, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
+        }
+        Text(
+            "Blocked Apps, Blocked Websites, Focus Cycle, and the Guardian Telegram Chat ID " +
+                "are locked once a guardian PIN is set — not just during a focus session or the " +
+                "daily ${WorkModeSchedule.LABEL} window. Enter the PIN to make changes.",
+            fontSize = 11.sp, color = White60,
+            modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
+        )
+        OutlinedTextField(
+            value         = pin,
+            onValueChange = { if (it.length <= 6) { pin = it; status = null } },
+            label         = { Text("Guardian PIN", color = White30) },
+            singleLine    = true,
+            modifier      = Modifier.fillMaxWidth(),
+            visualTransformation = PasswordVisualTransformation(),
+            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    when (val result = UninstallGuard.unlockWithPin(pin)) {
+                        is UninstallGuard.UnlockResult.Success -> {
+                            status = "Unlocked for 2 minutes"
+                            statusColor = AccentGreen
+                            pin = ""
+                            tick = System.currentTimeMillis()
+                        }
+                        is UninstallGuard.UnlockResult.WrongPin -> {
+                            status = "Incorrect PIN"
+                            statusColor = AccentRed
+                        }
+                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
+                            status = "No PIN generated yet - see Security settings"
+                            statusColor = AccentAmber
+                        }
+                        is UninstallGuard.UnlockResult.LockedOut -> {
+                            status = "Too many wrong attempts - locked for ${result.secondsLeft / 60}m"
+                            statusColor = AccentRed
+                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
+                        }
+                    }
+                }) {
+                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        status?.let {
+            Text(it, fontSize = 11.sp, color = statusColor, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+}
+
+// ── Holidays: the one guardian-approved exception to the hardcoded lock window ────────────
+//
+// Lives behind WorkModeLockGate (same guardian-PIN gate as Blocked Apps/Websites/Focus Cycle)
+// — see HolidaySchedule's doc for why marking a holiday can't be a self-service action.
+@Composable
+private fun HolidaySettings() {
+    var holidays by remember { mutableStateOf(HolidaySchedule.getSortedHolidays()) }
+    var dateInput by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Holidays", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 4.dp))
+        Text(
+            "On a marked holiday, the ${WorkModeSchedule.LABEL} window is replaced by a " +
+                "single reduced lock from 1:00 AM \u2013 3:10 PM for that day only \u2014 not " +
+                "removed entirely. Every other day is unaffected.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value         = dateInput,
+                onValueChange = { if (it.length <= 10) dateInput = it; status = null },
+                modifier      = Modifier.weight(1f),
+                singleLine    = true,
+                placeholder   = { Text("DD/MM/YYYY", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Event, null, tint = White60) },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            Spacer(Modifier.width(8.dp))
+            IconButton(onClick = {
+                val parts = dateInput.split("/")
+                val cal = Calendar.getInstance()
+                val parsed = parts.size == 3 &&
+                    parts[0].toIntOrNull() != null && parts[1].toIntOrNull() != null && parts[2].toIntOrNull() != null
+                if (parsed) {
+                    cal.set(Calendar.DAY_OF_MONTH, 1) // avoid overflow when swapping month/day below
+                    cal.set(parts[2].toInt(), parts[1].toInt() - 1, parts[0].toInt())
+                    HolidaySchedule.addHoliday(cal)
+                    holidays = HolidaySchedule.getSortedHolidays()
+                    dateInput = ""
+                    status = "Holiday added"
+                } else {
+                    status = "Enter a valid DD/MM/YYYY date"
+                }
+            }) {
+                Icon(Icons.Default.Add, null, tint = AccentGreen)
+            }
+        }
+        status?.let { Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp)) }
+
+        if (holidays.isEmpty()) {
+            Text("No holidays marked.", fontSize = 11.sp, color = White30, modifier = Modifier.padding(top = 10.dp))
+        } else {
+            Spacer(Modifier.height(10.dp))
+            holidays.forEach { (key, label) ->
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    items.forEach { screen ->
-                        NavigationBarItem(
-                            selected = currentRoute == screen.route,
-                            onClick  = {
-                                navController.navigate(screen.route) {
-                                    popUpTo(navController.graph.startDestinationId) { saveState = true }
-                                    launchSingleTop = true
-                                    restoreState    = true
-                                }
-                            },
-                            icon  = { Icon(screen.icon, contentDescription = screen.label) },
-                            label = { Text(screen.label) },
-                            colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor   = AccentGreen,
-                                selectedTextColor   = AccentGreen,
-                                unselectedIconColor = White30,
-                                unselectedTextColor = White30,
-                                indicatorColor      = White10
-                            )
-                        )
+                    Text(label, fontSize = 13.sp, color = White90)
+                    IconButton(onClick = {
+                        HolidaySchedule.removeHoliday(key)
+                        holidays = HolidaySchedule.getSortedHolidays()
+                    }) {
+                        Icon(Icons.Default.Close, null, tint = AccentRed, modifier = Modifier.size(18.dp))
                     }
                 }
             }
         }
-    ) { padding ->
-        NavHost(
-            navController    = navController,
-            startDestination = Screen.Home.route,
-            modifier         = Modifier.padding(padding)
+    }
+}
+
+@Composable
+fun SettingsScreen() {
+    val context = LocalContext.current
+    var showAppSelector     by remember { mutableStateOf(false) }
+    var showWebsiteBlocker  by remember { mutableStateOf(false) }
+
+    if (showAppSelector) {
+        AppSelectorScreen(onBack = { showAppSelector = false })
+        return
+    }
+    if (showWebsiteBlocker) {
+        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
+        return
+    }
+
+    Column(
+        modifier        = Modifier.fillMaxSize().background(BgDark)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Spacer(Modifier.height(20.dp))
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+        Spacer(Modifier.height(8.dp))
+
+        // ── LLM API Keys ──
+        SettingSection("AI PROVIDERS") {
+            LlmProviderSettings(context)
+        }
+
+        // ── Voice / TTS ──
+        SettingSection("VOICE") {
+            VoiceSettings(context)
+        }
+
+        // ── Work Mode ──
+        SettingSection("WORK MODE") {
+            Text(
+                "Hardcoded daily block window: ${WorkModeSchedule.LABEL}. " +
+                    "This window isn't editable from the app — see your guardian to change it. " +
+                    "The one exception is a guardian-approved holiday, below.",
+                fontSize = 11.sp, color = White60,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            )
+            HorizontalDivider(color = White10)
+            // Holidays (the only way the hardcoded schedule ever changes for a specific day),
+            // Blocked Apps, Blocked Websites, and the Focus Cycle toggles below are all
+            // read-only for the student while Work Mode is enforcing (an active session OR
+            // the hardcoded window) — closes the loophole where blocked apps get removed from
+            // the list, or a holiday gets self-approved, mid-session. Only a guardian PIN
+            // unlock (same PIN used for uninstall protection) lifts the lock. One shared gate
+            // for all of it, so unlocking once covers the whole section instead of prompting
+            // for the PIN twice.
+            WorkModeLockGate {
+                HolidaySettings()
+                HorizontalDivider(color = White10)
+                FocusCycleSettings(context)
+                HorizontalDivider(color = White10)
+                SettingTile(
+                    title    = "Blocked Apps",
+                    subtitle = "Block distraction apps incl. Google & system apps",
+                    icon     = Icons.Default.Block
+                ) { showAppSelector = true }
+                HorizontalDivider(color = White10)
+                SettingTile(
+                    title    = "Blocked Websites",
+                    subtitle = "Block distracting domains in any browser",
+                    icon     = Icons.Default.Language
+                ) { showWebsiteBlocker = true }
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Accessibility Service",
+                subtitle = "Required for app/site blocking and WhatsApp automation",
+                icon     = Icons.Default.Accessibility
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        // ── Task Sync (two-device) ──
+        SettingSection("TASK SYNC") {
+            TaskSyncSettings()
+        }
+
+        // ── Test Platform (Testmate) ──
+        SettingSection("TEST PLATFORM") {
+            TestmateSettings()
+        }
+
+        // ── Security / Uninstall Protection ──
+        SettingSection("SECURITY") {
+            UninstallProtectionSettings(context)
+        }
+
+        // ── Permissions ──
+        SettingSection("PERMISSIONS") {
+            SettingTile(
+                title    = "Notification Listener",
+                subtitle = "Required for WhatsApp message detection",
+                icon     = Icons.Default.Notifications
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Overlay Permission",
+                subtitle = "Required for floating attention timer",
+                icon     = Icons.Default.Layers
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            HorizontalDivider(color = White10)
+            SettingTile(
+                title    = "Usage Access",
+                subtitle = "Required for app usage history (Digital Wellbeing-style stats)",
+                icon     = Icons.Default.History
+            ) {
+                context.startActivity(
+                    Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
+    }
+}
+
+// ── Security: Device Admin activation + Guardian PIN (uninstall protection) ──
+
+@Composable
+private fun UninstallProtectionSettings(context: Context) {
+    val dpm = remember { context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager }
+    val adminComponent = remember { CheckmateDeviceAdminReceiver.componentName(context) }
+    var isAdminActive by remember { mutableStateOf(dpm.isAdminActive(adminComponent)) }
+
+    // Device Admin activation tile
+    Row(
+        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            if (isAdminActive) Icons.Default.GppGood else Icons.Default.GppMaybe,
+            null,
+            tint = if (isAdminActive) AccentGreen else AccentAmber,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Device Admin Protection", fontSize = 14.sp, color = White90)
+            Text(
+                if (isAdminActive)
+                    "Active — plain Uninstall is hidden on the App Info screen"
+                else
+                    "Not active — Checkmate can be uninstalled like any normal app",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        if (!isAdminActive) {
+            TextButton(onClick = {
+                val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent)
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Required so Checkmate can't be casually uninstalled mid-session."
+                    )
+                }
+                context.startActivity(intent)
+            }) { Text("Activate", color = AccentGreen, fontSize = 13.sp) }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    SettingTile(
+        title    = "Refresh Protection Status",
+        subtitle = "Tap after activating device admin in the system dialog",
+        icon     = Icons.Default.Refresh
+    ) {
+        isAdminActive = dpm.isAdminActive(adminComponent)
+    }
+
+    HorizontalDivider(color = White10)
+
+    // Guardian PIN — generated device-side, hashed on-device, plaintext sent
+    // ONLY to the guardian's Telegram. Whoever taps "Generate" never sees it,
+    // so tapping it from the student's side can't self-authorize anything.
+    val pinConfigured by remember { mutableStateOf(UninstallGuard.hasPinConfigured()) }
+    var genStatus by remember { mutableStateOf<String?>(null) }
+    var genInFlight by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian PIN", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            if (pinConfigured)
+                "A PIN is set. It was sent only to the guardian's Telegram — nobody on this screen can see it."
+            else
+                "No PIN yet — the watchdog will block every uninstall/disable attempt until one is generated.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
+        )
+        Button(
+            onClick = {
+                genInFlight = true
+                GuardianNotifier.generateAndSendGuardianPin(context) { success, message ->
+                    genStatus = message
+                    genInFlight = false
+                }
+            },
+            enabled  = !genInFlight,
+            modifier = Modifier.fillMaxWidth(),
+            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
         ) {
-            // Main tabs
-            composable(Screen.Home.route)     { HomeScreen(navController, vm = homeViewModel) }
-            composable(Screen.Planner.route)  { PlannerScreen(navController) }
-            composable(Screen.Mentor.route)   { MentorScreen() }
-            composable(Screen.Stats.route)    { StatsScreen(navController) }
-            composable(Screen.Settings.route) { SettingsScreen() }
+            Icon(Icons.Default.Send, null, modifier = Modifier.size(18.dp), tint = androidx.compose.ui.graphics.Color.Black)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (pinConfigured) "Generate New PIN → Guardian's Telegram" else "Generate PIN → Guardian's Telegram",
+                color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp
+            )
+        }
+        genStatus?.let {
+            Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
 
-            // Blueprint 6 new routes
-            composable("consultation")   { ConsultationScreen(navController) }
-            composable("daily_checkin")  { DailyCheckInScreen(navController) }
-            composable("coaching_plan")  { CoachingPlannerScreen(navController) }
+    HorizontalDivider(color = White10)
 
-            // Testmate integration (Phase 6)
-            composable("test_results")  { TestResultsScreen(navController) }
-            composable("test_web")      { TestmateWebScreen(navController) }
+    // Unlock — only the person who has the PIN from Telegram (the guardian)
+    // can pass this. Wrong-PIN attempts are counted; 5 failures locks the
+    // unlock field for 10 minutes and alerts the guardian.
+    var unlockPin by remember { mutableStateOf("") }
+    var unlockStatus by remember { mutableStateOf<String?>(null) }
+    var unlockStatusColor by remember { mutableStateOf(White60) }
 
-            // Proactive Execution Engine — Step 10 (Blueprint §16): the conversational
-            // negotiation screen. transactionId/taskId are UUID strings (no '/' characters),
-            // so plain path-segment interpolation above is safe without URL-encoding.
-            composable(
-                route = "negotiation/{transactionId}/{taskId}/{lateMinutes}",
-                arguments = listOf(
-                    navArgument("transactionId") { type = NavType.StringType },
-                    navArgument("taskId") { type = NavType.StringType },
-                    navArgument("lateMinutes") { type = NavType.IntType }
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Unlock Protection", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Guardian enters the PIN they received on Telegram to pass the watchdog for 2 minutes.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = unlockPin,
+            onValueChange = { if (it.length <= 6) unlockPin = it },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("6-digit guardian PIN", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    when (val result = UninstallGuard.unlockWithPin(unlockPin)) {
+                        is UninstallGuard.UnlockResult.Success -> {
+                            unlockStatus = "Unlocked for 2 minutes"
+                            unlockStatusColor = AccentGreen
+                            unlockPin = ""
+                        }
+                        is UninstallGuard.UnlockResult.WrongPin -> {
+                            unlockStatus = "Incorrect PIN"
+                            unlockStatusColor = AccentRed
+                        }
+                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
+                            unlockStatus = "No PIN generated yet"
+                            unlockStatusColor = AccentAmber
+                        }
+                        is UninstallGuard.UnlockResult.LockedOut -> {
+                            unlockStatus = "Too many wrong attempts — locked for ${result.secondsLeft / 60}m"
+                            unlockStatusColor = AccentRed
+                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
+                        }
+                    }
+                }) {
+                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        unlockStatus?.let {
+            Text(it, fontSize = 11.sp, color = unlockStatusColor, modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+}
+
+// ── Focus Cycle Settings (Floating bar + Pomodoro breaks toggles) ────────────
+
+@Composable
+private fun FocusCycleSettings(context: Context) {
+    var barEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, true))
+    }
+    var pomodoroEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, true))
+    }
+
+    Column {
+        // Floating Focus Bar toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (barEnabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                null, tint = AccentGreen, modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Floating Focus Bar", fontSize = 14.sp, color = White90)
+                Text(
+                    if (barEnabled)
+                        "Shows the on-screen timer bar over other apps during focus sessions"
+                    else
+                        "Bar hidden — use the notification to mark done / take a break / confirm checks",
+                    fontSize = 11.sp, color = White60
                 )
-            ) { backStackEntry ->
-                val args = backStackEntry.arguments
-                NegotiationScreen(
-                    navController = navController,
-                    transactionId = args?.getString("transactionId").orEmpty(),
-                    taskId        = args?.getString("taskId").orEmpty(),
-                    lateMinutes   = args?.getInt("lateMinutes") ?: 0
+            }
+            Switch(
+                checked         = barEnabled,
+                onCheckedChange = {
+                    barEnabled = it
+                    CheckmatePrefs.putBoolean(FloatingAttentionService.PREF_FOCUS_BAR_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
                 )
+            )
+        }
+
+        HorizontalDivider(color = White10)
+
+        // Pomodoro Breaks toggle
+        Row(
+            modifier          = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Timer, null, tint = AccentAmber, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Pomodoro Breaks", fontSize = 14.sp, color = White90)
+                Text(
+                    if (pomodoroEnabled)
+                        "30 min focus / 5–10 min break cycles, with attention check-ins"
+                    else
+                        "Off — one continuous focus timer for the full task, no forced breaks or checks",
+                    fontSize = 11.sp, color = White60
+                )
+            }
+            Switch(
+                checked         = pomodoroEnabled,
+                onCheckedChange = {
+                    pomodoroEnabled = it
+                    CheckmatePrefs.putBoolean(AttentionCycleManager.PREF_POMODORO_ENABLED, it)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor   = BgDark,
+                    checkedTrackColor   = AccentGreen,
+                    uncheckedThumbColor = White60,
+                    uncheckedTrackColor = White10
+                )
+            )
+        }
+        Text(
+            "Takes effect on your next focus session — won't change one already running.",
+            fontSize = 10.sp, color = White30,
+            modifier = Modifier.padding(start = 46.dp, end = 14.dp, bottom = 8.dp)
+        )
+    }
+}
+
+// ── LLM Provider Settings ─────────────────────────────────────────────────────
+//
+// VibeBuild (added): a single top-level chip fronting VibeBuild's gateway
+// (base URL stored in prefs, see LlmGateway's doc comment on why it's not
+// hardcoded) with a model sub-picker underneath — gpt-5.5-pro (routed through
+// VibeBuild's OpenAI-compatible path) or claude-fable-5 (routed through its
+// Anthropic-compatible path). One API key covers both, since it's a single
+// VibeBuild token, not separate OpenAI/Anthropic keys. Claude and OpenRouter's
+// existing direct-API code paths in LlmGateway are untouched — VibeBuild is
+// additive, not a replacement of that architecture.
+
+private val LLM_PROVIDERS = listOf("Groq", "VibeBuild", "Gemini", "OpenRouter")
+
+private data class VibeBuildModelOption(val id: String, val label: String)
+
+private val VIBEBUILD_MODEL_OPTIONS = listOf(
+    VibeBuildModelOption(LlmGateway.VibeBuildModels.GPT_5_5_PRO, "GPT-5.5 Pro"),
+    VibeBuildModelOption(LlmGateway.VibeBuildModels.CLAUDE_FABLE_5, "Claude Fable 5")
+)
+
+@Composable
+private fun LlmProviderSettings(context: Context) {
+    val providers = LLM_PROVIDERS
+
+    var selectedProvider by remember {
+        mutableStateOf(CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq")
+    }
+
+    // One key state per provider
+    val keys = providers.associateWith { provider ->
+        remember(provider) {
+            mutableStateOf(
+                CheckmatePrefs.getString("llm_key_${provider.lowercase()}", "") ?: ""
+            )
+        }
+    }
+
+    // Provider selector chips
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Active Provider", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            providers.forEach { provider ->
+                val selected = provider == selectedProvider
+                FilterChip(
+                    selected = selected,
+                    onClick  = {
+                        selectedProvider = provider
+                        CheckmatePrefs.putString("llm_provider", provider)
+                    },
+                    label    = { Text(provider, fontSize = 12.sp) },
+                    colors   = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = AccentGreen,
+                        selectedLabelColor     = BgDark
+                    )
+                )
+            }
+        }
+    }
+
+    // VibeBuild model sub-picker — only shown when VibeBuild is the active provider
+    if (selectedProvider == "VibeBuild") {
+        HorizontalDivider(color = White10)
+        var selectedModel by remember {
+            mutableStateOf(
+                CheckmatePrefs.getString("llm_vibebuild_model", LlmGateway.VibeBuildModels.GPT_5_5_PRO)
+                    ?: LlmGateway.VibeBuildModels.GPT_5_5_PRO
+            )
+        }
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("VibeBuild Model", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VIBEBUILD_MODEL_OPTIONS.forEach { option ->
+                    val selected = option.id == selectedModel
+                    FilterChip(
+                        selected = selected,
+                        onClick  = {
+                            selectedModel = option.id
+                            CheckmatePrefs.putString("llm_vibebuild_model", option.id)
+                        },
+                        label    = { Text(option.label, fontSize = 12.sp) },
+                        colors   = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentGreen,
+                            selectedLabelColor     = BgDark
+                        )
+                    )
+                }
+            }
+            Text(
+                if (selectedModel == LlmGateway.VibeBuildModels.CLAUDE_FABLE_5)
+                    "Routed through VibeBuild's Anthropic-compatible path — verify against a real response before relying on it."
+                else
+                    "Routed through VibeBuild's OpenAI-compatible path.",
+                fontSize = 10.sp, color = White30,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
+
+        HorizontalDivider(color = White10)
+
+        // Base URL override — vibebuild.pro is not an independently verified partner
+        // domain, so this is editable rather than hardcoded (see LlmGateway doc).
+        var vibeBaseUrl by remember {
+            mutableStateOf(CheckmatePrefs.getString("llm_vibebuild_base_url", "") ?: "")
+        }
+        var vibeBaseUrlSaved by remember { mutableStateOf(false) }
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("VibeBuild Base URL (optional)", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                "Leave blank to use https://vibebuild.pro. Override here if it moves or you're pointing at a different gateway.",
+                fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+            )
+            OutlinedTextField(
+                value         = vibeBaseUrl,
+                onValueChange = { vibeBaseUrl = it; vibeBaseUrlSaved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("https://vibebuild.pro", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString("llm_vibebuild_base_url", vibeBaseUrl.trim())
+                        vibeBaseUrlSaved = true
+                    }) {
+                        Icon(
+                            if (vibeBaseUrlSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (vibeBaseUrlSaved) AccentGreen else White60
+                        )
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (vibeBaseUrlSaved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // API key field for the currently selected provider
+    val currentKey = keys[selectedProvider]
+    if (currentKey != null) {
+        var showKey by remember { mutableStateOf(false) }
+        var saved   by remember { mutableStateOf(false) }
+
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text(
+                if (selectedProvider == "VibeBuild") "VibeBuild Token" else "$selectedProvider API Key",
+                fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+            OutlinedTextField(
+                value         = currentKey.value,
+                onValueChange = { currentKey.value = it; saved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("Paste API key here", color = White30, fontSize = 13.sp) },
+                visualTransformation = if (showKey) VisualTransformation.None
+                                       else PasswordVisualTransformation(),
+                trailingIcon  = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { showKey = !showKey }) {
+                            Icon(
+                                if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                null, tint = White60
+                            )
+                        }
+                        IconButton(onClick = {
+                            CheckmatePrefs.putString(
+                                "llm_key_${selectedProvider.lowercase()}",
+                                currentKey.value.trim()
+                            )
+                            saved = true
+                        }) {
+                            Icon(
+                                if (saved) Icons.Default.Check else Icons.Default.Save,
+                                null,
+                                tint = if (saved) AccentGreen else White60
+                            )
+                        }
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (saved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                    modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // ── Guardian WhatsApp number ──────────────────────────────────────────────
+    var guardianNumber by remember {
+        mutableStateOf(CheckmatePrefs.getString("guardian_number", "") ?: "")
+    }
+    var guardianSaved by remember { mutableStateOf(false) }
+
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Guardian WhatsApp Number", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        OutlinedTextField(
+            value         = guardianNumber,
+            onValueChange = { guardianNumber = it; guardianSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("+91XXXXXXXXXX", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Phone, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    CheckmatePrefs.putString("guardian_number", guardianNumber.trim())
+                    guardianSaved = true
+                }) {
+                    Icon(
+                        if (guardianSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (guardianSaved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (guardianSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+
+    HorizontalDivider(color = White10)
+
+    // ── Guardian Telegram Chat ID ─────────────────────────────────────────────
+    // Locked the same way as Blocked Apps / Blocked Websites / Focus Cycle —
+    // reuses WorkModeLockGate (same PIN/unlock flow, defined above in this
+    // file). Open on first launch (no PIN configured yet) so the guardian
+    // can do initial setup, then locked permanently — independent of
+    // session/schedule state — until the guardian PIN is entered. Without
+    // this, a student could just repoint alerts to their own Telegram chat.
+    WorkModeLockGate {
+        var telegramChatId by remember {
+            mutableStateOf(CheckmatePrefs.getString("telegram_chat_id", "") ?: "")
+        }
+        var telegramSaved by remember { mutableStateOf(false) }
+
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Text("Guardian Telegram Chat ID", fontSize = 12.sp, color = White60,
+                modifier = Modifier.padding(bottom = 6.dp))
+            Text(
+                "Guardian: open Telegram → message @userinfobot → copy the id: number here",
+                fontSize = 11.sp,
+                color    = White30,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+            OutlinedTextField(
+                value         = telegramChatId,
+                onValueChange = { telegramChatId = it; telegramSaved = false },
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("e.g. 123456789", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Send, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString("telegram_chat_id", telegramChatId.trim())
+                        telegramSaved = true
+                    }) {
+                        Icon(
+                            if (telegramSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (telegramSaved) AccentGreen else White60
+                        )
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            if (telegramSaved) {
+                Text("Saved ✓", fontSize = 11.sp, color = AccentGreen,
+                    modifier = Modifier.padding(top = 4.dp))
             }
         }
     }
 }
 
+// ── Task Sync (two-device) ─────────────────────────────────────────────────────
+//
+// Deliberately not gated behind WorkModeLockGate — unlike the guardian-facing
+// fields above, a sync code isn't a safety control the student could abuse by
+// changing it, it's just how they tell two of their own devices to share today's
+// task list. Only today's PlanStore list is synced (see TaskSyncManager); every
+// other setting/stat on this screen stays exactly as device-local as before.
+@Composable
+private fun TaskSyncSettings() {
+    var syncCode by remember {
+        mutableStateOf(CheckmatePrefs.getString("sync_code", "") ?: "")
+    }
+    var saved by remember { mutableStateOf(false) }
 
-//===== FILE: app/src/main/AndroidManifest.xml =====
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Sync Code", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Enter the exact same code on both devices to sync today's task list " +
+                "between them. Everything else (stats, streak, settings) stays separate.",
+            fontSize = 11.sp,
+            color    = White30,
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = syncCode,
+            onValueChange = { syncCode = it; saved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("e.g. priya-neet-2027", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Sync, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    val trimmed = syncCode.trim()
+                    if (trimmed.isBlank()) CheckmatePrefs.remove("sync_code")
+                    else CheckmatePrefs.putString("sync_code", trimmed)
+                    syncCode = trimmed
+                    saved = true
+                    // Pairing this device to an existing code should restore setup
+                    // immediately rather than waiting for the next Planner screen
+                    // open. No-op (won't clobber) if this device already has a
+                    // real local setup — see pullProfileIfLocalEmpty().
+                    if (trimmed.isNotBlank()) {
+                        Thread { ProfileSyncManager.pullProfileIfLocalEmpty() }.start()
+                    }
+                }) {
+                    Icon(
+                        if (saved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (saved) AccentGreen else White60
+                    )
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (saved) {
+            Text(
+                if (syncCode.isBlank()) "Sync turned off ✓" else "Saved ✓",
+                fontSize = 11.sp, color = AccentGreen,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+    }
+}
 
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
-    <uses-permission android:name="android.permission.CALL_SCREENING" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
-        tools:ignore="ProtectedPermissions" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
-    <!-- Only needed pre-Android 10: DownloadManager.setDestinationInExternalPublicDir()
-         requires this on API 28 and below. On API 29+ (scoped storage) it's a no-op
-         and is capped with maxSdkVersion so it's never requested at runtime there. -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+// ── Voice / TTS Settings ──────────────────────────────────────────────────────
 
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+@Composable
+private fun VoiceSettings(context: Context) {
+    var ttsEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean("tts_enabled", true))
+    }
 
-    <queries>
-        <package android:name="com.whatsapp" />
-        <package android:name="com.termux" />
-        <!-- Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"):
-             package-visibility declaration so SpeechRecognizer.isRecognitionAvailable()
-             (CheckmateSTT) can actually see the on-device recognition service on
-             API 30+ (targetSdk 35 here) instead of always reporting unavailable. -->
-        <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-    </queries>
+    Row(
+        modifier          = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.RecordVoiceOver, null, tint = AccentGreen,
+            modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("Voice Feedback", fontSize = 14.sp, color = White90)
+            Text(
+                if (ttsEnabled) "Mentor speaks task summaries aloud" else "Voice feedback is off",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        Switch(
+            checked         = ttsEnabled,
+            onCheckedChange = {
+                ttsEnabled = it
+                CheckmatePrefs.putBoolean("tts_enabled", it)
+            },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor   = BgDark,
+                checkedTrackColor   = AccentGreen,
+                uncheckedThumbColor = White60,
+                uncheckedTrackColor = White10
+            )
+        )
+    }
+}
 
-    <application
-        android:name="com.checkmate.CheckmateApp"
-        android:allowBackup="true"
-        android:label="@string/app_name"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Checkmate"
-        android:usesCleartextTraffic="true"
-        android:networkSecurityConfig="@xml/network_security_config">
+// ── Testmate (test platform) settings ─────────────────────────────────────────
 
-        <activity
-            android:name="com.checkmate.MainActivity"
-            android:exported="true"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+@Composable
+private fun TestmateSettings() {
+    var baseUrl by remember {
+        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, "") ?: "")
+    }
+    var baseUrlSaved by remember { mutableStateOf(false) }
+    var baseUrlError by remember { mutableStateOf<String?>(null) }
 
-        <!-- Regular foreground services -->
-        <service android:name="com.checkmate.service.FloatingAttentionService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <!-- mediaProjection type added so Android 14+ allows getMediaProjection() while this service is running -->
-        <service android:name="com.checkmate.service.AttentionCycleService"
-            android:exported="false" android:foregroundServiceType="dataSync|mediaProjection" />
-        <service android:name="com.checkmate.service.ReminderService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.service.WhatsAppReportService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.workmode.WorkModeService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
+    var token by remember {
+        mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, "") ?: "")
+    }
+    var showToken by remember { mutableStateOf(false) }
+    var tokenSaved by remember { mutableStateOf(false) }
 
-        <!-- Call screening service -->
-        <service android:name="com.checkmate.callhandler.CheckmateCallScreeningService"
-            android:permission="android.permission.BIND_SCREENING_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.telecom.CallScreeningService" />
-            </intent-filter>
-        </service>
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Testmate Base URL", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 4.dp))
+        Text(
+            "Only testmate2.com (or a subdomain) or the Testmate Supabase auth link are " +
+                "accepted — anything else is rejected before it's saved.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = baseUrl,
+            onValueChange = { baseUrl = it; baseUrlSaved = false; baseUrlError = null },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("https://testmate2.com", color = White30, fontSize = 13.sp) },
+            leadingIcon   = { Icon(Icons.Default.Link, null, tint = White60) },
+            trailingIcon  = {
+                IconButton(onClick = {
+                    val candidate = baseUrl.trim()
+                    // Allow-list gate (TestmateApi.isAllowedBaseUrl) — only testmate2.com (or
+                    // a subdomain) or this project's Supabase auth-verify URL get saved. Any
+                    // other host, including a plausible-looking lookalike, is rejected here
+                    // rather than silently persisted and only failing later at request time.
+                    if (TestmateApi.isAllowedBaseUrl(candidate)) {
+                        CheckmatePrefs.putString(TestmateApi.PREF_BASE_URL, candidate)
+                        baseUrlSaved = true
+                        baseUrlError = null
+                    } else {
+                        baseUrlSaved = false
+                        baseUrlError = "Only testmate2.com or the Testmate Supabase auth link are accepted"
+                    }
+                }) {
+                    Icon(
+                        if (baseUrlSaved) Icons.Default.Check else Icons.Default.Save,
+                        null,
+                        tint = if (baseUrlSaved) AccentGreen else White60
+                    )
+                }
+            },
+            isError = baseUrlError != null,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90,
+                errorBorderColor     = AccentRed
+            )
+        )
+        if (baseUrlSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
+        baseUrlError?.let {
+            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(top = 4.dp))
+        }
+    }
 
-        <service
-            android:name="com.checkmate.callhandler.CallAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:foregroundServiceType="dataSync">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/call_accessibility_config" />
-        </service>
+    HorizontalDivider(color = White10)
 
-        <service
-            android:name="com.checkmate.automation.AppAutomationService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:foregroundServiceType="dataSync">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Text("Access Token", fontSize = 12.sp, color = White60,
+            modifier = Modifier.padding(bottom = 6.dp))
+        Text(
+            "Token-authed per test-platform-blueprint.md §3/§5 — issued by Testmate for this device.",
+            fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 6.dp)
+        )
+        OutlinedTextField(
+            value         = token,
+            onValueChange = { token = it; tokenSaved = false },
+            modifier      = Modifier.fillMaxWidth(),
+            singleLine    = true,
+            placeholder   = { Text("Paste access token here", color = White30, fontSize = 13.sp) },
+            visualTransformation = if (showToken) VisualTransformation.None
+                                   else PasswordVisualTransformation(),
+            trailingIcon  = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showToken = !showToken }) {
+                        Icon(
+                            if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            null, tint = White60
+                        )
+                    }
+                    IconButton(onClick = {
+                        CheckmatePrefs.putString(TestmateApi.PREF_TOKEN, token.trim())
+                        tokenSaved = true
+                    }) {
+                        Icon(
+                            if (tokenSaved) Icons.Default.Check else Icons.Default.Save,
+                            null,
+                            tint = if (tokenSaved) AccentGreen else White60
+                        )
+                    }
+                }
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = AccentGreen,
+                unfocusedBorderColor = White30,
+                cursorColor          = AccentGreen,
+                focusedTextColor     = White90,
+                unfocusedTextColor   = White90
+            )
+        )
+        if (tokenSaved) {
+            Text("Saved ✓", fontSize = 11.sp, color = AccentGreen, modifier = Modifier.padding(top = 4.dp))
+        }
+    }
+}
 
-        <service android:name="com.checkmate.automation.WhatsAppNotificationListener"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-            android:exported="true"
-            android:process=":wa_listener">
-            <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
-            </intent-filter>
-        </service>
+// ── Shared layout helpers ─────────────────────────────────────────────────────
 
-        <!-- Device Admin — hides the plain Uninstall button on Checkmate's App Info
-             screen once activated. Activation is a user action from Settings →
-             Security tile (SettingsScreen.kt), not forced at install time. -->
-        <receiver
-            android:name="com.checkmate.admin.CheckmateDeviceAdminReceiver"
-            android:permission="android.permission.BIND_DEVICE_ADMIN"
-            android:exported="true">
-            <meta-data
-                android:name="android.app.device_admin"
-                android:resource="@xml/device_admin" />
-            <intent-filter>
-                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
-            </intent-filter>
-        </receiver>
+@Composable
+private fun SettingSection(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Text(
+            title,
+            fontSize      = 11.sp,
+            fontWeight    = FontWeight.Bold,
+            letterSpacing = androidx.compose.ui.unit.TextUnit(2f, androidx.compose.ui.unit.TextUnitType.Sp),
+            color         = White60,
+            modifier      = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        )
+        Surface(
+            shape  = RoundedCornerShape(12.dp),
+            color  = BgCard,
+            border = BorderStroke(0.5.dp, White10)
+        ) {
+            Column(content = content)
+        }
+    }
+}
 
-        <!-- Reschedules guardian alarms (EOD summary, 30-min usage report,
-             weekly report) after reboot, since AlarmManager repeating
-             alarms don't survive a restart. Also fires a one-time Safe Mode
-             notice to the guardian if relevant. -->
-        <receiver
-            android:name="com.checkmate.BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Fires at the four hardcoded Work Mode schedule boundaries (01:00,
-             05:00, 15:10, 19:00 daily) so the forced block window is
-             reconciled even while the phone is idle with Checkmate's UI
-             closed. Registered here (not :workmode's manifest) to match how
-             every other cross-module component in this app is declared. -->
-        <receiver
-            android:name="com.checkmate.workmode.WorkModeScheduleReceiver"
-            android:exported="false" />
-
-        <receiver android:name="com.checkmate.service.EodSummaryReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.EOD_SUMMARY" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Fires every 30 min: pushes app-usage Telegram alert + caches it
-             in the worker's KV for the on-demand "usage" command -->
-        <receiver android:name="com.checkmate.service.UsageReportReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.USAGE_REPORT" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Fires weekly (Sunday 20:00): builds and delivers PsycheEngine's
-             weekly guardian report via WhatsApp + Telegram. Previously
-             missing entirely — this is the fix for the weekly report never
-             going out. -->
-        <receiver android:name="com.checkmate.service.WeeklyReportReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.WEEKLY_REPORT" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Proactive Execution Engine (step 9, Blueprint §16): handles the "Start" /
-             "Snooze 5 min" actions on InterventionNotifier's heads-up notification.
-             "Talk to Checkmate" goes straight to MainActivity instead (no receiver needed
-             for that one — see InterventionNotifier). As of step 10, MainActivity now
-             actually reads the transaction id it's handed and opens NegotiationScreen. -->
-        <receiver android:name="com.checkmate.service.InterventionActionReceiver"
-            android:exported="false" />
-
-        <!-- Re-fires InterventionNotifier's prompt 5 minutes after a "Snooze" tap. -->
-        <receiver android:name="com.checkmate.service.InterventionSnoozeAlarmReceiver"
-            android:exported="false" />
-
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="com.checkmate.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
-
-    </application>
-</manifest>
+@Composable
+private fun SettingTile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    Surface(onClick = onClick, color = androidx.compose.ui.graphics.Color.Transparent) {
+        Row(
+            modifier          = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, tint = AccentGreen, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 14.sp, color = White90)
+                Text(subtitle, fontSize = 11.sp, color = White60)
+            }
+            Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(16.dp))
+        }
+    }
+}
