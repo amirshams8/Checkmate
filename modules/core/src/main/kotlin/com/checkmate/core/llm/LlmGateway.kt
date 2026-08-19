@@ -26,9 +26,18 @@ import java.util.concurrent.TimeUnit
  * it can be repointed without a rebuild if it turns out to be unreliable. The OpenAI
  * route reuses the existing callOpenAiCompatible() request shape (confirmed working
  * against gpt-5.5-pro). The Anthropic route (callVibeBuildAnthropic) reuses callClaude()'s
- * request body shape but with a Bearer auth header instead of x-api-key, mirroring the
- * confirmed OpenAI-route auth — this half has NOT been confirmed against a real
- * claude-fable-5 response and should be verified before being relied on.
+ * request body shape.
+ *
+ * FIX 1.5: gpt-5.5-pro rejected requests with HTTP 400 "Unsupported parameter: 'temperature'
+ *          is not supported with this model" — confirmed from live proxy error. Reasoning-tier
+ *          OpenAI models (gpt-5.x, o3, o4) don't accept sampling temperature at all.
+ *          callOpenAiCompatible() now omits it for those models instead of always sending 0.7.
+ *
+ * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently. The Bearer auth header on
+ *          callVibeBuildAnthropic() was an unverified guess (see prior comment). It now tries
+ *          Bearer first and automatically retries with native Anthropic-style x-api-key on a
+ *          401/403, logging both attempts' HTTP code + body so a real failure is diagnosable
+ *          from logcat instead of just looking like a dead response.
  */
 object LlmGateway {
 
@@ -45,6 +54,12 @@ object LlmGateway {
     }
 
     private const val VIBEBUILD_DEFAULT_BASE_URL = "https://vibebuild.pro"
+
+    // FIX 1.5: reasoning-tier OpenAI models reject sampling params like temperature entirely.
+    private val REASONING_MODEL_PREFIXES = listOf("gpt-5", "o3", "o4")
+
+    private fun supportsTemperature(model: String): Boolean =
+        REASONING_MODEL_PREFIXES.none { model.startsWith(it) }
 
     suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
         val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
@@ -102,7 +117,8 @@ object LlmGateway {
             put("model", model)
             put("messages", messages)
             put("max_tokens", 512)
-            put("temperature", 0.7)
+            // FIX 1.5: reasoning-tier models (gpt-5.x, o3, o4) 400 on this param entirely.
+            if (supportsTemperature(model)) put("temperature", 0.7)
         }.toString().toRequestBody("application/json".toMediaType())
 
         val req = Request.Builder().url(url)
@@ -160,35 +176,47 @@ object LlmGateway {
     /**
      * VibeBuild's Anthropic-compatible route (/proxy/anthropic). Reuses callClaude()'s
      * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
-     * schema) since VibeBuild fronts the Anthropic API rather than translating it. Auth uses
-     * "Authorization: Bearer $apiKey" — matching the pattern confirmed working on VibeBuild's
-     * OpenAI route — rather than Anthropic's native "x-api-key", since this is a gateway
-     * token, not a real Anthropic key. UNVERIFIED against a live response — if VibeBuild
-     * actually expects x-api-key passthrough instead, this will need a one-line header swap.
-     * Kept as its own function (not folded into callClaude) because the auth header and URL
-     * differ, and future VibeBuild-specific quirks (rate-limit headers, error shape) shouldn't
-     * leak into the direct-to-Anthropic path.
+     * schema) since VibeBuild fronts the Anthropic API rather than translating it.
+     *
+     * FIX 1.5: auth header was a one-way guess (Bearer only) and failures collapsed to "".
+     * Now tries "Authorization: Bearer $apiKey" first; if that comes back 401/403, retries
+     * once with native Anthropic-style "x-api-key" before giving up. Both attempts log their
+     * HTTP code + response body, so if it's still empty after this, logcat will show the
+     * actual upstream rejection reason instead of a silent dead end.
      */
     private fun callVibeBuildAnthropic(
         prompt: String, system: String, apiKey: String, baseUrl: String, model: String
     ): String {
-        val body = JSONObject().apply {
+        val url = "$baseUrl/proxy/anthropic/v1/messages"
+
+        fun buildBody() = JSONObject().apply {
             put("model", model)
             put("max_tokens", 512)
             if (system.isNotBlank()) put("system", system)
             put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
         }.toString().toRequestBody("application/json".toMediaType())
 
-        val req = Request.Builder()
-            .url("$baseUrl/proxy/anthropic/v1/messages")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+        fun attempt(authHeaderName: String, authHeaderValue: String) =
+            client.newCall(
+                Request.Builder()
+                    .url(url)
+                    .addHeader(authHeaderName, authHeaderValue)
+                    .addHeader("anthropic-version", "2023-06-01")
+                    .addHeader("Content-Type", "application/json")
+                    .post(buildBody())
+                    .build()
+            ).execute()
 
         return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
+            var resp    = attempt("Authorization", "Bearer $apiKey")
+            var bodyStr = resp.body?.string() ?: "{}"
+
+            if (!resp.isSuccessful && (resp.code == 401 || resp.code == 403)) {
+                Log.w(TAG, "VibeBuild/Anthropic Bearer auth rejected (HTTP ${resp.code}) model=$model — retrying with x-api-key")
+                resp    = attempt("x-api-key", apiKey)
+                bodyStr = resp.body?.string() ?: "{}"
+            }
+
             if (!resp.isSuccessful) {
                 Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
                 return ""
