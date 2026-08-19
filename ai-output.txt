@@ -1,271 +1,1345 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/llm/LlmGateway.kt =====
-package com.checkmate.core.llm
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LlmIntentParser.kt =====
+package com.checkmate.planner.intervention
 
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 /**
- * Unified LLM gateway supporting OpenRouter, Groq, Claude, Gemini, and VibeBuild.
- * FIX 1.4: Changed Groq model from deprecated "llama3-8b-8192" to "llama-3.1-8b-instant".
- * FIX 1.4: Added HTTP status check + response body logging on failure so errors are
- *           visible in logcat instead of silently returning empty string.
+ * Proactive Execution Engine — Step 11 (Blueprint Part One, §9-11).
  *
- * VibeBuild (added): a third-party gateway (https://vibebuild.pro) fronting both an
- * OpenAI-compatible route (/proxy/openai) and an Anthropic-compatible route
- * (/proxy/anthropic) behind a single VibeBuild token. NOTE: this domain is not an
- * Anthropic- or OpenAI-published partner — it hasn't been independently verified as
- * trustworthy, only as reachable. The base URL is stored in prefs (not hardcoded) so
- * it can be repointed without a rebuild if it turns out to be unreliable. The OpenAI
- * route reuses the existing callOpenAiCompatible() request shape (confirmed working
- * against gpt-5.5-pro). The Anthropic route (callVibeBuildAnthropic) reuses callClaude()'s
- * request body shape.
+ * Turns a raw LLM response string into a validated [LlmIntent]. This is the parser
+ * [InterventionFallback]'s own doc comment flagged as missing: "there is nothing safe to
+ * do with even a successful LLM response — no parser to trust it through." Anything that
+ * doesn't cleanly match the closed schema — unparseable JSON, a missing speech field, an
+ * intentType outside [InterventionIntentType] — comes back as null. Null is load-bearing:
+ * every caller treats a failed parse identically to a timed-out/blank LLM call (fall back
+ * to the deterministic path), so this function is never itself a way to reach a
+ * [PermittedAction] — only PolicyValidator, downstream of a *successful* parse, can do
+ * that.
  *
- * FIX 1.5: gpt-5.5-pro rejected requests with HTTP 400 "Unsupported parameter: 'temperature'
- *          is not supported with this model" — confirmed from live proxy error. Reasoning-tier
- *          OpenAI models (gpt-5.x, o3, o4) don't accept sampling temperature at all.
- *          callOpenAiCompatible() now omits it for those models instead of always sending 0.7.
- *
- * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently — two stacked bugs, both
- *          confirmed via live curl:
- *          1. Auth: the Bearer guess was wrong for this route — CONFIRMED via curl that
- *             VibeBuild's /proxy/anthropic route requires native Anthropic-style "x-api-key",
- *             not "Authorization: Bearer". callVibeBuildAnthropic() now sends x-api-key directly.
- *          2. Parsing: Fable 5 returns extended-thinking output, so content[0] is a
- *             {"type":"thinking",...} block with no "text" key — content[1] is the actual
- *             {"type":"text","text":"..."} block. The old code always read content[0], which
- *             threw on Fable 5 responses and got swallowed by the catch block into "". Both
- *             callClaude() and callVibeBuildAnthropic() now scan the content array for the
- *             first block with type=="text" instead of assuming index 0.
+ * Expected shape (see [LlmIntent]'s own doc for the per-intentType `parameters` keys):
+ *   {
+ *     "speech": "...",
+ *     "intentType": "REDUCE_DURATION",
+ *     "targetTaskId": "...",           // optional — see fallbackTaskId below
+ *     "parameters": { "newDurationMinutes": "35" }
+ *   }
  */
-object LlmGateway {
+object LlmIntentParser {
 
-    private const val TAG = "LlmGateway"
+    /**
+     * @param raw the LLM's raw text response. Tolerates a markdown code fence around the
+     *   JSON (some models wrap output in ```json fences even when the system prompt asks
+     *   for raw JSON only — stripping it here is cheaper and more robust than trying to
+     *   prompt every provider out of the habit).
+     * @param fallbackTaskId the negotiation screen is always scoped to exactly one task,
+     *   so a response that omits targetTaskId defaults to it rather than being treated as
+     *   malformed — the LLM shouldn't have to repeat back an ID it was never asked to track.
+     */
+    fun parse(raw: String, fallbackTaskId: String): LlmIntent? {
+        val obj = try {
+            JSONObject(stripCodeFence(raw))
+        } catch (e: JSONException) {
+            return null
+        }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+        val speech = obj.optString("speech", "").takeIf { it.isNotBlank() } ?: return null
+        val intentType = LlmIntent.parseIntentType(obj.optStringOrNull("intentType")) ?: return null
+        val targetTaskId = obj.optStringOrNull("targetTaskId")?.takeIf { it.isNotBlank() } ?: fallbackTaskId
 
-    object VibeBuildModels {
-        const val GPT_5_5_PRO    = "gpt-5.5-pro"
-        const val CLAUDE_FABLE_5 = "claude-fable-5"
+        val parameters: Map<String, String> = obj.optJSONObject("parameters")?.let { paramsObj ->
+            paramsObj.keys().asSequence().associateWith { key -> paramsObj.optString(key, "") }
+        } ?: emptyMap()
+
+        return LlmIntent(
+            speech = speech,
+            intentType = intentType,
+            targetTaskId = targetTaskId,
+            parameters = parameters
+        )
     }
 
-    private const val VIBEBUILD_DEFAULT_BASE_URL = "https://vibebuild.pro"
+    /** org.json's [JSONObject.optString] returns the literal string "null" for a missing
+     *  key by default in some call forms — using the two-arg overload with a sentinel and
+     *  normalizing avoids that footgun landing inside [LlmIntent.parseIntentType]. */
+    private fun JSONObject.optStringOrNull(key: String): String? =
+        if (has(key) && !isNull(key)) optString(key, null) else null
 
-    // FIX 1.5: reasoning-tier OpenAI models reject sampling params like temperature entirely.
-    private val REASONING_MODEL_PREFIXES = listOf("gpt-5", "o3", "o4")
+    private fun stripCodeFence(raw: String): String {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("```")) return trimmed
+        return trimmed
+            .removePrefix("```json").removePrefix("```JSON").removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+    }
+}
 
-    private fun supportsTemperature(model: String): Boolean =
-        REASONING_MODEL_PREFIXES.none { model.startsWith(it) }
 
-    // FIX 1.5: Anthropic-style responses can lead with a {"type":"thinking",...} block
-    // (extended thinking) before the {"type":"text","text":"..."} block. Always scan for
-    // the first text block instead of assuming content[0] — assuming index 0 silently broke
-    // Fable 5 responses since thinking blocks have no "text" key.
-    private fun firstTextBlock(content: JSONArray): String {
-        for (i in 0 until content.length()) {
-            val block = content.getJSONObject(i)
-            if (block.optString("type") == "text") {
-                return block.getString("text").trim()
-            }
-        }
-        throw JSONException("No content block with type=text found")
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionFallback.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.planner.model.StudyTask
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Proactive Execution Engine — Step 6 (Blueprint Part One, §14, §25 principle 2).
+ *
+ * "The internet must never become Checkmate's single point of failure." [attemptLlm] wraps
+ * an LLM call with a short, intervention-specific timeout — deliberately not a change to
+ * [LlmGateway]'s own client timeouts, which other callers (e.g. AdaptivePlanner's plan
+ * generation) reasonably rely on being longer. [strictReminderIntent] is the deterministic
+ * fallback itself: a fixed, non-LLM response that still goes through PolicyValidator like
+ * any other intent (§14's own diagram routes STRICT_REMINDER through PolicyValidator, not
+ * around it) — the policy boundary doesn't get to be softer just because nothing chose to
+ * be clever here.
+ */
+object InterventionFallback {
+
+    /** Blueprint §14/§18: "3-second timeout." */
+    const val DEFAULT_LLM_TIMEOUT_MILLIS = 3_000L
+
+    /**
+     * Attempts an LLM call with a hard timeout. Returns null on timeout, on a blank
+     * response, or on any failure LlmGateway itself already collapses to "" (missing API
+     * key, HTTP error, exception — see LlmGateway.complete's own doc). Callers should treat
+     * null uniformly as "the LLM path did not produce anything usable in time."
+     *
+     * [llmCall] defaults to the real [LlmGateway.complete] and is only overridden in tests,
+     * so this doesn't need Robolectric/instrumented tests to verify timeout behavior — a
+     * fake that suspends past the timeout exercises the exact same withTimeoutOrNull path
+     * the production call goes through.
+     */
+    suspend fun attemptLlm(
+        prompt: String,
+        systemPrompt: String = "",
+        timeoutMillis: Long = DEFAULT_LLM_TIMEOUT_MILLIS,
+        // Was `= LlmGateway::complete` — a suspend function *reference* as a default
+        // parameter value isn't supported by this Kotlin compiler config ("Unsupported
+        // [suspend function calls in a context of default parameter value]"). A lambda
+        // wrapping the same call compiles fine and is behaviorally identical.
+        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
+    ): String? {
+        val result = withTimeoutOrNull(timeoutMillis) { llmCall(prompt, systemPrompt) }
+        return result?.takeIf { it.isNotBlank() }
     }
 
-    suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
-        val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
-        val apiKey   = CheckmatePrefs.getString("llm_key_${provider.lowercase()}", null)
-
-        if (apiKey.isNullOrBlank()) {
-            Log.w(TAG, "No API key for $provider — returning empty (rule-based fallback will handle)")
-            return@withContext ""
+    /**
+     * The deterministic STRICT_REMINDER (§14's own worked example). Always a START_TASK
+     * intent — the fallback's whole purpose is to get the student moving on what was
+     * already planned, not to negotiate or reduce scope; negotiation is the AI Mentor's
+     * job once it exists.
+     */
+    fun strictReminderIntent(task: StudyTask, lateMinutes: Int): LlmIntent {
+        val speech = if (lateMinutes > 0) {
+            "You're $lateMinutes minutes late. Start ${task.topic} now. " +
+                "I'll adjust the remaining schedule afterward."
+        } else {
+            "It's time to start ${task.topic}."
         }
-
-        return@withContext when (provider) {
-            "Claude"      -> callClaude(prompt, systemPrompt, apiKey)
-            "Gemini"      -> callGemini(prompt, systemPrompt, apiKey)
-            "Groq"        -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://api.groq.com/openai/v1/chat/completions",
-                // FIX: "llama3-8b-8192" was deprecated by Groq → HTTP 400/404 → silent empty return
-                // → AdaptivePlanner always fell back to ruleBasedPlan() → vague tasks
-                "llama-3.1-8b-instant"
-            )
-            "OpenRouter"  -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://openrouter.ai/api/v1/chat/completions",
-                "mistralai/mistral-7b-instruct:free"
-            )
-            "VibeBuild"   -> {
-                val model = CheckmatePrefs.getString("llm_vibebuild_model", VibeBuildModels.GPT_5_5_PRO)
-                    ?: VibeBuildModels.GPT_5_5_PRO
-                val baseUrl = (CheckmatePrefs.getString("llm_vibebuild_base_url", null)
-                    ?.trim()?.takeIf { it.isNotBlank() } ?: VIBEBUILD_DEFAULT_BASE_URL)
-                    .trimEnd('/')
-                when (model) {
-                    VibeBuildModels.CLAUDE_FABLE_5 ->
-                        callVibeBuildAnthropic(prompt, systemPrompt, apiKey, baseUrl, model)
-                    else ->
-                        callOpenAiCompatible(
-                            prompt, systemPrompt, apiKey,
-                            "$baseUrl/proxy/openai/v1/chat/completions",
-                            model
-                        )
-                }
-            }
-            else          -> ""
-        }
+        return LlmIntent(
+            speech = speech,
+            intentType = InterventionIntentType.START_TASK,
+            targetTaskId = task.id
+        )
     }
+}
 
-    private fun callOpenAiCompatible(
-        prompt: String, system: String, apiKey: String, url: String, model: String
-    ): String {
-        val messages = JSONArray().apply {
-            if (system.isNotBlank()) put(JSONObject().put("role", "system").put("content", system))
-            put(JSONObject().put("role", "user").put("content", prompt))
-        }
-        val body = JSONObject().apply {
-            put("model", model)
-            put("messages", messages)
-            put("max_tokens", 512)
-            // FIX 1.5: reasoning-tier models (gpt-5.x, o3, o4) 400 on this param entirely.
-            if (supportsTemperature(model)) put("temperature", 0.7)
-        }.toString().toRequestBody("application/json".toMediaType())
+/**
+ * Orchestrates one intervention decision: try the LLM within budget (if asked to at all),
+ * then resolve deterministically either way, through PolicyValidator and ActionExecutor —
+ * never around them. Owns nothing about escrow lifecycle itself beyond resolving
+ * POLICY_REJECTED directly (ActionExecutor already resolves every other outcome as part of
+ * [ActionExecutor.execute]); the transaction must already be acquired via [TaskEscrow]
+ * before this is called.
+ *
+ * Two entry points, for two different kinds of caller:
+ *  - [decideAndExecute] backs callers that must resolve the transaction *right now* — the
+ *    notification's own Start button ([InterventionActionReceiver]), the negotiation
+ *    screen's Start button, and the TTL-expiry sweep. If [llmPrompt] is null, or the LLM
+ *    doesn't respond in time, or [LlmIntentParser] can't make sense of what it said, this
+ *    always falls back to [InterventionFallback.strictReminderIntent] — these callers have
+ *    no "come back later," so something decisive has to happen.
+ *  - [attemptConversationalTurn] backs the live back-and-forth on the negotiation screen
+ *    (Step 11 wiring — see its own doc below) — a single chat message is *not* the same
+ *    kind of event as a Start-button tap, and forcing a resolution on every turn (e.g.
+ *    silently START_TASK-ing the student's plan just because one LLM call timed out mid-
+ *    conversation) would be actively hostile UX. Most turns are just talk.
+ */
+class InterventionDecisionMaker(
+    private val taskEscrow: TaskEscrow,
+    private val actionExecutor: ActionExecutor
+) {
+    suspend fun decideAndExecute(
+        transactionId: String,
+        task: StudyTask,
+        lateMinutes: Int,
+        now: Long = System.currentTimeMillis(),
+        llmPrompt: String? = null,
+        llmSystemPrompt: String = "",
+        llmTimeoutMillis: Long = InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS,
+        // Same fix as InterventionFallback.attemptLlm above.
+        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
+    ): DecisionOutcome {
+        // Step 11: a raw LLM response is now actually trusted through LlmIntentParser
+        // before it can influence anything — parse failure (or no response at all) falls
+        // back to the deterministic reminder exactly as it always did, it just no longer
+        // discards a *successful, parseable* response the way it did before this step.
+        val rawResponse = if (llmPrompt != null) {
+            InterventionFallback.attemptLlm(llmPrompt, llmSystemPrompt, llmTimeoutMillis, llmCall)
+        } else null
 
-        val req = Request.Builder().url(url)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+        val parsedIntent = rawResponse?.let { LlmIntentParser.parse(it, fallbackTaskId = task.id) }
+        val intent = parsedIntent ?: InterventionFallback.strictReminderIntent(task, lateMinutes)
+        val usedFallback = parsedIntent == null
 
-        return try {
-            val resp     = client.newCall(req).execute()
-            val bodyStr  = resp.body?.string() ?: "{}"
-            // FIX: previously body was consumed before status check — error JSON was lost
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "OpenAI-compat HTTP ${resp.code} for model=$model url=$url body=$bodyStr")
-                return ""
+        val policyState = PolicyState(task = task, nowMillis = now)
+
+        return when (val result = PolicyValidator.validate(intent, policyState)) {
+            is PolicyResult.Permitted -> {
+                val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                DecisionOutcome.Executed(executionOutcome, usedFallback, intent.speech)
             }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("choices").getJSONObject(0)
-                .getJSONObject("message").getString("content").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "OpenAI-compat call failed: ${e.message}")
-            ""
-        }
-    }
-
-    private fun callClaude(prompt: String, system: String, apiKey: String): String {
-        val body = JSONObject().apply {
-            put("model", "claude-3-haiku-20240307")
-            put("max_tokens", 512)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("https://api.anthropic.com/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Claude HTTP ${resp.code} body=$bodyStr")
-                return ""
+            is PolicyResult.Rejected -> {
+                taskEscrow.resolveAs(
+                    transactionId,
+                    InterventionState.POLICY_REJECTED,
+                    failureReason = result.detail
+                )
+                DecisionOutcome.PolicyRejected(result.reason, result.detail, usedFallback)
             }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "Claude call failed: ${e.message}")
-            ""
         }
     }
 
     /**
-     * VibeBuild's Anthropic-compatible route (/proxy/anthropic). Reuses callClaude()'s
-     * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
-     * schema) since VibeBuild fronts the Anthropic API rather than translating it.
+     * Step 11. One turn of live negotiation: a raw LLM response the caller already has in
+     * hand (the ViewModel owns the attemptLlm call + chat transcript, since it needs the
+     * text to display either way — this function starts from the raw string rather than
+     * calling attemptLlm itself, to avoid a second, subtly different timeout/prompt path).
      *
-     * FIX 1.5: CONFIRMED via live curl against this exact route that VibeBuild requires
-     * native Anthropic-style "x-api-key" — "Authorization: Bearer" (which works on the
-     * OpenAI route) gets a flat 401 here. Also, Fable 5 responses lead with a "thinking"
-     * content block before the "text" block, so parsing now scans for the first
-     * type=="text" block via firstTextBlock() instead of assuming content[0].
+     * Deliberately does NOT fall back to [InterventionFallback.strictReminderIntent] on a
+     * failed/unparseable response, unlike [decideAndExecute] — mid-conversation, "the model
+     * didn't answer in time" should read as "let me try that again," not as the app quietly
+     * force-starting the task and ending the negotiation the student is actively having.
+     * [Continue] and [Rejected] both leave the transaction open in NEGOTIATING; only a
+     * genuinely decisive [PermittedAction] reaches [actionExecutor] and resolves it.
+     * RequestClarification/NoAction are Permitted by PolicyValidator like anything else (so
+     * they're still covered by the same policy test matrix) but are intentionally excluded
+     * here from reaching the executor: [ActionExecutor.execute] commits the transaction for
+     * *every* outcome including [ExecutionOutcome.NotApplicable], and committing the
+     * transaction the moment the AI Mentor asks a clarifying question would end the
+     * conversation after a single exchange.
      */
-    private fun callVibeBuildAnthropic(
-        prompt: String, system: String, apiKey: String, baseUrl: String, model: String
-    ): String {
-        val body = JSONObject().apply {
-            put("model", model)
-            put("max_tokens", 512)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
+    suspend fun attemptConversationalTurn(
+        transactionId: String,
+        task: StudyTask,
+        rawLlmResponse: String?,
+        now: Long = System.currentTimeMillis()
+    ): ConversationalOutcome {
+        if (rawLlmResponse == null) return ConversationalOutcome.LlmUnavailable
 
-        val req = Request.Builder()
-            .url("$baseUrl/proxy/anthropic/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+        val intent = LlmIntentParser.parse(rawLlmResponse, fallbackTaskId = task.id)
+            ?: return ConversationalOutcome.UnparseableResponse
 
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
-                return ""
+        val policyState = PolicyState(task = task, nowMillis = now)
+        return when (val result = PolicyValidator.validate(intent, policyState)) {
+            is PolicyResult.Rejected ->
+                ConversationalOutcome.Rejected(intent.speech, result.reason, result.detail)
+            is PolicyResult.Permitted -> when (result.action) {
+                is PermittedAction.RequestClarification, is PermittedAction.NoAction ->
+                    ConversationalOutcome.Continue(intent.speech)
+                else -> {
+                    val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                    ConversationalOutcome.Decided(intent.speech, executionOutcome)
+                }
             }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "VibeBuild/Anthropic call failed: ${e.message}")
-            ""
+        }
+    }
+}
+
+sealed class DecisionOutcome {
+    data class Executed(
+        val executionOutcome: ExecutionOutcome,
+        val usedFallback: Boolean,
+        // Step 11: the speech actually being shown/spoken now varies (a parsed LLM intent
+        // vs. the fixed strict-reminder line) — callers no longer have to reach back into
+        // InterventionFallback themselves to know what was said.
+        val speech: String
+    ) : DecisionOutcome()
+    data class PolicyRejected(val reason: RejectionReason, val detail: String, val usedFallback: Boolean) : DecisionOutcome()
+}
+
+/** Step 11. Outcome of one [InterventionDecisionMaker.attemptConversationalTurn] call. */
+sealed class ConversationalOutcome {
+    /** attemptLlm produced nothing within budget (timeout, blank, or LlmGateway failure). */
+    object LlmUnavailable : ConversationalOutcome()
+    /** A response arrived but didn't match the closed schema — see [LlmIntentParser]. */
+    object UnparseableResponse : ConversationalOutcome()
+    /** RequestClarification / NoAction — nothing executed, transaction stays NEGOTIATING. */
+    data class Continue(val speech: String) : ConversationalOutcome()
+    /** A well-formed intent that PolicyValidator declined. Transaction stays NEGOTIATING —
+     *  a rejected suggestion is a "no" to one idea, not a reason to end the conversation. */
+    data class Rejected(val speech: String, val reason: RejectionReason, val detail: String) : ConversationalOutcome()
+    /** A decisive action reached ActionExecutor and the transaction has resolved. */
+    data class Decided(val speech: String, val executionOutcome: ExecutionOutcome) : ConversationalOutcome()
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationScreen.kt =====
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationScreen.kt =====
+package com.checkmate.ui.negotiation
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.ui.theme.*
+import kotlinx.coroutines.delay
+
+/**
+ * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §16's "Talk to
+ * Checkmate"). See [NegotiationViewModel]'s class doc: the Start / Snooze 5m / Dismiss
+ * buttons still always resolve the transaction unconditionally, but as of Step 11 the
+ * conversation itself can now also resolve it — a decisive intent parsed from the
+ * student's own words (e.g. "reduce this to 30 minutes") runs through the same
+ * PolicyValidator/ActionExecutor pipeline and closes the screen exactly like a button tap.
+ */
+@Composable
+fun NegotiationScreen(
+    navController: NavController,
+    transactionId: String,
+    taskId: String,
+    lateMinutes: Int,
+    vm: NegotiationViewModel = viewModel()
+) {
+    val state by vm.state.collectAsState()
+    val context = LocalContext.current
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(transactionId) {
+        vm.init(context, transactionId, taskId, lateMinutes)
+    }
+
+    LaunchedEffect(state.messages.size) {
+        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    }
+
+    // A resolved outcome (Started/Snoozed/Dismissed/etc.) is shown briefly, then this
+    // screen closes itself — there's nothing further to negotiate once the transaction
+    // has resolved.
+    LaunchedEffect(state.resolution) {
+        if (state.resolution != NegotiationResolution.NONE) {
+            delay(1200)
+            navController.popBackStack()
         }
     }
 
-    private fun callGemini(prompt: String, system: String, apiKey: String): String {
-        val fullPrompt = if (system.isNotBlank()) "$system\n\n$prompt" else prompt
-        val body = JSONObject().apply {
-            put("contents", JSONArray().put(
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", fullPrompt)))
-            ))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$apiKey"
-        val req = Request.Builder().url(url)
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
-                return ""
+    Column(modifier = Modifier.fillMaxSize().background(BgDark).imePadding()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = White60)
             }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts").getJSONObject(0)
-                .getString("text").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "Gemini call failed: ${e.message}")
-            ""
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    state.task?.let { "${it.subject} — ${it.topic}" } ?: "Talk to Checkmate",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = White90
+                )
+                if (lateMinutes > 0) {
+                    Text("$lateMinutes min late", fontSize = 11.sp, color = AccentAmber)
+                }
+            }
+            Icon(Icons.Default.Psychology, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
         }
+        HorizontalDivider(color = White10, thickness = 0.5.dp)
+
+        if (state.loading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = AccentGreen)
+            }
+            return@Column
+        }
+
+        state.context?.let { ctx ->
+            if (ctx.recentSkipRatePercent > 0 || ctx.streakDays > 0) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (ctx.recentSkipRatePercent > 0) {
+                        ContextChip("Skip rate ${ctx.recentSkipRatePercent}%", AccentAmber)
+                    }
+                    if (ctx.streakDays > 0) {
+                        ContextChip("Streak ${ctx.streakDays}d", AccentGreen)
+                    }
+                }
+            }
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(state.messages) { msg -> NegotiationBubble(msg) }
+            if (state.isSending) {
+                item {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                        Surface(
+                            shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
+                            color = BgCard,
+                            border = BorderStroke(0.5.dp, White10)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("thinking…", fontSize = 13.sp, color = White60)
+                            }
+                        }
+                    }
+                }
+            }
+            if (state.resolution != NegotiationResolution.NONE) {
+                item {
+                    Text(
+                        resolutionLabel(state.resolution),
+                        fontSize = 12.sp,
+                        color = White60,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                    )
+                }
+            }
+        }
+
+        state.sttError?.let {
+            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+        }
+
+        HorizontalDivider(color = White10, thickness = 0.5.dp)
+
+        val actionsEnabled = state.resolution == NegotiationResolution.NONE
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { vm.onStart(context, transactionId, lateMinutes) },
+                enabled = actionsEnabled,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = Color.Black),
+                modifier = Modifier.weight(1f)
+            ) { Text("Start", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+
+            OutlinedButton(
+                onClick = { vm.onSnooze(context, transactionId, taskId, lateMinutes) },
+                enabled = actionsEnabled,
+                modifier = Modifier.weight(1f)
+            ) { Text("Snooze 5m", fontSize = 12.sp, color = White90) }
+
+            OutlinedButton(
+                onClick = { vm.onDismiss(context, transactionId) },
+                enabled = actionsEnabled,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                modifier = Modifier.weight(1f)
+            ) { Text("Dismiss", fontSize = 12.sp) }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedTextField(
+                value = state.inputText,
+                onValueChange = vm::setInput,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Say or type your response…", color = White30, fontSize = 13.sp) },
+                singleLine = false,
+                maxLines = 3,
+                enabled = actionsEnabled,
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor = AccentGreen,
+                    focusedTextColor = White90,
+                    unfocusedTextColor = White90
+                )
+            )
+            if (state.sttAvailable) {
+                FloatingActionButton(
+                    onClick = { if (state.isListening) vm.stopListening() else vm.startListening() },
+                    containerColor = if (state.isListening) AccentRed else BgCardAlt,
+                    contentColor = if (state.isListening) Color.White else AccentGreen,
+                    modifier = Modifier.size(46.dp)
+                ) {
+                    Icon(
+                        if (state.isListening) Icons.Default.MicOff else Icons.Default.Mic,
+                        contentDescription = if (state.isListening) "Stop listening" else "Start listening",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            FloatingActionButton(
+                onClick = { vm.send(context) },
+                containerColor = AccentGreen,
+                contentColor = Color.Black,
+                modifier = Modifier.size(46.dp)
+            ) {
+                Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContextChip(label: String, color: Color) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = color.copy(alpha = 0.15f),
+        border = BorderStroke(0.5.dp, color.copy(alpha = 0.4f))
+    ) {
+        Text(label, fontSize = 11.sp, color = color, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+    }
+}
+
+private fun resolutionLabel(r: NegotiationResolution): String = when (r) {
+    NegotiationResolution.STARTED -> "✓ Started — closing…"
+    NegotiationResolution.SNOOZED -> "Snoozed 5 minutes — closing…"
+    NegotiationResolution.DISMISSED -> "Dismissed — closing…"
+    NegotiationResolution.ALREADY_RESOLVED -> "This prompt was already handled — closing…"
+    NegotiationResolution.TASK_MISSING -> "This task no longer exists — closing…"
+    // Step 11: reached when the conversation itself (not a button) resolved things via a
+    // REDUCE_DURATION/RESCHEDULE_TASK/TAKE_SHORT_BREAK/KEEP_PLAN/REQUEST_GUARDIAN intent.
+    NegotiationResolution.PLAN_ADJUSTED -> "✓ Updated — closing…"
+    NegotiationResolution.NONE -> ""
+}
+
+@Composable
+private fun NegotiationBubble(msg: NegotiationMessage) {
+    val isUser = msg.role == "user"
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(
+                topStart = if (isUser) 14.dp else 4.dp,
+                topEnd = if (isUser) 4.dp else 14.dp,
+                bottomStart = 14.dp,
+                bottomEnd = 14.dp
+            ),
+            color = if (isUser) AccentGreen.copy(alpha = 0.15f) else BgCard,
+            border = BorderStroke(0.5.dp, if (isUser) AccentGreen.copy(alpha = 0.3f) else White10),
+            modifier = Modifier.widthIn(max = 300.dp)
+        ) {
+            Text(
+                text = msg.content,
+                fontSize = 14.sp,
+                color = White90,
+                lineHeight = 20.sp,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            )
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
+package com.checkmate.ui.negotiation
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.stt.CheckmateSTT
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.ConversationalOutcome
+import com.checkmate.planner.intervention.EscrowExtendResult
+import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionDecisionMaker
+import com.checkmate.planner.intervention.InterventionFallback
+import com.checkmate.planner.intervention.PermittedAction
+import com.checkmate.planner.intervention.PlanStoreTaskMutator
+import com.checkmate.planner.intervention.TaskEscrow
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.psyche.intervention.ContextBuilder
+import com.checkmate.psyche.intervention.InterventionContext
+import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.InterventionSnoozeAlarmReceiver
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class NegotiationMessage(val role: String, val content: String)
+
+enum class NegotiationResolution {
+    NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING,
+    // Step 11: any conversational decision other than STARTED — REDUCE_DURATION,
+    // RESCHEDULE_TASK, TAKE_SHORT_BREAK, KEEP_PLAN, or REQUEST_GUARDIAN all land here.
+    // The negotiation screen doesn't need to distinguish between them to close itself —
+    // the assistant's last chat bubble already says what happened in plain language.
+    PLAN_ADJUSTED
+}
+
+data class NegotiationUiState(
+    val loading: Boolean = true,
+    val task: StudyTask? = null,
+    val context: InterventionContext? = null,
+    val messages: List<NegotiationMessage> = emptyList(),
+    val isSending: Boolean = false,
+    val isListening: Boolean = false,
+    val sttAvailable: Boolean = true,
+    val sttError: String? = null,
+    val inputText: String = "",
+    val resolution: NegotiationResolution = NegotiationResolution.NONE
+)
+
+/**
+ * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §8-11, §16's
+ * "Talk to Checkmate").
+ *
+ * This is what a tap on "Talk to Checkmate" (or the notification body) opens into.
+ *
+ * STEP 11 UPDATE: the scope boundary this class's doc used to describe — "nothing parses
+ * what the LLM says into an executable decision, because that parser doesn't exist yet" —
+ * no longer holds. [send] now runs every reply through
+ * [InterventionDecisionMaker.attemptConversationalTurn], which parses the raw LLM response
+ * via [com.checkmate.planner.intervention.LlmIntentParser] and, for a genuinely decisive
+ * intent, validates it through PolicyValidator and applies it through ActionExecutor — the
+ * exact same pipeline [onStart] already used for the notification's own button. Most turns
+ * still don't execute anything (a clarifying question, small talk, a rejected suggestion) —
+ * see [InterventionDecisionMaker.attemptConversationalTurn]'s own doc for why those
+ * deliberately leave the transaction open rather than resolving it. [onStart]/[onSnooze]/
+ * [onDismiss] remain the three buttons that resolve things unconditionally, unrelated to
+ * whatever the conversation is doing.
+ */
+class NegotiationViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(NegotiationUiState())
+    val state: StateFlow<NegotiationUiState> = _state.asStateFlow()
+
+    private var stt: CheckmateSTT? = null
+    private var initialized = false
+
+    // Step 11: send() needs this to call attemptConversationalTurn, and previously nothing
+    // retained it after init() beyond the local scope of the initial DB read.
+    private var currentTransactionId: String? = null
+
+    /** Idempotent on purpose — Compose may recompose/re-enter this call across
+     *  configuration changes; only the first call for this ViewModel instance should do
+     *  the DB read + opening TTS utterance. */
+    fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (initialized) return
+        initialized = true
+        currentTransactionId = transactionId
+
+        val sttInstance = CheckmateSTT(context.applicationContext)
+        stt = sttInstance
+        _state.update { it.copy(sttAvailable = sttInstance.isAvailable()) }
+
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val transaction = dao.getById(transactionId)
+            if (transaction == null || transaction.currentState.isTerminal) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.ALREADY_RESOLVED) }
+                return@launch
+            }
+
+            val task = PlanStore.todayTasks.value.find { it.id == taskId }
+            if (task == null) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.TASK_MISSING) }
+                return@launch
+            }
+
+            // Same best-effort posture InterventionNotifier already uses around
+            // ContextBuilder.build — a missing behavioral summary shouldn't block the
+            // conversation from opening at all.
+            val ctx = runCatching { ContextBuilder.build(task, lateMinutes) }.getOrNull()
+
+            // The opening line is the exact same deterministic STRICT_REMINDER speech the
+            // no-gateway fallback (and the notification's "Start" action) would use — this
+            // conversation is layered on top of that reality, not a different story.
+            val opening = InterventionFallback.strictReminderIntent(task, lateMinutes).speech
+
+            _state.update {
+                it.copy(
+                    loading = false,
+                    task = task,
+                    context = ctx,
+                    messages = listOf(NegotiationMessage("assistant", opening))
+                )
+            }
+            CheckmateTTS.speak(context, opening)
+
+            // Runs for the lifetime of this ViewModel — a final transcript from voice input
+            // becomes a sent message through exactly the same path as the text field's send
+            // button (see the private send() overload below).
+            launch {
+                sttInstance.state.collect { s ->
+                    _state.update { it.copy(isListening = s.isListening, sttError = s.error) }
+                    val finalText = s.finalText
+                    if (!finalText.isNullOrBlank()) {
+                        sttInstance.consumeFinalText()
+                        send(context, finalText)
+                    }
+                }
+            }
+        }
+    }
+
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun startListening() {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.startListening()
+    }
+
+    fun stopListening() {
+        stt?.stopListening()
+    }
+
+    /** Text-field send button entry point. */
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank()) return
+        _state.update { it.copy(inputText = "") }
+        send(context, text)
+    }
+
+    /**
+     * Shared entry point for both the text field and a completed voice transcript.
+     *
+     * Step 11: this now asks the LLM for a structured intent (not just conversational
+     * text), runs the raw response through [InterventionDecisionMaker.attemptConversationalTurn],
+     * and reacts to whichever [ConversationalOutcome] comes back. The LLM call itself still
+     * goes through [InterventionFallback.attemptLlm] directly (rather than letting
+     * attemptConversationalTurn call it) so this function keeps ownership of the timeout
+     * budget and the raw string, exactly as before — attemptConversationalTurn only takes
+     * over from "here's what the model said" onward.
+     */
+    private fun send(context: Context, text: String) {
+        if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        val transactionId = currentTransactionId ?: return
+        val ctx = _state.value.context
+
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
+
+        viewModelScope.launch {
+            val systemPrompt = buildSystemPrompt(task, ctx)
+            val history = buildHistoryForLlm()
+            // A longer budget than InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS (3s) on
+            // purpose: that 3s default is sized for a silent background decision the
+            // student never sees waiting happen (§14/§18). This is the opposite case — the
+            // student is watching an active screen and knows a reply is coming, so it's
+            // worth waiting longer for a real answer before falling back.
+            val raw = InterventionFallback.attemptLlm(
+                prompt = history,
+                systemPrompt = systemPrompt,
+                timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
+            )
+
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            when (val outcome = decisionMaker.attemptConversationalTurn(transactionId, task, raw)) {
+                ConversationalOutcome.LlmUnavailable ->
+                    reply(context, "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below.")
+
+                ConversationalOutcome.UnparseableResponse ->
+                    reply(context, "Sorry, I didn't quite catch that — could you say it a different way?")
+
+                is ConversationalOutcome.Continue ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Rejected ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Decided -> {
+                    InterventionNotifier.cancel(context.applicationContext, transactionId)
+                    _state.update {
+                        it.copy(
+                            messages = it.messages + NegotiationMessage("assistant", outcome.speech),
+                            isSending = false,
+                            resolution = resolutionFor(outcome.executionOutcome)
+                        )
+                    }
+                    CheckmateTTS.speak(context, outcome.speech)
+                }
+            }
+        }
+    }
+
+    private fun reply(context: Context, text: String) {
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", text), isSending = false) }
+        CheckmateTTS.speak(context, text)
+    }
+
+    /** Maps a resolved conversational turn onto the same [NegotiationResolution] the
+     *  button-driven paths use, so the screen's existing "show a label, then close" flow
+     *  (see NegotiationScreen's LaunchedEffect on state.resolution) needs no special case
+     *  for how the resolution was reached. */
+    private fun resolutionFor(outcome: ExecutionOutcome): NegotiationResolution = when (outcome) {
+        is ExecutionOutcome.Applied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NoOpAlreadyApplied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NotApplicable -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.RequiresGuardianEscalation -> NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.Failed -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound -> NegotiationResolution.ALREADY_RESOLVED
+    }
+
+    /**
+     * Student tapped "Start". Resolves through the identical deterministic
+     * STRICT_REMINDER -> START_TASK -> PolicyValidator -> ActionExecutor path
+     * [InterventionActionReceiver.handleStart] already uses for the notification's own
+     * "Start" button — there is exactly one place "what happens when we decide to start
+     * this task" lives, regardless of whether the student tapped a notification action or
+     * talked their way here.
+     */
+    fun onStart(context: Context, transactionId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            decisionMaker.decideAndExecute(
+                transactionId = transactionId,
+                task = task,
+                lateMinutes = lateMinutes
+            )
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
+        }
+    }
+
+    /** Same TaskEscrow.extend() + re-notify alarm as
+     *  [InterventionActionReceiver.handleSnooze] — see that method's doc for why this
+     *  doesn't re-run TriggerEvaluator or re-acquire escrow. */
+    fun onSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val escrow = TaskEscrow(dao)
+            val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
+            if (result is EscrowExtendResult.Extended) {
+                InterventionSnoozeAlarmReceiver.scheduleRenotify(
+                    context.applicationContext, transactionId, taskId, lateMinutes
+                )
+            }
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.SNOOZED) }
+        }
+    }
+
+    /** USER_ABORTED (§3) — the student declined via the conversation screen rather than
+     *  ignoring the notification (USER_IGNORED) or running out the TTL. */
+    fun onDismiss(context: Context, transactionId: String) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val escrow = TaskEscrow(dao)
+            escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
+        }
+    }
+
+    private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
+        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+        return escrow to InterventionDecisionMaker(escrow, executor)
+    }
+
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(12)
+        return msgs.joinToString("\n") { m ->
+            if (m.role == "user") "Student: ${m.content}" else "Mentor: ${m.content}"
+        }
+    }
+
+    /**
+     * Step 11: this now asks for a strict JSON [com.checkmate.planner.intervention.LlmIntent]
+     * instead of free conversational text — "speech" carries what previously was the whole
+     * response. The intentType/parameters vocabulary listed here must stay in lockstep with
+     * [com.checkmate.planner.intervention.InterventionIntentType] and what
+     * [com.checkmate.planner.intervention.PolicyValidator] actually reads out of
+     * `parameters` — if a new intent type or parameter key is ever added there, it needs to
+     * be documented in this prompt too, or the model will never produce it.
+     */
+    private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
+        appendLine("You are Checkmate's AI Mentor, negotiating with a student about ${task.subject} — ${task.topic}")
+        appendLine("(current planned duration: ${task.durationMinutes} minutes), which is late or off-plan right now.")
+        appendLine()
+        appendLine("Respond with ONLY a single JSON object — no markdown code fences, no text before or after it —")
+        appendLine("in exactly this shape:")
+        appendLine("""{"speech": "...", "intentType": "...", "targetTaskId": "${task.id}", "parameters": {}}""")
+        appendLine()
+        appendLine("\"speech\" is what you actually say to the student out loud: direct, warm, brief (1-3 sentences),")
+        appendLine("a spoken reply, not an essay. Never claim you've already changed the plan in \"speech\" — describe")
+        appendLine("what you're recommending. A separate policy layer decides what's actually permitted (for example,")
+        appendLine("it will reject breaks longer than 30 minutes), and only that layer's decision, not your words,")
+        appendLine("changes anything.")
+        appendLine()
+        appendLine("\"intentType\" must be exactly one of:")
+        appendLine("  START_TASK            student is ready to begin right now")
+        appendLine("  REDUCE_DURATION       wants a shorter session — parameters: {\"newDurationMinutes\": \"<int>\"}")
+        appendLine("  RESCHEDULE_TASK       wants to move the start time — parameters: {\"newScheduledStartTime\": \"HH:mm\"}")
+        appendLine("  TAKE_SHORT_BREAK      needs a short break first — parameters: {\"minutes\": \"<int, 30 max>\"}")
+        appendLine("  KEEP_PLAN             no change needed, the plan as scheduled stands")
+        appendLine("  REQUEST_CLARIFICATION you need more information before recommending anything")
+        appendLine("  NO_ACTION             just talking/acknowledging, nothing to decide yet")
+        appendLine("  REQUEST_GUARDIAN      this needs a real person (guardian), not you")
+        appendLine()
+        appendLine("Omit \"parameters\" (or leave it {}) for any intentType that doesn't list one above.")
+        if (ctx != null) {
+            appendLine()
+            appendLine(ctx.toPromptText())
+        }
+    }.trim()
+
+    override fun onCleared() {
+        super.onCleared()
+        stt?.stopListening()
+    }
+
+    companion object {
+        private const val CONVERSATION_LLM_TIMEOUT_MILLIS = 12_000L
+    }
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LlmIntentParserTest.kt =====
+package com.checkmate.planner.intervention
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class LlmIntentParserTest {
+
+    @Test
+    fun `parses a well-formed intent with parameters`() {
+        val raw = """
+            {"speech": "Sure, 30 minutes it is.", "intentType": "REDUCE_DURATION",
+             "targetTaskId": "task-1", "parameters": {"newDurationMinutes": "30"}}
+        """.trimIndent()
+
+        val intent = LlmIntentParser.parse(raw, fallbackTaskId = "fallback-id")
+
+        assertEquals("Sure, 30 minutes it is.", intent?.speech)
+        assertEquals(InterventionIntentType.REDUCE_DURATION, intent?.intentType)
+        assertEquals("task-1", intent?.targetTaskId)
+        assertEquals("30", intent?.parameters?.get("newDurationMinutes"))
+    }
+
+    @Test
+    fun `strips a markdown code fence some models wrap JSON in`() {
+        val raw = "```json\n{\"speech\": \"ok\", \"intentType\": \"KEEP_PLAN\"}\n```"
+        val intent = LlmIntentParser.parse(raw, fallbackTaskId = "t1")
+        assertEquals(InterventionIntentType.KEEP_PLAN, intent?.intentType)
+    }
+
+    @Test
+    fun `missing targetTaskId falls back to the caller-supplied task id`() {
+        val raw = """{"speech": "ok", "intentType": "START_TASK"}"""
+        val intent = LlmIntentParser.parse(raw, fallbackTaskId = "the-only-task")
+        assertEquals("the-only-task", intent?.targetTaskId)
+    }
+
+    @Test
+    fun `missing speech is treated as unparseable`() {
+        val raw = """{"intentType": "KEEP_PLAN"}"""
+        assertNull(LlmIntentParser.parse(raw, fallbackTaskId = "t1"))
+    }
+
+    @Test
+    fun `intentType outside the closed schema is unparseable, including protected actions`() {
+        // Never representable — this is the "not rejected by a rule, simply not
+        // representable" property LlmIntent.parseIntentType's own doc describes.
+        val raw = """{"speech": "ok", "intentType": "UNLOCK_DEVICE"}"""
+        assertNull(LlmIntentParser.parse(raw, fallbackTaskId = "t1"))
+    }
+
+    @Test
+    fun `malformed JSON is unparseable`() {
+        assertNull(LlmIntentParser.parse("not json at all", fallbackTaskId = "t1"))
+        assertNull(LlmIntentParser.parse("""{"speech": "ok", """, fallbackTaskId = "t1"))
+    }
+
+    @Test
+    fun `blank raw text is unparseable`() {
+        assertNull(LlmIntentParser.parse("   ", fallbackTaskId = "t1"))
+    }
+
+    @Test
+    fun `missing parameters object defaults to empty map`() {
+        val raw = """{"speech": "ok", "intentType": "NO_ACTION"}"""
+        val intent = LlmIntentParser.parse(raw, fallbackTaskId = "t1")
+        assertTrue(intent?.parameters?.isEmpty() == true)
+    }
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/InterventionFallbackTest.kt =====
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/InterventionFallbackTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Proactive Execution Engine — Step 6 (Blueprint Part One, §14). Nothing here touches a
+ * real network or Robolectric — [InterventionFallback.attemptLlm] takes an injectable
+ * llmCall precisely so timeout behavior is testable as a plain JVM test. runTest's virtual
+ * time scheduler advances through delay() automatically, so the "LLM never responds in
+ * time" tests below don't actually wait 3 real seconds.
+ */
+class InterventionFallbackTest {
+
+    // ── attemptLlm ───────────────────────────────────────────────────────
+
+    @Test
+    fun `attemptLlm returns the response when it arrives within budget`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            timeoutMillis = 3_000L,
+            llmCall = { _, _ -> "structured response" }
+        )
+        assertEquals("structured response", result)
+    }
+
+    @Test
+    fun `attemptLlm returns null when the call does not resolve within the timeout`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            timeoutMillis = 3_000L,
+            llmCall = { _, _ -> delay(10_000L); "too late" }
+        )
+        assertNull(result)
+    }
+
+    @Test
+    fun `attemptLlm returns null for a blank response, matching LlmGateway's failure contract`() = runTest {
+        val result = InterventionFallback.attemptLlm(
+            prompt = "x",
+            llmCall = { _, _ -> "" }
+        )
+        assertNull(result)
+    }
+
+    // ── strictReminderIntent ─────────────────────────────────────────────
+
+    @Test
+    fun `strictReminderIntent mentions lateness when late`() {
+        val task = StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90)
+        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes = 8)
+        assertEquals(InterventionIntentType.START_TASK, intent.intentType)
+        assertEquals(task.id, intent.targetTaskId)
+        assertTrue(intent.speech.contains("8 minutes late"))
+        assertTrue(intent.speech.contains("Electrostatics"))
+    }
+
+    @Test
+    fun `strictReminderIntent has a plain prompt when not late`() {
+        val task = StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90)
+        val intent = InterventionFallback.strictReminderIntent(task, lateMinutes = 0)
+        assertTrue(!intent.speech.contains("late"))
+        assertTrue(intent.speech.contains("Electrostatics"))
+    }
+
+    // ── InterventionDecisionMaker ────────────────────────────────────────
+
+    private class Fixture(task: StudyTask) {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val mutator = FakeTaskMutator(listOf(task))
+        val executor = ActionExecutor(dao, escrow, mutator)
+        val decisionMaker = InterventionDecisionMaker(escrow, executor)
+        val taskId = task.id
+
+        suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
+            (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = now)
+                    as EscrowAcquireResult.Acquired).transaction
+    }
+
+    private fun pendingTask(state: TaskState = TaskState.PENDING) =
+        StudyTask(subject = "Physics", topic = "Electrostatics", durationMinutes = 90, state = state)
+
+    @Test
+    fun `deterministic-only path (no LLM attempted) starts the task`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 8
+        )
+
+        assertTrue(outcome is DecisionOutcome.Executed)
+        val executed = outcome as DecisionOutcome.Executed
+        assertTrue(executed.executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(executed.usedFallback)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `LLM timeout still resolves deterministically via the fallback path`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmTimeoutMillis = 3_000L,
+            llmCall = { _, _ -> delay(10_000L); "never arrives in time" }
+        )
+
+        assertTrue(outcome is DecisionOutcome.Executed)
+        assertTrue((outcome as DecisionOutcome.Executed).executionOutcome is ExecutionOutcome.Applied)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+    }
+
+    @Test
+    fun `an LLM response missing required fields still falls back deterministically`() = runTest {
+        // Step 11: LlmIntentParser now exists, but a response that doesn't match the closed
+        // schema (here: no "speech") is still unparseable, so this must still fall back —
+        // parse failure and "no response at all" are handled identically.
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ -> """{"intentType":"REDUCE_DURATION"}""" }
+        )
+
+        assertTrue(outcome is DecisionOutcome.Executed)
+        assertTrue((outcome as DecisionOutcome.Executed).executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(outcome.usedFallback)
+        // Still a START_TASK outcome (the deterministic reminder), not a REDUCE_DURATION —
+        // proves the malformed LLM text was not acted on.
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(90, f.mutator.currentState(f.taskId)?.durationMinutes)
+    }
+
+    @Test
+    fun `a well-formed LLM response is now actually trusted through the parser`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ ->
+                """{"speech": "Let's do 30 minutes instead.", "intentType": "REDUCE_DURATION",
+                    "parameters": {"newDurationMinutes": "30"}}"""
+            }
+        )
+
+        assertTrue(outcome is DecisionOutcome.Executed)
+        val executed = outcome as DecisionOutcome.Executed
+        assertTrue(executed.executionOutcome is ExecutionOutcome.Applied)
+        assertTrue(!executed.usedFallback)
+        assertEquals("Let's do 30 minutes instead.", executed.speech)
+        assertEquals(30, f.mutator.currentState(f.taskId)?.durationMinutes)
+        // Not started — this was a duration reduction, not a start.
+        assertEquals(TaskState.PENDING, f.mutator.currentState(f.taskId)?.state)
+    }
+
+    @Test
+    fun `a well-formed but policy-rejected LLM response is not silently downgraded to fallback`() = runTest {
+        // A 4-hour break parses fine but PolicyValidator rejects it (BREAK_TOO_LONG) — this
+        // must surface as PolicyRejected, not quietly re-resolve via the strict reminder.
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5,
+            llmPrompt = "what should the student do?",
+            llmCall = { _, _ ->
+                """{"speech": "Take four hours off.", "intentType": "TAKE_SHORT_BREAK",
+                    "parameters": {"minutes": "240"}}"""
+            }
+        )
+
+        assertTrue(outcome is DecisionOutcome.PolicyRejected)
+        assertEquals(RejectionReason.BREAK_TOO_LONG, (outcome as DecisionOutcome.PolicyRejected).reason)
+        assertTrue(!outcome.usedFallback)
+        assertEquals(TaskState.PENDING, f.mutator.currentState(f.taskId)?.state)
+    }
+
+    // ── attemptConversationalTurn ───────────────────────────────────────
+
+    @Test
+    fun `conversational turn with no LLM response does not touch the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = null
+        )
+
+        assertEquals(ConversationalOutcome.LlmUnavailable, outcome)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `conversational turn with unparseable response does not touch the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = "not json"
+        )
+
+        assertEquals(ConversationalOutcome.UnparseableResponse, outcome)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `REQUEST_CLARIFICATION does not execute or resolve the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "How long do you have right now?", "intentType": "REQUEST_CLARIFICATION"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Continue)
+        assertEquals("How long do you have right now?", (outcome as ConversationalOutcome.Continue).speech)
+        // Still open — NOT committed, unlike ActionExecutor's NotApplicable branch would do.
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `NO_ACTION does not execute or resolve the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Got it, take your time.", "intentType": "NO_ACTION"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Continue)
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a decisive intent in conversation executes and resolves the transaction`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Starting now.", "intentType": "START_TASK"}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Decided)
+        assertTrue((outcome as ConversationalOutcome.Decided).executionOutcome is ExecutionOutcome.Applied)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a policy-rejected intent in conversation leaves the transaction open to keep negotiating`() = runTest {
+        val f = Fixture(pendingTask())
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.attemptConversationalTurn(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            rawLlmResponse = """{"speech": "Take four hours off.", "intentType": "TAKE_SHORT_BREAK",
+                "parameters": {"minutes": "240"}}"""
+        )
+
+        assertTrue(outcome is ConversationalOutcome.Rejected)
+        assertEquals(RejectionReason.BREAK_TOO_LONG, (outcome as ConversationalOutcome.Rejected).reason)
+        // Unlike decideAndExecute's Rejected branch, a conversational rejection does NOT
+        // resolve the transaction — the student gets to try again in the same conversation.
+        assertEquals(InterventionState.NEGOTIATING, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `a task in a non-startable state is rejected by policy and resolves POLICY_REJECTED`() = runTest {
+        val f = Fixture(pendingTask(state = TaskState.ACTIVE))
+        val tx = f.acquire()
+
+        val outcome = f.decisionMaker.decideAndExecute(
+            transactionId = tx.transactionId,
+            task = f.mutator.currentState(f.taskId)!!,
+            lateMinutes = 5
+        )
+
+        assertTrue(outcome is DecisionOutcome.PolicyRejected)
+        assertEquals(RejectionReason.TASK_NOT_ACTIVE_STATE, (outcome as DecisionOutcome.PolicyRejected).reason)
+        assertEquals(InterventionState.POLICY_REJECTED, f.dao.getById(tx.transactionId)?.currentState)
     }
 }
