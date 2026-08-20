@@ -1,1690 +1,503 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionGuardianGateway.kt =====
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/OutcomeLedger.kt =====
 package com.checkmate.planner.intervention
 
-import android.content.Context
-import com.checkmate.planner.model.StudyTask
+import androidx.room.Dao
+import androidx.room.Entity
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.TypeConverter
+import androidx.room.TypeConverters
 
 /**
- * Fixes a gap flagged in [ActionExecutor]'s own doc comment: `PermittedAction.RequestGuardian`
- * was always recognized and correctly resolved the owning transaction as COMPLETED, but
- * nothing downstream ever actually told a guardian — the student (or, live in an AI Mentor
- * negotiation, the LLM speaking on their behalf) could ask for a real person and the app
- * would just silently agree and move on.
+ * Proactive Execution Engine — Step 12 (Blueprint Part One, §22 "The Feedback Loop",
+ * §24 "Final Architecture", §25 principle 6: "Measure intervention effectiveness. Don't
+ * merely log behavior — log cause -> intervention -> response -> outcome.").
  *
- * Same shape as [InterventionNotificationGateway]/[InterventionNotificationBridge] and this
- * codebase's older DistractionGuard.listener / UninstallGuard.listener pattern: an interface
- * owned by the module that needs to call out (planner), implemented and wired by the module
- * that can actually reach GuardianNotifier (`app`) — planner has no visibility into `app`,
- * so this is the seam. See [InterventionNotificationGateway]'s own doc for the fuller
- * rationale of why this can't just live in planner directly.
+ * "Every intervention is transactional" (§25 principle 3) already gave us
+ * [InterventionTransaction] as the single source of truth for *how* a transaction got
+ * resolved (its terminal [InterventionState]). The Outcome Ledger is a second, append-mostly
+ * record of *why* — one row per terminal transaction resolution, written at the same choke
+ * point [InterventionTransaction] itself resolves through ([TaskEscrow]'s private
+ * `resolve()`), so this table can never drift out of sync with "the FSM actually decided
+ * this transaction is done." [BehaviorLedger]/PsycheEngine (Part Two) are the eventual
+ * downstream readers of this table — nothing reads it yet, same "built ahead of its caller"
+ * posture this package has used for earlier steps (e.g. Step 3's InterventionTransaction
+ * before Step 4's TaskEscrow existed to write to it).
  *
- * [InterventionGuardianBridge] is the settable holder — set once from CheckmateApp.onCreate()
- * alongside [InterventionNotificationBridge.gateway]. If nothing has wired
- * [InterventionGuardianBridge.gateway] (a plain JVM unit test, or any future build variant
- * that doesn't want this), every call site treats a null gateway as a safe no-op — the
- * transaction still resolves correctly either way; this is purely the "does someone
- * downstream get told" half, never something the FSM's own correctness depends on.
+ * [OutcomeLedgerEntry.transactionId] is the primary key, not a generated one — this is
+ * deliberately a 1:1 companion row per [InterventionTransaction], not an independent log
+ * table, so `upsert` (REPLACE) is also how [TaskEscrow] corrects an initially-derived
+ * provenance after the fact (see [OutcomeProvenance]'s own doc on NETWORK_FALLBACK/
+ * LLM_INVALID).
  */
-interface InterventionGuardianGateway {
-    /**
-     * Called once a `REQUEST_GUARDIAN` intent has actually resolved (i.e. right where
-     * [ExecutionOutcome.RequiresGuardianEscalation] is observed) — not from inside
-     * [ActionExecutor] itself, since that class has no Context to work with. Implementations
-     * are expected to notify the guardian out of band (WhatsApp/Telegram, matching
-     * GuardianNotifier's existing dual-channel pattern) and return immediately; there is
-     * nothing further for the transaction to wait on.
-     */
-    fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String)
-}
-
-object InterventionGuardianBridge {
-    @Volatile
-    var gateway: InterventionGuardianGateway? = null
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTriggerWorker.kt =====
-package com.checkmate.planner.intervention
-
-import android.content.Context
-import androidx.work.CoroutineWorker
-import androidx.work.WorkerParameters
-import com.checkmate.planner.PlanStore
-
-/**
- * Proactive Execution Engine — Step 7 (build), amended in Step 9 (Blueprint Part One, §2,
- * §16) and Step 12 (§22 — see the [OutcomeLedgerWriter] wiring below).
- *
- * "It does not 'constantly run an AI.' It evaluates deterministic signals." Each run walks
- * today's tasks, asks [TriggerEvaluator] whether any fire, and for each one that does —
- * acquires escrow and hands the student a chance to respond before anything is decided for
- * them.
- *
- * Step 9 changes what happens after escrow is acquired. Previously this worker resolved
- * every fired trigger immediately and silently through [InterventionDecisionMaker]'s
- * deterministic fallback (STRICT_REMINDER -> START_TASK), with nothing ever shown to the
- * student — a gap flagged when Step 8 (Context Builder) was built but not yet wired to
- * anything. Now, if [InterventionNotificationBridge.gateway] is wired (from `app`, since
- * planner cannot itself show a notification or reach psyche's ContextBuilder — see that
- * interface's own doc), the worker prompts the student instead and stops there for this
- * task; the transaction stays NEGOTIATING and is resolved later, out of band, by
- * `app`'s InterventionActionReceiver (a tap) or by TTL expiry/reconciliation (silence). If
- * no gateway is wired, or the gateway reports it couldn't show anything (e.g. notification
- * permission denied), this falls back to exactly the old behavior — the deterministic path
- * is never allowed to become unreachable just because the notification layer exists now.
- *
- * Escrow's TTL is widened to [InterventionNotificationBridge.PROMPT_TTL_MILLIS] whenever a
- * gateway is wired, since the 60-second [TaskEscrow.DEFAULT_TTL_MILLIS] default was sized
- * for an active voice negotiation (§6), not for "waits until the student glances at their
- * phone." Without a gateway, escrow still uses the original 60-second default, since nothing
- * is waiting on human attention in that path.
- *
- * Deliberately relies on [TaskEscrow.acquire]'s own atomic check rather than calling
- * [TaskEscrow.isUnderEscrow] first — a separate pre-check would be a second DB read with a
- * race window between it and the acquire call; acquire() already returns AlreadyHeld
- * safely if something else (a concurrent run, or a manually-triggered intervention) beat
- * this one to it.
- */
-class InterventionTriggerWorker(
-    context: Context,
-    params: WorkerParameters
-) : CoroutineWorker(context, params) {
-
-    override suspend fun doWork(): Result {
-        val db = InterventionDatabase.getInstance(applicationContext)
-        val dao = db.interventionTransactionDao()
-        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-        val escrow = TaskEscrow(dao, ledgerWriter)
-        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        val gateway = InterventionNotificationBridge.gateway
-        val now = System.currentTimeMillis()
-
-        PlanStore.todayTasks.value.forEach { task ->
-            val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
-
-            val ttlMillis = if (gateway != null) {
-                InterventionNotificationBridge.PROMPT_TTL_MILLIS
-            } else {
-                TaskEscrow.DEFAULT_TTL_MILLIS
-            }
-            val acquired = escrow.acquire(task.id, signal.triggerType, now, ttlMillis)
-            if (acquired !is EscrowAcquireResult.Acquired) return@forEach
-
-            val dispatched = gateway?.promptStudent(
-                context = applicationContext,
-                transactionId = acquired.transaction.transactionId,
-                task = task,
-                lateMinutes = signal.lateMinutes,
-                now = now
-            )
-
-            if (dispatched != PromptDispatchResult.SHOWN) {
-                // No gateway wired, or the gateway couldn't show anything — resolve
-                // immediately through the deterministic fallback, same as before this step,
-                // rather than leaving the transaction to sit until TTL expiry with nothing
-                // ever having been shown to the student.
-                val decision = decisionMaker.decideAndExecute(
-                    transactionId = acquired.transaction.transactionId,
-                    task = task,
-                    lateMinutes = signal.lateMinutes,
-                    now = now
-                )
-                // Guardian-only, and currently unreachable in practice: decideAndExecute
-                // never receives an llmPrompt here, so the deterministic fallback always
-                // resolves to START_TASK. Checked anyway since InterventionGuardianBridge
-                // lives in this same module and costs nothing extra. ShortBreak's wake-up
-                // scheduling is deliberately NOT wired here — InterventionShortBreakAlarmReceiver
-                // is an `app`-layer class this module cannot reference, and building a second
-                // cross-module bridge solely for a path that can never produce ShortBreak
-                // today isn't worth it (see InterventionSideEffects' own doc, which is what
-                // the two `app`-layer call sites use instead).
-                if (decision is DecisionOutcome.Executed &&
-                    decision.executionOutcome is ExecutionOutcome.RequiresGuardianEscalation
-                ) {
-                    InterventionGuardianBridge.gateway?.notifyGuardianRequested(
-                        applicationContext, task, acquired.transaction.transactionId
-                    )
-                }
-            }
-            // dispatched == SHOWN: transaction intentionally left NEGOTIATING here.
-        }
-
-        return Result.success()
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
-package com.checkmate.service
-
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.util.Log
-import com.checkmate.automation.AutomationEngine
-import com.checkmate.core.AppUsageTracker
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.core.DailyChecklist
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeSchedule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import java.util.Calendar
-
-object GuardianNotifier {
-
-    private const val TAG = "GuardianNotifier"
-    const val ACTION_EOD_SUMMARY   = "com.checkmate.EOD_SUMMARY"
-    // Fires every 30 min — pushes a Telegram usage alert AND caches the same
-    // report in the worker's KV so a guardian texting "usage" any time in
-    // between gets an instant cached reply instead of nothing.
-    const val ACTION_USAGE_REPORT  = "com.checkmate.USAGE_REPORT"
-    // Fires weekly — builds PsycheEngine's weekly report and pushes it to
-    // the guardian. Previously nothing ever called this: PsycheEngine.
-    // getGuardianWeeklyReport() built the report string but no alarm,
-    // receiver, or call site existed anywhere in the app, so the weekly
-    // report never actually went out. This action + its alarm/receiver is
-    // the fix.
-    const val ACTION_WEEKLY_REPORT = "com.checkmate.WEEKLY_REPORT"
-
-    // GuardianNotifier is a singleton object living for the app process's
-    // lifetime, same as it being wired from CheckmateApp.onCreate — a
-    // module-level scope here follows the same pattern used by long-lived
-    // services elsewhere (e.g. AttentionCycleService, ReminderService).
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
-        val number = getGuardianNumber() ?: return
-        val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "Guardian notified: task started")
-    }
-
-    // Mentor v2 (spec 3.6): distractionApp is the label of whatever app was foregrounded
-    // right before the skip (from AppUsageTracker.getMostRecentForegroundApp, captured by
-    // HomeViewModel.markSkip). Null/blank means nothing was detected in the lookback window —
-    // message falls back to the original skip-only wording so this never regresses when usage
-    // access isn't granted.
-    fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String, distractionApp: String? = null) {
-        val number = getGuardianNumber() ?: return
-        val distractionClause = if (!distractionApp.isNullOrBlank()) " $distractionApp was open right before." else ""
-        val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic.$distractionClause Time: ${timeNow()}"
-        openWhatsAppAndSend(context, number, msg)
-        Log.d(TAG, "Guardian notified: skip streak=$skipCount distractionApp=$distractionApp")
-    }
-
-    fun scheduleEndOfDaySummary(context: Context) {
-        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pi = PendingIntent.getBroadcast(
-            context, 9001,
-            Intent(context, EodSummaryReceiver::class.java).apply { action = ACTION_EOD_SUMMARY },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 21)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
-        }
-        am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
-        Log.d(TAG, "EOD summary alarm set for 21:00 daily")
-    }
-
-    /**
-     * Schedules a repeating alarm every 30 min that pushes an app-usage
-     * report to the guardian via Telegram (sendAppUsageReport). Independent
-     * of whether a focus session is active — this is a standalone "Digital
-     * Wellbeing" style check-in, not tied to AttentionCycleService.
-     */
-    fun scheduleUsageReports(context: Context) {
-        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pi = PendingIntent.getBroadcast(
-            context, 9002,
-            Intent(context, UsageReportReceiver::class.java).apply { action = ACTION_USAGE_REPORT },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        am.setRepeating(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + AlarmManager.INTERVAL_HALF_HOUR,
-            AlarmManager.INTERVAL_HALF_HOUR,
-            pi
-        )
-        Log.d(TAG, "Usage report alarm set for every 30 min")
-    }
-
-    /**
-     * Schedules a repeating weekly alarm (every 7 days, Sunday 20:00) that
-     * builds and delivers PsycheEngine's weekly report. This was previously
-     * missing entirely — PsycheEngine.getGuardianWeeklyReport() existed and
-     * worked, but nothing ever scheduled or invoked it, so no weekly report
-     * was ever sent. Mirrors the same fixed-clock-time am.setRepeating
-     * pattern as the EOD summary and usage-report alarms above, just with a
-     * 7-day interval and a day-of-week anchor instead of a daily one.
-     */
-    fun scheduleWeeklyReport(context: Context) {
-        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pi = PendingIntent.getBroadcast(
-            context, 9003,
-            Intent(context, WeeklyReportReceiver::class.java).apply { action = ACTION_WEEKLY_REPORT },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.DAY_OF_WEEK, Calendar.SUNDAY)
-            set(Calendar.HOUR_OF_DAY, 20)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 7)
-        }
-        am.setRepeating(
-            AlarmManager.RTC_WAKEUP,
-            cal.timeInMillis,
-            AlarmManager.INTERVAL_DAY * 7,
-            pi
-        )
-        Log.d(TAG, "Weekly report alarm set for Sunday 20:00, every 7 days")
-    }
-
-    /**
-     * Builds and sends the daily report to the guardian — tasks, checklist,
-     * and (new) an on-device app usage breakdown for the day, Digital
-     * Wellbeing-style. Sent via WhatsApp (existing path) and, if a Telegram
-     * chat id is configured, also pushed straight to the guardian bot so the
-     * Telegram channel carries the same usage history, not just screenshots.
-     */
-    fun sendEndOfDaySummary(context: Context) {
-        val number = getGuardianNumber()
-        val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
-        val done    = tasks.count { it.state == TaskState.DONE }
-        val skipped = tasks.count { it.state == TaskState.SKIPPED }
-        val total   = tasks.size
-        val pct     = if (total > 0) done * 100 / total else 0
-
-        val taskLines = tasks.joinToString("\n") { t ->
-            val icon = when (t.state) {
-                TaskState.DONE    -> "done"
-                TaskState.SKIPPED -> "skip"
-                else              -> "miss"
-            }
-            "[$icon] ${t.subject}: ${t.topic}"
-        }
-
-        val checklistSummary = DailyChecklist.getTodaySummaryText()
-        val usageSummary = AppUsageTracker.buildUsageReportText(context)
-        val candidateName = ConsultationProfile.candidateDisplayName()
-
-        val msg = buildString {
-            appendLine("Checkmate Daily Report — ${dateToday()}")
-            appendLine("Candidate: $candidateName")
-            appendLine("Tasks: $done/$total ($pct%)")
-            if (skipped > 0) appendLine("Skipped: $skipped")
-            appendLine()
-            appendLine(taskLines)
-            if (checklistSummary.isNotBlank()) {
-                appendLine()
-                appendLine(checklistSummary)
-            }
-            appendLine()
-            appendLine(usageSummary)
-        }.trim()
-
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-            Log.d(TAG, "EOD summary sent to guardian via WhatsApp")
-        }
-
-        // Push the same report straight to the Telegram bot, independent of
-        // the WhatsApp path, so guardians who only use Telegram still get it.
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread {
-                TelegramAlertBot.sendAlert(context, msg)
-                Log.d(TAG, "EOD summary sent to guardian via Telegram")
-            }.start()
-        }
-    }
-
-    /**
-     * Sends the app usage breakdown to the guardian via Telegram (active
-     * push, fired every 30 min by scheduleUsageReports), AND caches the same
-     * report in the worker's KV so a guardian who texts "usage" any time in
-     * between scheduled pushes still gets an instant on-demand reply
-     * (worker.js: /usage cache + "usage" command — see Cloudflare Worker).
-     * Cached data is at most ~30 min stale, never live — the worker only
-     * ever replies from cache, it never wakes the phone.
-     */
-    fun sendAppUsageReport(context: Context) {
-        if (TelegramAlertBot.getChatId() == null) {
-            Log.w(TAG, "telegram_chat_id not set — skipping usage report")
-            return
-        }
-        val report = AppUsageTracker.buildUsageReportText(context)
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val text = "Checkmate — ${dateToday()}\nCandidate: $candidateName\n$report"
-        Thread {
-            TelegramAlertBot.sendAlert(context, text)
-            // Cache carries the candidate line too, since the worker's "usage"
-            // command replies with exactly this cached string.
-            StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
-            Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
-        }.start()
-    }
-
-    /**
-     * Builds PsycheEngine's weekly report (streak, tasks missed, consistency,
-     * attention-check stats, week-over-week delta) and delivers it to the
-     * guardian via BOTH channels — WhatsApp (existing openWhatsAppAndSend
-     * path, same as the daily/EOD report) and Telegram (if a chat id is
-     * configured), matching sendEndOfDaySummary's dual-delivery pattern.
-     *
-     * PsycheEngine.getGuardianWeeklyReport() is a suspend fun (it may call
-     * out to LlmGateway), so this runs on GuardianNotifier's own IO-scoped
-     * coroutine rather than a raw Thread.
-     */
-    fun sendWeeklyReport(context: Context) {
-        val number = getGuardianNumber()
-        val hasTelegram = TelegramAlertBot.getChatId() != null
-
-        if (number == null && !hasTelegram) {
-            Log.w(TAG, "No guardian number or Telegram chat id set — skipping weekly report")
-            return
-        }
-
-        scope.launch {
-            val report = try {
-                PsycheEngine.getGuardianWeeklyReport()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to build weekly report", e)
-                return@launch
-            }
-
-            if (number != null) {
-                openWhatsAppAndSend(context, number, report)
-                Log.d(TAG, "Weekly report sent to guardian via WhatsApp")
-            }
-
-            if (hasTelegram) {
-                TelegramAlertBot.sendAlert(context, report)
-                Log.d(TAG, "Weekly report sent to guardian via Telegram")
-            }
-        }
-    }
-
-    fun notifyDistractionAlert(
-        context: Context,
-        kind: String,
-        target: String,
-        screenshotUri: Uri? = null
-    ) {
-        val msg = when (kind) {
-            "app"    -> "⚠️ Checkmate Alert: Student attempted to open blocked app: $target " +
-                        "3 times during study session at ${timeNow()}."
-            "site"   -> "⚠️ Checkmate Alert: Student attempted to open blocked website: $target " +
-                        "3 times during study session at ${timeNow()}."
-            "scroll" -> "⚠️ Checkmate Alert: Student hit the continuous-scroll limit in $target " +
-                        "at ${timeNow()}."
-            else     -> "⚠️ Checkmate Alert: Student attempted to open blocked $target " +
-                        "3 times during study session at ${timeNow()}."
-        }
-        Log.w(TAG, "Distraction alert: $kind/$target")
-
-        val number = getGuardianNumber()
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-            Log.d(TAG, "Distraction alert sent via WhatsApp (text)")
-        }
-
-        Thread {
-            TelegramAlertBot.sendAlert(context, msg, screenshotUri)
-            Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
-        }.start()
-    }
-
-    /**
-     * Fired by CheckmateDeviceAdminReceiver and AppAutomationService's
-     * UninstallGuard watchdog whenever someone reaches a screen that could
-     * uninstall Checkmate, force-stop it, disable its device admin status,
-     * or disable its accessibility service. `reason` is a short machine tag
-     * (e.g. "settings_screen_blocked", "device_admin_disable_requested")
-     * kept out of the guardian-facing text but logged for debugging.
-     */
-    fun notifyUninstallAttempt(context: Context, reason: String) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = if (reason == "repeated_disable_attempt_hard_lock")
-            "🚨 Checkmate Security Alert: $candidateName tried to uninstall or disable Checkmate " +
-                "3 times in a row at ${timeNow()} on ${dateToday()}. The screen's touch input has " +
-                "been locked for 5 minutes."
-        else
-            "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
-                "Checkmate at ${timeNow()} on ${dateToday()}."
-        Log.w(TAG, "Uninstall attempt: reason=$reason")
-
-        val number = getGuardianNumber()
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-        }
-
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    /**
-     * Fired by ProactiveMentor.consistencyCheckIfNeeded() once a gap of consecutive missed
-     * days (PlanStore.getConsecutiveMissedDays — no plan generated OR nothing completed)
-     * crosses the alert threshold. Previously nothing ever surfaced this pattern to the
-     * guardian at all — a student could go stretches with zero study and, short of manually
-     * reading the day-by-day plan history, nobody would notice.
-     */
-    fun notifyStudyInactivity(context: Context, missedDays: Int) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "⚠️ Checkmate Alert: $candidateName has gone $missedDays days in a row with no " +
-                  "study recorded — no plan generated or nothing completed — as of ${timeNow()} " +
-                  "on ${dateToday()}."
-        Log.w(TAG, "Study inactivity alert: missedDays=$missedDays")
-
-        val number = getGuardianNumber()
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-        }
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    /**
-     * Proactive Execution Engine — fixes a gap flagged in ActionExecutor's own comment:
-     * `PermittedAction.RequestGuardian` was always recognized and resolved the transaction,
-     * but nothing downstream ever notified anyone. Fired via
-     * [com.checkmate.planner.intervention.InterventionGuardianBridge] (wired from
-     * CheckmateApp.onCreate(), same pattern as InterventionNotificationBridge) right where
-     * the intervention pipeline observes `ExecutionOutcome.RequiresGuardianEscalation` —
-     * i.e. the student (or the LLM speaking for them, live in the AI Mentor negotiation)
-     * asked for a real person instead of continuing to negotiate with the app.
-     */
-    fun notifyInterventionGuardianRequest(context: Context, subject: String, topic: String) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "🙋 Checkmate: $candidateName asked to talk to you instead of continuing " +
-                  "with the AI Mentor, about $subject — $topic, at ${timeNow()} on ${dateToday()}."
-        Log.d(TAG, "Intervention guardian request: $subject / $topic")
-
-        val number = getGuardianNumber()
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-        }
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    /**
-     * Fired by ProactiveMentor.holidayPromptIfNeeded() every Wednesday, once per week — a
-     * standing reminder for the guardian to review and mark any upcoming holiday, since that's
-     * the only way WorkModeSchedule's hardcoded window ever eases for a specific day (see
-     * HolidaySchedule). Purely informational; doesn't touch the holiday list itself.
-     */
-    fun notifyHolidayPrompt(context: Context) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "🗓️ Checkmate: weekly holiday check-in for $candidateName. Any holidays " +
-                  "coming up? Mark them in the app's Settings \u2192 Work Mode \u2192 Holidays " +
-                  "(guardian PIN required) — a marked holiday reduces that day's lock to " +
-                  "1:00 AM \u2013 3:10 PM only, instead of the usual ${WorkModeSchedule.LABEL} schedule."
-        Log.d(TAG, "Holiday prompt sent")
-
-        val number = getGuardianNumber()
-        if (number != null) {
-            openWhatsAppAndSend(context, number, msg)
-        }
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    /**
-     * Fired by BootReceiver when the device just booted into Safe Mode —
-     * Safe Mode disables all 3rd-party accessibility services and can bypass
-     * device-admin uninstall protection, which is the one gap this app
-     * cannot close from the app side. This is a best-effort notice only.
-     */
-    fun notifySafeModeBoot(context: Context) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
-                  "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
-        Log.w(TAG, "Safe Mode boot detected")
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    /**
-     * Generates a fresh 6-digit guardian PIN, stores only its hash on-device
-     * (UninstallGuard.storeNewPinHash), and sends the plaintext PIN to the
-     * guardian's Telegram chat — the only place it's ever visible. Whoever
-     * taps "Generate" on the phone (student or guardian) never sees the PIN
-     * itself, so generating a new one can't be used to self-authorize.
-     *
-     * Returns a short status string suitable for showing directly in the UI.
-     */
-    fun generateAndSendGuardianPin(context: Context, onResult: (success: Boolean, message: String) -> Unit) {
-        if (TelegramAlertBot.getChatId() == null) {
-            onResult(false, "Set Guardian Telegram Chat ID first")
-            return
-        }
-        if (!UninstallGuard.canRegeneratePin()) {
-            onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingSeconds()}s before generating another")
-            return
-        }
-        val pin = UninstallGuard.generateRandomPin()
-        UninstallGuard.storeNewPinHash(pin)
-        Thread {
-            TelegramAlertBot.sendAlert(
-                context,
-                "🔑 Checkmate Guardian PIN: $pin\n" +
-                "Enter this in the app to pass the uninstall-protection watchdog for 2 minutes. " +
-                "Keep it private from the student — anyone can request a new one from the phone, " +
-                "but only you ever see the code."
-            )
-            Log.d(TAG, "Guardian PIN generated and sent via Telegram")
-        }.start()
-        onResult(true, "New PIN sent to guardian via Telegram")
-    }
-
-    /** Fired by the unlock screen when UninstallGuard reports a brute-force lockout. */
-    fun notifyPinBruteForce(context: Context) {
-        val candidateName = ConsultationProfile.candidateDisplayName()
-        val msg = "🚨 Checkmate Alert: $candidateName entered the wrong guardian PIN too many times " +
-                  "at ${timeNow()} on ${dateToday()}. Unlock is locked for 10 minutes."
-        Log.w(TAG, "Guardian PIN brute-force lockout triggered")
-        if (TelegramAlertBot.getChatId() != null) {
-            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-        }
-    }
-
-    private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
-        val clean = number.replace(Regex("[^0-9]"), "")
-        if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
-
-        AutomationEngine.queueWhatsAppMessage(message)
-
-        val intentA = Intent(Intent.ACTION_VIEW,
-            Uri.parse("whatsapp://send?phone=$clean")).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        if (runCatching { context.startActivity(intentA) }.isSuccess) {
-            Log.d(TAG, "WhatsApp opened via method A"); return
-        }
-
-        val intentB = Intent(Intent.ACTION_VIEW,
-            Uri.parse("https://wa.me/$clean")).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        runCatching { context.startActivity(intentB) }
-            .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
-            .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
-    }
-
-    private fun getGuardianNumber(): String? {
-        val n = CheckmatePrefs.getString("guardian_number", null)
-        if (n.isNullOrBlank()) { Log.w(TAG, "Guardian number not set"); return null }
-        return n
-    }
-
-    private fun timeNow(): String {
-        val c = Calendar.getInstance()
-        return String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
-    }
-
-    private fun dateToday(): String {
-        val c = Calendar.getInstance()
-        return String.format("%02d/%02d/%04d",
-            c.get(Calendar.DAY_OF_MONTH), c.get(Calendar.MONTH) + 1, c.get(Calendar.YEAR))
-    }
-}
-
-class EodSummaryReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
-            GuardianNotifier.sendEndOfDaySummary(context)
-    }
-}
-
-class UsageReportReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == GuardianNotifier.ACTION_USAGE_REPORT)
-            GuardianNotifier.sendAppUsageReport(context)
-    }
-}
-
-class WeeklyReportReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == GuardianNotifier.ACTION_WEEKLY_REPORT)
-            GuardianNotifier.sendWeeklyReport(context)
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionShortBreakAlarmReceiver.kt =====
-package com.checkmate.service
-
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.util.Log
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.TaskState
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-
-/**
- * Fixes a gap flagged in [com.checkmate.planner.intervention.ActionExecutor.applyShortBreak]'s
- * own comment: a resolved `TAKE_SHORT_BREAK` intent paused the task via
- * [PlanStore.pauseTask], but the negotiated break length (`PermittedAction.ShortBreak.minutes`)
- * was discarded right after validation — nothing ever scheduled waking the student back up,
- * so a "15 minute break" just meant the task sat PAUSED indefinitely until the student
- * remembered to resume it manually themselves.
- *
- * Mirrors [InterventionSnoozeAlarmReceiver] deliberately closely: same one-shot
- * setExactAndAllowWhileIdle pattern (a short break should still wake the device from Doze —
- * the common case is the student locking their phone for the whole break, not an edge case),
- * same "recheck live state right before acting" idiom. The one real difference is what
- * "still relevant" means: snooze re-shows a prompt regardless of what else changed, but this
- * only resumes the task if it's STILL PAUSED when the alarm fires — if the student already
- * resumed manually, moved on to a different task, or the task finished/was skipped in the
- * meantime, firing resumeTask() here would be actively wrong, not just redundant.
- *
- * Known limitation: [com.checkmate.planner.PlanStore.pauseTask] has no concept of *why* a
- * task was paused, so this can't tell "paused via this negotiated short break" apart from
- * "student independently hit pause for an unrelated reason." Treating "still PAUSED
- * `minutes` later" as "the break is over, resume" is the best signal actually available —
- * consistent with how the rest of the intervention pipeline already treats live task state
- * as ground truth (see ActionExecutor's own re-read-before-mutating comment) rather than
- * threading a separate "pause reason" through PlanStore for this one case.
- */
-class InterventionShortBreakAlarmReceiver : BroadcastReceiver() {
-
-    override fun onReceive(context: Context, intent: Intent) {
-        val taskId = intent.getStringExtra(EXTRA_TASK_ID) ?: return
-        val appContext = context.applicationContext
-
-        val pendingResult = goAsync()
-        scope.launch {
-            try {
-                resumeIfStillPaused(taskId)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed resuming $taskId after short break", e)
-            } finally {
-                pendingResult.finish()
-            }
-        }
-    }
-
-    private fun resumeIfStillPaused(taskId: String) {
-        val task = PlanStore.todayTasks.value.find { it.id == taskId }
-        if (task == null || task.state != TaskState.PAUSED) {
-            Log.d(TAG, "Task $taskId no longer PAUSED (or gone) — not auto-resuming")
-            return
-        }
-        PlanStore.resumeTask(taskId, System.currentTimeMillis())
-        Log.d(TAG, "Auto-resumed $taskId after short break")
-    }
-
-    companion object {
-        private const val TAG = "ShortBreakAlarmRx"
-        private const val REQUEST_CODE_BASE = 91_000
-        const val EXTRA_TASK_ID = "task_id"
-
-        private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-        /**
-         * Same [PendingIntent.FLAG_UPDATE_CURRENT] idiom
-         * [InterventionSnoozeAlarmReceiver.scheduleRenotify] uses — calling this again for a
-         * task that already has a pending wake-up (e.g. the student negotiates "actually,
-         * make it 20 minutes" mid-break) replaces the existing alarm rather than stacking a
-         * second one, so only the most recently negotiated break length ever takes effect.
-         */
-        fun scheduleResume(context: Context, taskId: String, minutes: Int) {
-            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(context, InterventionShortBreakAlarmReceiver::class.java).apply {
-                putExtra(EXTRA_TASK_ID, taskId)
-            }
-            val pi = PendingIntent.getBroadcast(
-                context, requestCode(taskId), intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val delayMillis = minutes.coerceAtLeast(1) * 60_000L
-            am.setExactAndAllowWhileIdle(
-                AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + delayMillis,
-                pi
-            )
-            Log.d(TAG, "Short-break resume alarm set for $taskId in ${minutes}min")
-        }
-
-        /** Cancels a pending resume — for the (currently unused, but cheap to provide) case
-         *  of a caller wanting to cancel a scheduled wake-up outright rather than reschedule
-         *  it, e.g. if the task is abandoned entirely before the break ends. */
-        fun cancel(context: Context, taskId: String) {
-            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val intent = Intent(context, InterventionShortBreakAlarmReceiver::class.java)
-            val pi = PendingIntent.getBroadcast(
-                context, requestCode(taskId), intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            am.cancel(pi)
-        }
-
-        private fun requestCode(taskId: String): Int =
-            REQUEST_CODE_BASE + (taskId.hashCode() % 10_000)
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionSideEffects.kt =====
-package com.checkmate.service
-
-import android.content.Context
-import com.checkmate.planner.intervention.ExecutionOutcome
-import com.checkmate.planner.intervention.InterventionGuardianBridge
-import com.checkmate.planner.intervention.PermittedAction
-import com.checkmate.planner.model.StudyTask
-
-/**
- * Fixes two gaps flagged in [com.checkmate.planner.intervention.ActionExecutor]'s own
- * comments: `RequestGuardian` resolving the transaction without ever notifying anyone, and
- * `ShortBreak`'s negotiated `minutes` being discarded right after validation with nothing
- * ever scheduled to wake the task back up.
- *
- * Both [InterventionActionReceiver] and NegotiationViewModel observe a freshly-resolved
- * [ExecutionOutcome] with a Context on hand — this is the one place that shared handling
- * lives, rather than being duplicated at each call site. [InterventionTriggerWorker] does
- * NOT use this: it lives in `modules:planner`, which cannot reference
- * [InterventionShortBreakAlarmReceiver] (an `app`-layer class) without its own bridge, and
- * — unlike the two `app`-layer call sites — its `decideAndExecute` call never receives an
- * `llmPrompt`, so its deterministic-only fallback can in practice never produce
- * `RequestGuardian` or `ShortBreak` in the first place (see its own doc comment).
- */
-object InterventionSideEffects {
-
-    fun handle(
-        context: Context,
-        task: StudyTask,
-        transactionId: String,
-        executionOutcome: ExecutionOutcome
-    ) {
-        if (executionOutcome is ExecutionOutcome.RequiresGuardianEscalation) {
-            InterventionGuardianBridge.gateway?.notifyGuardianRequested(context, task, transactionId)
-        }
-
-        val action = when (executionOutcome) {
-            is ExecutionOutcome.Applied -> executionOutcome.action
-            is ExecutionOutcome.NoOpAlreadyApplied -> executionOutcome.action
-            else -> null
-        }
-        if (action is PermittedAction.ShortBreak) {
-            InterventionShortBreakAlarmReceiver.scheduleResume(context, action.taskId, action.minutes)
-        }
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionActionReceiver.kt =====
-package com.checkmate.service
-
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.util.Log
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.ActionExecutor
-import com.checkmate.planner.intervention.DecisionOutcome
-import com.checkmate.planner.intervention.EscrowExtendResult
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.planner.intervention.InterventionDecisionMaker
-import com.checkmate.planner.intervention.OutcomeLedgerWriter
-import com.checkmate.planner.intervention.PlanStoreTaskMutator
-import com.checkmate.planner.intervention.TaskEscrow
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-
-/**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16), amended in Step 12 (§22)
- * to wire the Outcome Ledger through both handlers' [TaskEscrow] instances.
- *
- * Handles the "Start" and "Snooze 5 min" notification actions built by [InterventionNotifier].
- * "Talk to Checkmate" is not handled here — it's a plain [android.app.PendingIntent.getActivity]
- * straight to MainActivity (see [InterventionNotifier]), since it has nothing to resolve on
- * its own yet; Step 10 (STT/TTS) is what will eventually turn that tap into a real
- * negotiation.
- *
- * BroadcastReceiver.onReceive is synchronous and Room/TaskEscrow are suspend APIs, so this
- * follows the standard goAsync() + coroutine pattern (a PendingResult is held open until the
- * coroutine finishes) rather than InterventionReconciliation's fire-and-forget module-scope
- * launch — a receiver's process can be killed as soon as onReceive returns unless goAsync()
- * says otherwise, which fire-and-forget alone doesn't guarantee.
- */
-class InterventionActionReceiver : BroadcastReceiver() {
-
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    override fun onReceive(context: Context, intent: Intent) {
-        val transactionId = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID) ?: return
-        val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID) ?: return
-        val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
-        val action = intent.action
-        val appContext = context.applicationContext
-
-        InterventionNotifier.cancel(appContext, transactionId)
-
-        val pendingResult = goAsync()
-        scope.launch {
-            try {
-                when (action) {
-                    InterventionNotifier.ACTION_START -> handleStart(appContext, transactionId, taskId, lateMinutes)
-                    InterventionNotifier.ACTION_SNOOZE -> handleSnooze(appContext, transactionId, taskId, lateMinutes)
-                    else -> Log.w(TAG, "Unrecognized intervention action: $action")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed handling $action for $transactionId", e)
-            } finally {
-                pendingResult.finish()
-            }
-        }
-    }
-
-    /**
-     * Student tapped "Start". Resolves through the same deterministic STRICT_REMINDER ->
-     * START_TASK -> PolicyValidator -> ActionExecutor path the no-gateway fallback already
-     * uses (Blueprint §14/§25 principle 2 — the LLM has no execution path yet regardless of
-     * how the student got here) rather than mutating PlanStore directly, so there is exactly
-     * one place ("what happens when we decide to start this task") for both the seen and
-     * unseen paths to share.
-     */
-    private suspend fun handleStart(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val task = PlanStore.todayTasks.value.find { it.id == taskId }
-        if (task == null) {
-            Log.w(TAG, "Start tapped for $transactionId but task $taskId no longer exists")
-            return
-        }
-        val db = InterventionDatabase.getInstance(context)
-        val dao = db.interventionTransactionDao()
-        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-        val escrow = TaskEscrow(dao, ledgerWriter)
-        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        val decision = decisionMaker.decideAndExecute(
-            transactionId = transactionId,
-            task = task,
-            lateMinutes = lateMinutes
-        )
-        // Currently unreachable in practice — decideAndExecute is never given an llmPrompt
-        // here, so its deterministic fallback always resolves to START_TASK, never
-        // RequestGuardian/ShortBreak. Checked anyway so this handler doesn't quietly need
-        // updating the day an llmPrompt does get threaded through the "Start" button too —
-        // see InterventionSideEffects' own doc.
-        if (decision is DecisionOutcome.Executed) {
-            InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
-        }
-        Log.d(TAG, "Start handled for $transactionId")
-    }
-
-    /**
-     * Student tapped "Snooze 5 min". Extends the live escrow (see [TaskEscrow.extend]'s doc
-     * for why this doesn't touch currentState) and schedules a one-shot re-notification —
-     * does NOT re-run [com.checkmate.planner.intervention.TriggerEvaluator] or re-acquire
-     * escrow, since the transaction this belongs to is still live and already owns the task.
-     */
-    private suspend fun handleSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val db = InterventionDatabase.getInstance(context)
-        val dao = db.interventionTransactionDao()
-        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-        val escrow = TaskEscrow(dao, ledgerWriter)
-        val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
-        if (result !is EscrowExtendResult.Extended) {
-            Log.w(TAG, "Snooze for $transactionId did not extend (state: $result) — not rescheduling")
-            return
-        }
-        InterventionSnoozeAlarmReceiver.scheduleRenotify(context, transactionId, taskId, lateMinutes)
-        Log.d(TAG, "Snoozed $transactionId until ${result.newExpiresAt}")
-    }
-
-    companion object {
-        private const val TAG = "InterventionActionRx"
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
-package com.checkmate.ui.negotiation
-
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.stt.CheckmateSTT
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.ActionExecutor
-import com.checkmate.planner.intervention.ConversationalOutcome
-import com.checkmate.planner.intervention.DecisionOutcome
-import com.checkmate.planner.intervention.EscrowExtendResult
-import com.checkmate.planner.intervention.ExecutionOutcome
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.planner.intervention.InterventionDecisionMaker
-import com.checkmate.planner.intervention.InterventionFallback
-import com.checkmate.planner.intervention.OutcomeLedgerWriter
-import com.checkmate.planner.intervention.PermittedAction
-import com.checkmate.planner.intervention.PlanStoreTaskMutator
-import com.checkmate.planner.intervention.TaskEscrow
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.psyche.intervention.ContextBuilder
-import com.checkmate.psyche.intervention.InterventionContext
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.InterventionSideEffects
-import com.checkmate.service.InterventionSnoozeAlarmReceiver
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-
-data class NegotiationMessage(val role: String, val content: String)
-
-enum class NegotiationResolution {
-    NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING,
-    // Step 11: any conversational decision other than STARTED — REDUCE_DURATION,
-    // RESCHEDULE_TASK, TAKE_SHORT_BREAK, KEEP_PLAN, or REQUEST_GUARDIAN all land here.
-    // The negotiation screen doesn't need to distinguish between them to close itself —
-    // the assistant's last chat bubble already says what happened in plain language.
-    PLAN_ADJUSTED
-}
-
-data class NegotiationUiState(
-    val loading: Boolean = true,
-    val task: StudyTask? = null,
-    val context: InterventionContext? = null,
-    val messages: List<NegotiationMessage> = emptyList(),
-    val isSending: Boolean = false,
-    val isListening: Boolean = false,
-    val sttAvailable: Boolean = true,
-    val sttError: String? = null,
-    val inputText: String = "",
-    val resolution: NegotiationResolution = NegotiationResolution.NONE
+@Entity(tableName = "outcome_ledger_entries")
+@TypeConverters(InterventionConverters::class, OutcomeLedgerConverters::class)
+data class OutcomeLedgerEntry(
+    @PrimaryKey
+    val transactionId: String,
+    val taskId: String,
+    val triggerType: InterventionTriggerType,
+    val terminalState: InterventionState,
+    val provenance: OutcomeProvenance,
+    val attemptCount: Int,
+    val resolvedAt: Long,
+    val outcome: String? = null,
+    val failureReason: String? = null
 )
 
 /**
- * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §8-11, §16's
- * "Talk to Checkmate"), amended in Step 12 (§22) to wire the Outcome Ledger through every
- * [TaskEscrow] this ViewModel constructs.
- *
- * This is what a tap on "Talk to Checkmate" (or the notification body) opens into.
- *
- * STEP 11 UPDATE: the scope boundary this class's doc used to describe — "nothing parses
- * what the LLM says into an executable decision, because that parser doesn't exist yet" —
- * no longer holds. [send] now runs every reply through
- * [InterventionDecisionMaker.attemptConversationalTurn], which parses the raw LLM response
- * via [com.checkmate.planner.intervention.LlmIntentParser] and, for a genuinely decisive
- * intent, validates it through PolicyValidator and applies it through ActionExecutor — the
- * exact same pipeline [onStart] already used for the notification's own button. Most turns
- * still don't execute anything (a clarifying question, small talk, a rejected suggestion) —
- * see [InterventionDecisionMaker.attemptConversationalTurn]'s own doc for why those
- * deliberately leave the transaction open rather than resolving it. [onStart]/[onSnooze]/
- * [onDismiss] remain the three buttons that resolve things unconditionally, unrelated to
- * whatever the conversation is doing.
+ * Why a transaction ended up where it did — a layer above [InterventionState] itself.
+ * Six of these (everything but NETWORK_FALLBACK/LLM_INVALID) are 1:1 derivable from the
+ * terminal [InterventionState] alone (see [OutcomeProvenanceDerivation]). The remaining two
+ * exist because [InterventionDecisionMaker.decideAndExecute]'s fallback path resolves
+ * *identically* to a genuine LLM-negotiated success at [TaskEscrow]'s level — both commit
+ * as COMPLETED — so provenance for those two is corrected via a follow-up
+ * [TaskEscrow.overrideProvenance] call once decideAndExecute knows `usedFallback` was true,
+ * rather than ever being read off `currentState` (see that enum's own doc: NETWORK_FALLBACK
+ * and LLM_INVALID are declared states that no production code actually transitions a
+ * transaction into).
  */
-class NegotiationViewModel : ViewModel() {
+enum class OutcomeProvenance {
+    /** Terminal state was COMPLETED and nothing overrode it — a genuine, decisive
+     *  resolution (LLM-negotiated or otherwise), not a fallback. */
+    SUCCESS,
+    USER_ABORTED,
+    /** Declared for completeness alongside [InterventionState.USER_IGNORED] — not
+     *  currently reachable, since nothing in production distinguishes "ignored" from
+     *  "timed out" today; both resolve via TTL_EXPIRED. See that state's own doc. */
+    USER_IGNORED,
+    TTL_EXPIRED,
+    EXECUTION_FAILED,
+    POLICY_REJECTED,
+    /** COMPLETED, but no LLM was ever attempted, or [InterventionFallback.attemptLlm]
+     *  produced nothing within budget (timeout/blank/gateway failure) — the deterministic
+     *  STRICT_REMINDER fallback ran instead. */
+    NETWORK_FALLBACK,
+    /** COMPLETED, but the LLM *did* respond and [InterventionDecisionMaker] fell back
+     *  anyway because [LlmIntentParser] couldn't make sense of it. */
+    LLM_INVALID
+}
 
-    private val _state = MutableStateFlow(NegotiationUiState())
-    val state: StateFlow<NegotiationUiState> = _state.asStateFlow()
-
-    private var stt: CheckmateSTT? = null
-    private var initialized = false
-
-    // Step 11: send() needs this to call attemptConversationalTurn, and previously nothing
-    // retained it after init() beyond the local scope of the initial DB read.
-    private var currentTransactionId: String? = null
-
-    /** Idempotent on purpose — Compose may recompose/re-enter this call across
-     *  configuration changes; only the first call for this ViewModel instance should do
-     *  the DB read + opening TTS utterance. */
-    fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        if (initialized) return
-        initialized = true
-        currentTransactionId = transactionId
-
-        val sttInstance = CheckmateSTT(context.applicationContext)
-        stt = sttInstance
-        _state.update { it.copy(sttAvailable = sttInstance.isAvailable()) }
-
-        viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val transaction = dao.getById(transactionId)
-            if (transaction == null || transaction.currentState.isTerminal) {
-                _state.update { it.copy(loading = false, resolution = NegotiationResolution.ALREADY_RESOLVED) }
-                return@launch
-            }
-
-            val task = PlanStore.todayTasks.value.find { it.id == taskId }
-            if (task == null) {
-                _state.update { it.copy(loading = false, resolution = NegotiationResolution.TASK_MISSING) }
-                return@launch
-            }
-
-            // Same best-effort posture InterventionNotifier already uses around
-            // ContextBuilder.build — a missing behavioral summary shouldn't block the
-            // conversation from opening at all.
-            val ctx = runCatching { ContextBuilder.build(task, lateMinutes) }.getOrNull()
-
-            // The opening line is the exact same deterministic STRICT_REMINDER speech the
-            // no-gateway fallback (and the notification's "Start" action) would use — this
-            // conversation is layered on top of that reality, not a different story.
-            val opening = InterventionFallback.strictReminderIntent(task, lateMinutes).speech
-
-            _state.update {
-                it.copy(
-                    loading = false,
-                    task = task,
-                    context = ctx,
-                    messages = listOf(NegotiationMessage("assistant", opening))
-                )
-            }
-            CheckmateTTS.speak(context, opening)
-
-            // Runs for the lifetime of this ViewModel — a final transcript from voice input
-            // becomes a sent message through exactly the same path as the text field's send
-            // button (see the private send() overload below).
-            launch {
-                sttInstance.state.collect { s ->
-                    _state.update { it.copy(isListening = s.isListening, sttError = s.error) }
-                    val finalText = s.finalText
-                    if (!finalText.isNullOrBlank()) {
-                        sttInstance.consumeFinalText()
-                        send(context, finalText)
-                    }
-                }
-            }
+/**
+ * Derives [OutcomeProvenance] from an already-terminal [InterventionState]. Pure and
+ * synchronous on purpose (see [OutcomeLedgerTest]) — this is the "six of eight categories
+ * are fully derivable from terminal state, attempt count, and failure reason text" mapping;
+ * `attemptCount`/`failureReason` aren't consulted by the mapping itself today (the terminal
+ * state alone is unambiguous for all eight), but stay as parameters/columns because a future
+ * refinement (e.g. splitting SUCCESS by attemptCount) shouldn't need a new call site.
+ */
+object OutcomeProvenanceDerivation {
+    fun derive(terminalState: InterventionState, @Suppress("UNUSED_PARAMETER") failureReason: String? = null): OutcomeProvenance {
+        require(terminalState.isTerminal) {
+            "OutcomeProvenanceDerivation.derive requires a terminal state, got $terminalState"
+        }
+        return when (terminalState) {
+            InterventionState.COMPLETED -> OutcomeProvenance.SUCCESS
+            InterventionState.USER_ABORTED -> OutcomeProvenance.USER_ABORTED
+            InterventionState.USER_IGNORED -> OutcomeProvenance.USER_IGNORED
+            InterventionState.TTL_EXPIRED -> OutcomeProvenance.TTL_EXPIRED
+            InterventionState.EXECUTION_FAILED -> OutcomeProvenance.EXECUTION_FAILED
+            InterventionState.POLICY_REJECTED -> OutcomeProvenance.POLICY_REJECTED
+            InterventionState.NETWORK_FALLBACK -> OutcomeProvenance.NETWORK_FALLBACK
+            InterventionState.LLM_INVALID -> OutcomeProvenance.LLM_INVALID
+            else -> error("unreachable — $terminalState is terminal but has no provenance mapping")
         }
     }
+}
 
-    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+@Dao
+interface OutcomeLedgerDao {
 
-    fun startListening() {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.startListening()
-    }
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entry: OutcomeLedgerEntry)
 
-    fun stopListening() {
-        stt?.stopListening()
-    }
+    /** Used by [TaskEscrow.overrideProvenance] to correct NETWORK_FALLBACK/LLM_INVALID
+     *  after the baseline SUCCESS row has already been written — see [OutcomeProvenance]'s
+     *  own doc. A no-op if [transactionId] has no ledger row yet (e.g. ledgerWriter was
+     *  null when the transaction resolved). */
+    @Query("UPDATE outcome_ledger_entries SET provenance = :provenance WHERE transactionId = :transactionId")
+    suspend fun updateProvenance(transactionId: String, provenance: OutcomeProvenance)
 
-    /** Text-field send button entry point. */
-    fun send(context: Context) {
-        val text = _state.value.inputText.trim()
-        if (text.isBlank()) return
-        _state.update { it.copy(inputText = "") }
-        send(context, text)
-    }
+    @Query("SELECT * FROM outcome_ledger_entries WHERE transactionId = :transactionId")
+    suspend fun getByTransactionId(transactionId: String): OutcomeLedgerEntry?
 
-    /**
-     * Shared entry point for both the text field and a completed voice transcript.
-     *
-     * Step 11: this now asks the LLM for a structured intent (not just conversational
-     * text), runs the raw response through [InterventionDecisionMaker.attemptConversationalTurn],
-     * and reacts to whichever [ConversationalOutcome] comes back. The LLM call itself still
-     * goes through [InterventionFallback.attemptLlm] directly (rather than letting
-     * attemptConversationalTurn call it) so this function keeps ownership of the timeout
-     * budget and the raw string, exactly as before — attemptConversationalTurn only takes
-     * over from "here's what the model said" onward.
-     */
-    private fun send(context: Context, text: String) {
-        if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
-        val task = _state.value.task ?: return
-        val transactionId = currentTransactionId ?: return
-        val ctx = _state.value.context
+    @Query("SELECT * FROM outcome_ledger_entries ORDER BY resolvedAt DESC LIMIT :limit")
+    suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry>
 
-        _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
+    /** Step 14 (Blueprint §26 "Baseline intervention statistics"): full scan for
+     *  [OutcomeLedgerStats.compute]. Unbounded is fine at this app's expected volume — at
+     *  most a handful of intervention resolutions per student per day, so even a year of
+     *  history is a few thousand rows, not a table [getRecent]'s LIMIT needs to guard here. */
+    @Query("SELECT * FROM outcome_ledger_entries")
+    suspend fun getAll(): List<OutcomeLedgerEntry>
+}
 
-        viewModelScope.launch {
-            val systemPrompt = buildSystemPrompt(task, ctx)
-            val history = buildHistoryForLlm()
-            // A longer budget than InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS (3s) on
-            // purpose: that 3s default is sized for a silent background decision the
-            // student never sees waiting happen (§14/§18). This is the opposite case — the
-            // student is watching an active screen and knows a reply is coming, so it's
-            // worth waiting longer for a real answer before falling back.
-            val raw = InterventionFallback.attemptLlm(
-                prompt = history,
-                systemPrompt = systemPrompt,
-                timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
+object OutcomeLedgerConverters {
+    @TypeConverter
+    fun fromProvenance(provenance: OutcomeProvenance): String = provenance.name
+
+    @TypeConverter
+    fun toProvenance(value: String): OutcomeProvenance = OutcomeProvenance.valueOf(value)
+}
+
+/**
+ * Thin wrapper [TaskEscrow] holds an optional reference to — keeps TaskEscrow's own code
+ * talking in terms of "record this transaction" / "override this provenance" rather than
+ * reaching into DAO/derivation details itself. Optional and defaulted to null everywhere
+ * it's threaded through (see [TaskEscrow]'s constructor doc) so this is purely additive:
+ * every existing single-arg `TaskEscrow(dao)` call site — 15+ of them, 22 in
+ * TaskEscrowTest.kt alone — keeps compiling and behaving exactly as before, just without a
+ * ledger.
+ */
+class OutcomeLedgerWriter(private val dao: OutcomeLedgerDao) {
+
+    suspend fun record(transaction: InterventionTransaction, now: Long = System.currentTimeMillis()) {
+        val provenance = OutcomeProvenanceDerivation.derive(transaction.currentState, transaction.failureReason)
+        dao.upsert(
+            OutcomeLedgerEntry(
+                transactionId = transaction.transactionId,
+                taskId = transaction.taskId,
+                triggerType = transaction.triggerType,
+                terminalState = transaction.currentState,
+                provenance = provenance,
+                attemptCount = transaction.attemptCount,
+                resolvedAt = now,
+                outcome = transaction.outcome,
+                failureReason = transaction.failureReason
             )
-
-            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
-            when (val outcome = decisionMaker.attemptConversationalTurn(transactionId, task, raw)) {
-                ConversationalOutcome.LlmUnavailable ->
-                    reply(context, "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below.")
-
-                ConversationalOutcome.UnparseableResponse ->
-                    reply(context, "Sorry, I didn't quite catch that — could you say it a different way?")
-
-                is ConversationalOutcome.Continue ->
-                    reply(context, outcome.speech)
-
-                is ConversationalOutcome.Rejected ->
-                    reply(context, outcome.speech)
-
-                is ConversationalOutcome.Decided -> {
-                    InterventionNotifier.cancel(context.applicationContext, transactionId)
-                    // The only production path that can actually reach RequestGuardian or
-                    // ShortBreak — see InterventionSideEffects' own doc for why onStart()
-                    // and InterventionActionReceiver.handleStart() can't in practice today.
-                    InterventionSideEffects.handle(context, task, transactionId, outcome.executionOutcome)
-                    _state.update {
-                        it.copy(
-                            messages = it.messages + NegotiationMessage("assistant", outcome.speech),
-                            isSending = false,
-                            resolution = resolutionFor(outcome.executionOutcome)
-                        )
-                    }
-                    CheckmateTTS.speak(context, outcome.speech)
-                }
-            }
-        }
+        )
     }
 
-    private fun reply(context: Context, text: String) {
-        _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", text), isSending = false) }
-        CheckmateTTS.speak(context, text)
+    suspend fun overrideProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        dao.updateProvenance(transactionId, provenance)
     }
+}
 
-    /** Maps a resolved conversational turn onto the same [NegotiationResolution] the
-     *  button-driven paths use, so the screen's existing "show a label, then close" flow
-     *  (see NegotiationScreen's LaunchedEffect on state.resolution) needs no special case
-     *  for how the resolution was reached. */
-    private fun resolutionFor(outcome: ExecutionOutcome): NegotiationResolution = when (outcome) {
-        is ExecutionOutcome.Applied ->
-            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
-        is ExecutionOutcome.NoOpAlreadyApplied ->
-            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
-        is ExecutionOutcome.NotApplicable -> NegotiationResolution.PLAN_ADJUSTED
-        ExecutionOutcome.RequiresGuardianEscalation -> NegotiationResolution.PLAN_ADJUSTED
-        is ExecutionOutcome.Failed -> NegotiationResolution.PLAN_ADJUSTED
-        ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound -> NegotiationResolution.ALREADY_RESOLVED
-    }
 
-    /**
-     * Student tapped "Start". Resolves through the identical deterministic
-     * STRICT_REMINDER -> START_TASK -> PolicyValidator -> ActionExecutor path
-     * [InterventionActionReceiver.handleStart] already uses for the notification's own
-     * "Start" button — there is exactly one place "what happens when we decide to start
-     * this task" lives, regardless of whether the student tapped a notification action or
-     * talked their way here.
-     */
-    fun onStart(context: Context, transactionId: String, lateMinutes: Int) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        val task = _state.value.task ?: return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
-            val decision = decisionMaker.decideAndExecute(
-                transactionId = transactionId,
-                task = task,
-                lateMinutes = lateMinutes
-            )
-            if (decision is DecisionOutcome.Executed) {
-                InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
-            }
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
-        }
-    }
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
+package com.checkmate.planner.intervention
 
-    /** Same TaskEscrow.extend() + re-notify alarm as
-     *  [InterventionActionReceiver.handleSnooze] — see that method's doc for why this
-     *  doesn't re-run TriggerEvaluator or re-acquire escrow. */
-    fun onSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val db = InterventionDatabase.getInstance(context)
-            val dao = db.interventionTransactionDao()
-            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-            val escrow = TaskEscrow(dao, ledgerWriter)
-            val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
-            if (result is EscrowExtendResult.Extended) {
-                InterventionSnoozeAlarmReceiver.scheduleRenotify(
-                    context.applicationContext, transactionId, taskId, lateMinutes
-                )
-            }
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.SNOOZED) }
-        }
-    }
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
-    /** USER_ABORTED (§3) — the student declined via the conversation screen rather than
-     *  ignoring the notification (USER_IGNORED) or running out the TTL. */
-    fun onDismiss(context: Context, transactionId: String) {
-        if (_state.value.resolution != NegotiationResolution.NONE) return
-        stt?.stopListening()
-        viewModelScope.launch {
-            val db = InterventionDatabase.getInstance(context)
-            val dao = db.interventionTransactionDao()
-            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-            val escrow = TaskEscrow(dao, ledgerWriter)
-            escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
-            InterventionNotifier.cancel(context.applicationContext, transactionId)
-            _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
-        }
-    }
+/**
+ * Proactive Execution Engine — Step 3 (Blueprint Part One, §4), amended in Step 12 (§22,
+ * §25 principle 6) to add the Outcome Ledger table.
+ *
+ * Standalone singleton, same shape as a typical Room setup — deliberately not wired into
+ * CheckmateApp.onCreate() yet. Nothing calls InterventionDatabase.getInstance() until the
+ * Task Escrow (step 4) and ActionExecutor (step 5) exist to actually create/update rows,
+ * so wiring it into app startup now would be speculative.
+ *
+ * Step 12: version bumped 1 -> 2 to add [OutcomeLedgerEntry]. Originally shipped with
+ * `fallbackToDestructiveMigration()` as a deliberate stopgap (safe pre-pilot, since no
+ * student data existed anywhere yet — see that method's own since-removed doc). Now
+ * replaced with a real [MIGRATION_1_2] before any pilot student's device can carry
+ * `intervention_transactions` rows a destructive wipe would actually lose. The migration
+ * only ever needs to ADD `outcome_ledger_entries` — v1's `intervention_transactions` table
+ * is untouched by this bump, so there's nothing to alter or backfill.
+ *
+ * `fallbackToDestructiveMigrationOnDowngrade()` is kept (not the blanket
+ * `fallbackToDestructiveMigration()`) — a *downgrade* only happens by someone reinstalling
+ * an older build over a newer one (e.g. switching branches on a dev device), which isn't a
+ * scenario a real migration path can meaningfully support, whereas every forward *upgrade*
+ * now has to go through [MIGRATION_1_2] or the app won't compile against a mismatched
+ * version — Room throws IllegalStateException on an unhandled upgrade rather than silently
+ * wiping data, which is exactly the safety property destructive-fallback gave up.
+ */
+@Database(
+    entities = [InterventionTransaction::class, OutcomeLedgerEntry::class],
+    version = 2,
+    exportSchema = false
+)
+abstract class InterventionDatabase : RoomDatabase() {
 
-    private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
-        val db = InterventionDatabase.getInstance(context)
-        val dao = db.interventionTransactionDao()
-        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-        val escrow = TaskEscrow(dao, ledgerWriter)
-        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-        return escrow to InterventionDecisionMaker(escrow, executor)
-    }
-
-    private fun buildHistoryForLlm(): String {
-        val msgs = _state.value.messages.takeLast(12)
-        return msgs.joinToString("\n") { m ->
-            if (m.role == "user") "Student: ${m.content}" else "Mentor: ${m.content}"
-        }
-    }
-
-    /**
-     * Step 11: this now asks for a strict JSON [com.checkmate.planner.intervention.LlmIntent]
-     * instead of free conversational text — "speech" carries what previously was the whole
-     * response. The intentType/parameters vocabulary listed here must stay in lockstep with
-     * [com.checkmate.planner.intervention.InterventionIntentType] and what
-     * [com.checkmate.planner.intervention.PolicyValidator] actually reads out of
-     * `parameters` — if a new intent type or parameter key is ever added there, it needs to
-     * be documented in this prompt too, or the model will never produce it.
-     */
-    private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
-        appendLine("You are Checkmate's AI Mentor, negotiating with a student about ${task.subject} — ${task.topic}")
-        appendLine("(current planned duration: ${task.durationMinutes} minutes), which is late or off-plan right now.")
-        appendLine()
-        appendLine("Respond with ONLY a single JSON object — no markdown code fences, no text before or after it —")
-        appendLine("in exactly this shape:")
-        appendLine("""{"speech": "...", "intentType": "...", "targetTaskId": "${task.id}", "parameters": {}}""")
-        appendLine()
-        appendLine("\"speech\" is what you actually say to the student out loud: direct, warm, brief (1-3 sentences),")
-        appendLine("a spoken reply, not an essay. Never claim you've already changed the plan in \"speech\" — describe")
-        appendLine("what you're recommending. A separate policy layer decides what's actually permitted (for example,")
-        appendLine("it will reject breaks longer than 30 minutes), and only that layer's decision, not your words,")
-        appendLine("changes anything.")
-        appendLine()
-        appendLine("\"intentType\" must be exactly one of:")
-        appendLine("  START_TASK            student is ready to begin right now")
-        appendLine("  REDUCE_DURATION       wants a shorter session — parameters: {\"newDurationMinutes\": \"<int>\"}")
-        appendLine("  RESCHEDULE_TASK       wants to move the start time — parameters: {\"newScheduledStartTime\": \"HH:mm\"}")
-        appendLine("  TAKE_SHORT_BREAK      needs a short break first — parameters: {\"minutes\": \"<int, 30 max>\"}")
-        appendLine("  KEEP_PLAN             no change needed, the plan as scheduled stands")
-        appendLine("  REQUEST_CLARIFICATION you need more information before recommending anything")
-        appendLine("  NO_ACTION             just talking/acknowledging, nothing to decide yet")
-        appendLine("  REQUEST_GUARDIAN      this needs a real person (guardian), not you")
-        appendLine()
-        appendLine("Omit \"parameters\" (or leave it {}) for any intentType that doesn't list one above.")
-        if (ctx != null) {
-            appendLine()
-            appendLine(ctx.toPromptText())
-        }
-    }.trim()
-
-    override fun onCleared() {
-        super.onCleared()
-        stt?.stopListening()
-    }
+    abstract fun interventionTransactionDao(): InterventionTransactionDao
+    abstract fun outcomeLedgerDao(): OutcomeLedgerDao
 
     companion object {
-        private const val CONVERSATION_LLM_TIMEOUT_MILLIS = 12_000L
+        @Volatile
+        private var INSTANCE: InterventionDatabase? = null
+
+        /**
+         * Column types/converters mirror [OutcomeLedgerEntry] and [OutcomeLedgerConverters]/
+         * [InterventionConverters] exactly: `triggerType`/`terminalState`/`provenance` are
+         * all stored as the enum's `.name` (TEXT), same convention [InterventionTransaction]'s
+         * own `intervention_transactions` table already uses for `currentState`/`triggerType`
+         * — nothing here introduces a new storage convention, just applies the existing one
+         * to a second table.
+         */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `outcome_ledger_entries` (
+                        `transactionId` TEXT NOT NULL,
+                        `taskId` TEXT NOT NULL,
+                        `triggerType` TEXT NOT NULL,
+                        `terminalState` TEXT NOT NULL,
+                        `provenance` TEXT NOT NULL,
+                        `attemptCount` INTEGER NOT NULL,
+                        `resolvedAt` INTEGER NOT NULL,
+                        `outcome` TEXT,
+                        `failureReason` TEXT,
+                        PRIMARY KEY(`transactionId`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        fun getInstance(context: Context): InterventionDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    InterventionDatabase::class.java,
+                    "checkmate_intervention.db"
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    .fallbackToDestructiveMigrationOnDowngrade()
+                    .build().also { INSTANCE = it }
+            }
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
-package com.checkmate
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/OutcomeLedgerStats.kt =====
+package com.checkmate.planner.intervention
 
-import android.app.Application
-import android.content.Context
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CheckmateState
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.intervention.InterventionGuardianBridge
-import com.checkmate.planner.intervention.InterventionGuardianGateway
-import com.checkmate.planner.intervention.InterventionNotificationBridge
-import com.checkmate.planner.intervention.InterventionReconciliation
-import com.checkmate.planner.intervention.InterventionTriggerScheduler
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.DistractionListener
-import com.checkmate.workmode.ScrollGuard
-import com.checkmate.workmode.UninstallAlertListener
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeScheduleReceiver
+/**
+ * Proactive Execution Engine — Step 14 (Blueprint §26 "Baseline intervention statistics"),
+ * built on top of Step 12's Outcome Ledger.
+ *
+ * "Learning comes after measurement" (§25 principle 7) — this is the measurement half only.
+ * Nothing here feeds back into trigger sensitivity, policy, or strategy selection; that's
+ * Step 15 (Adaptive strategy learning), deliberately sequenced after this. [InterventionStats]
+ * is a plain read model, computed fresh on demand from [OutcomeLedgerDao.getAll] rather than
+ * maintained incrementally — at this app's expected volume (a handful of intervention
+ * resolutions per student per day) a full scan is cheap enough that there's no reason to take
+ * on the complexity of a running aggregate that could drift out of sync with the ledger.
+ *
+ * Two derived rates matter more than the rest and get named fields of their own rather than
+ * being left as something a caller has to reconstruct from [byProvenance] each time:
+ *  - [completionRate]: of everything that resolved, how much ended in the student actually
+ *    starting/acting on the task (terminalState == COMPLETED, i.e. provenance SUCCESS,
+ *    NETWORK_FALLBACK, or LLM_INVALID) as opposed to USER_ABORTED / TTL_EXPIRED /
+ *    POLICY_REJECTED / EXECUTION_FAILED.
+ *  - [fallbackRate]: *of those completions*, how many were NETWORK_FALLBACK/LLM_INVALID
+ *    rather than a genuine LLM-negotiated SUCCESS. This one is a more informative signal
+ *    than it might look at first — see [OutcomeProvenance]'s own doc on how it's derived —
+ *    because [InterventionDecisionMaker.decideAndExecute]'s three production callers
+ *    (the notification's own Start button, the negotiation screen's Start button, and the
+ *    TTL-expiry/worker fallback path) never pass an `llmPrompt`, so *every* resolution
+ *    through those three always corrects to NETWORK_FALLBACK. A SUCCESS-provenance
+ *    completion, today, can only mean one thing: the student actually talked to the AI
+ *    Mentor and it resolved decisively. A high [fallbackRate] doesn't mean the LLM is
+ *    failing — it's the more literal "how often is the student just tapping Start instead
+ *    of negotiating."
+ */
+data class InterventionStats(
+    val totalResolved: Int,
+    val completedCount: Int,
+    val completionRate: Double,
+    val fallbackCount: Int,
+    val fallbackRate: Double,
+    val byProvenance: Map<OutcomeProvenance, Int>,
+    val byTriggerType: Map<InterventionTriggerType, Int>
+) {
+    companion object {
+        val EMPTY = InterventionStats(
+            totalResolved = 0,
+            completedCount = 0,
+            completionRate = 0.0,
+            fallbackCount = 0,
+            fallbackRate = 0.0,
+            byProvenance = emptyMap(),
+            byTriggerType = emptyMap()
+        )
+    }
+}
 
-class CheckmateApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        CheckmatePrefs.init(this)
-        CheckmateState.init(this)
-        CheckmateTTS.init(this)
+object OutcomeLedgerStats {
 
-        // Reconcile Work Mode with the hardcoded daily schedule (usual
-        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
-        // Sunday/Wednesday) and re-arm the four daily boundary alarms
-        // (AlarmManager repeating alarms don't survive a reboot, hence also
-        // doing this in BootReceiver). This must run after
-        // CheckmateState.init() above.
-        WorkModeManager.init(this)
-        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
-        GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
-        // worker's KV for the on-demand "usage" command (see worker.js).
-        GuardianNotifier.scheduleUsageReports(this)
-        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
-        // guardian report via WhatsApp + Telegram. Previously never
-        // scheduled anywhere, which is why the weekly report never sent.
-        GuardianNotifier.scheduleWeeklyReport(this)
-        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+    private val FALLBACK_PROVENANCES = setOf(OutcomeProvenance.NETWORK_FALLBACK, OutcomeProvenance.LLM_INVALID)
+    private val COMPLETED_PROVENANCES = FALLBACK_PROVENANCES + OutcomeProvenance.SUCCESS
 
-        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
-        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
-        // where a worker run could find InterventionNotificationBridge.gateway still null
-        // and silently fall back to the deterministic path when a notification was actually
-        // intended. InterventionNotifier is `app`'s implementation — the only module that
-        // can see both Android's NotificationManager and psyche's ContextBuilder at once
-        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
-        InterventionNotificationBridge.gateway = InterventionNotifier
+    /**
+     * [since] restricts to entries with `resolvedAt >= since` (epoch millis) — e.g. "just
+     * today" or "this week" for a guardian-facing summary. Null (the default) computes over
+     * the entire ledger.
+     */
+    suspend fun compute(dao: OutcomeLedgerDao, since: Long? = null): InterventionStats {
+        val all = dao.getAll()
+        val entries = if (since != null) all.filter { it.resolvedAt >= since } else all
+        if (entries.isEmpty()) return InterventionStats.EMPTY
 
-        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
-        // intent always resolved the transaction, but nothing downstream ever notified
-        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
-        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
-        // this just gives the intervention pipeline a way to call it without planner
-        // depending on `app` directly.
-        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
-            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
-                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
-            }
-        }
+        val byProvenance = entries.groupingBy { it.provenance }.eachCount()
+        val byTriggerType = entries.groupingBy { it.triggerType }.eachCount()
 
-        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
-        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
-        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
-        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
-        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
-        // reconciliation call added to BootReceiver below.
-        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
-        InterventionReconciliation.runAtStartup(this)
+        val completedCount = byProvenance.filterKeys { it in COMPLETED_PROVENANCES }.values.sum()
+        val fallbackCount = byProvenance.filterKeys { it in FALLBACK_PROVENANCES }.values.sum()
 
-        // Wire real screenshot capture via MediaProjection into DistractionGuard
-        // (and ScrollGuard, which reuses the same listener/pipeline for its
-        // "scroll" kind — see ScrollGuard.kt)
-        val distractionListener = object : DistractionListener {
-            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                Thread {
-                    val uri = ScreenCaptureManager.capture(context)
-                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
-                }.start()
-                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
-                // the guardian-facing alert above — this is student-facing, not parent-facing.
-                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
-            }
-        }
-        DistractionGuard.listener = distractionListener
-        ScrollGuard.listener = distractionListener
-
-        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
-        // (via :workmode's UninstallGuard) into GuardianNotifier.
-        UninstallGuard.listener = object : UninstallAlertListener {
-            override fun onGuardedScreenBlocked(context: Context, reason: String) {
-                Thread {
-                    GuardianNotifier.notifyUninstallAttempt(context, reason)
-                }.start()
-            }
-        }
+        return InterventionStats(
+            totalResolved = entries.size,
+            completedCount = completedCount,
+            completionRate = completedCount.toDouble() / entries.size,
+            fallbackCount = fallbackCount,
+            fallbackRate = if (completedCount > 0) fallbackCount.toDouble() / completedCount else 0.0,
+            byProvenance = byProvenance,
+            byTriggerType = byTriggerType
+        )
     }
 }
 
 
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/FakeOutcomeLedgerDao.kt =====
+package com.checkmate.planner.intervention
 
-//===== FILE: app/src/main/AndroidManifest.xml =====
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+/**
+ * In-memory stand-in for [OutcomeLedgerDao], same conventions as
+ * [FakeInterventionTransactionDao]: [entriesByTransactionId] is exposed/mutable so tests can
+ * inspect what got written without a getter round-trip, and so two independent
+ * [OutcomeLedgerWriter]/[TaskEscrow] instances can be pointed at the same backing store the
+ * same way TaskEscrowTest's reconciliation tests share a `sharedStore`.
+ */
+class FakeOutcomeLedgerDao(
+    val entriesByTransactionId: MutableMap<String, OutcomeLedgerEntry> = mutableMapOf()
+) : OutcomeLedgerDao {
 
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
-    <uses-permission android:name="android.permission.CALL_SCREENING" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
-        tools:ignore="ProtectedPermissions" />
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
-    <!-- Only needed pre-Android 10: DownloadManager.setDestinationInExternalPublicDir()
-         requires this on API 28 and below. On API 29+ (scoped storage) it's a no-op
-         and is capped with maxSdkVersion so it's never requested at runtime there. -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+    override suspend fun upsert(entry: OutcomeLedgerEntry) {
+        entriesByTransactionId[entry.transactionId] = entry
+    }
 
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    override suspend fun updateProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        val existing = entriesByTransactionId[transactionId] ?: return
+        entriesByTransactionId[transactionId] = existing.copy(provenance = provenance)
+    }
 
-    <queries>
-        <package android:name="com.whatsapp" />
-        <package android:name="com.termux" />
-        <!-- Proactive Execution Engine — Step 10 (Blueprint §16 "Talk to Checkmate"):
-             package-visibility declaration so SpeechRecognizer.isRecognitionAvailable()
-             (CheckmateSTT) can actually see the on-device recognition service on
-             API 30+ (targetSdk 35 here) instead of always reporting unavailable. -->
-        <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-    </queries>
+    override suspend fun getByTransactionId(transactionId: String): OutcomeLedgerEntry? =
+        entriesByTransactionId[transactionId]
 
-    <application
-        android:name="com.checkmate.CheckmateApp"
-        android:allowBackup="true"
-        android:label="@string/app_name"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Checkmate"
-        android:usesCleartextTraffic="true"
-        android:networkSecurityConfig="@xml/network_security_config">
+    override suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry> =
+        entriesByTransactionId.values.sortedByDescending { it.resolvedAt }.take(limit)
 
-        <activity
-            android:name="com.checkmate.MainActivity"
-            android:exported="true"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+    override suspend fun getAll(): List<OutcomeLedgerEntry> =
+        entriesByTransactionId.values.toList()
+}
 
-        <!-- Regular foreground services -->
-        <service android:name="com.checkmate.service.FloatingAttentionService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <!-- mediaProjection type added so Android 14+ allows getMediaProjection() while this service is running -->
-        <service android:name="com.checkmate.service.AttentionCycleService"
-            android:exported="false" android:foregroundServiceType="dataSync|mediaProjection" />
-        <service android:name="com.checkmate.service.ReminderService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.service.WhatsAppReportService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
-        <service android:name="com.checkmate.workmode.WorkModeService"
-            android:exported="false" android:foregroundServiceType="dataSync" />
 
-        <!-- Call screening service -->
-        <service android:name="com.checkmate.callhandler.CheckmateCallScreeningService"
-            android:permission="android.permission.BIND_SCREENING_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.telecom.CallScreeningService" />
-            </intent-filter>
-        </service>
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/OutcomeLedgerStatsTest.kt =====
+package com.checkmate.planner.intervention
 
-        <service
-            android:name="com.checkmate.callhandler.CallAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:foregroundServiceType="dataSync">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/call_accessibility_config" />
-        </service>
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Test
 
-        <service
-            android:name="com.checkmate.automation.AppAutomationService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:foregroundServiceType="dataSync">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
+class OutcomeLedgerStatsTest {
 
-        <service android:name="com.checkmate.automation.WhatsAppNotificationListener"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-            android:exported="true"
-            android:process=":wa_listener">
-            <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
-            </intent-filter>
-        </service>
+    private fun entry(
+        id: String,
+        provenance: OutcomeProvenance,
+        triggerType: InterventionTriggerType = InterventionTriggerType.LATE_START,
+        resolvedAt: Long = 1_000L
+    ) = OutcomeLedgerEntry(
+        transactionId = id,
+        taskId = "task-$id",
+        triggerType = triggerType,
+        terminalState = InterventionState.COMPLETED, // not consulted by stats; provenance is
+        provenance = provenance,
+        attemptCount = 0,
+        resolvedAt = resolvedAt
+    )
 
-        <!-- Device Admin — hides the plain Uninstall button on Checkmate's App Info
-             screen once activated. Activation is a user action from Settings →
-             Security tile (SettingsScreen.kt), not forced at install time. -->
-        <receiver
-            android:name="com.checkmate.admin.CheckmateDeviceAdminReceiver"
-            android:permission="android.permission.BIND_DEVICE_ADMIN"
-            android:exported="true">
-            <meta-data
-                android:name="android.app.device_admin"
-                android:resource="@xml/device_admin" />
-            <intent-filter>
-                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
-            </intent-filter>
-        </receiver>
+    @Test
+    fun `empty ledger returns InterventionStats EMPTY`() = runTest {
+        val dao = FakeOutcomeLedgerDao()
+        assertEquals(InterventionStats.EMPTY, OutcomeLedgerStats.compute(dao))
+    }
 
-        <!-- Reschedules guardian alarms (EOD summary, 30-min usage report,
-             weekly report) after reboot, since AlarmManager repeating
-             alarms don't survive a restart. Also fires a one-time Safe Mode
-             notice to the guardian if relevant. -->
-        <receiver
-            android:name="com.checkmate.BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
+    @Test
+    fun `completionRate counts SUCCESS NETWORK_FALLBACK and LLM_INVALID as completed`() = runTest {
+        val dao = FakeOutcomeLedgerDao(mutableMapOf(
+            "a" to entry("a", OutcomeProvenance.SUCCESS),
+            "b" to entry("b", OutcomeProvenance.NETWORK_FALLBACK),
+            "c" to entry("c", OutcomeProvenance.LLM_INVALID),
+            "d" to entry("d", OutcomeProvenance.USER_ABORTED),
+            "e" to entry("e", OutcomeProvenance.TTL_EXPIRED)
+        ))
 
-        <!-- Fires at the four hardcoded Work Mode schedule boundaries (01:00,
-             05:00, 15:10, 19:00 daily) so the forced block window is
-             reconciled even while the phone is idle with Checkmate's UI
-             closed. Registered here (not :workmode's manifest) to match how
-             every other cross-module component in this app is declared. -->
-        <receiver
-            android:name="com.checkmate.workmode.WorkModeScheduleReceiver"
-            android:exported="false" />
+        val stats = OutcomeLedgerStats.compute(dao)
 
-        <receiver android:name="com.checkmate.service.EodSummaryReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.EOD_SUMMARY" />
-            </intent-filter>
-        </receiver>
+        assertEquals(5, stats.totalResolved)
+        assertEquals(3, stats.completedCount)
+        assertEquals(3.0 / 5.0, stats.completionRate, 0.0001)
+    }
 
-        <!-- Fires every 30 min: pushes app-usage Telegram alert + caches it
-             in the worker's KV for the on-demand "usage" command -->
-        <receiver android:name="com.checkmate.service.UsageReportReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.USAGE_REPORT" />
-            </intent-filter>
-        </receiver>
+    @Test
+    fun `fallbackRate is a fraction of completions, not of all resolutions`() = runTest {
+        val dao = FakeOutcomeLedgerDao(mutableMapOf(
+            "a" to entry("a", OutcomeProvenance.SUCCESS),
+            "b" to entry("b", OutcomeProvenance.NETWORK_FALLBACK),
+            "c" to entry("c", OutcomeProvenance.USER_ABORTED),
+            "d" to entry("d", OutcomeProvenance.USER_ABORTED)
+        ))
 
-        <!-- Fires weekly (Sunday 20:00): builds and delivers PsycheEngine's
-             weekly guardian report via WhatsApp + Telegram. Previously
-             missing entirely — this is the fix for the weekly report never
-             going out. -->
-        <receiver android:name="com.checkmate.service.WeeklyReportReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.checkmate.WEEKLY_REPORT" />
-            </intent-filter>
-        </receiver>
+        val stats = OutcomeLedgerStats.compute(dao)
 
-        <!-- Proactive Execution Engine (step 9, Blueprint §16): handles the "Start" /
-             "Snooze 5 min" actions on InterventionNotifier's heads-up notification.
-             "Talk to Checkmate" goes straight to MainActivity instead (no receiver needed
-             for that one — see InterventionNotifier). As of step 10, MainActivity now
-             actually reads the transaction id it's handed and opens NegotiationScreen. -->
-        <receiver android:name="com.checkmate.service.InterventionActionReceiver"
-            android:exported="false" />
+        // completedCount = 2 (SUCCESS + NETWORK_FALLBACK), fallbackCount = 1
+        assertEquals(2, stats.completedCount)
+        assertEquals(1, stats.fallbackCount)
+        assertEquals(0.5, stats.fallbackRate, 0.0001)
+        // Not 1/4 — fallbackRate is scoped to completions, not all 4 resolutions.
+    }
 
-        <!-- Re-fires InterventionNotifier's prompt 5 minutes after a "Snooze" tap. -->
-        <receiver android:name="com.checkmate.service.InterventionSnoozeAlarmReceiver"
-            android:exported="false" />
+    @Test
+    fun `fallbackRate is zero when there are zero completions, not a division error`() = runTest {
+        val dao = FakeOutcomeLedgerDao(mutableMapOf(
+            "a" to entry("a", OutcomeProvenance.USER_ABORTED),
+            "b" to entry("b", OutcomeProvenance.TTL_EXPIRED)
+        ))
 
-        <!-- Wakes a task back up once a negotiated TAKE_SHORT_BREAK's minutes have elapsed —
-             fixes the gap where a resolved short-break intent paused the task but nothing
-             ever scheduled resuming it. -->
-        <receiver android:name="com.checkmate.service.InterventionShortBreakAlarmReceiver"
-            android:exported="false" />
+        val stats = OutcomeLedgerStats.compute(dao)
 
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="com.checkmate.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
+        assertEquals(0, stats.completedCount)
+        assertEquals(0.0, stats.fallbackRate, 0.0001)
+    }
 
-    </application>
-</manifest>
+    @Test
+    fun `byProvenance and byTriggerType tally correctly`() = runTest {
+        val dao = FakeOutcomeLedgerDao(mutableMapOf(
+            "a" to entry("a", OutcomeProvenance.SUCCESS, InterventionTriggerType.LATE_START),
+            "b" to entry("b", OutcomeProvenance.SUCCESS, InterventionTriggerType.REPEATED_SKIPS),
+            "c" to entry("c", OutcomeProvenance.TTL_EXPIRED, InterventionTriggerType.LATE_START)
+        ))
 
+        val stats = OutcomeLedgerStats.compute(dao)
+
+        assertEquals(2, stats.byProvenance[OutcomeProvenance.SUCCESS])
+        assertEquals(1, stats.byProvenance[OutcomeProvenance.TTL_EXPIRED])
+        assertEquals(2, stats.byTriggerType[InterventionTriggerType.LATE_START])
+        assertEquals(1, stats.byTriggerType[InterventionTriggerType.REPEATED_SKIPS])
+    }
+
+    @Test
+    fun `since filters out entries resolved before the cutoff`() = runTest {
+        val dao = FakeOutcomeLedgerDao(mutableMapOf(
+            "old" to entry("old", OutcomeProvenance.SUCCESS, resolvedAt = 1_000L),
+            "new" to entry("new", OutcomeProvenance.SUCCESS, resolvedAt = 5_000L)
+        ))
+
+        val stats = OutcomeLedgerStats.compute(dao, since = 3_000L)
+
+        assertEquals(1, stats.totalResolved)
+        assertEquals(1, stats.byProvenance[OutcomeProvenance.SUCCESS])
+    }
+}
 
 
