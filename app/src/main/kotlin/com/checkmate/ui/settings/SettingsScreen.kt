@@ -28,6 +28,7 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProfileSyncManager
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
@@ -924,6 +925,7 @@ private fun LlmProviderSettings(context: Context) {
 // other setting/stat on this screen stays exactly as device-local as before.
 @Composable
 private fun TaskSyncSettings() {
+    val context = LocalContext.current
     var syncCode by remember {
         mutableStateOf(CheckmatePrefs.getString("sync_code", "") ?: "")
     }
@@ -959,6 +961,11 @@ private fun TaskSyncSettings() {
                     // real local setup — see pullProfileIfLocalEmpty().
                     if (trimmed.isNotBlank()) {
                         Thread { ProfileSyncManager.pullProfileIfLocalEmpty() }.start()
+                        // Same non-destructive "restore only if this device has nothing
+                        // yet" pairing behavior as the profile pull just above — see
+                        // OutcomeLedgerSyncManager's own doc for why this is a plain
+                        // fire-and-forget call rather than another Thread{}.
+                        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(context)
                     }
                 }) {
                     Icon(

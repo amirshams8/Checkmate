@@ -194,6 +194,13 @@ object GuardianNotifier {
                 Log.d(TAG, "EOD summary sent to guardian via Telegram")
             }.start()
         }
+
+        // Step 12 wiring: piggyback the Outcome Ledger's daily backup push on the same
+        // once-a-day cadence as the EOD summary itself, rather than giving it a separate
+        // alarm — the ledger only grows by a handful of rows a day (see
+        // OutcomeLedgerSyncManager's own doc), so there's no reason for its own schedule.
+        // No-op internally if no sync_code is configured.
+        OutcomeLedgerSyncManager.pushLedger(context)
     }
 
     /**

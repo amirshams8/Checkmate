@@ -13,6 +13,7 @@ import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.workmode.DistractionGuard
@@ -77,6 +78,15 @@ class CheckmateApp : Application() {
         // reconciliation call added to BootReceiver below.
         InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
         InterventionReconciliation.runAtStartup(this)
+
+        // Step 12 wiring: reinstall-recovery restore for the Outcome Ledger, mirroring
+        // the profile pull pattern (ProfileSyncManager.pullProfileIfLocalEmpty) but at
+        // app startup rather than lazily on a specific screen open — there's no single
+        // "ledger screen" whose open would naturally trigger this the way Planner/
+        // ConsultationProfile do for the profile pull. No-op if the local ledger table
+        // already has rows, or if no sync_code is configured — see
+        // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
+        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
         // (and ScrollGuard, which reuses the same listener/pipeline for its
