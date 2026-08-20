@@ -5,6 +5,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.core.AppUsageTracker
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionStats
+import com.checkmate.planner.intervention.OutcomeLedgerStats
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.workmode.WorkModeSchedule
 import kotlinx.coroutines.Dispatchers
@@ -41,7 +44,13 @@ data class StatsState(
     val consistencyMonth:      Map<Int, PlanStore.DayStudyStatus> = emptyMap(),
     // "No tasks in plan == no study": consecutive days (ending yesterday) with nothing
     // planned or nothing completed. 0 means no gap right now.
-    val consecutiveMissedDays: Int                                = 0
+    val consecutiveMissedDays: Int                                = 0,
+    // Step 14 (Blueprint §26 "Baseline intervention statistics"): read model over the
+    // Step 12 Outcome Ledger. Defaults to InterventionStats.EMPTY (totalResolved == 0)
+    // until loadInterventionStats() below actually runs — the screen uses that as the
+    // signal to hide the card entirely rather than show an all-zero one, same posture as
+    // the consecutiveMissedDays warning card already does for its own condition.
+    val interventionStats: InterventionStats = InterventionStats.EMPTY
 )
 
 class StatsViewModel : ViewModel() {
@@ -195,5 +204,26 @@ class StatsViewModel : ViewModel() {
         val usedDuringLockedMillis = ranges.sumOf { (s, e) -> AppUsageTracker.getUsageMillisInRange(context, s, e) }
         val adherence = 1f - (usedDuringLockedMillis.toFloat() / lockedElapsedMillis.toFloat())
         return (adherence.coerceIn(0f, 1f) * 100).roundToInt()
+    }
+
+    /**
+     * Step 14 (Blueprint §26 "Baseline intervention statistics"). Separate load function,
+     * same pattern as [loadAppUsage] just above — needs a Context (for
+     * [InterventionDatabase.getInstance]) that only the Composable has, so it's called from
+     * its own LaunchedEffect in StatsScreen rather than folded into [loadStats]'s init-time
+     * call. Safe to call repeatedly (e.g. on resume), same as loadAppUsage.
+     *
+     * This is purely a read model — see [OutcomeLedgerStats]'s own doc for why "Learning
+     * comes after measurement" (§25 principle 7) means nothing here feeds back into
+     * trigger sensitivity, policy, or strategy selection. That's Step 15, not this.
+     */
+    fun loadInterventionStats(context: Context) {
+        viewModelScope.launch {
+            val stats = withContext(Dispatchers.IO) {
+                val dao = InterventionDatabase.getInstance(context).outcomeLedgerDao()
+                OutcomeLedgerStats.compute(dao)
+            }
+            _state.update { it.copy(interventionStats = stats) }
+        }
     }
 }

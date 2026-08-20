@@ -19,8 +19,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.OutcomeProvenance
 import com.checkmate.ui.theme.*
 import java.util.Calendar
+import kotlin.math.roundToInt
 
 @Composable
 fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewModel()) {
@@ -28,6 +30,8 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
     val context = LocalContext.current
 
     LaunchedEffect(Unit) { vm.loadAppUsage(context) }
+    // Step 14: separate effect, same reasoning as loadAppUsage above — needs Context.
+    LaunchedEffect(Unit) { vm.loadInterventionStats(context) }
 
     Column(
         modifier            = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState()),
@@ -176,6 +180,44 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                     AttentionStat("Focus Today",  "${state.actualFocusMinutesToday}m")
                     AttentionStat("Pauses/Sesh",  "%.1f".format(state.avgPausesPerSession))
                     AttentionStat("Pause Rate",   "${state.pauseRatePercent}%")
+                }
+            }
+        }
+
+        // ── AI Mentor (Blueprint §26 "Baseline intervention statistics", Step 14) ─────
+        // Read model over the Step 12 Outcome Ledger — see OutcomeLedgerStats' own doc.
+        // Hidden entirely (rather than shown all-zero) until at least one intervention has
+        // actually resolved, same posture as the consecutiveMissedDays warning card above.
+        if (state.interventionStats.totalResolved > 0) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                shape    = RoundedCornerShape(14.dp),
+                color    = BgCard,
+                border   = BorderStroke(0.5.dp, White10)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("AI Mentor", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "How intervention prompts have been resolved",
+                        fontSize = 11.sp, color = White60
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        AttentionStat("Prompts", "${state.interventionStats.totalResolved}")
+                        AttentionStat("Handled", "${(state.interventionStats.completionRate * 100).roundToInt()}%")
+                        AttentionStat("Talked It Through", "${state.interventionStats.completedCount - state.interventionStats.fallbackCount}")
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    HorizontalDivider(color = White10, thickness = 0.5.dp)
+                    Spacer(Modifier.height(12.dp))
+                    state.interventionStats.byProvenance
+                        .toList()
+                        .sortedByDescending { it.second }
+                        .forEach { (provenance, count) ->
+                            ProvenanceBar(provenance, count, state.interventionStats.totalResolved)
+                            Spacer(Modifier.height(8.dp))
+                        }
                 }
             }
         }
@@ -354,6 +396,47 @@ private fun AttentionStat(label: String, value: String) {
         Text(value, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = White90)
         Text(label, fontSize = 11.sp, color = White60)
     }
+}
+
+// ── AI Mentor / Outcome Ledger helpers (Step 14) ────────────────────────────
+
+@Composable
+private fun ProvenanceBar(provenance: OutcomeProvenance, count: Int, total: Int) {
+    val pct = if (total > 0) (count * 100 / total) else 0
+    Column {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(provenanceLabel(provenance), fontSize = 13.sp, color = White90)
+            Text("$count · $pct%", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
+        }
+        Spacer(Modifier.height(4.dp))
+        LinearProgressIndicator(
+            progress   = { pct / 100f },
+            modifier   = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
+            color      = provenanceColor(provenance),
+            trackColor = White10
+        )
+    }
+}
+
+// Plain-language labels — the founder-facing meaning behind each OutcomeProvenance value
+// (see that enum's own doc in OutcomeLedger.kt for the precise derivation of each).
+private fun provenanceLabel(provenance: OutcomeProvenance): String = when (provenance) {
+    OutcomeProvenance.SUCCESS          -> "Talked it through"
+    OutcomeProvenance.NETWORK_FALLBACK -> "Started directly (no reply in time)"
+    OutcomeProvenance.LLM_INVALID      -> "Started directly (unusable reply)"
+    OutcomeProvenance.USER_ABORTED     -> "Dismissed"
+    OutcomeProvenance.USER_IGNORED     -> "Ignored"
+    OutcomeProvenance.TTL_EXPIRED      -> "Timed out"
+    OutcomeProvenance.POLICY_REJECTED  -> "Rejected by policy"
+    OutcomeProvenance.EXECUTION_FAILED -> "Execution failed"
+}
+
+private fun provenanceColor(provenance: OutcomeProvenance): Color = when (provenance) {
+    OutcomeProvenance.SUCCESS                                       -> AccentGreen
+    OutcomeProvenance.NETWORK_FALLBACK, OutcomeProvenance.LLM_INVALID -> AccentBlue
+    OutcomeProvenance.USER_ABORTED, OutcomeProvenance.USER_IGNORED,
+    OutcomeProvenance.TTL_EXPIRED                                   -> AccentAmber
+    OutcomeProvenance.POLICY_REJECTED, OutcomeProvenance.EXECUTION_FAILED -> AccentRed
 }
 
 // ── App usage helpers ─────────────────────────────────────────────────────────
