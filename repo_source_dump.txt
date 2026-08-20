@@ -27,6 +27,8 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── GuardianNotifier.kt
 │   │   │   │   │   │   │   ├── InterventionActionReceiver.kt
 │   │   │   │   │   │   │   ├── InterventionNotifier.kt
+│   │   │   │   │   │   │   ├── InterventionShortBreakAlarmReceiver.kt
+│   │   │   │   │   │   │   ├── InterventionSideEffects.kt
 │   │   │   │   │   │   │   ├── InterventionSnoozeAlarmReceiver.kt
 │   │   │   │   │   │   │   ├── MentorNotifier.kt
 │   │   │   │   │   │   │   ├── ProactiveMentor.kt
@@ -165,6 +167,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── ActionExecutor.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionDatabase.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionFallback.kt
+│   │   │   │   │   │   │   │   │   ├── InterventionGuardianGateway.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionIntent.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionNotificationGateway.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionReconciliation.kt
@@ -572,6 +575,12 @@ class ExampleInstrumentedTest {
         <receiver android:name="com.checkmate.service.InterventionSnoozeAlarmReceiver"
             android:exported="false" />
 
+        <!-- Wakes a task back up once a negotiated TAKE_SHORT_BREAK's minutes have elapsed —
+             fixes the gap where a resolved short-break intent paused the task but nothing
+             ever scheduled resuming it. -->
+        <receiver android:name="com.checkmate.service.InterventionShortBreakAlarmReceiver"
+            android:exported="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.checkmate.fileprovider"
@@ -658,9 +667,12 @@ import android.content.Context
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionGuardianBridge
+import com.checkmate.planner.intervention.InterventionGuardianGateway
 import com.checkmate.planner.intervention.InterventionNotificationBridge
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
+import com.checkmate.planner.model.StudyTask
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.ProactiveMentor
@@ -706,6 +718,18 @@ class CheckmateApp : Application() {
         // can see both Android's NotificationManager and psyche's ContextBuilder at once
         // (see InterventionNotificationGateway's doc for why planner can't be this itself).
         InterventionNotificationBridge.gateway = InterventionNotifier
+
+        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
+        // intent always resolved the transaction, but nothing downstream ever notified
+        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
+        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
+        // this just gives the intervention pipeline a way to call it without planner
+        // depending on `app` directly.
+        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
+            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
+                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
+            }
+        }
 
         // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
         // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
@@ -1979,6 +2003,31 @@ object GuardianNotifier {
     }
 
     /**
+     * Proactive Execution Engine — fixes a gap flagged in ActionExecutor's own comment:
+     * `PermittedAction.RequestGuardian` was always recognized and resolved the transaction,
+     * but nothing downstream ever notified anyone. Fired via
+     * [com.checkmate.planner.intervention.InterventionGuardianBridge] (wired from
+     * CheckmateApp.onCreate(), same pattern as InterventionNotificationBridge) right where
+     * the intervention pipeline observes `ExecutionOutcome.RequiresGuardianEscalation` —
+     * i.e. the student (or the LLM speaking for them, live in the AI Mentor negotiation)
+     * asked for a real person instead of continuing to negotiate with the app.
+     */
+    fun notifyInterventionGuardianRequest(context: Context, subject: String, topic: String) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🙋 Checkmate: $candidateName asked to talk to you instead of continuing " +
+                  "with the AI Mentor, about $subject — $topic, at ${timeNow()} on ${dateToday()}."
+        Log.d(TAG, "Intervention guardian request: $subject / $topic")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
      * Fired by ProactiveMentor.holidayPromptIfNeeded() every Wednesday, once per week — a
      * standing reminder for the guardian to review and mark any upcoming holiday, since that's
      * the only way WorkModeSchedule's hardcoded window ever eases for a specific day (see
@@ -2133,6 +2182,7 @@ import android.content.Intent
 import android.util.Log
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.DecisionOutcome
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
@@ -2209,11 +2259,19 @@ class InterventionActionReceiver : BroadcastReceiver() {
         val escrow = TaskEscrow(dao, ledgerWriter)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
         val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        decisionMaker.decideAndExecute(
+        val decision = decisionMaker.decideAndExecute(
             transactionId = transactionId,
             task = task,
             lateMinutes = lateMinutes
         )
+        // Currently unreachable in practice — decideAndExecute is never given an llmPrompt
+        // here, so its deterministic fallback always resolves to START_TASK, never
+        // RequestGuardian/ShortBreak. Checked anyway so this handler doesn't quietly need
+        // updating the day an llmPrompt does get threaded through the "Start" button too —
+        // see InterventionSideEffects' own doc.
+        if (decision is DecisionOutcome.Executed) {
+            InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
+        }
         Log.d(TAG, "Start handled for $transactionId")
     }
 
@@ -2459,6 +2517,174 @@ object InterventionNotifier : InterventionNotificationGateway {
             }
             (context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .createNotificationChannel(channel)
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionShortBreakAlarmReceiver.kt =====
+package com.checkmate.service
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+/**
+ * Fixes a gap flagged in [com.checkmate.planner.intervention.ActionExecutor.applyShortBreak]'s
+ * own comment: a resolved `TAKE_SHORT_BREAK` intent paused the task via
+ * [PlanStore.pauseTask], but the negotiated break length (`PermittedAction.ShortBreak.minutes`)
+ * was discarded right after validation — nothing ever scheduled waking the student back up,
+ * so a "15 minute break" just meant the task sat PAUSED indefinitely until the student
+ * remembered to resume it manually themselves.
+ *
+ * Mirrors [InterventionSnoozeAlarmReceiver] deliberately closely: same one-shot
+ * setExactAndAllowWhileIdle pattern (a short break should still wake the device from Doze —
+ * the common case is the student locking their phone for the whole break, not an edge case),
+ * same "recheck live state right before acting" idiom. The one real difference is what
+ * "still relevant" means: snooze re-shows a prompt regardless of what else changed, but this
+ * only resumes the task if it's STILL PAUSED when the alarm fires — if the student already
+ * resumed manually, moved on to a different task, or the task finished/was skipped in the
+ * meantime, firing resumeTask() here would be actively wrong, not just redundant.
+ *
+ * Known limitation: [com.checkmate.planner.PlanStore.pauseTask] has no concept of *why* a
+ * task was paused, so this can't tell "paused via this negotiated short break" apart from
+ * "student independently hit pause for an unrelated reason." Treating "still PAUSED
+ * `minutes` later" as "the break is over, resume" is the best signal actually available —
+ * consistent with how the rest of the intervention pipeline already treats live task state
+ * as ground truth (see ActionExecutor's own re-read-before-mutating comment) rather than
+ * threading a separate "pause reason" through PlanStore for this one case.
+ */
+class InterventionShortBreakAlarmReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        val taskId = intent.getStringExtra(EXTRA_TASK_ID) ?: return
+        val appContext = context.applicationContext
+
+        val pendingResult = goAsync()
+        scope.launch {
+            try {
+                resumeIfStillPaused(taskId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed resuming $taskId after short break", e)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun resumeIfStillPaused(taskId: String) {
+        val task = PlanStore.todayTasks.value.find { it.id == taskId }
+        if (task == null || task.state != TaskState.PAUSED) {
+            Log.d(TAG, "Task $taskId no longer PAUSED (or gone) — not auto-resuming")
+            return
+        }
+        PlanStore.resumeTask(taskId, System.currentTimeMillis())
+        Log.d(TAG, "Auto-resumed $taskId after short break")
+    }
+
+    companion object {
+        private const val TAG = "ShortBreakAlarmRx"
+        private const val REQUEST_CODE_BASE = 91_000
+        const val EXTRA_TASK_ID = "task_id"
+
+        private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+        /**
+         * Same [PendingIntent.FLAG_UPDATE_CURRENT] idiom
+         * [InterventionSnoozeAlarmReceiver.scheduleRenotify] uses — calling this again for a
+         * task that already has a pending wake-up (e.g. the student negotiates "actually,
+         * make it 20 minutes" mid-break) replaces the existing alarm rather than stacking a
+         * second one, so only the most recently negotiated break length ever takes effect.
+         */
+        fun scheduleResume(context: Context, taskId: String, minutes: Int) {
+            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val intent = Intent(context, InterventionShortBreakAlarmReceiver::class.java).apply {
+                putExtra(EXTRA_TASK_ID, taskId)
+            }
+            val pi = PendingIntent.getBroadcast(
+                context, requestCode(taskId), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val delayMillis = minutes.coerceAtLeast(1) * 60_000L
+            am.setExactAndAllowWhileIdle(
+                AlarmManager.RTC_WAKEUP,
+                System.currentTimeMillis() + delayMillis,
+                pi
+            )
+            Log.d(TAG, "Short-break resume alarm set for $taskId in ${minutes}min")
+        }
+
+        /** Cancels a pending resume — for the (currently unused, but cheap to provide) case
+         *  of a caller wanting to cancel a scheduled wake-up outright rather than reschedule
+         *  it, e.g. if the task is abandoned entirely before the break ends. */
+        fun cancel(context: Context, taskId: String) {
+            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val intent = Intent(context, InterventionShortBreakAlarmReceiver::class.java)
+            val pi = PendingIntent.getBroadcast(
+                context, requestCode(taskId), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            am.cancel(pi)
+        }
+
+        private fun requestCode(taskId: String): Int =
+            REQUEST_CODE_BASE + (taskId.hashCode() % 10_000)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionSideEffects.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.planner.intervention.InterventionGuardianBridge
+import com.checkmate.planner.intervention.PermittedAction
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Fixes two gaps flagged in [com.checkmate.planner.intervention.ActionExecutor]'s own
+ * comments: `RequestGuardian` resolving the transaction without ever notifying anyone, and
+ * `ShortBreak`'s negotiated `minutes` being discarded right after validation with nothing
+ * ever scheduled to wake the task back up.
+ *
+ * Both [InterventionActionReceiver] and NegotiationViewModel observe a freshly-resolved
+ * [ExecutionOutcome] with a Context on hand — this is the one place that shared handling
+ * lives, rather than being duplicated at each call site. [InterventionTriggerWorker] does
+ * NOT use this: it lives in `modules:planner`, which cannot reference
+ * [InterventionShortBreakAlarmReceiver] (an `app`-layer class) without its own bridge, and
+ * — unlike the two `app`-layer call sites — its `decideAndExecute` call never receives an
+ * `llmPrompt`, so its deterministic-only fallback can in practice never produce
+ * `RequestGuardian` or `ShortBreak` in the first place (see its own doc comment).
+ */
+object InterventionSideEffects {
+
+    fun handle(
+        context: Context,
+        task: StudyTask,
+        transactionId: String,
+        executionOutcome: ExecutionOutcome
+    ) {
+        if (executionOutcome is ExecutionOutcome.RequiresGuardianEscalation) {
+            InterventionGuardianBridge.gateway?.notifyGuardianRequested(context, task, transactionId)
+        }
+
+        val action = when (executionOutcome) {
+            is ExecutionOutcome.Applied -> executionOutcome.action
+            is ExecutionOutcome.NoOpAlreadyApplied -> executionOutcome.action
+            else -> null
+        }
+        if (action is PermittedAction.ShortBreak) {
+            InterventionShortBreakAlarmReceiver.scheduleResume(context, action.taskId, action.minutes)
         }
     }
 }
@@ -6513,6 +6739,7 @@ import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
 import com.checkmate.planner.intervention.ConversationalOutcome
+import com.checkmate.planner.intervention.DecisionOutcome
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.ExecutionOutcome
 import com.checkmate.planner.intervention.InterventionDatabase
@@ -6526,6 +6753,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.intervention.ContextBuilder
 import com.checkmate.psyche.intervention.InterventionContext
 import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.InterventionSideEffects
 import com.checkmate.service.InterventionSnoozeAlarmReceiver
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -6719,6 +6947,10 @@ class NegotiationViewModel : ViewModel() {
 
                 is ConversationalOutcome.Decided -> {
                     InterventionNotifier.cancel(context.applicationContext, transactionId)
+                    // The only production path that can actually reach RequestGuardian or
+                    // ShortBreak — see InterventionSideEffects' own doc for why onStart()
+                    // and InterventionActionReceiver.handleStart() can't in practice today.
+                    InterventionSideEffects.handle(context, task, transactionId, outcome.executionOutcome)
                     _state.update {
                         it.copy(
                             messages = it.messages + NegotiationMessage("assistant", outcome.speech),
@@ -6766,11 +6998,14 @@ class NegotiationViewModel : ViewModel() {
         stt?.stopListening()
         viewModelScope.launch {
             val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
-            decisionMaker.decideAndExecute(
+            val decision = decisionMaker.decideAndExecute(
                 transactionId = transactionId,
                 task = task,
                 lateMinutes = lateMinutes
             )
+            if (decision is DecisionOutcome.Executed) {
+                InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
+            }
             InterventionNotifier.cancel(context.applicationContext, transactionId)
             _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
         }
@@ -15297,6 +15532,51 @@ sealed class ConversationalOutcome {
 }
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionGuardianGateway.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Fixes a gap flagged in [ActionExecutor]'s own doc comment: `PermittedAction.RequestGuardian`
+ * was always recognized and correctly resolved the owning transaction as COMPLETED, but
+ * nothing downstream ever actually told a guardian — the student (or, live in an AI Mentor
+ * negotiation, the LLM speaking on their behalf) could ask for a real person and the app
+ * would just silently agree and move on.
+ *
+ * Same shape as [InterventionNotificationGateway]/[InterventionNotificationBridge] and this
+ * codebase's older DistractionGuard.listener / UninstallGuard.listener pattern: an interface
+ * owned by the module that needs to call out (planner), implemented and wired by the module
+ * that can actually reach GuardianNotifier (`app`) — planner has no visibility into `app`,
+ * so this is the seam. See [InterventionNotificationGateway]'s own doc for the fuller
+ * rationale of why this can't just live in planner directly.
+ *
+ * [InterventionGuardianBridge] is the settable holder — set once from CheckmateApp.onCreate()
+ * alongside [InterventionNotificationBridge.gateway]. If nothing has wired
+ * [InterventionGuardianBridge.gateway] (a plain JVM unit test, or any future build variant
+ * that doesn't want this), every call site treats a null gateway as a safe no-op — the
+ * transaction still resolves correctly either way; this is purely the "does someone
+ * downstream get told" half, never something the FSM's own correctness depends on.
+ */
+interface InterventionGuardianGateway {
+    /**
+     * Called once a `REQUEST_GUARDIAN` intent has actually resolved (i.e. right where
+     * [ExecutionOutcome.RequiresGuardianEscalation] is observed) — not from inside
+     * [ActionExecutor] itself, since that class has no Context to work with. Implementations
+     * are expected to notify the guardian out of band (WhatsApp/Telegram, matching
+     * GuardianNotifier's existing dual-channel pattern) and return immediately; there is
+     * nothing further for the transaction to wait on.
+     */
+    fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String)
+}
+
+object InterventionGuardianBridge {
+    @Volatile
+    var gateway: InterventionGuardianGateway? = null
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionIntent.kt =====
 package com.checkmate.planner.intervention
 
@@ -15783,12 +16063,28 @@ class InterventionTriggerWorker(
                 // immediately through the deterministic fallback, same as before this step,
                 // rather than leaving the transaction to sit until TTL expiry with nothing
                 // ever having been shown to the student.
-                decisionMaker.decideAndExecute(
+                val decision = decisionMaker.decideAndExecute(
                     transactionId = acquired.transaction.transactionId,
                     task = task,
                     lateMinutes = signal.lateMinutes,
                     now = now
                 )
+                // Guardian-only, and currently unreachable in practice: decideAndExecute
+                // never receives an llmPrompt here, so the deterministic fallback always
+                // resolves to START_TASK. Checked anyway since InterventionGuardianBridge
+                // lives in this same module and costs nothing extra. ShortBreak's wake-up
+                // scheduling is deliberately NOT wired here — InterventionShortBreakAlarmReceiver
+                // is an `app`-layer class this module cannot reference, and building a second
+                // cross-module bridge solely for a path that can never produce ShortBreak
+                // today isn't worth it (see InterventionSideEffects' own doc, which is what
+                // the two `app`-layer call sites use instead).
+                if (decision is DecisionOutcome.Executed &&
+                    decision.executionOutcome is ExecutionOutcome.RequiresGuardianEscalation
+                ) {
+                    InterventionGuardianBridge.gateway?.notifyGuardianRequested(
+                        applicationContext, task, acquired.transaction.transactionId
+                    )
+                }
             }
             // dispatched == SHOWN: transaction intentionally left NEGOTIATING here.
         }
