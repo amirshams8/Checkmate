@@ -13,6 +13,7 @@ import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
+import com.checkmate.planner.model.TaskType
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -211,13 +212,7 @@ Rules:
             val arr   = JSONArray(json)
             val tasks = mutableListOf<StudyTask>()
             for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val subtopic = if (obj.has("subtopic")) " — ${obj.getString("subtopic")}" else ""
-                tasks.add(StudyTask(
-                    subject         = obj.getString("subject"),
-                    topic           = obj.getString("topic") + subtopic,
-                    durationMinutes = obj.getInt("durationMinutes")
-                ))
+                tasks.add(arr.getJSONObject(i).toStudyTask())
             }
             Log.d(TAG, "LLM generated ${tasks.size} tasks")
             tasks
@@ -225,6 +220,51 @@ Rules:
             Log.w(TAG, "LLM plan failed: ${e.message}")
             emptyList()
         }
+    }
+
+    /**
+     * Upgrade Blueprint Phase 0 item #1 ("Fix planner information loss"): the system
+     * prompt above already asks the LLM for sessionType/priority/reason on every task (see
+     * its own "Format:"/"Rules:" block), but the parse loop this replaced only ever read
+     * subject/topic/durationMinutes back out — sessionType, priority, and reason were
+     * generated, then silently thrown away. One canonical JSONObject -> StudyTask mapper,
+     * so the field contract exists in exactly one place rather than being re-derived (and
+     * re-forgotten) at any future call site that builds a StudyTask from raw LLM plan JSON.
+     *
+     * Deliberately tolerant of a missing/unrecognized sessionType or priority (optString
+     * with a neutral default, not getString) — a malformed field on one task in the array
+     * shouldn't fail parsing of the whole plan the way a missing *required* field
+     * (subject/topic/durationMinutes, still via getString/getInt) correctly does.
+     */
+    private fun JSONObject.toStudyTask(): StudyTask {
+        val subtopic = if (has("subtopic")) " — ${getString("subtopic")}" else ""
+        return StudyTask(
+            subject         = getString("subject"),
+            topic           = getString("topic") + subtopic,
+            durationMinutes = getInt("durationMinutes"),
+            priority        = mapLlmPriority(optString("priority", "MEDIUM")),
+            taskType        = mapLlmSessionType(optString("sessionType", "")),
+            rationale       = optString("reason", "")
+        )
+    }
+
+    private fun mapLlmPriority(raw: String): Int = when (raw.trim().uppercase()) {
+        "HIGH"   -> 3
+        "MEDIUM" -> 2
+        "LOW"    -> 1
+        else     -> 2 // unrecognized/missing — neutral middle, not silently lowest
+    }
+
+    // sessionType (LEARN/REVISE/PRACTICE/TEST_PREP, per the systemPrompt above) onto the
+    // existing TaskType enum (LECTURE/PRACTICE/REVISION/READING/OTHER) — StudyTask.taskType's
+    // own doc already called this mapping out as owed. TEST_PREP has no exact match; PRACTICE
+    // is the closest existing semantic (timed/applied work, not new teaching).
+    private fun mapLlmSessionType(raw: String): TaskType = when (raw.trim().uppercase()) {
+        "LEARN"     -> TaskType.LECTURE
+        "REVISE"    -> TaskType.REVISION
+        "PRACTICE"  -> TaskType.PRACTICE
+        "TEST_PREP" -> TaskType.PRACTICE
+        else        -> TaskType.OTHER
     }
 
     private fun ruleBasedPlan(

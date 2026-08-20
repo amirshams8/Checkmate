@@ -37,8 +37,16 @@ data class StudyTask(
     // ── Mentor v2: skip-pattern granularity (spec 2.1) ──
     val taskType:        TaskType   = TaskType.OTHER, // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
                                                         // for existing/rule-based tasks that don't set it explicitly.
-                                                        // AdaptivePlanner's LLM plan should map sessionType (LEARN/
-                                                        // REVISE/PRACTICE/TEST_PREP) onto this when generating tasks.
+                                                        // AdaptivePlanner.tryLlmPlan() maps sessionType (LEARN/REVISE/
+                                                        // PRACTICE/TEST_PREP) onto this — see its toStudyTask() mapper
+                                                        // (Upgrade Blueprint Phase 0 item #1, "fix planner information
+                                                        // loss" — this mapping used to be silently dropped entirely).
+    // Upgrade Blueprint Phase 0 item #1: the LLM's plan JSON already includes a "reason"
+    // per task (see tryLlmPlan's systemPrompt — "reason must be specific: mention PYQ %,
+    // coaching test dates, weak topic flags"), but nothing ever kept it past parsing. Blank
+    // for rule-based tasks, which have no free-text reasoning to preserve — only a numeric
+    // priority ranking.
+    val rationale:       String     = "",
     // ── Blueprint 4.2: Smart Scheduling ──
     val scheduledStartTime: String? = null    // "HH:mm" 24h clock time this task is slotted into today's
                                                // free time (computed by AdaptivePlanner from
