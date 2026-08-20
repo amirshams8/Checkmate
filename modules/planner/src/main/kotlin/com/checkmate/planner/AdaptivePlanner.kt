@@ -2,6 +2,7 @@ package com.checkmate.planner
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
@@ -14,6 +15,9 @@ import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
 import com.checkmate.planner.model.TaskType
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -25,7 +29,10 @@ object AdaptivePlanner {
 
     suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
         val daysLeft          = daysUntilExam(config.examDate)
-        val behaviorSummary   = getBehaviorSummary()
+        // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"):
+        // structured deterministic metrics, not a hand-built prose string — see
+        // getBehaviorSnapshot() below.
+        val behaviorSnapshot  = getBehaviorSnapshot()
         val studyWindowHours  = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
         val profile           = ConsultationProfile.load()
         val checkIn           = DailyCheckIn.loadToday()
@@ -35,10 +42,11 @@ object AdaptivePlanner {
         // feeds tomorrow's plan so an incomplete checklist skews the next plan
         // toward catching up on fundamentals rather than piling on new PYQ topics.
         val checklistContext  = buildChecklistContext()
-        // Mentor v2 (spec 3.7): read TodayContext directly (not only via the cached
-        // behavior_summary string) so a mid-day regenerate always reflects the latest
-        // same-day free-text updates even if refreshBehaviorSummaryCache() hasn't run
-        // since the last one (e.g. the very first plan of the day).
+        // Mentor v2 (spec 3.7): read TodayContext directly (not folded into the cached
+        // BehaviorSnapshot — see PsycheEngine.refreshBehaviorSummaryCache()'s doc on why)
+        // so a mid-day regenerate always reflects the latest same-day free-text updates
+        // even if refreshBehaviorSummaryCache() hasn't run since the last one (e.g. the
+        // very first plan of the day).
         val todayContext      = TodayContext.getSummaryText()
 
         // Blueprint 4.1: today's free windows (study window minus school/coaching
@@ -47,10 +55,10 @@ object AdaptivePlanner {
             profile.blockedSlots, config.studyStartTime, config.studyEndTime
         )
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
         if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
 
-        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours), freeSlots)
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours), freeSlots)
     }
 
     /**
@@ -90,8 +98,26 @@ object AdaptivePlanner {
         }
     }
 
-    private fun getBehaviorSummary(): String =
-        CheckmatePrefs.getString("behavior_summary", "No behavior data yet") ?: "No behavior data yet"
+    /**
+     * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+     * Reads the structured BehaviorSnapshot PsycheEngine.refreshBehaviorSummaryCache()
+     * serializes into CheckmatePrefs (same cross-module bridge as before — :modules:planner
+     * still can't depend on :modules:psyche directly, see PsycheEngine's own doc on why —
+     * only the payload crossing that bridge changed, from hand-built prose to JSON).
+     *
+     * Falls back to BehaviorSnapshot.EMPTY (all zeros/empty lists) instead of a sentence
+     * like "No behavior data yet" — the LLM gets the same JSON shape whether or not history
+     * exists yet, rather than a special-cased string it would have to treat differently.
+     */
+    private fun getBehaviorSnapshot(): BehaviorSnapshot {
+        val raw = CheckmatePrefs.getString("behavior_snapshot_json", null) ?: return BehaviorSnapshot.EMPTY
+        return try {
+            Json { ignoreUnknownKeys = true }.decodeFromString<BehaviorSnapshot>(raw)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to decode behavior snapshot, using empty: ${e.message}")
+            BehaviorSnapshot.EMPTY
+        }
+    }
 
     private fun buildPyqContext(exam: String, checkIn: DailyCheckIn?): String {
         if (checkIn == null) return ""
@@ -137,7 +163,7 @@ object AdaptivePlanner {
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
-        behaviorSummary: String,
+        behaviorSnapshot: BehaviorSnapshot,
         studyWindowHours: Float,
         profile: com.checkmate.core.ConsultationProfile,
         checkIn: DailyCheckIn?,
@@ -165,6 +191,11 @@ Rules:
 - If TODAY'S LOGGED UPDATES mentions something already covered today (e.g. "back from coaching,
   did Physics 2hrs"), do not re-assign that same subject/topic — build on it or move to the next
   weak area instead
+- BEHAVIOR_METRICS below is deterministic data computed directly from stored events, not a
+  prose summary — treat every number and list in it as ground truth. subjectPatterns lists
+  specific (subject, taskType) combinations the student has repeatedly skipped (occurrences >= 3
+  in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
+  to the aggregate recentSkipRatePercent
 """.trimIndent()
 
         val prompt = buildString {
@@ -200,7 +231,11 @@ Rules:
                 appendLine(todayContext)
                 appendLine()
             }
-            appendLine("BEHAVIOR DATA: $behaviorSummary")
+            // Upgrade Blueprint Phase 0 item #2: structured JSON, not a prose sentence — see
+            // getBehaviorSnapshot()/BehaviorSnapshot's own doc for why this crosses the
+            // psyche->planner boundary as data instead of as text.
+            appendLine("BEHAVIOR_METRICS (JSON, deterministic, authoritative):")
+            appendLine(Json.encodeToString(behaviorSnapshot))
             appendLine()
             appendLine("Generate today's plan.")
         }
@@ -267,10 +302,13 @@ Rules:
         else        -> TaskType.OTHER
     }
 
+    // NOTE: previously took an unused `behaviorSummary: String` param (never referenced in the
+    // body below — the actual behavior signal this function reads is CheckmatePrefs'
+    // "recent_skip_rate", a couple of lines down). Dropped as dead code while touching this
+    // call site for Upgrade Blueprint Phase 0 item #2.
     private fun ruleBasedPlan(
         config: PlannerState,
         daysLeft: Int,
-        behaviorSummary: String,
         studyWindowHours: Float
     ): List<StudyTask> {
         val tasks        = mutableListOf<StudyTask>()

@@ -1,9 +1,9 @@
 package com.checkmate.psyche
 
 import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CoachingPlannerEntry
-import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -30,15 +30,20 @@ object PsycheEngine {
 
     private const val TAG = "PsycheEngine"
     private const val KEY_LAST_SNAPSHOT = "psyche_last_week_snapshot"
-    // Mentor v2 (spec section 0): this is the pref key AdaptivePlanner.getBehaviorSummary()
+    // Mentor v2 (spec section 0): this is the pref key AdaptivePlanner.getBehaviorSnapshot()
     // reads. It previously had NO writer anywhere in the codebase — AdaptivePlanner always
     // saw "No behavior data yet" no matter how much behavior history existed. :modules:planner
     // can't depend on :modules:psyche directly (psyche already depends on planner for
     // StudyTask/TaskState, so the reverse would be circular) — refreshBehaviorSummaryCache()
     // below is the bridge: the :app layer (which depends on both modules) calls it after
-    // every completion/skip, and it writes the real summary into this shared CheckmatePrefs
+    // every completion/skip, and it writes the real snapshot into this shared CheckmatePrefs
     // key so planner's read-only access keeps working with no new module dependency.
-    private const val KEY_BEHAVIOR_SUMMARY_CACHE = "behavior_summary"
+    //
+    // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"): renamed
+    // from KEY_BEHAVIOR_SUMMARY_CACHE / "behavior_summary" — the value stored under this key
+    // is no longer a hand-built prose sentence, it's a serialized BehaviorSnapshot (see
+    // BehaviorLedger.getSnapshot()). Same bridge, structured payload instead of prose.
+    private const val KEY_BEHAVIOR_SNAPSHOT_CACHE = "behavior_snapshot_json"
     private val json = Json { ignoreUnknownKeys = true }
 
     private val SYSTEM_PROMPT = """
@@ -99,42 +104,36 @@ Rules:
     }
 
     /**
-     * Mentor v2 (spec section 0 + 3.7): rebuilds the cached behavior-summary string that
-     * AdaptivePlanner reads (KEY_BEHAVIOR_SUMMARY_CACHE) — the previously-dead pref key.
-     * Combines the existing 7-day aggregate (streak/skip rate) with today's actual completed
-     * tasks (BehaviorLedger.getTodayCompletedSummary()) and any free-text same-day updates
-     * (TodayContext), so a fresh call to AdaptivePlanner.generateDailyPlan() reflects what's
-     * really happened today — e.g. already back from coaching — not just morning intent.
+     * Mentor v2 (spec section 0 + 3.7), rewired under Upgrade Blueprint Phase 0 item #2:
+     * rebuilds the cached BehaviorSnapshot JSON that AdaptivePlanner reads
+     * (KEY_BEHAVIOR_SNAPSHOT_CACHE). Previously this concatenated three prose strings
+     * (7-day aggregate + today's completed tasks + free-text TodayContext updates) into one
+     * blob of text for the LLM to re-parse by eye; now it serializes BehaviorLedger's
+     * deterministic snapshot (streak/skip-rate/attention/today's completions/skip patterns)
+     * straight to JSON — no LLM-facing prose is generated on this path at all.
+     *
+     * TodayContext's free-text same-day updates (Mentor chat / quick-log) are deliberately
+     * NOT folded into this cache — they're genuine user-authored text, not a summary this
+     * code generates about the state, so item #2 doesn't apply to them. AdaptivePlanner
+     * still reads TodayContext.getSummaryText() directly and appends it as its own labeled
+     * prompt section (see AdaptivePlanner.tryLlmPlan) rather than mixed into the structured
+     * snapshot.
      *
      * Call this from the :app layer any time behavior state changes: after
-     * onTaskCompleted/onTaskSkipped (HomeViewModel), and ideally whenever TodayContext gets
-     * a new entry, so the cache never goes stale between plan regenerations.
+     * onTaskCompleted/onTaskSkipped (HomeViewModel), so the cache never goes stale between
+     * plan regenerations.
      */
     fun refreshBehaviorSummaryCache() {
-        val aggregate     = BehaviorLedger.getSummaryForPlanner()
-        val todayDone     = BehaviorLedger.getTodayCompletedSummary()
-        val todayContext  = TodayContext.getSummaryText()
-
-        // Mentor v2 (spec 3.5): same bridge pattern as KEY_BEHAVIOR_SUMMARY_CACHE below —
+        // Mentor v2 (spec 3.5): same bridge pattern as KEY_BEHAVIOR_SNAPSHOT_CACHE below —
         // "recent_skip_rate" was ALSO a dead pref key (read by AdaptivePlanner.ruleBasedPlan()
         // and now also by WorkModeManager.skipRateExceedsThreshold(), never written anywhere).
-        // Writing it here, alongside the existing cache refresh, fixes both readers with one
-        // call site.
+        // Writing it here, alongside the snapshot refresh, fixes both readers with one call site.
         CheckmatePrefs.putString("recent_skip_rate", BehaviorLedger.getRecentSkipRate().toString())
 
-        val combined = buildString {
-            append(aggregate)
-            if (todayDone.isNotBlank()) {
-                append("\nAlready completed today:\n")
-                append(todayDone)
-            }
-            if (todayContext.isNotBlank()) {
-                append("\nToday's logged updates:\n")
-                append(todayContext)
-            }
-        }
-        CheckmatePrefs.putString(KEY_BEHAVIOR_SUMMARY_CACHE, combined)
-        Log.d(TAG, "behavior_summary cache refreshed")
+        val snapshot: BehaviorSnapshot = BehaviorLedger.getSnapshot()
+        CheckmatePrefs.putString(KEY_BEHAVIOR_SNAPSHOT_CACHE, json.encodeToString(snapshot))
+        Log.d(TAG, "behavior snapshot cache refreshed (${snapshot.todayCompleted.size} completed today, " +
+            "${snapshot.subjectPatterns.size} active skip patterns)")
     }
 
     // Mentor v2 (spec 3.3): specific-pattern branch, layered on top of the existing

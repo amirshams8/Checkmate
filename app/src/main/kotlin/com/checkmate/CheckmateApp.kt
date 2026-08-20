@@ -11,6 +11,7 @@ import com.checkmate.planner.intervention.InterventionNotificationBridge
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
+import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
@@ -30,6 +31,13 @@ class CheckmateApp : Application() {
         CheckmatePrefs.init(this)
         CheckmateState.init(this)
         CheckmateTTS.init(this)
+        // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
+        // opens BehaviorDatabase, imports any pre-upgrade CheckmatePrefs event history
+        // into it once, and loads the in-memory read cache — see BehaviorLedger.init()'s
+        // own doc for why this runs synchronously here, same as CheckmatePrefs.init()
+        // right above. Must run before anything below can call BehaviorLedger or
+        // PsycheEngine (WorkModeManager.init() does, via the skip-rate check).
+        BehaviorLedger.init(this)
 
         // Reconcile Work Mode with the hardcoded daily schedule (usual
         // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
