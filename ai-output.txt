@@ -1,67 +1,790 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/model/StudyTask.kt =====
-package com.checkmate.planner.model
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/BehaviorSnapshot.kt =====
+package com.checkmate.core
 
 import kotlinx.serialization.Serializable
 
-enum class TaskState { PENDING, ACTIVE, PAUSED, DONE, SKIPPED }
+/**
+ * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+ *
+ * This is the single structured payload that crosses the :modules:psyche ->
+ * :modules:planner boundary to feed AdaptivePlanner's LLM prompt. Every field is a
+ * plain number or list computed deterministically from BehaviorLedger's stored
+ * events (see BehaviorLedger.getSnapshot()) — nothing here is LLM-generated and
+ * nothing is pre-rendered into prose. AdaptivePlanner embeds this as literal JSON
+ * in the prompt instead of the old hand-built "Streak: Xd, skip rate: Y%..."
+ * string, so the model reasons over auditable numbers instead of a summary that
+ * was already someone's (or something's) interpretation of the numbers.
+ *
+ * Lives in :modules:core (not :modules:psyche, which produces it, or
+ * :modules:planner, which consumes it) because both of those already depend on
+ * core, and core depends on neither — planner can't depend on psyche directly
+ * (psyche depends on planner for StudyTask/TaskState, so the reverse would be
+ * circular; see PsycheEngine's own doc on the CheckmatePrefs bridge this rides
+ * across). Putting the shared shape in core lets both sides decode/encode the
+ * same concrete type instead of hand-parsing raw JSON on either end.
+ */
+@Serializable
+data class BehaviorSnapshot(
+    val streakDays: Int = 0,
+    val recentSkipRatePercent: Int = 0,
+    val totalSkips7d: Int = 0,
+    val attentionChecksPassed: Int = 0,
+    val attentionChecksMissed: Int = 0,
+    val avgFocusMinutes: Int = 0,
+    // Same-day DONE tasks, most recent first — structured replacement for the old
+    // BehaviorLedger.getTodayCompletedSummary() prose string (that method is kept
+    // as-is for its other caller, the intervention-context pipeline, which is
+    // outside item #2's scope — this is a parallel structured view for planning).
+    val todayCompleted: List<CompletedItem> = emptyList(),
+    // Deterministic pattern flags: (subject, taskType) pairs with skip counts at or
+    // above BehaviorLedger's threshold in the last 7 days. Same "you've made this
+    // mistake N times" framing the Upgrade Blueprint calls out for ErrorEngine
+    // (Phase 1.6), applied here to skip behavior a phase early since the data
+    // already existed in BehaviorLedger.
+    val subjectPatterns: List<SkipPattern> = emptyList(),
+    val generatedAt: Long = System.currentTimeMillis()
+) {
+    @Serializable
+    data class CompletedItem(
+        val subject: String,
+        val topic: String,
+        val taskType: String
+    )
 
-// Mentor v2 (spec 2.1): task-type dimension, separate from free-text topic.
-// Lets BehaviorLedger detect patterns like "skips PRACTICE specifically in
-// Physics" instead of only an aggregate skip rate across all task types.
-enum class TaskType { LECTURE, PRACTICE, REVISION, READING, OTHER }
+    @Serializable
+    data class SkipPattern(
+        val subject: String,
+        val taskType: String,
+        val occurrences: Int
+    )
+
+    companion object {
+        // Returned by AdaptivePlanner when no cached snapshot exists yet (e.g. very
+        // first plan ever generated) — the LLM gets the same JSON shape either way,
+        // all zeros/empty, rather than a special-cased sentence like "No behavior
+        // data yet" it would have to treat as a different kind of input.
+        val EMPTY = BehaviorSnapshot()
+    }
+}
+
+//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/db/BehaviorEventEntity.kt =====
+package com.checkmate.psyche.db
+
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+/**
+ * Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth").
+ * Room-backed mirror of BehaviorLedger.TaskEvent — see BehaviorDatabase's doc for
+ * why this replaces the old single-blob CheckmatePrefs storage. Field-for-field
+ * match with TaskEvent (BehaviorLedger.kt) so the entity<->model mapping there is
+ * a straight copy, not a re-derivation.
+ */
+@Entity(
+    tableName = "behavior_events",
+    indices = [Index(value = ["timestamp"]), Index(value = ["subject", "taskType"])]
+)
+data class BehaviorEventEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val subject: String,
+    val topic: String,
+    val state: String,          // DONE / SKIPPED — mirrors TaskState.name
+    val timestamp: Long,
+    val focusMinutes: Int = 0,
+    val checksPassed: Int = 0,
+    val checksMissed: Int = 0,
+    val taskType: String = "OTHER",
+    val distractionApp: String? = null
+)
+
+//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/db/BehaviorEventDao.kt =====
+package com.checkmate.psyche.db
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.Query
+
+@Dao
+interface BehaviorEventDao {
+
+    @Insert
+    suspend fun insert(event: BehaviorEventEntity)
+
+    // Oldest-first, matching the ordering contract the old CheckmatePrefs JSON-blob
+    // list had (BehaviorLedger appended to the end) — callers that take the last N
+    // for "most recent" still work unchanged against this ordering.
+    @Query("SELECT * FROM behavior_events ORDER BY timestamp ASC")
+    suspend fun getAll(): List<BehaviorEventEntity>
+
+    @Query("SELECT COUNT(*) FROM behavior_events")
+    suspend fun count(): Int
+
+    // Same 200-event cap the old blob enforced by construction (list.takeLast(200)
+    // before every write) — enforced here instead as an explicit trim after insert,
+    // since Room has no "keep only the newest N rows" primitive of its own.
+    @Query(
+        """
+        DELETE FROM behavior_events WHERE id NOT IN (
+            SELECT id FROM behavior_events ORDER BY timestamp DESC LIMIT :keep
+        )
+        """
+    )
+    suspend fun trimToNewest(keep: Int)
+}
+
+//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/db/BehaviorDatabase.kt =====
+package com.checkmate.psyche.db
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+/**
+ * Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth").
+ *
+ * BehaviorLedger previously persisted its entire event log as one JSON-blob
+ * string inside CheckmatePrefs (plain SharedPreferences, key "behavior_events"),
+ * rewriting the whole blob on every single record() call and offering no query
+ * surface beyond "deserialize everything, filter in Kotlin." That's exactly the
+ * anti-pattern this item calls out — state downstream decisions (streaks, skip
+ * rate, pattern detection) depend on wasn't living in the durable, queryable
+ * store the rest of the intervention pipeline already uses
+ * (:modules:planner's InterventionDatabase). This mirrors that same
+ * Room-singleton shape, scoped to behavior events specifically, since psyche
+ * can't depend on planner's InterventionDatabase without pulling in the whole
+ * intervention-pipeline dependency graph for an unrelated table.
+ *
+ * Separate .db file from InterventionDatabase's "checkmate_intervention.db" —
+ * deliberately not merged into one giant database, since behavior events and
+ * intervention transactions have unrelated lifecycles and no foreign-key
+ * relationship between them.
+ *
+ * See BehaviorLedger.migrateLegacyPrefsIfEmpty() for the one-time import of any
+ * pre-existing CheckmatePrefs blob so students upgrading don't lose history.
+ */
+@Database(entities = [BehaviorEventEntity::class], version = 1, exportSchema = false)
+abstract class BehaviorDatabase : RoomDatabase() {
+
+    abstract fun behaviorEventDao(): BehaviorEventDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: BehaviorDatabase? = null
+
+        fun getInstance(context: Context): BehaviorDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    BehaviorDatabase::class.java,
+                    "checkmate_behavior.db"
+                )
+                    // Version 1, no upgrade path needed yet — same
+                    // downgrade-only-destructive posture as InterventionDatabase
+                    // (see its own doc on why a genuine forward migration is kept
+                    // strict instead of falling back to a silent wipe).
+                    .fallbackToDestructiveMigrationOnDowngrade()
+                    .build().also { INSTANCE = it }
+            }
+    }
+}
+
+//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/BehaviorLedger.kt =====
+package com.checkmate.psyche
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.db.BehaviorDatabase
+import com.checkmate.psyche.db.BehaviorEventEntity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
 
 @Serializable
-data class StudyTask(
-    val id:              String     = java.util.UUID.randomUUID().toString(),
+data class TaskEvent(
     val subject:         String,
     val topic:           String,
-    val durationMinutes: Int,
-    val priority:        Int        = 1,
-    val scheduledAt:     Long       = System.currentTimeMillis(),
-    val state:           TaskState  = TaskState.PENDING,
-    val completedAt:     Long?      = null,
-    val focusMinutes:    Int        = 0,
-    val checksPassed:    Int        = 0,
-    val checksMissed:    Int        = 0,
-    // ── Pause/Resume fields (Blueprint 2.1) ──
-    val pausedAt:        Long?      = null,   // epoch ms when task was paused
-    val totalPausedMs:   Long       = 0L,     // accumulated pause time across all pauses
-    val actualMinutes:   Int        = 0,      // real focus time excluding paused periods
-    // ── Blueprint 2.6: pause count per session, feeds Stats "pause rate" ──
-    val pauseCount:       Int       = 0,      // incremented once per pause -> resume cycle (PlanStore.pauseTask)
-    // ── Manual task tracking ──
-    val isCustom:        Boolean    = false,  // true only for tasks added via HomeViewModel.addCustomTask;
-                                               // gates the duration-edit affordance in HomeScreen
-    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
-    val intentionText:   String     = "",     // free-text answer to "What will you study?" (pre-session)
-    val completedStatus: String?    = null,   // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
-    // ── Mentor v2: skip-pattern granularity (spec 2.1) ──
-    val taskType:        TaskType   = TaskType.OTHER, // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
-                                                        // for existing/rule-based tasks that don't set it explicitly.
-                                                        // AdaptivePlanner.tryLlmPlan() maps sessionType (LEARN/REVISE/
-                                                        // PRACTICE/TEST_PREP) onto this — see its toStudyTask() mapper
-                                                        // (Upgrade Blueprint Phase 0 item #1, "fix planner information
-                                                        // loss" — this mapping used to be silently dropped entirely).
-    // Upgrade Blueprint Phase 0 item #1: the LLM's plan JSON already includes a "reason"
-    // per task (see tryLlmPlan's systemPrompt — "reason must be specific: mention PYQ %,
-    // coaching test dates, weak topic flags"), but nothing ever kept it past parsing. Blank
-    // for rule-based tasks, which have no free-text reasoning to preserve — only a numeric
-    // priority ranking.
-    val rationale:       String     = "",
-    // ── Blueprint 4.2: Smart Scheduling ──
-    val scheduledStartTime: String? = null    // "HH:mm" 24h clock time this task is slotted into today's
-                                               // free time (computed by AdaptivePlanner from
-                                               // ConsultationProfile.blockedSlots — see FreeSlotCalculator).
-                                               // Null means the planner couldn't fit it into a free slot
-                                               // (e.g. total plan exceeds available time) — HomeScreen's
-                                               // timeline view falls back to an "Unscheduled" section for these.
+    val state:           String,   // DONE / SKIPPED
+    val timestamp:       Long,
+    val focusMinutes:    Int = 0,
+    val checksPassed:    Int = 0,
+    val checksMissed:    Int = 0,
+    // Mentor v2 (spec 2.2):
+    val taskType:        String  = "OTHER", // mirrors StudyTask.TaskType.name — lets skip patterns be
+                                             // queried per task-type (e.g. "PRACTICE skips in Physics")
+                                             // rather than only aggregate skip rate.
+    val distractionApp:  String? = null     // label of the app foregrounded right after this skip, if any.
+                                             // Populated by the caller (HomeViewModel.markSkip) so guardian
+                                             // alerts can say what caused the skip, not just that it happened.
 )
 
-@Serializable
-data class SubjectConfig(
-    val name:      String,
-    val weightage: Int = 1
+data class AttentionStats(
+    val checksPassed:    Int,
+    val checksMissed:    Int,
+    val avgFocusMinutes: Int
 )
+
+/**
+ * Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth").
+ *
+ * Storage moved from a single CheckmatePrefs JSON-blob string (rewritten whole on
+ * every record() call, no query surface beyond "load everything, filter in
+ * Kotlin") onto Room (BehaviorDatabase) — see that class's doc for the full
+ * rationale. Room is now the durable source of truth; `cache` below is an
+ * in-memory mirror only, kept so every existing synchronous caller (WorkModeManager,
+ * PsycheEngine, HomeViewModel, BehaviorLedgerContextSource) keeps working exactly
+ * as before — none of them needed to become suspend functions for this migration.
+ */
+object BehaviorLedger {
+
+    private const val TAG = "BehaviorLedger"
+    // Legacy CheckmatePrefs key — read exactly once, by migrateLegacyPrefsIfEmpty(),
+    // to import pre-upgrade history into Room. Never written to again after this
+    // change; kept around only as the migration source, not a live store.
+    private const val LEGACY_KEY_EVENTS = "behavior_events"
+    private const val MAX_EVENTS = 200
+    private const val PATTERN_SKIP_THRESHOLD = 3
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile private var db: BehaviorDatabase? = null
+    // Oldest-first, capped at MAX_EVENTS — same ordering/cap contract the old
+    // CheckmatePrefs blob had, so every read method below is byte-for-byte
+    // identical in behavior regardless of which storage engine backs it.
+    private val cache: MutableList<TaskEvent> = mutableListOf()
+    @Volatile private var initialized = false
+
+    /**
+     * Must be called once at app startup (CheckmateApp.onCreate(), alongside
+     * CheckmatePrefs.init() — same pattern). Opens Room, imports the legacy
+     * CheckmatePrefs blob on first run after this upgrade if one exists, then
+     * loads the in-memory cache from Room.
+     *
+     * Deliberately blocks the caller via runBlocking rather than firing an
+     * async load: Application.onCreate() already runs CheckmatePrefs.init()
+     * synchronously right before this, and every read method on this object
+     * needs the cache populated immediately (WorkModeManager and others may
+     * call BehaviorLedger getters before any coroutine would have finished
+     * loading). At most 200 rows, so the one-time cost at process start is
+     * negligible — the same trade-off CheckmatePrefs.init() already makes.
+     */
+    fun init(context: Context) {
+        if (initialized) return
+        val database = BehaviorDatabase.getInstance(context)
+        db = database
+        runBlocking(Dispatchers.IO) {
+            migrateLegacyPrefsIfEmpty(context, database)
+            val loaded = database.behaviorEventDao().getAll().takeLast(MAX_EVENTS).map { it.toTaskEvent() }
+            synchronized(cache) {
+                cache.clear()
+                cache.addAll(loaded)
+            }
+        }
+        initialized = true
+        Log.d(TAG, "BehaviorLedger initialized, ${cache.size} events loaded from Room")
+    }
+
+    private suspend fun migrateLegacyPrefsIfEmpty(context: Context, database: BehaviorDatabase) {
+        val dao = database.behaviorEventDao()
+        if (dao.count() > 0) return // already migrated (or genuinely started empty on Room from day one)
+        val legacyRaw = CheckmatePrefs.getString(LEGACY_KEY_EVENTS, null) ?: return
+        val legacyEvents = try {
+            json.decodeFromString<List<TaskEvent>>(legacyRaw)
+        } catch (e: Exception) {
+            Log.w(TAG, "Legacy behavior_events blob unreadable, skipping migration: ${e.message}")
+            emptyList()
+        }
+        if (legacyEvents.isEmpty()) return
+        legacyEvents.forEach { dao.insert(it.toEntity()) }
+        Log.d(TAG, "Migrated ${legacyEvents.size} legacy events from CheckmatePrefs into Room")
+    }
+
+    // distractionApp is optional and only meaningful for SKIPPED events — callers recording a
+    // DONE task can omit it. taskType defaults to task.taskType.name so existing call sites
+    // (PsycheEngine.onTaskCompleted/onTaskSkipped) don't need to change at all.
+    fun record(
+        task: StudyTask,
+        state: TaskState,
+        checksPassed: Int = 0,
+        checksMissed: Int = 0,
+        distractionApp: String? = null
+    ) {
+        val event = TaskEvent(
+            subject         = task.subject,
+            topic           = task.topic,
+            state           = state.name,
+            timestamp       = System.currentTimeMillis(),
+            focusMinutes    = task.focusMinutes,
+            checksPassed    = checksPassed,
+            checksMissed    = checksMissed,
+            taskType        = task.taskType.name,
+            distractionApp  = distractionApp
+        )
+        // Update the in-memory cache immediately so any synchronous read that
+        // happens right after record() (same call stack, e.g. HomeViewModel
+        // calling markDone() then immediately refreshing behavior-derived UI)
+        // sees it — Room write below happens on a background dispatcher and is
+        // the durable copy, but callers were never asynchronous before this
+        // change and shouldn't have to become so now.
+        synchronized(cache) {
+            cache.add(event)
+            if (cache.size > MAX_EVENTS) cache.removeAt(0)
+        }
+        val database = db
+        if (database != null) {
+            scope.launch {
+                database.behaviorEventDao().insert(event.toEntity())
+                database.behaviorEventDao().trimToNewest(MAX_EVENTS)
+            }
+        } else {
+            Log.w(TAG, "record() called before BehaviorLedger.init() — event kept in cache only, not persisted")
+        }
+    }
+
+    fun getSkipCountForSubject(subject: String, withinDays: Int = 7): Int {
+        val cutoff = System.currentTimeMillis() - withinDays * 24 * 60 * 60 * 1000L
+        return getEvents().count { it.subject == subject && it.state == "SKIPPED" && it.timestamp > cutoff }
+    }
+
+    /**
+     * Mentor v2 (spec 2.2): skip count scoped to a specific task type within a subject —
+     * e.g. getSkipCountByType("Physics", "PRACTICE", 7) answers "how many times has the
+     * student skipped Physics *practice* tasks specifically this week," which the aggregate
+     * getSkipCountForSubject() can't distinguish from skipped lectures/revision.
+     */
+    fun getSkipCountByType(subject: String, taskType: String, withinDays: Int = 7): Int {
+        val cutoff = System.currentTimeMillis() - withinDays * 24 * 60 * 60 * 1000L
+        return getEvents().count {
+            it.subject == subject && it.taskType == taskType && it.state == "SKIPPED" && it.timestamp > cutoff
+        }
+    }
+
+    fun getTotalSkipCount(withinDays: Int = 7): Int {
+        val cutoff = System.currentTimeMillis() - withinDays * 24 * 60 * 60 * 1000L
+        return getEvents().count { it.state == "SKIPPED" && it.timestamp > cutoff }
+    }
+
+    fun getRecentSkipRate(): Float {
+        val recent = getEvents().takeLast(20)
+        if (recent.isEmpty()) return 0f
+        return recent.count { it.state == "SKIPPED" }.toFloat() / recent.size
+    }
+
+    fun getStreakDays(): Int {
+        val events = getEvents().sortedByDescending { it.timestamp }
+        var streak = 0
+        val cal    = Calendar.getInstance()
+        for (i in 0..30) {
+            val dayStart = cal.clone() as Calendar
+            dayStart.set(Calendar.HOUR_OF_DAY, 0)
+            dayStart.set(Calendar.MINUTE, 0)
+            dayStart.set(Calendar.SECOND, 0)
+            val dayEnd = cal.clone() as Calendar
+            dayEnd.set(Calendar.HOUR_OF_DAY, 23)
+            dayEnd.set(Calendar.MINUTE, 59)
+
+            val dayEvents = events.filter { it.timestamp in dayStart.timeInMillis..dayEnd.timeInMillis }
+            if (dayEvents.isEmpty() && i > 0) break
+            if (dayEvents.any { it.state == "DONE" }) streak++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return streak
+    }
+
+    // Kept as-is: this is legitimate LLM-facing prose (fed into PsycheEngine's morning
+    // message / weekly report generation, both user- or parent-facing tone/text, not a
+    // planning decision) — outside Phase 0 item #2's scope, which targets the planner's
+    // decision pipeline specifically. See getSnapshot() below for the structured
+    // equivalent AdaptivePlanner now uses instead of this.
+    fun getSummaryForPlanner(): String {
+        val skipRate = getRecentSkipRate()
+        val streak   = getStreakDays()
+        return "Streak: ${streak}d, Recent skip rate: ${(skipRate * 100).toInt()}%, Total skips (7d): ${getTotalSkipCount()}"
+    }
+
+    /**
+     * Mentor v2 (spec 3.7): same-day DONE tasks, most recent first. Kept for its existing
+     * consumer, BehaviorLedgerContextSource (intervention-context pipeline) — see
+     * getSnapshot().todayCompleted for the structured equivalent AdaptivePlanner now reads.
+     */
+    fun getTodayCompletedSummary(): String {
+        val startOfDay = todayStartMillis()
+        val todayDone = getEvents()
+            .filter { it.state == "DONE" && it.timestamp >= startOfDay }
+            .sortedByDescending { it.timestamp }
+        if (todayDone.isEmpty()) return ""
+        return todayDone.joinToString("\n") { "  ${it.subject}: ${it.topic} (${it.taskType})" }
+    }
+
+    fun getAttentionStats(): AttentionStats {
+        val events = getEvents().filter { it.checksPassed + it.checksMissed > 0 }
+        val passed = events.sumOf { it.checksPassed }
+        val missed = events.sumOf { it.checksMissed }
+        val avgFocus = if (events.isEmpty()) 0 else events.sumOf { it.focusMinutes } / events.size
+        return AttentionStats(passed, missed, avgFocus)
+    }
+
+    /**
+     * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+     * The structured, deterministic replacement for what AdaptivePlanner used to read as
+     * a hand-built prose string (getSummaryForPlanner() + getTodayCompletedSummary()
+     * concatenated together in PsycheEngine.refreshBehaviorSummaryCache()). Every field
+     * here is a plain computed number or list — nothing is LLM output, nothing is free
+     * text — so it can be serialized straight to JSON for the planner's prompt instead of
+     * pre-digested into a sentence.
+     */
+    fun getSnapshot(): BehaviorSnapshot {
+        val events = getEvents()
+        val attn = getAttentionStats()
+        val cutoff = System.currentTimeMillis() - 7 * 24 * 60 * 60 * 1000L
+        val startOfDay = todayStartMillis()
+
+        val todayCompleted = events
+            .filter { it.state == "DONE" && it.timestamp >= startOfDay }
+            .sortedByDescending { it.timestamp }
+            .map { BehaviorSnapshot.CompletedItem(it.subject, it.topic, it.taskType) }
+
+        val patterns = events
+            .filter { it.state == "SKIPPED" && it.timestamp > cutoff }
+            .groupBy { it.subject to it.taskType }
+            .mapNotNull { (key, group) ->
+                if (group.size >= PATTERN_SKIP_THRESHOLD) {
+                    BehaviorSnapshot.SkipPattern(key.first, key.second, group.size)
+                } else null
+            }
+
+        return BehaviorSnapshot(
+            streakDays              = getStreakDays(),
+            recentSkipRatePercent   = (getRecentSkipRate() * 100).toInt(),
+            totalSkips7d            = getTotalSkipCount(),
+            attentionChecksPassed   = attn.checksPassed,
+            attentionChecksMissed   = attn.checksMissed,
+            avgFocusMinutes         = attn.avgFocusMinutes,
+            todayCompleted          = todayCompleted,
+            subjectPatterns         = patterns
+        )
+    }
+
+    private fun todayStartMillis(): Long =
+        Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+
+    private fun getEvents(): List<TaskEvent> = synchronized(cache) { cache.toList() }
+
+    private fun TaskEvent.toEntity() = BehaviorEventEntity(
+        subject = subject, topic = topic, state = state, timestamp = timestamp,
+        focusMinutes = focusMinutes, checksPassed = checksPassed, checksMissed = checksMissed,
+        taskType = taskType, distractionApp = distractionApp
+    )
+
+    private fun BehaviorEventEntity.toTaskEvent() = TaskEvent(
+        subject = subject, topic = topic, state = state, timestamp = timestamp,
+        focusMinutes = focusMinutes, checksPassed = checksPassed, checksMissed = checksMissed,
+        taskType = taskType, distractionApp = distractionApp
+    )
+}
+
+//===== FILE: modules/psyche/src/main/kotlin/com/checkmate/psyche/PsycheEngine.kt =====
+package com.checkmate.psyche
+
+import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+
+// FEATURE: Weekly Report Delta — snapshots each week's numbers so the next
+// report can show trend direction (e.g. "Consistency dropped from Good to
+// Moderate") instead of an isolated snapshot. First week has no baseline
+// and falls back to the original non-delta format.
+@Serializable
+data class WeeklySnapshot(
+    val skipTotal:    Int    = 0,
+    val streak:       Int    = 0,
+    val checksPassed: Int    = 0,
+    val checksMissed: Int    = 0,
+    val consistency:  String = "",
+    val timestamp:    Long   = 0L
+)
+
+object PsycheEngine {
+
+    private const val TAG = "PsycheEngine"
+    private const val KEY_LAST_SNAPSHOT = "psyche_last_week_snapshot"
+    // Mentor v2 (spec section 0): this is the pref key AdaptivePlanner.getBehaviorSnapshot()
+    // reads. It previously had NO writer anywhere in the codebase — AdaptivePlanner always
+    // saw "No behavior data yet" no matter how much behavior history existed. :modules:planner
+    // can't depend on :modules:psyche directly (psyche already depends on planner for
+    // StudyTask/TaskState, so the reverse would be circular) — refreshBehaviorSummaryCache()
+    // below is the bridge: the :app layer (which depends on both modules) calls it after
+    // every completion/skip, and it writes the real snapshot into this shared CheckmatePrefs
+    // key so planner's read-only access keeps working with no new module dependency.
+    //
+    // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"): renamed
+    // from KEY_BEHAVIOR_SUMMARY_CACHE / "behavior_summary" — the value stored under this key
+    // is no longer a hand-built prose sentence, it's a serialized BehaviorSnapshot (see
+    // BehaviorLedger.getSnapshot()). Same bridge, structured payload instead of prose.
+    private const val KEY_BEHAVIOR_SNAPSHOT_CACHE = "behavior_snapshot_json"
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private val SYSTEM_PROMPT = """
+You are a strict but adaptive study coach. Your job is to enforce behavior, not motivate with fluff.
+Rules:
+- Keep messages SHORT (1-2 sentences max)
+- Be direct and consequence-based
+- Never say "you can do it" or generic praise
+- React to actual behavior patterns
+- If skip: state the consequence
+- If done well: acknowledge briefly and raise the bar
+""".trimIndent()
+
+    suspend fun getDailyMorningMessage(): String {
+        val skipRate = BehaviorLedger.getRecentSkipRate()
+        val streak   = BehaviorLedger.getStreakDays()
+
+        // Rule-based first (fast, works offline)
+        val ruleMsg = when {
+            streak >= 7  -> "7-day streak. Maintain this — it's the only thing that matters now."
+            streak >= 3  -> "Good consistency this week. Keep it."
+            skipRate > 0.5f -> "You've been skipping more than completing. That needs to stop today."
+            skipRate > 0.3f -> "Inconsistent last few days. Today has to be clean."
+            else         -> "New day. Complete your tasks — nothing else counts."
+        }
+
+        return try {
+            val llmMsg = LlmGateway.complete(
+                "Behavior data: ${BehaviorLedger.getSummaryForPlanner()}. Write one short morning message.",
+                SYSTEM_PROMPT
+            )
+            if (llmMsg.isBlank()) ruleMsg else llmMsg
+        } catch (_: Exception) { ruleMsg }
+    }
+
+    // BUGFIX: previously these two took no checksPassed/checksMissed args and
+    // always recorded 0/0 into BehaviorLedger, so attention-check counts never
+    // reached the dashboard or the weekly guardian report even though
+    // AttentionCycleManager was tracking them correctly during the session.
+    // Callers (HomeViewModel.markDone/markSkip) now read
+    // AttentionCycleManager.currentState() BEFORE stopping the service and
+    // pass the real counts through here.
+    fun onTaskCompleted(task: StudyTask, checksPassed: Int = 0, checksMissed: Int = 0) {
+        BehaviorLedger.record(task, TaskState.DONE, checksPassed, checksMissed)
+    }
+
+    // Mentor v2 (spec 2.2/3.6): distractionApp is optional — pass the label of whatever app
+    // was foregrounded right before/at the moment of skip (e.g. from AppUsageTracker or an
+    // active DistractionGuard counter) so parent alerts can name the actual cause, not just
+    // report that a skip happened.
+    fun onTaskSkipped(
+        task: StudyTask,
+        checksPassed: Int = 0,
+        checksMissed: Int = 0,
+        distractionApp: String? = null
+    ) {
+        BehaviorLedger.record(task, TaskState.SKIPPED, checksPassed, checksMissed, distractionApp)
+    }
+
+    /**
+     * Mentor v2 (spec section 0 + 3.7), rewired under Upgrade Blueprint Phase 0 item #2:
+     * rebuilds the cached BehaviorSnapshot JSON that AdaptivePlanner reads
+     * (KEY_BEHAVIOR_SNAPSHOT_CACHE). Previously this concatenated three prose strings
+     * (7-day aggregate + today's completed tasks + free-text TodayContext updates) into one
+     * blob of text for the LLM to re-parse by eye; now it serializes BehaviorLedger's
+     * deterministic snapshot (streak/skip-rate/attention/today's completions/skip patterns)
+     * straight to JSON — no LLM-facing prose is generated on this path at all.
+     *
+     * TodayContext's free-text same-day updates (Mentor chat / quick-log) are deliberately
+     * NOT folded into this cache — they're genuine user-authored text, not a summary this
+     * code generates about the state, so item #2 doesn't apply to them. AdaptivePlanner
+     * still reads TodayContext.getSummaryText() directly and appends it as its own labeled
+     * prompt section (see AdaptivePlanner.tryLlmPlan) rather than mixed into the structured
+     * snapshot.
+     *
+     * Call this from the :app layer any time behavior state changes: after
+     * onTaskCompleted/onTaskSkipped (HomeViewModel), so the cache never goes stale between
+     * plan regenerations.
+     */
+    fun refreshBehaviorSummaryCache() {
+        // Mentor v2 (spec 3.5): same bridge pattern as KEY_BEHAVIOR_SNAPSHOT_CACHE below —
+        // "recent_skip_rate" was ALSO a dead pref key (read by AdaptivePlanner.ruleBasedPlan()
+        // and now also by WorkModeManager.skipRateExceedsThreshold(), never written anywhere).
+        // Writing it here, alongside the snapshot refresh, fixes both readers with one call site.
+        CheckmatePrefs.putString("recent_skip_rate", BehaviorLedger.getRecentSkipRate().toString())
+
+        val snapshot: BehaviorSnapshot = BehaviorLedger.getSnapshot()
+        CheckmatePrefs.putString(KEY_BEHAVIOR_SNAPSHOT_CACHE, json.encodeToString(snapshot))
+        Log.d(TAG, "behavior snapshot cache refreshed (${snapshot.todayCompleted.size} completed today, " +
+            "${snapshot.subjectPatterns.size} active skip patterns)")
+    }
+
+    // Mentor v2 (spec 3.3): specific-pattern branch, layered on top of the existing
+    // aggregate-skip-count logic below rather than replacing it — a student can be low on
+    // aggregate skips but still have a real pattern in one task type/subject.
+    private const val PATTERN_SKIP_THRESHOLD = 3
+    private const val PATTERN_WINDOW_DAYS    = 7
+
+    fun getSkipReaction(task: StudyTask): String {
+        val skipCount = BehaviorLedger.getSkipCountForSubject(task.subject, withinDays = 7)
+
+        val patternSkips = BehaviorLedger.getSkipCountByType(
+            task.subject, task.taskType.name, withinDays = PATTERN_WINDOW_DAYS
+        )
+        val patternClause = if (patternSkips >= PATTERN_SKIP_THRESHOLD) {
+            " That's $patternSkips ${task.taskType.name.lowercase()} skips in ${task.subject} this week specifically — not just an overall dip."
+        } else ""
+
+        val upcomingTest = try {
+            CoachingPlannerEntry.nearestUpcomingTest(task.subject, withinDays = COACHING_TEST_URGENT_DAYS)
+        } catch (_: Exception) { null }
+
+        val urgencyClause = upcomingTest?.let { test ->
+            when (test.daysAway) {
+                0    -> " Your ${test.subject} test is today."
+                1    -> " Your ${test.subject} test is tomorrow."
+                else -> " Your ${test.subject} test is in ${test.daysAway} days."
+            }
+        } ?: ""
+
+        return when {
+            skipCount >= 3 -> "Third ${task.subject} skip this week. Guardian will be notified.$urgencyClause$patternClause"
+            skipCount == 2 -> "Second skip on ${task.subject}. Tomorrow's load is reduced but this delay costs you.$urgencyClause$patternClause"
+            else           -> "You skipped ${task.subject}. Stay consistent.$urgencyClause$patternClause"
+        }
+    }
+
+    // FEATURE: Coaching-Test Countdown — a skip 2 days before a coaching test
+    // in that subject reads with real urgency instead of generic streak
+    // language. Deliberately conservative: only fires within COACHING_TEST_URGENT_DAYS,
+    // only for type=="test" (not lectures), and any lookup failure (bad date,
+    // no entry, subject mismatch) falls straight through to the existing
+    // skip-count logic unchanged — a stale or empty coaching calendar can
+    // only under-trigger this, never fabricate false urgency.
+    private const val COACHING_TEST_URGENT_DAYS = 3
+
+    suspend fun getGuardianWeeklyReport(): String {
+        val skipTotal = BehaviorLedger.getTotalSkipCount(7)
+        val streak    = BehaviorLedger.getStreakDays()
+        val attnStats = BehaviorLedger.getAttentionStats()
+        val skipRate  = BehaviorLedger.getRecentSkipRate()
+
+        val consistency = when {
+            skipRate < 0.1f -> "Excellent"
+            skipRate < 0.3f -> "Good"
+            skipRate < 0.5f -> "Moderate"
+            else            -> "Poor"
+        }
+
+        // ── Load last week's snapshot (if any) before we overwrite it ──────────
+        val previous = loadLastSnapshot()
+        val deltaBlock = buildDeltaBlock(previous, consistency, attnStats, skipTotal)
+
+        val ruleReport = """
+*Checkmate Weekly Report*
+
+Streak: ${streak} days
+Tasks missed this week: $skipTotal
+Consistency: $consistency
+Attention checks passed: ${attnStats.checksPassed}
+Attention checks missed: ${attnStats.checksMissed}
+Avg focus per session: ${attnStats.avgFocusMinutes} min
+${deltaBlock}
+${if (skipRate > 0.4f) "⚠ Needs better discipline. Evening sessions are being skipped frequently." else "Performance is on track."}
+""".trimIndent()
+
+        val report = try {
+            val llm = LlmGateway.complete(
+                "Generate a short parent WhatsApp report. Data: $ruleReport",
+                "You write brief, factual parent reports about student study performance. 5-6 lines max. No fluff. " +
+                "If a WEEK-OVER-WEEK CHANGE line is present in the data, include that trend — it matters more to the parent than the raw snapshot."
+            )
+            if (llm.isBlank()) ruleReport else llm
+        } catch (_: Exception) { ruleReport }
+
+        // ── Persist this week's numbers as next week's baseline ────────────────
+        saveSnapshot(WeeklySnapshot(
+            skipTotal    = skipTotal,
+            streak       = streak,
+            checksPassed = attnStats.checksPassed,
+            checksMissed = attnStats.checksMissed,
+            consistency  = consistency,
+            timestamp    = System.currentTimeMillis()
+        ))
+
+        return report
+    }
+
+    // ── Delta helpers ────────────────────────────────────────────────────────
+
+    private fun buildDeltaBlock(
+        previous: WeeklySnapshot?,
+        consistency: String,
+        attnStats: AttentionStats,
+        skipTotal: Int
+    ): String {
+        if (previous == null) return "" // first week — nothing to diff against yet
+
+        val consistencyLine = if (previous.consistency.isNotBlank() && previous.consistency != consistency) {
+            "Consistency ${trendWord(previous.consistency, consistency)} from ${previous.consistency} to $consistency."
+        } else null
+
+        val missedDelta = attnStats.checksMissed - previous.checksMissed
+        val missedLine = when {
+            missedDelta > 0 -> "Focus checks missed rose from ${previous.checksMissed} to ${attnStats.checksMissed}."
+            missedDelta < 0 -> "Focus checks missed fell from ${previous.checksMissed} to ${attnStats.checksMissed}."
+            else            -> null
+        }
+
+        val skipDelta = skipTotal - previous.skipTotal
+        val skipLine = when {
+            skipDelta > 0 -> "Tasks missed rose from ${previous.skipTotal} to $skipTotal this week."
+            skipDelta < 0 -> "Tasks missed dropped from ${previous.skipTotal} to $skipTotal this week."
+            else          -> null
+        }
+
+        val lines = listOfNotNull(consistencyLine, missedLine, skipLine)
+        if (lines.isEmpty()) return ""
+
+        return "\nWEEK-OVER-WEEK CHANGE:\n" + lines.joinToString("\n") { "• $it" } + "\n"
+    }
+
+    /** Simple ordinal comparison so we say "improved" vs "dropped" correctly. */
+    private fun trendWord(prev: String, current: String): String {
+        val order = listOf("Poor", "Moderate", "Good", "Excellent")
+        val prevIdx = order.indexOf(prev)
+        val currIdx = order.indexOf(current)
+        if (prevIdx < 0 || currIdx < 0) return "changed"
+        return if (currIdx > prevIdx) "improved" else "dropped"
+    }
+
+    private fun loadLastSnapshot(): WeeklySnapshot? {
+        val raw = CheckmatePrefs.getString(KEY_LAST_SNAPSHOT, null) ?: return null
+        return try { json.decodeFromString(raw) } catch (_: Exception) { null }
+    }
+
+    private fun saveSnapshot(snapshot: WeeklySnapshot) {
+        CheckmatePrefs.putString(KEY_LAST_SNAPSHOT, json.encodeToString(snapshot))
+    }
+}
 
 
 
@@ -70,6 +793,7 @@ package com.checkmate.planner
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
@@ -82,6 +806,9 @@ import com.checkmate.core.llm.LlmGateway
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
 import com.checkmate.planner.model.TaskType
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -93,7 +820,10 @@ object AdaptivePlanner {
 
     suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
         val daysLeft          = daysUntilExam(config.examDate)
-        val behaviorSummary   = getBehaviorSummary()
+        // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"):
+        // structured deterministic metrics, not a hand-built prose string — see
+        // getBehaviorSnapshot() below.
+        val behaviorSnapshot  = getBehaviorSnapshot()
         val studyWindowHours  = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
         val profile           = ConsultationProfile.load()
         val checkIn           = DailyCheckIn.loadToday()
@@ -103,10 +833,11 @@ object AdaptivePlanner {
         // feeds tomorrow's plan so an incomplete checklist skews the next plan
         // toward catching up on fundamentals rather than piling on new PYQ topics.
         val checklistContext  = buildChecklistContext()
-        // Mentor v2 (spec 3.7): read TodayContext directly (not only via the cached
-        // behavior_summary string) so a mid-day regenerate always reflects the latest
-        // same-day free-text updates even if refreshBehaviorSummaryCache() hasn't run
-        // since the last one (e.g. the very first plan of the day).
+        // Mentor v2 (spec 3.7): read TodayContext directly (not folded into the cached
+        // BehaviorSnapshot — see PsycheEngine.refreshBehaviorSummaryCache()'s doc on why)
+        // so a mid-day regenerate always reflects the latest same-day free-text updates
+        // even if refreshBehaviorSummaryCache() hasn't run since the last one (e.g. the
+        // very first plan of the day).
         val todayContext      = TodayContext.getSummaryText()
 
         // Blueprint 4.1: today's free windows (study window minus school/coaching
@@ -115,10 +846,10 @@ object AdaptivePlanner {
             profile.blockedSlots, config.studyStartTime, config.studyEndTime
         )
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSummary, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
         if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
 
-        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, behaviorSummary, studyWindowHours), freeSlots)
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours), freeSlots)
     }
 
     /**
@@ -158,8 +889,26 @@ object AdaptivePlanner {
         }
     }
 
-    private fun getBehaviorSummary(): String =
-        CheckmatePrefs.getString("behavior_summary", "No behavior data yet") ?: "No behavior data yet"
+    /**
+     * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+     * Reads the structured BehaviorSnapshot PsycheEngine.refreshBehaviorSummaryCache()
+     * serializes into CheckmatePrefs (same cross-module bridge as before — :modules:planner
+     * still can't depend on :modules:psyche directly, see PsycheEngine's own doc on why —
+     * only the payload crossing that bridge changed, from hand-built prose to JSON).
+     *
+     * Falls back to BehaviorSnapshot.EMPTY (all zeros/empty lists) instead of a sentence
+     * like "No behavior data yet" — the LLM gets the same JSON shape whether or not history
+     * exists yet, rather than a special-cased string it would have to treat differently.
+     */
+    private fun getBehaviorSnapshot(): BehaviorSnapshot {
+        val raw = CheckmatePrefs.getString("behavior_snapshot_json", null) ?: return BehaviorSnapshot.EMPTY
+        return try {
+            Json { ignoreUnknownKeys = true }.decodeFromString<BehaviorSnapshot>(raw)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to decode behavior snapshot, using empty: ${e.message}")
+            BehaviorSnapshot.EMPTY
+        }
+    }
 
     private fun buildPyqContext(exam: String, checkIn: DailyCheckIn?): String {
         if (checkIn == null) return ""
@@ -205,7 +954,7 @@ object AdaptivePlanner {
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
-        behaviorSummary: String,
+        behaviorSnapshot: BehaviorSnapshot,
         studyWindowHours: Float,
         profile: com.checkmate.core.ConsultationProfile,
         checkIn: DailyCheckIn?,
@@ -233,6 +982,11 @@ Rules:
 - If TODAY'S LOGGED UPDATES mentions something already covered today (e.g. "back from coaching,
   did Physics 2hrs"), do not re-assign that same subject/topic — build on it or move to the next
   weak area instead
+- BEHAVIOR_METRICS below is deterministic data computed directly from stored events, not a
+  prose summary — treat every number and list in it as ground truth. subjectPatterns lists
+  specific (subject, taskType) combinations the student has repeatedly skipped (occurrences >= 3
+  in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
+  to the aggregate recentSkipRatePercent
 """.trimIndent()
 
         val prompt = buildString {
@@ -268,7 +1022,11 @@ Rules:
                 appendLine(todayContext)
                 appendLine()
             }
-            appendLine("BEHAVIOR DATA: $behaviorSummary")
+            // Upgrade Blueprint Phase 0 item #2: structured JSON, not a prose sentence — see
+            // getBehaviorSnapshot()/BehaviorSnapshot's own doc for why this crosses the
+            // psyche->planner boundary as data instead of as text.
+            appendLine("BEHAVIOR_METRICS (JSON, deterministic, authoritative):")
+            appendLine(Json.encodeToString(behaviorSnapshot))
             appendLine()
             appendLine("Generate today's plan.")
         }
@@ -335,10 +1093,13 @@ Rules:
         else        -> TaskType.OTHER
     }
 
+    // NOTE: previously took an unused `behaviorSummary: String` param (never referenced in the
+    // body below — the actual behavior signal this function reads is CheckmatePrefs'
+    // "recent_skip_rate", a couple of lines down). Dropped as dead code while touching this
+    // call site for Upgrade Blueprint Phase 0 item #2.
     private fun ruleBasedPlan(
         config: PlannerState,
         daysLeft: Int,
-        behaviorSummary: String,
         studyWindowHours: Float
     ): List<StudyTask> {
         val tasks        = mutableListOf<StudyTask>()
@@ -392,6 +1153,178 @@ Rules:
             val endMin   = eh * 60 + em
             ((endMin - startMin) / 60f).coerceAtLeast(1f)
         } catch (_: Exception) { 8f }
+    }
+}
+
+
+
+//===== FILE: modules/psyche/build.gradle.kts =====
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
+    // added alongside the new BehaviorDatabase/BehaviorEventEntity/BehaviorEventDao —
+    // Room's compiler needs kapt for Kotlin sources (annotationProcessor only handles
+    // Java, which is why :modules:core's existing Room deps are effectively dead —
+    // see its build.gradle.kts). :modules:planner already applies this same plugin
+    // for InterventionDatabase; same pattern here.
+    id("org.jetbrains.kotlin.kapt")
+}
+android {
+    namespace  = "com.checkmate.psyche"
+    compileSdk = 35
+    defaultConfig { minSdk = 26; targetSdk = 35 }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation(project(":modules:core"))
+    implementation(project(":modules:planner"))
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    // Upgrade Blueprint Phase 0 item #3: Room for BehaviorDatabase (see its own doc) —
+    // same versions :modules:planner already pins for InterventionDatabase.
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    kapt("androidx.room:room-compiler:2.6.1")
+    // Added for ContextBuilderTest (Proactive Execution Engine step 8) — same gap noted
+    // in modules/planner previously: no testImplementation("junit:...") existed here
+    // either. ContextBuilder itself is fully synchronous, so no coroutines-test needed.
+    testImplementation("junit:junit:4.13.2")
+}
+
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
+package com.checkmate
+
+import android.app.Application
+import android.content.Context
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionGuardianBridge
+import com.checkmate.planner.intervention.InterventionGuardianGateway
+import com.checkmate.planner.intervention.InterventionNotificationBridge
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.planner.intervention.InterventionTriggerScheduler
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.OutcomeLedgerSyncManager
+import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.UninstallAlertListener
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
+
+class CheckmateApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        CheckmatePrefs.init(this)
+        CheckmateState.init(this)
+        CheckmateTTS.init(this)
+        // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
+        // opens BehaviorDatabase, imports any pre-upgrade CheckmatePrefs event history
+        // into it once, and loads the in-memory read cache — see BehaviorLedger.init()'s
+        // own doc for why this runs synchronously here, same as CheckmatePrefs.init()
+        // right above. Must run before anything below can call BehaviorLedger or
+        // PsycheEngine (WorkModeManager.init() does, via the skip-rate check).
+        BehaviorLedger.init(this)
+
+        // Reconcile Work Mode with the hardcoded daily schedule (usual
+        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
+        // Sunday/Wednesday) and re-arm the four daily boundary alarms
+        // (AlarmManager repeating alarms don't survive a reboot, hence also
+        // doing this in BootReceiver). This must run after
+        // CheckmateState.init() above.
+        WorkModeManager.init(this)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
+        GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
+        // worker's KV for the on-demand "usage" command (see worker.js).
+        GuardianNotifier.scheduleUsageReports(this)
+        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
+        // guardian report via WhatsApp + Telegram. Previously never
+        // scheduled anywhere, which is why the weekly report never sent.
+        GuardianNotifier.scheduleWeeklyReport(this)
+        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+
+        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
+        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
+        // where a worker run could find InterventionNotificationBridge.gateway still null
+        // and silently fall back to the deterministic path when a notification was actually
+        // intended. InterventionNotifier is `app`'s implementation — the only module that
+        // can see both Android's NotificationManager and psyche's ContextBuilder at once
+        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
+        InterventionNotificationBridge.gateway = InterventionNotifier
+
+        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
+        // intent always resolved the transaction, but nothing downstream ever notified
+        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
+        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
+        // this just gives the intervention pipeline a way to call it without planner
+        // depending on `app` directly.
+        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
+            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
+                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
+            }
+        }
+
+        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
+        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
+        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
+        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
+        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
+        // reconciliation call added to BootReceiver below.
+        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
+        InterventionReconciliation.runAtStartup(this)
+
+        // Step 12 wiring: reinstall-recovery restore for the Outcome Ledger, mirroring
+        // the profile pull pattern (ProfileSyncManager.pullProfileIfLocalEmpty) but at
+        // app startup rather than lazily on a specific screen open — there's no single
+        // "ledger screen" whose open would naturally trigger this the way Planner/
+        // ConsultationProfile do for the profile pull. No-op if the local ledger table
+        // already has rows, or if no sync_code is configured — see
+        // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
+        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // Wire real screenshot capture via MediaProjection into DistractionGuard
+        // (and ScrollGuard, which reuses the same listener/pipeline for its
+        // "scroll" kind — see ScrollGuard.kt)
+        val distractionListener = object : DistractionListener {
+            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
+                Thread {
+                    val uri = ScreenCaptureManager.capture(context)
+                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
+                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
+                // the guardian-facing alert above — this is student-facing, not parent-facing.
+                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
+            }
+        }
+        DistractionGuard.listener = distractionListener
+        ScrollGuard.listener = distractionListener
+
+        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
+        // (via :workmode's UninstallGuard) into GuardianNotifier.
+        UninstallGuard.listener = object : UninstallAlertListener {
+            override fun onGuardedScreenBlocked(context: Context, reason: String) {
+                Thread {
+                    GuardianNotifier.notifyUninstallAttempt(context, reason)
+                }.start()
+            }
+        }
     }
 }
 
