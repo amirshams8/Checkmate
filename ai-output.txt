@@ -1,284 +1,1627 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/llm/LlmGateway.kt =====
-package com.checkmate.core.llm
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/OutcomeLedger.kt =====
+package com.checkmate.planner.intervention
 
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONException
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import androidx.room.Dao
+import androidx.room.Entity
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.TypeConverter
+import androidx.room.TypeConverters
 
 /**
- * Unified LLM gateway supporting OpenRouter, Groq, Claude, Gemini, and VibeBuild.
- * FIX 1.4: Changed Groq model from deprecated "llama3-8b-8192" to "llama-3.1-8b-instant".
- * FIX 1.4: Added HTTP status check + response body logging on failure so errors are
- *           visible in logcat instead of silently returning empty string.
+ * Proactive Execution Engine — Step 12 (Blueprint Part One, §22 "The Feedback Loop",
+ * §24 "Final Architecture", §25 principle 6: "Measure intervention effectiveness. Don't
+ * merely log behavior — log cause -> intervention -> response -> outcome.").
  *
- * VibeBuild (added): a third-party gateway (https://vibebuild.pro) fronting both an
- * OpenAI-compatible route (/proxy/openai) and an Anthropic-compatible route
- * (/proxy/anthropic) behind a single VibeBuild token. NOTE: this domain is not an
- * Anthropic- or OpenAI-published partner — it hasn't been independently verified as
- * trustworthy, only as reachable. The base URL is stored in prefs (not hardcoded) so
- * it can be repointed without a rebuild if it turns out to be unreliable. The OpenAI
- * route reuses the existing callOpenAiCompatible() request shape (confirmed working
- * against gpt-5.5-pro). The Anthropic route (callVibeBuildAnthropic) reuses callClaude()'s
- * request body shape.
+ * "Every intervention is transactional" (§25 principle 3) already gave us
+ * [InterventionTransaction] as the single source of truth for *how* a transaction got
+ * resolved (its terminal [InterventionState]). The Outcome Ledger is a second, append-mostly
+ * record of *why* — one row per terminal transaction resolution, written at the same choke
+ * point [InterventionTransaction] itself resolves through ([TaskEscrow]'s private
+ * `resolve()`), so this table can never drift out of sync with "the FSM actually decided
+ * this transaction is done." [BehaviorLedger]/PsycheEngine (Part Two) are the eventual
+ * downstream readers of this table — nothing reads it yet, same "built ahead of its caller"
+ * posture this package has used for earlier steps (e.g. Step 3's InterventionTransaction
+ * before Step 4's TaskEscrow existed to write to it).
  *
- * FIX 1.5: gpt-5.5-pro rejected requests with HTTP 400 "Unsupported parameter: 'temperature'
- *          is not supported with this model" — confirmed from live proxy error. Reasoning-tier
- *          OpenAI models (gpt-5.x, o3, o4) don't accept sampling temperature at all.
- *          callOpenAiCompatible() now omits it for those models instead of always sending 0.7.
- *
- * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently — two stacked bugs, both
- *          confirmed via live curl:
- *          1. Auth: the Bearer guess was wrong for this route — CONFIRMED via curl that
- *             VibeBuild's /proxy/anthropic route requires native Anthropic-style "x-api-key",
- *             not "Authorization: Bearer". callVibeBuildAnthropic() now sends x-api-key directly.
- *          2. Parsing: Fable 5 returns extended-thinking output, so content[0] is a
- *             {"type":"thinking",...} block with no "text" key — content[1] is the actual
- *             {"type":"text","text":"..."} block. The old code always read content[0], which
- *             threw on Fable 5 responses and got swallowed by the catch block into "". Both
- *             callClaude() and callVibeBuildAnthropic() now scan the content array for the
- *             first block with type=="text" instead of assuming index 0.
+ * [OutcomeLedgerEntry.transactionId] is the primary key, not a generated one — this is
+ * deliberately a 1:1 companion row per [InterventionTransaction], not an independent log
+ * table, so `upsert` (REPLACE) is also how [TaskEscrow] corrects an initially-derived
+ * provenance after the fact (see [OutcomeProvenance]'s own doc on NETWORK_FALLBACK/
+ * LLM_INVALID).
  */
-object LlmGateway {
+@Entity(tableName = "outcome_ledger_entries")
+@TypeConverters(InterventionConverters::class, OutcomeLedgerConverters::class)
+data class OutcomeLedgerEntry(
+    @PrimaryKey
+    val transactionId: String,
+    val taskId: String,
+    val triggerType: InterventionTriggerType,
+    val terminalState: InterventionState,
+    val provenance: OutcomeProvenance,
+    val attemptCount: Int,
+    val resolvedAt: Long,
+    val outcome: String? = null,
+    val failureReason: String? = null
+)
 
-    private const val TAG = "LlmGateway"
+/**
+ * Why a transaction ended up where it did — a layer above [InterventionState] itself.
+ * Six of these (everything but NETWORK_FALLBACK/LLM_INVALID) are 1:1 derivable from the
+ * terminal [InterventionState] alone (see [OutcomeProvenanceDerivation]). The remaining two
+ * exist because [InterventionDecisionMaker.decideAndExecute]'s fallback path resolves
+ * *identically* to a genuine LLM-negotiated success at [TaskEscrow]'s level — both commit
+ * as COMPLETED — so provenance for those two is corrected via a follow-up
+ * [TaskEscrow.overrideProvenance] call once decideAndExecute knows `usedFallback` was true,
+ * rather than ever being read off `currentState` (see that enum's own doc: NETWORK_FALLBACK
+ * and LLM_INVALID are declared states that no production code actually transitions a
+ * transaction into).
+ */
+enum class OutcomeProvenance {
+    /** Terminal state was COMPLETED and nothing overrode it — a genuine, decisive
+     *  resolution (LLM-negotiated or otherwise), not a fallback. */
+    SUCCESS,
+    USER_ABORTED,
+    /** Declared for completeness alongside [InterventionState.USER_IGNORED] — not
+     *  currently reachable, since nothing in production distinguishes "ignored" from
+     *  "timed out" today; both resolve via TTL_EXPIRED. See that state's own doc. */
+    USER_IGNORED,
+    TTL_EXPIRED,
+    EXECUTION_FAILED,
+    POLICY_REJECTED,
+    /** COMPLETED, but no LLM was ever attempted, or [InterventionFallback.attemptLlm]
+     *  produced nothing within budget (timeout/blank/gateway failure) — the deterministic
+     *  STRICT_REMINDER fallback ran instead. */
+    NETWORK_FALLBACK,
+    /** COMPLETED, but the LLM *did* respond and [InterventionDecisionMaker] fell back
+     *  anyway because [LlmIntentParser] couldn't make sense of it. */
+    LLM_INVALID
+}
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
-
-    object VibeBuildModels {
-        const val GPT_5_5_PRO    = "gpt-5.5-pro"
-        const val CLAUDE_FABLE_5 = "claude-fable-5"
-    }
-
-    private const val VIBEBUILD_DEFAULT_BASE_URL = "https://vibebuild.pro"
-
-    // FIX: true "unrestricted" isn't possible — both Anthropic's and OpenAI-compatible APIs
-    // require a numeric max_tokens — so this is set to each model's practical output ceiling
-    // instead of the 512 used for the other providers. GPT-5.5 Pro and Claude Fable 5 both
-    // support up to 64K output tokens; this is set conservatively below that so a very long
-    // reply still can't blow the 60s OkHttp readTimeout above.
-    private const val VIBEBUILD_MAX_TOKENS = 8192
-
-    // FIX 1.5: reasoning-tier OpenAI models reject sampling params like temperature entirely.
-    private val REASONING_MODEL_PREFIXES = listOf("gpt-5", "o3", "o4")
-
-    private fun supportsTemperature(model: String): Boolean =
-        REASONING_MODEL_PREFIXES.none { model.startsWith(it) }
-
-    // FIX 1.5: Anthropic-style responses can lead with a {"type":"thinking",...} block
-    // (extended thinking) before the {"type":"text","text":"..."} block. Always scan for
-    // the first text block instead of assuming content[0] — assuming index 0 silently broke
-    // Fable 5 responses since thinking blocks have no "text" key.
-    private fun firstTextBlock(content: JSONArray): String {
-        for (i in 0 until content.length()) {
-            val block = content.getJSONObject(i)
-            if (block.optString("type") == "text") {
-                return block.getString("text").trim()
-            }
+/**
+ * Derives [OutcomeProvenance] from an already-terminal [InterventionState]. Pure and
+ * synchronous on purpose (see [OutcomeLedgerTest]) — this is the "six of eight categories
+ * are fully derivable from terminal state, attempt count, and failure reason text" mapping;
+ * `attemptCount`/`failureReason` aren't consulted by the mapping itself today (the terminal
+ * state alone is unambiguous for all eight), but stay as parameters/columns because a future
+ * refinement (e.g. splitting SUCCESS by attemptCount) shouldn't need a new call site.
+ */
+object OutcomeProvenanceDerivation {
+    fun derive(terminalState: InterventionState, @Suppress("UNUSED_PARAMETER") failureReason: String? = null): OutcomeProvenance {
+        require(terminalState.isTerminal) {
+            "OutcomeProvenanceDerivation.derive requires a terminal state, got $terminalState"
         }
-        throw JSONException("No content block with type=text found")
-    }
-
-    suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
-        val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
-        val apiKey   = CheckmatePrefs.getString("llm_key_${provider.lowercase()}", null)
-
-        if (apiKey.isNullOrBlank()) {
-            Log.w(TAG, "No API key for $provider — returning empty (rule-based fallback will handle)")
-            return@withContext ""
+        return when (terminalState) {
+            InterventionState.COMPLETED -> OutcomeProvenance.SUCCESS
+            InterventionState.USER_ABORTED -> OutcomeProvenance.USER_ABORTED
+            InterventionState.USER_IGNORED -> OutcomeProvenance.USER_IGNORED
+            InterventionState.TTL_EXPIRED -> OutcomeProvenance.TTL_EXPIRED
+            InterventionState.EXECUTION_FAILED -> OutcomeProvenance.EXECUTION_FAILED
+            InterventionState.POLICY_REJECTED -> OutcomeProvenance.POLICY_REJECTED
+            InterventionState.NETWORK_FALLBACK -> OutcomeProvenance.NETWORK_FALLBACK
+            InterventionState.LLM_INVALID -> OutcomeProvenance.LLM_INVALID
+            else -> error("unreachable — $terminalState is terminal but has no provenance mapping")
         }
+    }
+}
 
-        return@withContext when (provider) {
-            "Claude"      -> callClaude(prompt, systemPrompt, apiKey)
-            "Gemini"      -> callGemini(prompt, systemPrompt, apiKey)
-            "Groq"        -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://api.groq.com/openai/v1/chat/completions",
-                // FIX: "llama3-8b-8192" was deprecated by Groq → HTTP 400/404 → silent empty return
-                // → AdaptivePlanner always fell back to ruleBasedPlan() → vague tasks
-                "llama-3.1-8b-instant"
+@Dao
+interface OutcomeLedgerDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entry: OutcomeLedgerEntry)
+
+    /** Used by [TaskEscrow.overrideProvenance] to correct NETWORK_FALLBACK/LLM_INVALID
+     *  after the baseline SUCCESS row has already been written — see [OutcomeProvenance]'s
+     *  own doc. A no-op if [transactionId] has no ledger row yet (e.g. ledgerWriter was
+     *  null when the transaction resolved). */
+    @Query("UPDATE outcome_ledger_entries SET provenance = :provenance WHERE transactionId = :transactionId")
+    suspend fun updateProvenance(transactionId: String, provenance: OutcomeProvenance)
+
+    @Query("SELECT * FROM outcome_ledger_entries WHERE transactionId = :transactionId")
+    suspend fun getByTransactionId(transactionId: String): OutcomeLedgerEntry?
+
+    @Query("SELECT * FROM outcome_ledger_entries ORDER BY resolvedAt DESC LIMIT :limit")
+    suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry>
+}
+
+object OutcomeLedgerConverters {
+    @TypeConverter
+    fun fromProvenance(provenance: OutcomeProvenance): String = provenance.name
+
+    @TypeConverter
+    fun toProvenance(value: String): OutcomeProvenance = OutcomeProvenance.valueOf(value)
+}
+
+/**
+ * Thin wrapper [TaskEscrow] holds an optional reference to — keeps TaskEscrow's own code
+ * talking in terms of "record this transaction" / "override this provenance" rather than
+ * reaching into DAO/derivation details itself. Optional and defaulted to null everywhere
+ * it's threaded through (see [TaskEscrow]'s constructor doc) so this is purely additive:
+ * every existing single-arg `TaskEscrow(dao)` call site — 15+ of them, 22 in
+ * TaskEscrowTest.kt alone — keeps compiling and behaving exactly as before, just without a
+ * ledger.
+ */
+class OutcomeLedgerWriter(private val dao: OutcomeLedgerDao) {
+
+    suspend fun record(transaction: InterventionTransaction, now: Long = System.currentTimeMillis()) {
+        val provenance = OutcomeProvenanceDerivation.derive(transaction.currentState, transaction.failureReason)
+        dao.upsert(
+            OutcomeLedgerEntry(
+                transactionId = transaction.transactionId,
+                taskId = transaction.taskId,
+                triggerType = transaction.triggerType,
+                terminalState = transaction.currentState,
+                provenance = provenance,
+                attemptCount = transaction.attemptCount,
+                resolvedAt = now,
+                outcome = transaction.outcome,
+                failureReason = transaction.failureReason
             )
-            "OpenRouter"  -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://openrouter.ai/api/v1/chat/completions",
-                "mistralai/mistral-7b-instruct:free"
+        )
+    }
+
+    suspend fun overrideProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        dao.updateProvenance(transactionId, provenance)
+    }
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+/**
+ * Proactive Execution Engine — Step 3 (Blueprint Part One, §4), amended in Step 12 (§22,
+ * §25 principle 6) to add the Outcome Ledger table.
+ *
+ * Standalone singleton, same shape as a typical Room setup — deliberately not wired into
+ * CheckmateApp.onCreate() yet. Nothing calls InterventionDatabase.getInstance() until the
+ * Task Escrow (step 4) and ActionExecutor (step 5) exist to actually create/update rows,
+ * so wiring it into app startup now would be speculative.
+ *
+ * Step 12: version bumped 1 -> 2 to add [OutcomeLedgerEntry]. No real migration is written
+ * — [fallbackToDestructiveMigration] is safe here specifically because this database is
+ * still pre-pilot (Blueprint §26's build sequence puts "Real-student pilot" at step 13,
+ * *after* this step), so there is no student data anywhere for a destructive wipe to lose.
+ * This should be revisited (a real Migration) before step 13 ships.
+ */
+@Database(
+    entities = [InterventionTransaction::class, OutcomeLedgerEntry::class],
+    version = 2,
+    exportSchema = false
+)
+abstract class InterventionDatabase : RoomDatabase() {
+
+    abstract fun interventionTransactionDao(): InterventionTransactionDao
+    abstract fun outcomeLedgerDao(): OutcomeLedgerDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: InterventionDatabase? = null
+
+        fun getInstance(context: Context): InterventionDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    InterventionDatabase::class.java,
+                    "checkmate_intervention.db"
+                )
+                    .fallbackToDestructiveMigration()
+                    .build().also { INSTANCE = it }
+            }
+    }
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskEscrow.kt =====
+package com.checkmate.planner.intervention
+
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6), amended in Step 9 (§16
+ * "Snooze 5 min" — see [extend]) and Step 12 (§22, §25 principle 6 — see [ledgerWriter]).
+ *
+ * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
+ * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
+ * owns the task until it reaches COMMIT or ABORT" (§5). This deliberately does NOT touch
+ * [com.checkmate.planner.model.TaskState] or [com.checkmate.planner.PlanStore] — there is
+ * no NEGOTIATING case added to TaskState, because that enum is matched exhaustively across
+ * the UI layer (HomeScreen/HomeViewModel/etc.) and adding a case there is a much wider,
+ * riskier change than this step calls for. Escrow ownership is entirely a property of the
+ * transaction table from step 3: a task is under escrow iff `dao.getLatestForTask(taskId)`
+ * is non-null and non-terminal. Callers that need to gate task-mutation UI on escrow can
+ * check that via [isUnderEscrow] without StudyTask ever knowing escrow exists.
+ *
+ * Atomicity: this is a single-process Android app, not a multi-process one, so the actual
+ * correctness boundary is in-process mutual exclusion, not a Room `@Transaction`/SQLite
+ * isolation level. Every entry point below funnels through [withTaskLock], which holds a
+ * per-taskId [Mutex] for the duration of its read-then-write. Two concurrent acquire()
+ * calls for the same task always serialize through that Mutex, so exactly one observes
+ * "no existing escrow" and wins; the other sees the transaction the winner just wrote and
+ * gets [EscrowAcquireResult.AlreadyHeld]. The lock map itself is never persisted — that's
+ * fine, because after a real process death there's no second in-process caller left to
+ * race against; the surviving [InterventionTransaction] row is instead picked up by
+ * [reconcileUnfinished] (or reclaimed inline by the next [acquire] call for that task).
+ *
+ * Step 12: [ledgerWriter] is optional and defaults to null so every existing single-arg
+ * `TaskEscrow(dao)` call site — 15+ of them, 22 in TaskEscrowTest.kt alone — keeps
+ * compiling and behaving exactly as before, just without an Outcome Ledger. Every terminal
+ * transition funnels through the private [resolve] choke point *except* TTL_EXPIRED, which
+ * [acquire]'s inline reclaim and [expireIfPastTtl] both write directly via `dao.update`
+ * (they predate [resolve] taking on that role, and reclaiming inside an already-open
+ * [withTaskLock] section made routing them through a second lock-acquiring call wasteful) —
+ * both of those direct-update sites also write a ledger entry, so all eight terminal states
+ * are covered no matter which of the three code paths reaches them.
+ */
+class TaskEscrow(
+    private val dao: InterventionTransactionDao,
+    private val ledgerWriter: OutcomeLedgerWriter? = null
+) {
+
+    private val taskLocks = ConcurrentHashMap<String, Mutex>()
+
+    /**
+     * Attempts to acquire escrow for [taskId]. Succeeds and creates a new NEGOTIATING
+     * transaction unless one already exists and is both non-terminal AND still within its
+     * TTL. A non-terminal transaction found past its TTL is treated as abandoned — reclaimed
+     * (marked TTL_EXPIRED) in the same locked section, and acquisition then proceeds. This
+     * is what makes expiry deterministic even if no reconciliation job has run yet: the very
+     * next acquire() attempt for that task will not be blocked by a stale escrow forever.
+     */
+    suspend fun acquire(
+        taskId: String,
+        triggerType: InterventionTriggerType,
+        now: Long = System.currentTimeMillis(),
+        ttlMillis: Long = DEFAULT_TTL_MILLIS
+    ): EscrowAcquireResult = withTaskLock(taskId) {
+        val existing = dao.getLatestForTask(taskId)
+        if (existing != null && !existing.currentState.isTerminal) {
+            if (now < existing.expiresAt) {
+                return@withTaskLock EscrowAcquireResult.AlreadyHeld(existing)
+            }
+            // Past TTL and nobody released it — reclaim before proceeding.
+            val reclaimed = existing.copy(
+                currentState = InterventionState.TTL_EXPIRED,
+                failureReason = "TTL expired before release; reclaimed by acquire()"
             )
-            "VibeBuild"   -> {
-                val model = CheckmatePrefs.getString("llm_vibebuild_model", VibeBuildModels.GPT_5_5_PRO)
-                    ?: VibeBuildModels.GPT_5_5_PRO
-                val baseUrl = (CheckmatePrefs.getString("llm_vibebuild_base_url", null)
-                    ?.trim()?.takeIf { it.isNotBlank() } ?: VIBEBUILD_DEFAULT_BASE_URL)
-                    .trimEnd('/')
-                when (model) {
-                    VibeBuildModels.CLAUDE_FABLE_5 ->
-                        callVibeBuildAnthropic(prompt, systemPrompt, apiKey, baseUrl, model)
-                    else ->
-                        callOpenAiCompatible(
-                            prompt, systemPrompt, apiKey,
-                            "$baseUrl/proxy/openai/v1/chat/completions",
-                            model,
-                            // FIX: VibeBuild responses were being cut off mid-sentence at the
-                            // default 512-token cap. VibeBuild gets a much higher ceiling; other
-                            // providers (Groq/OpenRouter) keep the original 512 default.
-                            maxTokens = VIBEBUILD_MAX_TOKENS
-                        )
-                }
-            }
-            else          -> ""
+            dao.update(reclaimed)
+            ledgerWriter?.record(reclaimed, now)
         }
+
+        val transaction = InterventionTransaction(
+            taskId = taskId,
+            currentState = InterventionState.NEGOTIATING,
+            triggerType = triggerType,
+            createdAt = now,
+            expiresAt = now + ttlMillis
+        )
+        dao.upsert(transaction)
+        EscrowAcquireResult.Acquired(transaction)
     }
 
-    private fun callOpenAiCompatible(
-        prompt: String, system: String, apiKey: String, url: String, model: String,
-        maxTokens: Int = 512
-    ): String {
-        val messages = JSONArray().apply {
-            if (system.isNotBlank()) put(JSONObject().put("role", "system").put("content", system))
-            put(JSONObject().put("role", "user").put("content", prompt))
-        }
-        val body = JSONObject().apply {
-            put("model", model)
-            put("messages", messages)
-            put("max_tokens", maxTokens)
-            // FIX 1.5: reasoning-tier models (gpt-5.x, o3, o4) 400 on this param entirely.
-            if (supportsTemperature(model)) put("temperature", 0.7)
-        }.toString().toRequestBody("application/json".toMediaType())
+    /** COMMIT (§5): the intervention concluded with an action taken. Idempotent — calling
+     *  this again (or calling [abort] afterward) on the same transaction is a no-op. */
+    suspend fun commit(transactionId: String, outcome: String? = null): EscrowReleaseResult =
+        resolveAs(transactionId, InterventionState.COMPLETED, outcome = outcome)
 
-        val req = Request.Builder().url(url)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+    /** ABORT (§5): the intervention concluded without acting on the task because the
+     *  *student* declined/dismissed it. Idempotent, same as [commit]. Distinct from a
+     *  system-side execution failure — see [resolveAs]. */
+    suspend fun abort(transactionId: String, reason: String? = null): EscrowReleaseResult =
+        resolveAs(transactionId, InterventionState.USER_ABORTED, failureReason = reason)
 
-        return try {
-            val resp     = client.newCall(req).execute()
-            val bodyStr  = resp.body?.string() ?: "{}"
-            // FIX: previously body was consumed before status check — error JSON was lost
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "OpenAI-compat HTTP ${resp.code} for model=$model url=$url body=$bodyStr")
-                return ""
-            }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("choices").getJSONObject(0)
-                .getJSONObject("message").getString("content").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "OpenAI-compat call failed: ${e.message}")
-            ""
-        }
-    }
-
-    private fun callClaude(prompt: String, system: String, apiKey: String): String {
-        val body = JSONObject().apply {
-            put("model", "claude-3-haiku-20240307")
-            put("max_tokens", 512)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("https://api.anthropic.com/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Claude HTTP ${resp.code} body=$bodyStr")
-                return ""
-            }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "Claude call failed: ${e.message}")
-            ""
+    /**
+     * Step 9 (§16 "Snooze 5 min"): extends a still-live NEGOTIATING transaction's TTL
+     * without resolving it — unlike [commit]/[abort]/[resolveAs], this deliberately does
+     * NOT touch [InterventionTransaction.currentState]. A snooze is the student saying "not
+     * yet, ask me again later," not a decision the FSM has reached, so the transaction stays
+     * exactly where it was; escrow is not released, so nothing else can start/mutate the
+     * task in the meantime either. [additionalMillis] is added to `max(current expiresAt,
+     * now)` rather than just `now + additionalMillis`, so calling this before the previous
+     * deadline has passed extends from the existing deadline instead of ever shortening it.
+     * Not resolving means there is nothing to write to the Outcome Ledger here either — a
+     * snooze isn't a terminal outcome.
+     *
+     * Idempotent-safe the same way [resolve] is: if the transaction already resolved (by
+     * TTL, or a concurrent notification-action tap) between the notification tap and this
+     * call, this is a no-op that reports [EscrowExtendResult.AlreadyResolved] rather than
+     * reviving a dead transaction.
+     */
+    suspend fun extend(
+        transactionId: String,
+        additionalMillis: Long,
+        now: Long = System.currentTimeMillis()
+    ): EscrowExtendResult {
+        val current = dao.getById(transactionId) ?: return EscrowExtendResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExtendResult.NotFound
+            if (fresh.currentState.isTerminal) return@withTaskLock EscrowExtendResult.AlreadyResolved
+            val newExpiry = maxOf(fresh.expiresAt, now) + additionalMillis
+            dao.update(fresh.copy(expiresAt = newExpiry))
+            EscrowExtendResult.Extended(newExpiry)
         }
     }
 
     /**
-     * VibeBuild's Anthropic-compatible route (/proxy/anthropic). Reuses callClaude()'s
-     * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
-     * schema) since VibeBuild fronts the Anthropic API rather than translating it.
-     *
-     * FIX 1.5: CONFIRMED via live curl against this exact route that VibeBuild requires
-     * native Anthropic-style "x-api-key" — "Authorization: Bearer" (which works on the
-     * OpenAI route) gets a flat 401 here. Also, Fable 5 responses lead with a "thinking"
-     * content block before the "text" block, so parsing now scans for the first
-     * type=="text" block via firstTextBlock() instead of assuming content[0].
+     * General resolution entry point for any terminal [InterventionState] — added in step
+     * 5. [commit]/[abort] cover the two most common cases, but ActionExecutor also needs
+     * to resolve into EXECUTION_FAILED specifically when a permitted mutation can no
+     * longer be applied (e.g. task state changed between validation and execution). That's
+     * a different fact than USER_ABORTED (the student declined) or TTL_EXPIRED (nobody
+     * responded in time), and the Outcome Ledger tells them apart via [OutcomeProvenance].
      */
-    private fun callVibeBuildAnthropic(
-        prompt: String, system: String, apiKey: String, baseUrl: String, model: String
-    ): String {
-        val body = JSONObject().apply {
-            put("model", model)
-            put("max_tokens", VIBEBUILD_MAX_TOKENS)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
+    suspend fun resolveAs(
+        transactionId: String,
+        terminalState: InterventionState,
+        outcome: String? = null,
+        failureReason: String? = null
+    ): EscrowReleaseResult {
+        require(terminalState.isTerminal) { "resolveAs requires a terminal state, got $terminalState" }
+        return resolve(transactionId, terminalState, outcome, failureReason)
+    }
 
-        val req = Request.Builder()
-            .url("$baseUrl/proxy/anthropic/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+    /**
+     * Step 12: corrects a ledger row's [OutcomeProvenance] after the fact. Exists because
+     * [InterventionDecisionMaker.decideAndExecute]'s fallback path resolves through
+     * [ActionExecutor.execute] -> [commit] exactly like a genuine LLM-negotiated success —
+     * by the time decideAndExecute learns `usedFallback` was true, the baseline SUCCESS row
+     * [resolve] wrote is already there. A no-op (via [OutcomeLedgerDao.updateProvenance]'s
+     * own WHERE clause) if [ledgerWriter] is null or no row exists for [transactionId].
+     */
+    suspend fun overrideProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        ledgerWriter?.overrideProvenance(transactionId, provenance)
+    }
 
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
-                return ""
+    /**
+     * Explicit TTL check for one transaction, independent of [acquire]'s inline reclaim —
+     * for a reconciliation job (a later step) that wants to sweep expired escrows without
+     * also trying to acquire a new one. Deterministic and idempotent: calling it again after
+     * it has already expired (or already resolved by commit/abort) a transaction is a safe
+     * no-op.
+     */
+    suspend fun expireIfPastTtl(
+        transactionId: String,
+        now: Long = System.currentTimeMillis()
+    ): EscrowExpiryResult {
+        val current = dao.getById(transactionId) ?: return EscrowExpiryResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowExpiryResult.NotFound
+            when {
+                fresh.currentState.isTerminal -> EscrowExpiryResult.AlreadyResolved
+                now < fresh.expiresAt -> EscrowExpiryResult.NotYetExpired
+                else -> {
+                    val expired = fresh.copy(
+                        currentState = InterventionState.TTL_EXPIRED,
+                        failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
+                    )
+                    dao.update(expired)
+                    ledgerWriter?.record(expired, now)
+                    EscrowExpiryResult.Expired
+                }
             }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "VibeBuild/Anthropic call failed: ${e.message}")
-            ""
         }
     }
 
-    private fun callGemini(prompt: String, system: String, apiKey: String): String {
-        val fullPrompt = if (system.isNotBlank()) "$system\n\n$prompt" else prompt
-        val body = JSONObject().apply {
-            put("contents", JSONArray().put(
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", fullPrompt)))
-            ))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$apiKey"
-        val req = Request.Builder().url(url)
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
-                return ""
+    /**
+     * Reconciliation (§4): "Process dies -> Room remains -> Worker/receiver restarts ->
+     * unfinished transaction discovered -> FSM reconciles it." Intended to run once after
+     * process restart (from BootReceiver, or a WorkManager job — wiring that trigger point
+     * is a later step; this only provides the sweep itself). Every unfinished transaction
+     * past its TTL is expired; anything unfinished but still within TTL is left alone and
+     * returned so the caller can decide what to do with a live, still-valid negotiation
+     * that survived the restart.
+     */
+    suspend fun reconcileUnfinished(now: Long = System.currentTimeMillis()): ReconciliationResult {
+        val unfinished = dao.getUnfinished(InterventionState.TERMINAL_STATES.toList())
+        val expired = mutableListOf<InterventionTransaction>()
+        val stillLive = mutableListOf<InterventionTransaction>()
+        for (transaction in unfinished) {
+            when (expireIfPastTtl(transaction.transactionId, now)) {
+                is EscrowExpiryResult.Expired -> expired += transaction.copy(currentState = InterventionState.TTL_EXPIRED)
+                is EscrowExpiryResult.NotYetExpired -> stillLive += transaction
+                // Resolved by a concurrent caller between the query above and this check,
+                // or the row vanished — either way it's no longer this sweep's concern.
+                is EscrowExpiryResult.AlreadyResolved, is EscrowExpiryResult.NotFound -> Unit
             }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts").getJSONObject(0)
-                .getString("text").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "Gemini call failed: ${e.message}")
-            ""
         }
+        return ReconciliationResult(expiredTransactions = expired, stillLiveTransactions = stillLive)
+    }
+
+    /** True iff [taskId] currently has a non-terminal transaction — i.e. is under escrow
+     *  and should not be independently mutated/started elsewhere. */
+    suspend fun isUnderEscrow(taskId: String): Boolean {
+        val existing = dao.getLatestForTask(taskId) ?: return false
+        return !existing.currentState.isTerminal
+    }
+
+    private suspend fun resolve(
+        transactionId: String,
+        state: InterventionState,
+        outcome: String? = null,
+        failureReason: String? = null,
+        now: Long = System.currentTimeMillis()
+    ): EscrowReleaseResult {
+        val current = dao.getById(transactionId) ?: return EscrowReleaseResult.NotFound
+        return withTaskLock(current.taskId) {
+            val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowReleaseResult.NotFound
+            if (fresh.currentState.isTerminal) return@withTaskLock EscrowReleaseResult.AlreadyResolved
+            val resolved = fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason)
+            dao.update(resolved)
+            ledgerWriter?.record(resolved, now)
+            EscrowReleaseResult.Released
+        }
+    }
+
+    private suspend fun <T> withTaskLock(taskId: String, block: suspend () -> T): T {
+        val mutex = taskLocks.getOrPut(taskId) { Mutex() }
+        return mutex.withLock { block() }
+    }
+
+    companion object {
+        /** Blueprint §6 example TTL. */
+        const val DEFAULT_TTL_MILLIS = 60_000L
+    }
+}
+
+sealed class EscrowAcquireResult {
+    data class Acquired(val transaction: InterventionTransaction) : EscrowAcquireResult()
+    data class AlreadyHeld(val existing: InterventionTransaction) : EscrowAcquireResult()
+}
+
+sealed class EscrowReleaseResult {
+    object Released : EscrowReleaseResult()
+    /** Idempotency case: already COMPLETED/ABORTED/EXPIRED/etc. — commit()/abort() called
+     *  twice, or called after TTL already resolved it first. Not an error. */
+    object AlreadyResolved : EscrowReleaseResult()
+    object NotFound : EscrowReleaseResult()
+}
+
+sealed class EscrowExpiryResult {
+    object Expired : EscrowExpiryResult()
+    object AlreadyResolved : EscrowExpiryResult()
+    object NotYetExpired : EscrowExpiryResult()
+    object NotFound : EscrowExpiryResult()
+}
+
+/** Result of [TaskEscrow.extend] — step 9's snooze support. */
+sealed class EscrowExtendResult {
+    data class Extended(val newExpiresAt: Long) : EscrowExtendResult()
+    object AlreadyResolved : EscrowExtendResult()
+    object NotFound : EscrowExtendResult()
+}
+
+data class ReconciliationResult(
+    val expiredTransactions: List<InterventionTransaction>,
+    val stillLiveTransactions: List<InterventionTransaction>
+)
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionFallback.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.planner.model.StudyTask
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Proactive Execution Engine — Step 6 (Blueprint Part One, §14, §25 principle 2).
+ *
+ * "The internet must never become Checkmate's single point of failure." [attemptLlm] wraps
+ * an LLM call with a short, intervention-specific timeout — deliberately not a change to
+ * [LlmGateway]'s own client timeouts, which other callers (e.g. AdaptivePlanner's plan
+ * generation) reasonably rely on being longer. [strictReminderIntent] is the deterministic
+ * fallback itself: a fixed, non-LLM response that still goes through PolicyValidator like
+ * any other intent (§14's own diagram routes STRICT_REMINDER through PolicyValidator, not
+ * around it) — the policy boundary doesn't get to be softer just because nothing chose to
+ * be clever here.
+ */
+object InterventionFallback {
+
+    /** Blueprint §14/§18: "3-second timeout." */
+    const val DEFAULT_LLM_TIMEOUT_MILLIS = 3_000L
+
+    /**
+     * Attempts an LLM call with a hard timeout. Returns null on timeout, on a blank
+     * response, or on any failure LlmGateway itself already collapses to "" (missing API
+     * key, HTTP error, exception — see LlmGateway.complete's own doc). Callers should treat
+     * null uniformly as "the LLM path did not produce anything usable in time."
+     *
+     * [llmCall] defaults to the real [LlmGateway.complete] and is only overridden in tests,
+     * so this doesn't need Robolectric/instrumented tests to verify timeout behavior — a
+     * fake that suspends past the timeout exercises the exact same withTimeoutOrNull path
+     * the production call goes through.
+     */
+    suspend fun attemptLlm(
+        prompt: String,
+        systemPrompt: String = "",
+        timeoutMillis: Long = DEFAULT_LLM_TIMEOUT_MILLIS,
+        // Was `= LlmGateway::complete` — a suspend function *reference* as a default
+        // parameter value isn't supported by this Kotlin compiler config ("Unsupported
+        // [suspend function calls in a context of default parameter value]"). A lambda
+        // wrapping the same call compiles fine and is behaviorally identical.
+        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
+    ): String? {
+        val result = withTimeoutOrNull(timeoutMillis) { llmCall(prompt, systemPrompt) }
+        return result?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * The deterministic STRICT_REMINDER (§14's own worked example). Always a START_TASK
+     * intent — the fallback's whole purpose is to get the student moving on what was
+     * already planned, not to negotiate or reduce scope; negotiation is the AI Mentor's
+     * job once it exists.
+     */
+    fun strictReminderIntent(task: StudyTask, lateMinutes: Int): LlmIntent {
+        val speech = if (lateMinutes > 0) {
+            "You're $lateMinutes minutes late. Start ${task.topic} now. " +
+                "I'll adjust the remaining schedule afterward."
+        } else {
+            "It's time to start ${task.topic}."
+        }
+        return LlmIntent(
+            speech = speech,
+            intentType = InterventionIntentType.START_TASK,
+            targetTaskId = task.id
+        )
+    }
+}
+
+/**
+ * Orchestrates one intervention decision: try the LLM within budget (if asked to at all),
+ * then resolve deterministically either way, through PolicyValidator and ActionExecutor —
+ * never around them. Owns nothing about escrow lifecycle itself beyond resolving
+ * POLICY_REJECTED directly (ActionExecutor already resolves every other outcome as part of
+ * [ActionExecutor.execute]); the transaction must already be acquired via [TaskEscrow]
+ * before this is called.
+ *
+ * Two entry points, for two different kinds of caller:
+ *  - [decideAndExecute] backs callers that must resolve the transaction *right now* — the
+ *    notification's own Start button ([InterventionActionReceiver]), the negotiation
+ *    screen's Start button, and the TTL-expiry sweep. If [llmPrompt] is null, or the LLM
+ *    doesn't respond in time, or [LlmIntentParser] can't make sense of what it said, this
+ *    always falls back to [InterventionFallback.strictReminderIntent] — these callers have
+ *    no "come back later," so something decisive has to happen.
+ *  - [attemptConversationalTurn] backs the live back-and-forth on the negotiation screen
+ *    (Step 11 wiring — see its own doc below) — a single chat message is *not* the same
+ *    kind of event as a Start-button tap, and forcing a resolution on every turn (e.g.
+ *    silently START_TASK-ing the student's plan just because one LLM call timed out mid-
+ *    conversation) would be actively hostile UX. Most turns are just talk.
+ *
+ * Step 12: when [decideAndExecute] falls back (`usedFallback == true`), the transaction
+ * still resolves as COMPLETED via [ActionExecutor.execute] -> [TaskEscrow.commit] exactly
+ * like a genuine LLM-negotiated success — [TaskEscrow]'s resolve() choke point has no way
+ * to tell the two apart on its own, so it writes the baseline SUCCESS ledger row. Once
+ * `usedFallback` is known here, a follow-up [TaskEscrow.overrideProvenance] call corrects
+ * that row to NETWORK_FALLBACK or LLM_INVALID — see [fallbackProvenance] below for how the
+ * two are distinguished. Only fired when the execution outcome actually resolved the
+ * transaction as COMPLETED (not EXECUTION_FAILED, and not the already-resolved/not-found
+ * no-ops, which never had a fresh ledger row to correct in the first place).
+ */
+class InterventionDecisionMaker(
+    private val taskEscrow: TaskEscrow,
+    private val actionExecutor: ActionExecutor
+) {
+    suspend fun decideAndExecute(
+        transactionId: String,
+        task: StudyTask,
+        lateMinutes: Int,
+        now: Long = System.currentTimeMillis(),
+        llmPrompt: String? = null,
+        llmSystemPrompt: String = "",
+        llmTimeoutMillis: Long = InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS,
+        // Same fix as InterventionFallback.attemptLlm above.
+        llmCall: suspend (String, String) -> String = { p, s -> LlmGateway.complete(p, s) }
+    ): DecisionOutcome {
+        // Step 11: a raw LLM response is now actually trusted through LlmIntentParser
+        // before it can influence anything — parse failure (or no response at all) falls
+        // back to the deterministic reminder exactly as it always did, it just no longer
+        // discards a *successful, parseable* response the way it did before this step.
+        val rawResponse = if (llmPrompt != null) {
+            InterventionFallback.attemptLlm(llmPrompt, llmSystemPrompt, llmTimeoutMillis, llmCall)
+        } else null
+
+        val parsedIntent = rawResponse?.let { LlmIntentParser.parse(it, fallbackTaskId = task.id) }
+        val intent = parsedIntent ?: InterventionFallback.strictReminderIntent(task, lateMinutes)
+        val usedFallback = parsedIntent == null
+
+        val policyState = PolicyState(task = task, nowMillis = now)
+
+        return when (val result = PolicyValidator.validate(intent, policyState)) {
+            is PolicyResult.Permitted -> {
+                val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                if (usedFallback && executionOutcome.resolvedAsCompleted()) {
+                    taskEscrow.overrideProvenance(
+                        transactionId,
+                        fallbackProvenance(llmPrompt, rawResponse)
+                    )
+                }
+                DecisionOutcome.Executed(executionOutcome, usedFallback, intent.speech)
+            }
+            is PolicyResult.Rejected -> {
+                taskEscrow.resolveAs(
+                    transactionId,
+                    InterventionState.POLICY_REJECTED,
+                    failureReason = result.detail
+                )
+                DecisionOutcome.PolicyRejected(result.reason, result.detail, usedFallback)
+            }
+        }
+    }
+
+    /**
+     * Step 12: NETWORK_FALLBACK covers "no LLM was ever attempted" (`llmPrompt == null` —
+     * e.g. the no-gateway worker path, or a TTL sweep) as well as "attemptLlm produced
+     * nothing within budget" (`rawResponse == null` — timeout, blank, or an LlmGateway-level
+     * failure). LLM_INVALID is narrower: a response *did* come back, it's only that
+     * [LlmIntentParser] couldn't make sense of it — a model output-quality problem, not a
+     * connectivity one.
+     */
+    private fun fallbackProvenance(llmPrompt: String?, rawResponse: String?): OutcomeProvenance = when {
+        llmPrompt == null -> OutcomeProvenance.NETWORK_FALLBACK
+        rawResponse == null -> OutcomeProvenance.NETWORK_FALLBACK
+        else -> OutcomeProvenance.LLM_INVALID
+    }
+
+    /**
+     * Step 11. One turn of live negotiation: a raw LLM response the caller already has in
+     * hand (the ViewModel owns the attemptLlm call + chat transcript, since it needs the
+     * text to display either way — this function starts from the raw string rather than
+     * calling attemptLlm itself, to avoid a second, subtly different timeout/prompt path).
+     *
+     * Deliberately does NOT fall back to [InterventionFallback.strictReminderIntent] on a
+     * failed/unparseable response, unlike [decideAndExecute] — mid-conversation, "the model
+     * didn't answer in time" should read as "let me try that again," not as the app quietly
+     * force-starting the task and ending the negotiation the student is actively having.
+     * [Continue] and [Rejected] both leave the transaction open in NEGOTIATING; only a
+     * genuinely decisive [PermittedAction] reaches [actionExecutor] and resolves it. Since
+     * nothing here ever falls back, there's no `usedFallback`/provenance-override step to
+     * mirror from [decideAndExecute] — a [ConversationalOutcome.Decided] here was always a
+     * genuine parsed intent, so the baseline SUCCESS ledger row [resolve] writes is already
+     * correct.
+     * RequestClarification/NoAction are Permitted by PolicyValidator like anything else (so
+     * they're still covered by the same policy test matrix) but are intentionally excluded
+     * here from reaching the executor: [ActionExecutor.execute] commits the transaction for
+     * *every* outcome including [ExecutionOutcome.NotApplicable], and committing the
+     * transaction the moment the AI Mentor asks a clarifying question would end the
+     * conversation after a single exchange.
+     */
+    suspend fun attemptConversationalTurn(
+        transactionId: String,
+        task: StudyTask,
+        rawLlmResponse: String?,
+        now: Long = System.currentTimeMillis()
+    ): ConversationalOutcome {
+        if (rawLlmResponse == null) return ConversationalOutcome.LlmUnavailable
+
+        val intent = LlmIntentParser.parse(rawLlmResponse, fallbackTaskId = task.id)
+            ?: return ConversationalOutcome.UnparseableResponse
+
+        val policyState = PolicyState(task = task, nowMillis = now)
+        return when (val result = PolicyValidator.validate(intent, policyState)) {
+            is PolicyResult.Rejected ->
+                ConversationalOutcome.Rejected(intent.speech, result.reason, result.detail)
+            is PolicyResult.Permitted -> when (result.action) {
+                is PermittedAction.RequestClarification, is PermittedAction.NoAction ->
+                    ConversationalOutcome.Continue(intent.speech)
+                else -> {
+                    val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                    ConversationalOutcome.Decided(intent.speech, executionOutcome)
+                }
+            }
+        }
+    }
+}
+
+/** Step 12: true iff [ExecutionOutcome] actually resolved the transaction as COMPLETED via
+ *  [TaskEscrow.commit] — i.e. there is a fresh baseline SUCCESS ledger row worth correcting.
+ *  EXECUTION_FAILED resolves through a different path (should stay EXECUTION_FAILED, never
+ *  overridden to a fallback provenance); the two no-op cases never wrote a new row at all. */
+private fun ExecutionOutcome.resolvedAsCompleted(): Boolean = when (this) {
+    is ExecutionOutcome.Applied,
+    is ExecutionOutcome.NoOpAlreadyApplied,
+    is ExecutionOutcome.NotApplicable,
+    ExecutionOutcome.RequiresGuardianEscalation -> true
+    is ExecutionOutcome.Failed,
+    ExecutionOutcome.TransactionAlreadyResolved,
+    ExecutionOutcome.TransactionNotFound -> false
+}
+
+sealed class DecisionOutcome {
+    data class Executed(
+        val executionOutcome: ExecutionOutcome,
+        val usedFallback: Boolean,
+        // Step 11: the speech actually being shown/spoken now varies (a parsed LLM intent
+        // vs. the fixed strict-reminder line) — callers no longer have to reach back into
+        // InterventionFallback themselves to know what was said.
+        val speech: String
+    ) : DecisionOutcome()
+    data class PolicyRejected(val reason: RejectionReason, val detail: String, val usedFallback: Boolean) : DecisionOutcome()
+}
+
+/** Step 11. Outcome of one [InterventionDecisionMaker.attemptConversationalTurn] call. */
+sealed class ConversationalOutcome {
+    /** attemptLlm produced nothing within budget (timeout, blank, or LlmGateway failure). */
+    object LlmUnavailable : ConversationalOutcome()
+    /** A response arrived but didn't match the closed schema — see [LlmIntentParser]. */
+    object UnparseableResponse : ConversationalOutcome()
+    /** RequestClarification / NoAction — nothing executed, transaction stays NEGOTIATING. */
+    data class Continue(val speech: String) : ConversationalOutcome()
+    /** A well-formed intent that PolicyValidator declined. Transaction stays NEGOTIATING —
+     *  a rejected suggestion is a "no" to one idea, not a reason to end the conversation. */
+    data class Rejected(val speech: String, val reason: RejectionReason, val detail: String) : ConversationalOutcome()
+    /** A decisive action reached ActionExecutor and the transaction has resolved. */
+    data class Decided(val speech: String, val executionOutcome: ExecutionOutcome) : ConversationalOutcome()
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionReconciliation.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+/**
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §4), amended in Step 12 (§22) to
+ * wire the Outcome Ledger through so TTL sweeps reconciled at startup are recorded too.
+ *
+ * "Process dies -> Room remains -> Worker/receiver restarts -> unfinished transaction
+ * discovered -> FSM reconciles it." This is that sweep. Call from both
+ * CheckmateApp.onCreate() and BootReceiver — mirrors this codebase's existing
+ * WorkModeManager.init() pattern of running the same reconciliation logic from both entry
+ * points, since either can be the first code to run after a restart. Fire-and-forget by
+ * design (like CheckmateApp's existing `Thread { ... }.start()` calls for guardian
+ * alerts) — nothing in either caller's synchronous startup path should block on this.
+ */
+object InterventionReconciliation {
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    fun runAtStartup(context: Context) {
+        scope.launch {
+            val db = InterventionDatabase.getInstance(context)
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            TaskEscrow(db.interventionTransactionDao(), ledgerWriter).reconcileUnfinished()
+        }
+    }
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionTriggerWorker.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.checkmate.planner.PlanStore
+
+/**
+ * Proactive Execution Engine — Step 7 (build), amended in Step 9 (Blueprint Part One, §2,
+ * §16) and Step 12 (§22 — see the [OutcomeLedgerWriter] wiring below).
+ *
+ * "It does not 'constantly run an AI.' It evaluates deterministic signals." Each run walks
+ * today's tasks, asks [TriggerEvaluator] whether any fire, and for each one that does —
+ * acquires escrow and hands the student a chance to respond before anything is decided for
+ * them.
+ *
+ * Step 9 changes what happens after escrow is acquired. Previously this worker resolved
+ * every fired trigger immediately and silently through [InterventionDecisionMaker]'s
+ * deterministic fallback (STRICT_REMINDER -> START_TASK), with nothing ever shown to the
+ * student — a gap flagged when Step 8 (Context Builder) was built but not yet wired to
+ * anything. Now, if [InterventionNotificationBridge.gateway] is wired (from `app`, since
+ * planner cannot itself show a notification or reach psyche's ContextBuilder — see that
+ * interface's own doc), the worker prompts the student instead and stops there for this
+ * task; the transaction stays NEGOTIATING and is resolved later, out of band, by
+ * `app`'s InterventionActionReceiver (a tap) or by TTL expiry/reconciliation (silence). If
+ * no gateway is wired, or the gateway reports it couldn't show anything (e.g. notification
+ * permission denied), this falls back to exactly the old behavior — the deterministic path
+ * is never allowed to become unreachable just because the notification layer exists now.
+ *
+ * Escrow's TTL is widened to [InterventionNotificationBridge.PROMPT_TTL_MILLIS] whenever a
+ * gateway is wired, since the 60-second [TaskEscrow.DEFAULT_TTL_MILLIS] default was sized
+ * for an active voice negotiation (§6), not for "waits until the student glances at their
+ * phone." Without a gateway, escrow still uses the original 60-second default, since nothing
+ * is waiting on human attention in that path.
+ *
+ * Deliberately relies on [TaskEscrow.acquire]'s own atomic check rather than calling
+ * [TaskEscrow.isUnderEscrow] first — a separate pre-check would be a second DB read with a
+ * race window between it and the acquire call; acquire() already returns AlreadyHeld
+ * safely if something else (a concurrent run, or a manually-triggered intervention) beat
+ * this one to it.
+ */
+class InterventionTriggerWorker(
+    context: Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val db = InterventionDatabase.getInstance(applicationContext)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
+        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+        val decisionMaker = InterventionDecisionMaker(escrow, executor)
+        val gateway = InterventionNotificationBridge.gateway
+        val now = System.currentTimeMillis()
+
+        PlanStore.todayTasks.value.forEach { task ->
+            val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
+
+            val ttlMillis = if (gateway != null) {
+                InterventionNotificationBridge.PROMPT_TTL_MILLIS
+            } else {
+                TaskEscrow.DEFAULT_TTL_MILLIS
+            }
+            val acquired = escrow.acquire(task.id, signal.triggerType, now, ttlMillis)
+            if (acquired !is EscrowAcquireResult.Acquired) return@forEach
+
+            val dispatched = gateway?.promptStudent(
+                context = applicationContext,
+                transactionId = acquired.transaction.transactionId,
+                task = task,
+                lateMinutes = signal.lateMinutes,
+                now = now
+            )
+
+            if (dispatched != PromptDispatchResult.SHOWN) {
+                // No gateway wired, or the gateway couldn't show anything — resolve
+                // immediately through the deterministic fallback, same as before this step,
+                // rather than leaving the transaction to sit until TTL expiry with nothing
+                // ever having been shown to the student.
+                decisionMaker.decideAndExecute(
+                    transactionId = acquired.transaction.transactionId,
+                    task = task,
+                    lateMinutes = signal.lateMinutes,
+                    now = now
+                )
+            }
+            // dispatched == SHOWN: transaction intentionally left NEGOTIATING here.
+        }
+
+        return Result.success()
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/InterventionActionReceiver.kt =====
+package com.checkmate.service
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.EscrowExtendResult
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionDecisionMaker
+import com.checkmate.planner.intervention.OutcomeLedgerWriter
+import com.checkmate.planner.intervention.PlanStoreTaskMutator
+import com.checkmate.planner.intervention.TaskEscrow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+/**
+ * Proactive Execution Engine — Step 9 (Blueprint Part One, §16), amended in Step 12 (§22)
+ * to wire the Outcome Ledger through both handlers' [TaskEscrow] instances.
+ *
+ * Handles the "Start" and "Snooze 5 min" notification actions built by [InterventionNotifier].
+ * "Talk to Checkmate" is not handled here — it's a plain [android.app.PendingIntent.getActivity]
+ * straight to MainActivity (see [InterventionNotifier]), since it has nothing to resolve on
+ * its own yet; Step 10 (STT/TTS) is what will eventually turn that tap into a real
+ * negotiation.
+ *
+ * BroadcastReceiver.onReceive is synchronous and Room/TaskEscrow are suspend APIs, so this
+ * follows the standard goAsync() + coroutine pattern (a PendingResult is held open until the
+ * coroutine finishes) rather than InterventionReconciliation's fire-and-forget module-scope
+ * launch — a receiver's process can be killed as soon as onReceive returns unless goAsync()
+ * says otherwise, which fire-and-forget alone doesn't guarantee.
+ */
+class InterventionActionReceiver : BroadcastReceiver() {
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    override fun onReceive(context: Context, intent: Intent) {
+        val transactionId = intent.getStringExtra(InterventionNotifier.EXTRA_TRANSACTION_ID) ?: return
+        val taskId = intent.getStringExtra(InterventionNotifier.EXTRA_TASK_ID) ?: return
+        val lateMinutes = intent.getIntExtra(InterventionNotifier.EXTRA_LATE_MINUTES, 0)
+        val action = intent.action
+        val appContext = context.applicationContext
+
+        InterventionNotifier.cancel(appContext, transactionId)
+
+        val pendingResult = goAsync()
+        scope.launch {
+            try {
+                when (action) {
+                    InterventionNotifier.ACTION_START -> handleStart(appContext, transactionId, taskId, lateMinutes)
+                    InterventionNotifier.ACTION_SNOOZE -> handleSnooze(appContext, transactionId, taskId, lateMinutes)
+                    else -> Log.w(TAG, "Unrecognized intervention action: $action")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed handling $action for $transactionId", e)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    /**
+     * Student tapped "Start". Resolves through the same deterministic STRICT_REMINDER ->
+     * START_TASK -> PolicyValidator -> ActionExecutor path the no-gateway fallback already
+     * uses (Blueprint §14/§25 principle 2 — the LLM has no execution path yet regardless of
+     * how the student got here) rather than mutating PlanStore directly, so there is exactly
+     * one place ("what happens when we decide to start this task") for both the seen and
+     * unseen paths to share.
+     */
+    private suspend fun handleStart(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        val task = PlanStore.todayTasks.value.find { it.id == taskId }
+        if (task == null) {
+            Log.w(TAG, "Start tapped for $transactionId but task $taskId no longer exists")
+            return
+        }
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
+        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+        val decisionMaker = InterventionDecisionMaker(escrow, executor)
+        decisionMaker.decideAndExecute(
+            transactionId = transactionId,
+            task = task,
+            lateMinutes = lateMinutes
+        )
+        Log.d(TAG, "Start handled for $transactionId")
+    }
+
+    /**
+     * Student tapped "Snooze 5 min". Extends the live escrow (see [TaskEscrow.extend]'s doc
+     * for why this doesn't touch currentState) and schedules a one-shot re-notification —
+     * does NOT re-run [com.checkmate.planner.intervention.TriggerEvaluator] or re-acquire
+     * escrow, since the transaction this belongs to is still live and already owns the task.
+     */
+    private suspend fun handleSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
+        val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
+        if (result !is EscrowExtendResult.Extended) {
+            Log.w(TAG, "Snooze for $transactionId did not extend (state: $result) — not rescheduling")
+            return
+        }
+        InterventionSnoozeAlarmReceiver.scheduleRenotify(context, transactionId, taskId, lateMinutes)
+        Log.d(TAG, "Snoozed $transactionId until ${result.newExpiresAt}")
+    }
+
+    companion object {
+        private const val TAG = "InterventionActionRx"
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/negotiation/NegotiationViewModel.kt =====
+package com.checkmate.ui.negotiation
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.stt.CheckmateSTT
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.ConversationalOutcome
+import com.checkmate.planner.intervention.EscrowExtendResult
+import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionDecisionMaker
+import com.checkmate.planner.intervention.InterventionFallback
+import com.checkmate.planner.intervention.OutcomeLedgerWriter
+import com.checkmate.planner.intervention.PermittedAction
+import com.checkmate.planner.intervention.PlanStoreTaskMutator
+import com.checkmate.planner.intervention.TaskEscrow
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.psyche.intervention.ContextBuilder
+import com.checkmate.psyche.intervention.InterventionContext
+import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.InterventionSnoozeAlarmReceiver
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class NegotiationMessage(val role: String, val content: String)
+
+enum class NegotiationResolution {
+    NONE, STARTED, SNOOZED, DISMISSED, ALREADY_RESOLVED, TASK_MISSING,
+    // Step 11: any conversational decision other than STARTED — REDUCE_DURATION,
+    // RESCHEDULE_TASK, TAKE_SHORT_BREAK, KEEP_PLAN, or REQUEST_GUARDIAN all land here.
+    // The negotiation screen doesn't need to distinguish between them to close itself —
+    // the assistant's last chat bubble already says what happened in plain language.
+    PLAN_ADJUSTED
+}
+
+data class NegotiationUiState(
+    val loading: Boolean = true,
+    val task: StudyTask? = null,
+    val context: InterventionContext? = null,
+    val messages: List<NegotiationMessage> = emptyList(),
+    val isSending: Boolean = false,
+    val isListening: Boolean = false,
+    val sttAvailable: Boolean = true,
+    val sttError: String? = null,
+    val inputText: String = "",
+    val resolution: NegotiationResolution = NegotiationResolution.NONE
+)
+
+/**
+ * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §8-11, §16's
+ * "Talk to Checkmate"), amended in Step 12 (§22) to wire the Outcome Ledger through every
+ * [TaskEscrow] this ViewModel constructs.
+ *
+ * This is what a tap on "Talk to Checkmate" (or the notification body) opens into.
+ *
+ * STEP 11 UPDATE: the scope boundary this class's doc used to describe — "nothing parses
+ * what the LLM says into an executable decision, because that parser doesn't exist yet" —
+ * no longer holds. [send] now runs every reply through
+ * [InterventionDecisionMaker.attemptConversationalTurn], which parses the raw LLM response
+ * via [com.checkmate.planner.intervention.LlmIntentParser] and, for a genuinely decisive
+ * intent, validates it through PolicyValidator and applies it through ActionExecutor — the
+ * exact same pipeline [onStart] already used for the notification's own button. Most turns
+ * still don't execute anything (a clarifying question, small talk, a rejected suggestion) —
+ * see [InterventionDecisionMaker.attemptConversationalTurn]'s own doc for why those
+ * deliberately leave the transaction open rather than resolving it. [onStart]/[onSnooze]/
+ * [onDismiss] remain the three buttons that resolve things unconditionally, unrelated to
+ * whatever the conversation is doing.
+ */
+class NegotiationViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(NegotiationUiState())
+    val state: StateFlow<NegotiationUiState> = _state.asStateFlow()
+
+    private var stt: CheckmateSTT? = null
+    private var initialized = false
+
+    // Step 11: send() needs this to call attemptConversationalTurn, and previously nothing
+    // retained it after init() beyond the local scope of the initial DB read.
+    private var currentTransactionId: String? = null
+
+    /** Idempotent on purpose — Compose may recompose/re-enter this call across
+     *  configuration changes; only the first call for this ViewModel instance should do
+     *  the DB read + opening TTS utterance. */
+    fun init(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (initialized) return
+        initialized = true
+        currentTransactionId = transactionId
+
+        val sttInstance = CheckmateSTT(context.applicationContext)
+        stt = sttInstance
+        _state.update { it.copy(sttAvailable = sttInstance.isAvailable()) }
+
+        viewModelScope.launch {
+            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
+            val transaction = dao.getById(transactionId)
+            if (transaction == null || transaction.currentState.isTerminal) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.ALREADY_RESOLVED) }
+                return@launch
+            }
+
+            val task = PlanStore.todayTasks.value.find { it.id == taskId }
+            if (task == null) {
+                _state.update { it.copy(loading = false, resolution = NegotiationResolution.TASK_MISSING) }
+                return@launch
+            }
+
+            // Same best-effort posture InterventionNotifier already uses around
+            // ContextBuilder.build — a missing behavioral summary shouldn't block the
+            // conversation from opening at all.
+            val ctx = runCatching { ContextBuilder.build(task, lateMinutes) }.getOrNull()
+
+            // The opening line is the exact same deterministic STRICT_REMINDER speech the
+            // no-gateway fallback (and the notification's "Start" action) would use — this
+            // conversation is layered on top of that reality, not a different story.
+            val opening = InterventionFallback.strictReminderIntent(task, lateMinutes).speech
+
+            _state.update {
+                it.copy(
+                    loading = false,
+                    task = task,
+                    context = ctx,
+                    messages = listOf(NegotiationMessage("assistant", opening))
+                )
+            }
+            CheckmateTTS.speak(context, opening)
+
+            // Runs for the lifetime of this ViewModel — a final transcript from voice input
+            // becomes a sent message through exactly the same path as the text field's send
+            // button (see the private send() overload below).
+            launch {
+                sttInstance.state.collect { s ->
+                    _state.update { it.copy(isListening = s.isListening, sttError = s.error) }
+                    val finalText = s.finalText
+                    if (!finalText.isNullOrBlank()) {
+                        sttInstance.consumeFinalText()
+                        send(context, finalText)
+                    }
+                }
+            }
+        }
+    }
+
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun startListening() {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.startListening()
+    }
+
+    fun stopListening() {
+        stt?.stopListening()
+    }
+
+    /** Text-field send button entry point. */
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank()) return
+        _state.update { it.copy(inputText = "") }
+        send(context, text)
+    }
+
+    /**
+     * Shared entry point for both the text field and a completed voice transcript.
+     *
+     * Step 11: this now asks the LLM for a structured intent (not just conversational
+     * text), runs the raw response through [InterventionDecisionMaker.attemptConversationalTurn],
+     * and reacts to whichever [ConversationalOutcome] comes back. The LLM call itself still
+     * goes through [InterventionFallback.attemptLlm] directly (rather than letting
+     * attemptConversationalTurn call it) so this function keeps ownership of the timeout
+     * budget and the raw string, exactly as before — attemptConversationalTurn only takes
+     * over from "here's what the model said" onward.
+     */
+    private fun send(context: Context, text: String) {
+        if (_state.value.isSending || _state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        val transactionId = currentTransactionId ?: return
+        val ctx = _state.value.context
+
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("user", text), isSending = true) }
+
+        viewModelScope.launch {
+            val systemPrompt = buildSystemPrompt(task, ctx)
+            val history = buildHistoryForLlm()
+            // A longer budget than InterventionFallback.DEFAULT_LLM_TIMEOUT_MILLIS (3s) on
+            // purpose: that 3s default is sized for a silent background decision the
+            // student never sees waiting happen (§14/§18). This is the opposite case — the
+            // student is watching an active screen and knows a reply is coming, so it's
+            // worth waiting longer for a real answer before falling back.
+            val raw = InterventionFallback.attemptLlm(
+                prompt = history,
+                systemPrompt = systemPrompt,
+                timeoutMillis = CONVERSATION_LLM_TIMEOUT_MILLIS
+            )
+
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            when (val outcome = decisionMaker.attemptConversationalTurn(transactionId, task, raw)) {
+                ConversationalOutcome.LlmUnavailable ->
+                    reply(context, "I'm having trouble reaching the mentor model right now — the plan still stands. Use Start, Snooze, or Dismiss below.")
+
+                ConversationalOutcome.UnparseableResponse ->
+                    reply(context, "Sorry, I didn't quite catch that — could you say it a different way?")
+
+                is ConversationalOutcome.Continue ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Rejected ->
+                    reply(context, outcome.speech)
+
+                is ConversationalOutcome.Decided -> {
+                    InterventionNotifier.cancel(context.applicationContext, transactionId)
+                    _state.update {
+                        it.copy(
+                            messages = it.messages + NegotiationMessage("assistant", outcome.speech),
+                            isSending = false,
+                            resolution = resolutionFor(outcome.executionOutcome)
+                        )
+                    }
+                    CheckmateTTS.speak(context, outcome.speech)
+                }
+            }
+        }
+    }
+
+    private fun reply(context: Context, text: String) {
+        _state.update { it.copy(messages = it.messages + NegotiationMessage("assistant", text), isSending = false) }
+        CheckmateTTS.speak(context, text)
+    }
+
+    /** Maps a resolved conversational turn onto the same [NegotiationResolution] the
+     *  button-driven paths use, so the screen's existing "show a label, then close" flow
+     *  (see NegotiationScreen's LaunchedEffect on state.resolution) needs no special case
+     *  for how the resolution was reached. */
+    private fun resolutionFor(outcome: ExecutionOutcome): NegotiationResolution = when (outcome) {
+        is ExecutionOutcome.Applied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NoOpAlreadyApplied ->
+            if (outcome.action is PermittedAction.StartTask) NegotiationResolution.STARTED else NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.NotApplicable -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.RequiresGuardianEscalation -> NegotiationResolution.PLAN_ADJUSTED
+        is ExecutionOutcome.Failed -> NegotiationResolution.PLAN_ADJUSTED
+        ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound -> NegotiationResolution.ALREADY_RESOLVED
+    }
+
+    /**
+     * Student tapped "Start". Resolves through the identical deterministic
+     * STRICT_REMINDER -> START_TASK -> PolicyValidator -> ActionExecutor path
+     * [InterventionActionReceiver.handleStart] already uses for the notification's own
+     * "Start" button — there is exactly one place "what happens when we decide to start
+     * this task" lives, regardless of whether the student tapped a notification action or
+     * talked their way here.
+     */
+    fun onStart(context: Context, transactionId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        val task = _state.value.task ?: return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
+            decisionMaker.decideAndExecute(
+                transactionId = transactionId,
+                task = task,
+                lateMinutes = lateMinutes
+            )
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
+        }
+    }
+
+    /** Same TaskEscrow.extend() + re-notify alarm as
+     *  [InterventionActionReceiver.handleSnooze] — see that method's doc for why this
+     *  doesn't re-run TriggerEvaluator or re-acquire escrow. */
+    fun onSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val db = InterventionDatabase.getInstance(context)
+            val dao = db.interventionTransactionDao()
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            val escrow = TaskEscrow(dao, ledgerWriter)
+            val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
+            if (result is EscrowExtendResult.Extended) {
+                InterventionSnoozeAlarmReceiver.scheduleRenotify(
+                    context.applicationContext, transactionId, taskId, lateMinutes
+                )
+            }
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.SNOOZED) }
+        }
+    }
+
+    /** USER_ABORTED (§3) — the student declined via the conversation screen rather than
+     *  ignoring the notification (USER_IGNORED) or running out the TTL. */
+    fun onDismiss(context: Context, transactionId: String) {
+        if (_state.value.resolution != NegotiationResolution.NONE) return
+        stt?.stopListening()
+        viewModelScope.launch {
+            val db = InterventionDatabase.getInstance(context)
+            val dao = db.interventionTransactionDao()
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            val escrow = TaskEscrow(dao, ledgerWriter)
+            escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
+            InterventionNotifier.cancel(context.applicationContext, transactionId)
+            _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
+        }
+    }
+
+    private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
+        val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+        return escrow to InterventionDecisionMaker(escrow, executor)
+    }
+
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(12)
+        return msgs.joinToString("\n") { m ->
+            if (m.role == "user") "Student: ${m.content}" else "Mentor: ${m.content}"
+        }
+    }
+
+    /**
+     * Step 11: this now asks for a strict JSON [com.checkmate.planner.intervention.LlmIntent]
+     * instead of free conversational text — "speech" carries what previously was the whole
+     * response. The intentType/parameters vocabulary listed here must stay in lockstep with
+     * [com.checkmate.planner.intervention.InterventionIntentType] and what
+     * [com.checkmate.planner.intervention.PolicyValidator] actually reads out of
+     * `parameters` — if a new intent type or parameter key is ever added there, it needs to
+     * be documented in this prompt too, or the model will never produce it.
+     */
+    private fun buildSystemPrompt(task: StudyTask, ctx: InterventionContext?): String = buildString {
+        appendLine("You are Checkmate's AI Mentor, negotiating with a student about ${task.subject} — ${task.topic}")
+        appendLine("(current planned duration: ${task.durationMinutes} minutes), which is late or off-plan right now.")
+        appendLine()
+        appendLine("Respond with ONLY a single JSON object — no markdown code fences, no text before or after it —")
+        appendLine("in exactly this shape:")
+        appendLine("""{"speech": "...", "intentType": "...", "targetTaskId": "${task.id}", "parameters": {}}""")
+        appendLine()
+        appendLine("\"speech\" is what you actually say to the student out loud: direct, warm, brief (1-3 sentences),")
+        appendLine("a spoken reply, not an essay. Never claim you've already changed the plan in \"speech\" — describe")
+        appendLine("what you're recommending. A separate policy layer decides what's actually permitted (for example,")
+        appendLine("it will reject breaks longer than 30 minutes), and only that layer's decision, not your words,")
+        appendLine("changes anything.")
+        appendLine()
+        appendLine("\"intentType\" must be exactly one of:")
+        appendLine("  START_TASK            student is ready to begin right now")
+        appendLine("  REDUCE_DURATION       wants a shorter session — parameters: {\"newDurationMinutes\": \"<int>\"}")
+        appendLine("  RESCHEDULE_TASK       wants to move the start time — parameters: {\"newScheduledStartTime\": \"HH:mm\"}")
+        appendLine("  TAKE_SHORT_BREAK      needs a short break first — parameters: {\"minutes\": \"<int, 30 max>\"}")
+        appendLine("  KEEP_PLAN             no change needed, the plan as scheduled stands")
+        appendLine("  REQUEST_CLARIFICATION you need more information before recommending anything")
+        appendLine("  NO_ACTION             just talking/acknowledging, nothing to decide yet")
+        appendLine("  REQUEST_GUARDIAN      this needs a real person (guardian), not you")
+        appendLine()
+        appendLine("Omit \"parameters\" (or leave it {}) for any intentType that doesn't list one above.")
+        if (ctx != null) {
+            appendLine()
+            appendLine(ctx.toPromptText())
+        }
+    }.trim()
+
+    override fun onCleared() {
+        super.onCleared()
+        stt?.stopListening()
+    }
+
+    companion object {
+        private const val CONVERSATION_LLM_TIMEOUT_MILLIS = 12_000L
+    }
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/FakeOutcomeLedgerDao.kt =====
+package com.checkmate.planner.intervention
+
+/**
+ * In-memory stand-in for [OutcomeLedgerDao], same conventions as
+ * [FakeInterventionTransactionDao]: [entriesByTransactionId] is exposed/mutable so tests can
+ * inspect what got written without a getter round-trip, and so two independent
+ * [OutcomeLedgerWriter]/[TaskEscrow] instances can be pointed at the same backing store the
+ * same way TaskEscrowTest's reconciliation tests share a `sharedStore`.
+ */
+class FakeOutcomeLedgerDao(
+    val entriesByTransactionId: MutableMap<String, OutcomeLedgerEntry> = mutableMapOf()
+) : OutcomeLedgerDao {
+
+    override suspend fun upsert(entry: OutcomeLedgerEntry) {
+        entriesByTransactionId[entry.transactionId] = entry
+    }
+
+    override suspend fun updateProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        val existing = entriesByTransactionId[transactionId] ?: return
+        entriesByTransactionId[transactionId] = existing.copy(provenance = provenance)
+    }
+
+    override suspend fun getByTransactionId(transactionId: String): OutcomeLedgerEntry? =
+        entriesByTransactionId[transactionId]
+
+    override suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry> =
+        entriesByTransactionId.values.sortedByDescending { it.resolvedAt }.take(limit)
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/OutcomeLedgerTest.kt =====
+package com.checkmate.planner.intervention
+
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Proactive Execution Engine — Step 12 (Blueprint Part One, §22, §25 principle 6).
+ *
+ * Two things are covered separately on purpose: [OutcomeProvenanceDerivation] is pure and
+ * synchronous, so it's tested directly with no DAO/coroutine involved at all; everything
+ * else here goes through a real [TaskEscrow] wired to both fakes, exercising the three
+ * distinct code paths that can write a ledger entry — [TaskEscrow]'s private `resolve()`
+ * choke point (commit/abort/resolveAs), [TaskEscrow.acquire]'s inline TTL reclaim, and
+ * [TaskEscrow.expireIfPastTtl] — the same three call sites enumerated in that class's own
+ * doc. [InterventionDecisionMaker]'s NETWORK_FALLBACK/LLM_INVALID override path is covered
+ * in InterventionDecisionMakerTest instead, since it needs the full decideAndExecute
+ * pipeline (LLM/PolicyValidator/ActionExecutor) to exercise meaningfully.
+ */
+class OutcomeLedgerTest {
+
+    private val taskId = "task-1"
+
+    // ── Pure derivation ──────────────────────────────────────────────────
+
+    @Test
+    fun `derive maps each terminal state to its matching provenance`() {
+        val expected = mapOf(
+            InterventionState.COMPLETED to OutcomeProvenance.SUCCESS,
+            InterventionState.USER_ABORTED to OutcomeProvenance.USER_ABORTED,
+            InterventionState.USER_IGNORED to OutcomeProvenance.USER_IGNORED,
+            InterventionState.TTL_EXPIRED to OutcomeProvenance.TTL_EXPIRED,
+            InterventionState.EXECUTION_FAILED to OutcomeProvenance.EXECUTION_FAILED,
+            InterventionState.POLICY_REJECTED to OutcomeProvenance.POLICY_REJECTED,
+            InterventionState.NETWORK_FALLBACK to OutcomeProvenance.NETWORK_FALLBACK,
+            InterventionState.LLM_INVALID to OutcomeProvenance.LLM_INVALID
+        )
+        expected.forEach { (state, provenance) ->
+            assertEquals(provenance, OutcomeProvenanceDerivation.derive(state))
+        }
+    }
+
+    @Test
+    fun `derive rejects a non-terminal state`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            OutcomeProvenanceDerivation.derive(InterventionState.NEGOTIATING)
+        }
+    }
+
+    // ── TaskEscrow wiring: resolve() choke point (commit/abort/resolveAs) ─
+
+    @Test
+    fun `commit writes a SUCCESS ledger entry`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.commit(tx.transactionId, outcome = "Session started")
+
+        val entry = ledgerDao.getByTransactionId(tx.transactionId)
+        assertEquals(OutcomeProvenance.SUCCESS, entry?.provenance)
+        assertEquals(InterventionState.COMPLETED, entry?.terminalState)
+        assertEquals(taskId, entry?.taskId)
+    }
+
+    @Test
+    fun `abort writes a USER_ABORTED ledger entry`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.abort(tx.transactionId, reason = "Student dismissed")
+
+        val entry = ledgerDao.getByTransactionId(tx.transactionId)
+        assertEquals(OutcomeProvenance.USER_ABORTED, entry?.provenance)
+        assertEquals("Student dismissed", entry?.failureReason)
+    }
+
+    @Test
+    fun `resolveAs writes a matching ledger entry for an arbitrary terminal state`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.resolveAs(tx.transactionId, InterventionState.POLICY_REJECTED, failureReason = "duration cap exceeded")
+
+        val entry = ledgerDao.getByTransactionId(tx.transactionId)
+        assertEquals(OutcomeProvenance.POLICY_REJECTED, entry?.provenance)
+    }
+
+    @Test
+    fun `a second commit does not duplicate or corrupt the ledger entry`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.commit(tx.transactionId, outcome = "first")
+        escrow.commit(tx.transactionId, outcome = "second") // AlreadyResolved, no-op
+
+        assertEquals(1, ledgerDao.entriesByTransactionId.size)
+        assertEquals(OutcomeProvenance.SUCCESS, ledgerDao.getByTransactionId(tx.transactionId)?.provenance)
+    }
+
+    @Test
+    fun `a null ledgerWriter never writes anything and does not affect resolution`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao) // no ledgerWriter — backward-compat default
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        val result = escrow.commit(tx.transactionId, outcome = "Session started")
+
+        assertEquals(EscrowReleaseResult.Released, result)
+        assertEquals(InterventionState.COMPLETED, dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── TaskEscrow wiring: TTL_EXPIRED's two direct-update sites ──────────
+
+    @Test
+    fun `acquire's inline TTL reclaim writes a TTL_EXPIRED ledger entry`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val first = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        // now = 2_000 is well past expiresAt = 1_500 for the first transaction — this
+        // acquire() call reclaims it inline before creating a new one.
+        escrow.acquire(taskId, InterventionTriggerType.REPEATED_SKIPS, now = 2_000L)
+
+        val entry = ledgerDao.getByTransactionId(first.transactionId)
+        assertEquals(OutcomeProvenance.TTL_EXPIRED, entry?.provenance)
+        assertEquals(InterventionState.TTL_EXPIRED, entry?.terminalState)
+    }
+
+    @Test
+    fun `expireIfPastTtl writes a TTL_EXPIRED ledger entry`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L, ttlMillis = 500L)
+                as EscrowAcquireResult.Acquired).transaction
+
+        escrow.expireIfPastTtl(tx.transactionId, now = 2_000L)
+
+        val entry = ledgerDao.getByTransactionId(tx.transactionId)
+        assertEquals(OutcomeProvenance.TTL_EXPIRED, entry?.provenance)
+    }
+
+    // ── overrideProvenance ──────────────────────────────────────────────
+
+    @Test
+    fun `overrideProvenance corrects an existing ledger entry's provenance`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val escrow = TaskEscrow(dao, OutcomeLedgerWriter(ledgerDao))
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        escrow.commit(tx.transactionId, outcome = "Session started")
+
+        escrow.overrideProvenance(tx.transactionId, OutcomeProvenance.NETWORK_FALLBACK)
+
+        assertEquals(OutcomeProvenance.NETWORK_FALLBACK, ledgerDao.getByTransactionId(tx.transactionId)?.provenance)
+    }
+
+    @Test
+    fun `overrideProvenance on a transaction with no ledger row is a safe no-op`() = runTest {
+        val ledgerDao = FakeOutcomeLedgerDao()
+        val writer = OutcomeLedgerWriter(ledgerDao)
+
+        writer.overrideProvenance("does-not-exist", OutcomeProvenance.LLM_INVALID)
+
+        assertNull(ledgerDao.getByTransactionId("does-not-exist"))
+    }
+
+    @Test
+    fun `overrideProvenance with a null ledgerWriter is a safe no-op`() = runTest {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao) // no ledgerWriter
+        val tx = (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = 1_000L)
+                as EscrowAcquireResult.Acquired).transaction
+        escrow.commit(tx.transactionId)
+
+        // Should not throw.
+        escrow.overrideProvenance(tx.transactionId, OutcomeProvenance.NETWORK_FALLBACK)
+        assertTrue(true)
     }
 }
 
