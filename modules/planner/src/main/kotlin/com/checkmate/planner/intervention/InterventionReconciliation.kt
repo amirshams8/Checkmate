@@ -7,7 +7,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * Proactive Execution Engine — Step 7 (Blueprint Part One, §4).
+ * Proactive Execution Engine — Step 7 (Blueprint Part One, §4), amended in Step 12 (§22) to
+ * wire the Outcome Ledger through so TTL sweeps reconciled at startup are recorded too.
  *
  * "Process dies -> Room remains -> Worker/receiver restarts -> unfinished transaction
  * discovered -> FSM reconciles it." This is that sweep. Call from both
@@ -23,8 +24,9 @@ object InterventionReconciliation {
 
     fun runAtStartup(context: Context) {
         scope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            TaskEscrow(dao).reconcileUnfinished()
+            val db = InterventionDatabase.getInstance(context)
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            TaskEscrow(db.interventionTransactionDao(), ledgerWriter).reconcileUnfinished()
         }
     }
 }

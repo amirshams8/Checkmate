@@ -13,6 +13,7 @@ import com.checkmate.planner.intervention.ExecutionOutcome
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
 import com.checkmate.planner.intervention.InterventionFallback
+import com.checkmate.planner.intervention.OutcomeLedgerWriter
 import com.checkmate.planner.intervention.PermittedAction
 import com.checkmate.planner.intervention.PlanStoreTaskMutator
 import com.checkmate.planner.intervention.TaskEscrow
@@ -53,7 +54,8 @@ data class NegotiationUiState(
 
 /**
  * Proactive Execution Engine — Step 10 + Step 11 (Blueprint Part One, §8-11, §16's
- * "Talk to Checkmate").
+ * "Talk to Checkmate"), amended in Step 12 (§22) to wire the Outcome Ledger through every
+ * [TaskEscrow] this ViewModel constructs.
  *
  * This is what a tap on "Talk to Checkmate" (or the notification body) opens into.
  *
@@ -276,8 +278,10 @@ class NegotiationViewModel : ViewModel() {
         if (_state.value.resolution != NegotiationResolution.NONE) return
         stt?.stopListening()
         viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val escrow = TaskEscrow(dao)
+            val db = InterventionDatabase.getInstance(context)
+            val dao = db.interventionTransactionDao()
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            val escrow = TaskEscrow(dao, ledgerWriter)
             val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
             if (result is EscrowExtendResult.Extended) {
                 InterventionSnoozeAlarmReceiver.scheduleRenotify(
@@ -295,8 +299,10 @@ class NegotiationViewModel : ViewModel() {
         if (_state.value.resolution != NegotiationResolution.NONE) return
         stt?.stopListening()
         viewModelScope.launch {
-            val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-            val escrow = TaskEscrow(dao)
+            val db = InterventionDatabase.getInstance(context)
+            val dao = db.interventionTransactionDao()
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            val escrow = TaskEscrow(dao, ledgerWriter)
             escrow.abort(transactionId, reason = "Dismissed from negotiation screen")
             InterventionNotifier.cancel(context.applicationContext, transactionId)
             _state.update { it.copy(resolution = NegotiationResolution.DISMISSED) }
@@ -304,8 +310,10 @@ class NegotiationViewModel : ViewModel() {
     }
 
     private fun buildEscrowAndDecisionMaker(context: Context): Pair<TaskEscrow, InterventionDecisionMaker> {
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
         return escrow to InterventionDecisionMaker(escrow, executor)
     }

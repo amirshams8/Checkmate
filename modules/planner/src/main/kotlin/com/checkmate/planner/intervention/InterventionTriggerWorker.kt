@@ -7,7 +7,7 @@ import com.checkmate.planner.PlanStore
 
 /**
  * Proactive Execution Engine — Step 7 (build), amended in Step 9 (Blueprint Part One, §2,
- * §16).
+ * §16) and Step 12 (§22 — see the [OutcomeLedgerWriter] wiring below).
  *
  * "It does not 'constantly run an AI.' It evaluates deterministic signals." Each run walks
  * today's tasks, asks [TriggerEvaluator] whether any fire, and for each one that does —
@@ -45,8 +45,10 @@ class InterventionTriggerWorker(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
-        val dao = InterventionDatabase.getInstance(applicationContext).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
+        val db = InterventionDatabase.getInstance(applicationContext)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
         val decisionMaker = InterventionDecisionMaker(escrow, executor)
         val gateway = InterventionNotificationBridge.gateway

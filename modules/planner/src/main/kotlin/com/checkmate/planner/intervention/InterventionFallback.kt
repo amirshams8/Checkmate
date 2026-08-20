@@ -87,6 +87,16 @@ object InterventionFallback {
  *    kind of event as a Start-button tap, and forcing a resolution on every turn (e.g.
  *    silently START_TASK-ing the student's plan just because one LLM call timed out mid-
  *    conversation) would be actively hostile UX. Most turns are just talk.
+ *
+ * Step 12: when [decideAndExecute] falls back (`usedFallback == true`), the transaction
+ * still resolves as COMPLETED via [ActionExecutor.execute] -> [TaskEscrow.commit] exactly
+ * like a genuine LLM-negotiated success — [TaskEscrow]'s resolve() choke point has no way
+ * to tell the two apart on its own, so it writes the baseline SUCCESS ledger row. Once
+ * `usedFallback` is known here, a follow-up [TaskEscrow.overrideProvenance] call corrects
+ * that row to NETWORK_FALLBACK or LLM_INVALID — see [fallbackProvenance] below for how the
+ * two are distinguished. Only fired when the execution outcome actually resolved the
+ * transaction as COMPLETED (not EXECUTION_FAILED, and not the already-resolved/not-found
+ * no-ops, which never had a fresh ledger row to correct in the first place).
  */
 class InterventionDecisionMaker(
     private val taskEscrow: TaskEscrow,
@@ -120,6 +130,12 @@ class InterventionDecisionMaker(
         return when (val result = PolicyValidator.validate(intent, policyState)) {
             is PolicyResult.Permitted -> {
                 val executionOutcome = actionExecutor.execute(transactionId, result.action, now)
+                if (usedFallback && executionOutcome.resolvedAsCompleted()) {
+                    taskEscrow.overrideProvenance(
+                        transactionId,
+                        fallbackProvenance(llmPrompt, rawResponse)
+                    )
+                }
                 DecisionOutcome.Executed(executionOutcome, usedFallback, intent.speech)
             }
             is PolicyResult.Rejected -> {
@@ -134,6 +150,20 @@ class InterventionDecisionMaker(
     }
 
     /**
+     * Step 12: NETWORK_FALLBACK covers "no LLM was ever attempted" (`llmPrompt == null` —
+     * e.g. the no-gateway worker path, or a TTL sweep) as well as "attemptLlm produced
+     * nothing within budget" (`rawResponse == null` — timeout, blank, or an LlmGateway-level
+     * failure). LLM_INVALID is narrower: a response *did* come back, it's only that
+     * [LlmIntentParser] couldn't make sense of it — a model output-quality problem, not a
+     * connectivity one.
+     */
+    private fun fallbackProvenance(llmPrompt: String?, rawResponse: String?): OutcomeProvenance = when {
+        llmPrompt == null -> OutcomeProvenance.NETWORK_FALLBACK
+        rawResponse == null -> OutcomeProvenance.NETWORK_FALLBACK
+        else -> OutcomeProvenance.LLM_INVALID
+    }
+
+    /**
      * Step 11. One turn of live negotiation: a raw LLM response the caller already has in
      * hand (the ViewModel owns the attemptLlm call + chat transcript, since it needs the
      * text to display either way — this function starts from the raw string rather than
@@ -144,7 +174,11 @@ class InterventionDecisionMaker(
      * didn't answer in time" should read as "let me try that again," not as the app quietly
      * force-starting the task and ending the negotiation the student is actively having.
      * [Continue] and [Rejected] both leave the transaction open in NEGOTIATING; only a
-     * genuinely decisive [PermittedAction] reaches [actionExecutor] and resolves it.
+     * genuinely decisive [PermittedAction] reaches [actionExecutor] and resolves it. Since
+     * nothing here ever falls back, there's no `usedFallback`/provenance-override step to
+     * mirror from [decideAndExecute] — a [ConversationalOutcome.Decided] here was always a
+     * genuine parsed intent, so the baseline SUCCESS ledger row [resolve] writes is already
+     * correct.
      * RequestClarification/NoAction are Permitted by PolicyValidator like anything else (so
      * they're still covered by the same policy test matrix) but are intentionally excluded
      * here from reaching the executor: [ActionExecutor.execute] commits the transaction for
@@ -177,6 +211,20 @@ class InterventionDecisionMaker(
             }
         }
     }
+}
+
+/** Step 12: true iff [ExecutionOutcome] actually resolved the transaction as COMPLETED via
+ *  [TaskEscrow.commit] — i.e. there is a fresh baseline SUCCESS ledger row worth correcting.
+ *  EXECUTION_FAILED resolves through a different path (should stay EXECUTION_FAILED, never
+ *  overridden to a fallback provenance); the two no-op cases never wrote a new row at all. */
+private fun ExecutionOutcome.resolvedAsCompleted(): Boolean = when (this) {
+    is ExecutionOutcome.Applied,
+    is ExecutionOutcome.NoOpAlreadyApplied,
+    is ExecutionOutcome.NotApplicable,
+    ExecutionOutcome.RequiresGuardianEscalation -> true
+    is ExecutionOutcome.Failed,
+    ExecutionOutcome.TransactionAlreadyResolved,
+    ExecutionOutcome.TransactionNotFound -> false
 }
 
 sealed class DecisionOutcome {

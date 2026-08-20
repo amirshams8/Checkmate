@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Proactive Execution Engine — Step 4 (Blueprint Part One, §5-6), amended in Step 9 (§16
- * "Snooze 5 min" — see [extend]).
+ * "Snooze 5 min" — see [extend]) and Step 12 (§22, §25 principle 6 — see [ledgerWriter]).
  *
  * Task Escrow. While a task has a live (non-terminal) [InterventionTransaction], nothing
  * else may start it, edit it, or create a second concurrent negotiation for it — "The FSM
@@ -29,8 +29,21 @@ import java.util.concurrent.ConcurrentHashMap
  * fine, because after a real process death there's no second in-process caller left to
  * race against; the surviving [InterventionTransaction] row is instead picked up by
  * [reconcileUnfinished] (or reclaimed inline by the next [acquire] call for that task).
+ *
+ * Step 12: [ledgerWriter] is optional and defaults to null so every existing single-arg
+ * `TaskEscrow(dao)` call site — 15+ of them, 22 in TaskEscrowTest.kt alone — keeps
+ * compiling and behaving exactly as before, just without an Outcome Ledger. Every terminal
+ * transition funnels through the private [resolve] choke point *except* TTL_EXPIRED, which
+ * [acquire]'s inline reclaim and [expireIfPastTtl] both write directly via `dao.update`
+ * (they predate [resolve] taking on that role, and reclaiming inside an already-open
+ * [withTaskLock] section made routing them through a second lock-acquiring call wasteful) —
+ * both of those direct-update sites also write a ledger entry, so all eight terminal states
+ * are covered no matter which of the three code paths reaches them.
  */
-class TaskEscrow(private val dao: InterventionTransactionDao) {
+class TaskEscrow(
+    private val dao: InterventionTransactionDao,
+    private val ledgerWriter: OutcomeLedgerWriter? = null
+) {
 
     private val taskLocks = ConcurrentHashMap<String, Mutex>()
 
@@ -54,12 +67,12 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
                 return@withTaskLock EscrowAcquireResult.AlreadyHeld(existing)
             }
             // Past TTL and nobody released it — reclaim before proceeding.
-            dao.update(
-                existing.copy(
-                    currentState = InterventionState.TTL_EXPIRED,
-                    failureReason = "TTL expired before release; reclaimed by acquire()"
-                )
+            val reclaimed = existing.copy(
+                currentState = InterventionState.TTL_EXPIRED,
+                failureReason = "TTL expired before release; reclaimed by acquire()"
             )
+            dao.update(reclaimed)
+            ledgerWriter?.record(reclaimed, now)
         }
 
         val transaction = InterventionTransaction(
@@ -93,6 +106,8 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
      * task in the meantime either. [additionalMillis] is added to `max(current expiresAt,
      * now)` rather than just `now + additionalMillis`, so calling this before the previous
      * deadline has passed extends from the existing deadline instead of ever shortening it.
+     * Not resolving means there is nothing to write to the Outcome Ledger here either — a
+     * snooze isn't a terminal outcome.
      *
      * Idempotent-safe the same way [resolve] is: if the transaction already resolved (by
      * TTL, or a concurrent notification-action tap) between the notification tap and this
@@ -120,7 +135,7 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
      * to resolve into EXECUTION_FAILED specifically when a permitted mutation can no
      * longer be applied (e.g. task state changed between validation and execution). That's
      * a different fact than USER_ABORTED (the student declined) or TTL_EXPIRED (nobody
-     * responded in time), and the Outcome Ledger (a later step) needs to tell them apart.
+     * responded in time), and the Outcome Ledger tells them apart via [OutcomeProvenance].
      */
     suspend fun resolveAs(
         transactionId: String,
@@ -130,6 +145,18 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
     ): EscrowReleaseResult {
         require(terminalState.isTerminal) { "resolveAs requires a terminal state, got $terminalState" }
         return resolve(transactionId, terminalState, outcome, failureReason)
+    }
+
+    /**
+     * Step 12: corrects a ledger row's [OutcomeProvenance] after the fact. Exists because
+     * [InterventionDecisionMaker.decideAndExecute]'s fallback path resolves through
+     * [ActionExecutor.execute] -> [commit] exactly like a genuine LLM-negotiated success —
+     * by the time decideAndExecute learns `usedFallback` was true, the baseline SUCCESS row
+     * [resolve] wrote is already there. A no-op (via [OutcomeLedgerDao.updateProvenance]'s
+     * own WHERE clause) if [ledgerWriter] is null or no row exists for [transactionId].
+     */
+    suspend fun overrideProvenance(transactionId: String, provenance: OutcomeProvenance) {
+        ledgerWriter?.overrideProvenance(transactionId, provenance)
     }
 
     /**
@@ -150,12 +177,12 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
                 fresh.currentState.isTerminal -> EscrowExpiryResult.AlreadyResolved
                 now < fresh.expiresAt -> EscrowExpiryResult.NotYetExpired
                 else -> {
-                    dao.update(
-                        fresh.copy(
-                            currentState = InterventionState.TTL_EXPIRED,
-                            failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
-                        )
+                    val expired = fresh.copy(
+                        currentState = InterventionState.TTL_EXPIRED,
+                        failureReason = "TTL expired; reclaimed by expireIfPastTtl()"
                     )
+                    dao.update(expired)
+                    ledgerWriter?.record(expired, now)
                     EscrowExpiryResult.Expired
                 }
             }
@@ -198,13 +225,16 @@ class TaskEscrow(private val dao: InterventionTransactionDao) {
         transactionId: String,
         state: InterventionState,
         outcome: String? = null,
-        failureReason: String? = null
+        failureReason: String? = null,
+        now: Long = System.currentTimeMillis()
     ): EscrowReleaseResult {
         val current = dao.getById(transactionId) ?: return EscrowReleaseResult.NotFound
         return withTaskLock(current.taskId) {
             val fresh = dao.getById(transactionId) ?: return@withTaskLock EscrowReleaseResult.NotFound
             if (fresh.currentState.isTerminal) return@withTaskLock EscrowReleaseResult.AlreadyResolved
-            dao.update(fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason))
+            val resolved = fresh.copy(currentState = state, outcome = outcome, failureReason = failureReason)
+            dao.update(resolved)
+            ledgerWriter?.record(resolved, now)
             EscrowReleaseResult.Released
         }
     }

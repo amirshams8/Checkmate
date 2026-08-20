@@ -9,6 +9,7 @@ import com.checkmate.planner.intervention.ActionExecutor
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
+import com.checkmate.planner.intervention.OutcomeLedgerWriter
 import com.checkmate.planner.intervention.PlanStoreTaskMutator
 import com.checkmate.planner.intervention.TaskEscrow
 import kotlinx.coroutines.CoroutineScope
@@ -17,7 +18,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * Proactive Execution Engine — Step 9 (Blueprint Part One, §16).
+ * Proactive Execution Engine — Step 9 (Blueprint Part One, §16), amended in Step 12 (§22)
+ * to wire the Outcome Ledger through both handlers' [TaskEscrow] instances.
  *
  * Handles the "Start" and "Snooze 5 min" notification actions built by [InterventionNotifier].
  * "Talk to Checkmate" is not handled here — it's a plain [android.app.PendingIntent.getActivity]
@@ -74,8 +76,10 @@ class InterventionActionReceiver : BroadcastReceiver() {
             Log.w(TAG, "Start tapped for $transactionId but task $taskId no longer exists")
             return
         }
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
         val decisionMaker = InterventionDecisionMaker(escrow, executor)
         decisionMaker.decideAndExecute(
@@ -93,8 +97,10 @@ class InterventionActionReceiver : BroadcastReceiver() {
      * escrow, since the transaction this belongs to is still live and already owns the task.
      */
     private suspend fun handleSnooze(context: Context, transactionId: String, taskId: String, lateMinutes: Int) {
-        val dao = InterventionDatabase.getInstance(context).interventionTransactionDao()
-        val escrow = TaskEscrow(dao)
+        val db = InterventionDatabase.getInstance(context)
+        val dao = db.interventionTransactionDao()
+        val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+        val escrow = TaskEscrow(dao, ledgerWriter)
         val result = escrow.extend(transactionId, InterventionNotifier.SNOOZE_MILLIS)
         if (result !is EscrowExtendResult.Extended) {
             Log.w(TAG, "Snooze for $transactionId did not extend (state: $result) — not rescheduling")
