@@ -124,6 +124,13 @@ interface OutcomeLedgerDao {
 
     @Query("SELECT * FROM outcome_ledger_entries ORDER BY resolvedAt DESC LIMIT :limit")
     suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry>
+
+    /** Step 14 (Blueprint §26 "Baseline intervention statistics"): full scan for
+     *  [OutcomeLedgerStats.compute]. Unbounded is fine at this app's expected volume — at
+     *  most a handful of intervention resolutions per student per day, so even a year of
+     *  history is a few thousand rows, not a table [getRecent]'s LIMIT needs to guard here. */
+    @Query("SELECT * FROM outcome_ledger_entries")
+    suspend fun getAll(): List<OutcomeLedgerEntry>
 }
 
 object OutcomeLedgerConverters {

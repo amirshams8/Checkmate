@@ -25,4 +25,7 @@ class FakeOutcomeLedgerDao(
 
     override suspend fun getRecent(limit: Int): List<OutcomeLedgerEntry> =
         entriesByTransactionId.values.sortedByDescending { it.resolvedAt }.take(limit)
+
+    override suspend fun getAll(): List<OutcomeLedgerEntry> =
+        entriesByTransactionId.values.toList()
 }
