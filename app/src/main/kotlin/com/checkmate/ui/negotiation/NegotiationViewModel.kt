@@ -8,6 +8,7 @@ import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
 import com.checkmate.planner.intervention.ConversationalOutcome
+import com.checkmate.planner.intervention.DecisionOutcome
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.ExecutionOutcome
 import com.checkmate.planner.intervention.InterventionDatabase
@@ -21,6 +22,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.intervention.ContextBuilder
 import com.checkmate.psyche.intervention.InterventionContext
 import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.InterventionSideEffects
 import com.checkmate.service.InterventionSnoozeAlarmReceiver
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -214,6 +216,10 @@ class NegotiationViewModel : ViewModel() {
 
                 is ConversationalOutcome.Decided -> {
                     InterventionNotifier.cancel(context.applicationContext, transactionId)
+                    // The only production path that can actually reach RequestGuardian or
+                    // ShortBreak — see InterventionSideEffects' own doc for why onStart()
+                    // and InterventionActionReceiver.handleStart() can't in practice today.
+                    InterventionSideEffects.handle(context, task, transactionId, outcome.executionOutcome)
                     _state.update {
                         it.copy(
                             messages = it.messages + NegotiationMessage("assistant", outcome.speech),
@@ -261,11 +267,14 @@ class NegotiationViewModel : ViewModel() {
         stt?.stopListening()
         viewModelScope.launch {
             val (_, decisionMaker) = buildEscrowAndDecisionMaker(context)
-            decisionMaker.decideAndExecute(
+            val decision = decisionMaker.decideAndExecute(
                 transactionId = transactionId,
                 task = task,
                 lateMinutes = lateMinutes
             )
+            if (decision is DecisionOutcome.Executed) {
+                InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
+            }
             InterventionNotifier.cancel(context.applicationContext, transactionId)
             _state.update { it.copy(resolution = NegotiationResolution.STARTED) }
         }

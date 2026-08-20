@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.DecisionOutcome
 import com.checkmate.planner.intervention.EscrowExtendResult
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionDecisionMaker
@@ -82,11 +83,19 @@ class InterventionActionReceiver : BroadcastReceiver() {
         val escrow = TaskEscrow(dao, ledgerWriter)
         val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
         val decisionMaker = InterventionDecisionMaker(escrow, executor)
-        decisionMaker.decideAndExecute(
+        val decision = decisionMaker.decideAndExecute(
             transactionId = transactionId,
             task = task,
             lateMinutes = lateMinutes
         )
+        // Currently unreachable in practice — decideAndExecute is never given an llmPrompt
+        // here, so its deterministic fallback always resolves to START_TASK, never
+        // RequestGuardian/ShortBreak. Checked anyway so this handler doesn't quietly need
+        // updating the day an llmPrompt does get threaded through the "Start" button too —
+        // see InterventionSideEffects' own doc.
+        if (decision is DecisionOutcome.Executed) {
+            InterventionSideEffects.handle(context, task, transactionId, decision.executionOutcome)
+        }
         Log.d(TAG, "Start handled for $transactionId")
     }
 

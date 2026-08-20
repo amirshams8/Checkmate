@@ -78,12 +78,28 @@ class InterventionTriggerWorker(
                 // immediately through the deterministic fallback, same as before this step,
                 // rather than leaving the transaction to sit until TTL expiry with nothing
                 // ever having been shown to the student.
-                decisionMaker.decideAndExecute(
+                val decision = decisionMaker.decideAndExecute(
                     transactionId = acquired.transaction.transactionId,
                     task = task,
                     lateMinutes = signal.lateMinutes,
                     now = now
                 )
+                // Guardian-only, and currently unreachable in practice: decideAndExecute
+                // never receives an llmPrompt here, so the deterministic fallback always
+                // resolves to START_TASK. Checked anyway since InterventionGuardianBridge
+                // lives in this same module and costs nothing extra. ShortBreak's wake-up
+                // scheduling is deliberately NOT wired here — InterventionShortBreakAlarmReceiver
+                // is an `app`-layer class this module cannot reference, and building a second
+                // cross-module bridge solely for a path that can never produce ShortBreak
+                // today isn't worth it (see InterventionSideEffects' own doc, which is what
+                // the two `app`-layer call sites use instead).
+                if (decision is DecisionOutcome.Executed &&
+                    decision.executionOutcome is ExecutionOutcome.RequiresGuardianEscalation
+                ) {
+                    InterventionGuardianBridge.gateway?.notifyGuardianRequested(
+                        applicationContext, task, acquired.transaction.transactionId
+                    )
+                }
             }
             // dispatched == SHOWN: transaction intentionally left NEGOTIATING here.
         }

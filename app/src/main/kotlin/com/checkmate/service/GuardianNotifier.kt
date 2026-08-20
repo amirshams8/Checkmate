@@ -345,6 +345,31 @@ object GuardianNotifier {
     }
 
     /**
+     * Proactive Execution Engine — fixes a gap flagged in ActionExecutor's own comment:
+     * `PermittedAction.RequestGuardian` was always recognized and resolved the transaction,
+     * but nothing downstream ever notified anyone. Fired via
+     * [com.checkmate.planner.intervention.InterventionGuardianBridge] (wired from
+     * CheckmateApp.onCreate(), same pattern as InterventionNotificationBridge) right where
+     * the intervention pipeline observes `ExecutionOutcome.RequiresGuardianEscalation` —
+     * i.e. the student (or the LLM speaking for them, live in the AI Mentor negotiation)
+     * asked for a real person instead of continuing to negotiate with the app.
+     */
+    fun notifyInterventionGuardianRequest(context: Context, subject: String, topic: String) {
+        val candidateName = ConsultationProfile.candidateDisplayName()
+        val msg = "🙋 Checkmate: $candidateName asked to talk to you instead of continuing " +
+                  "with the AI Mentor, about $subject — $topic, at ${timeNow()} on ${dateToday()}."
+        Log.d(TAG, "Intervention guardian request: $subject / $topic")
+
+        val number = getGuardianNumber()
+        if (number != null) {
+            openWhatsAppAndSend(context, number, msg)
+        }
+        if (TelegramAlertBot.getChatId() != null) {
+            Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+        }
+    }
+
+    /**
      * Fired by ProactiveMentor.holidayPromptIfNeeded() every Wednesday, once per week — a
      * standing reminder for the guardian to review and mark any upcoming holiday, since that's
      * the only way WorkModeSchedule's hardcoded window ever eases for a specific day (see
