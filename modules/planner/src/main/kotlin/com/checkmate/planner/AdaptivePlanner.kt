@@ -12,9 +12,14 @@ import com.checkmate.core.DailyChecklist
 import com.checkmate.core.PYQWeightage
 import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
 import com.checkmate.planner.model.TaskType
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -49,16 +54,27 @@ object AdaptivePlanner {
         // very first plan of the day).
         val todayContext      = TodayContext.getSummaryText()
 
+        // Upgrade Blueprint Phase 2 wiring ("Planner reframe"): StudentModelBuilder.build()
+        // was fully implemented back in Phase 1 (aggregates MasteryEngine/ErrorEngine/
+        // RetentionEngine/KnowledgeGraph, itself fed by every report.md import via
+        // TestResultNormalizer) but nothing ever called it — real test performance was
+        // computed and persisted, then sat unread while the planner kept guessing from
+        // PYQ weightage + behavior alone. This is the first consumer: one snapshot, reused
+        // by both the LLM path (as structured JSON, same "deterministic data, not prose"
+        // discipline as BEHAVIOR_METRICS below) and the rule-based fallback (prefers the
+        // weakest/review-due concept per subject over blind PYQ rotation, when one exists).
+        val studentModel = StudentModelBuilder.build(context)
+
         // Blueprint 4.1: today's free windows (study window minus school/coaching
         // blocked slots). Computed once, applied to whichever plan comes out below.
         val freeSlots = FreeSlotCalculator.computeFreeSlots(
             profile.blockedSlots, config.studyStartTime, config.studyEndTime
         )
 
-        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext)
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext, studentModel)
         if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
 
-        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours), freeSlots)
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours, studentModel), freeSlots)
     }
 
     /**
@@ -160,6 +176,103 @@ object AdaptivePlanner {
         }.trim()
     }
 
+    // ── Upgrade Blueprint Phase 2 wiring: compact StudentModel → LLM prompt ──
+    // StudentModel.concepts can grow to hundreds of rows over a full prep cycle
+    // (:modules:learning's model classes are deliberately not @Serializable — see
+    // StudentModel.kt's own class doc on why it stays a derived, non-persisted read
+    // model — so this hand-builds a small, prompt-sized, @Serializable summary here
+    // rather than dumping the whole thing). Same "own words / own shape" boundary
+    // StudentModel.kt's class doc already draws around StudentModelBuilder itself.
+
+    @Serializable
+    private data class ConceptEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val masteryPercent: Int,
+        val hasWeakPrerequisite: Boolean
+    )
+
+    @Serializable
+    private data class ErrorEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val errorType: String,
+        val occurrences: Int
+    )
+
+    @Serializable
+    private data class StudentModelPromptSummary(
+        val conceptsTracked: Int,
+        val conceptsMastered: Int,
+        val conceptsWeak: Int,
+        val averageMasteryPercent: Int,
+        val unresolvedErrorCount: Int,
+        /** Lowest-mastery concepts first, capped — see class doc above. */
+        val weakestConcepts: List<ConceptEntry>,
+        /** RetentionEngine.decide() == REVIEW, sorted by forgettingRisk desc, capped. */
+        val reviewDue: List<ConceptEntry>,
+        /** StudentModel.unresolvedErrors, already occurrences-desc, capped. */
+        val topErrorPatterns: List<ErrorEntry>
+    )
+
+    /**
+     * Compacts a full [StudentModel] into a small, prompt-sized summary: top-8
+     * weakest concepts, top-8 review-due concepts, top-8 unresolved error
+     * patterns — pre-sorted so the LLM sees the highest-signal rows first
+     * instead of reasoning over a large, unranked blob.
+     *
+     * Returns null when the student has no tracked concepts yet (no report.md
+     * ever imported) — same empty-guard pattern as [buildPyqContext]/
+     * [buildChecklistContext] — so the prompt doesn't grow an empty/misleading
+     * STUDENT_MODEL section before the first mock is imported.
+     */
+    private fun buildStudentModelSummary(model: StudentModel): StudentModelPromptSummary? {
+        if (model.overall.conceptsTracked == 0) return null
+
+        fun ConceptSnapshot.toEntry() = ConceptEntry(
+            subject = subject,
+            chapter = chapter,
+            topic = topic,
+            masteryPercent = (mastery * 100).toInt(),
+            hasWeakPrerequisite = prerequisiteIssues.isNotEmpty()
+        )
+
+        val weakest = model.concepts.values
+            .sortedBy { it.mastery }
+            .take(8)
+            .map { it.toEntry() }
+
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(8)
+            .map { it.toEntry() }
+
+        val topErrors = model.unresolvedErrors.take(8).map { pattern ->
+            val concept = model.concepts[pattern.conceptId]
+            ErrorEntry(
+                subject = concept?.subject,
+                chapter = concept?.chapter,
+                topic = concept?.topic,
+                errorType = pattern.errorType,
+                occurrences = pattern.occurrences
+            )
+        }
+
+        return StudentModelPromptSummary(
+            conceptsTracked = model.overall.conceptsTracked,
+            conceptsMastered = model.overall.conceptsMastered,
+            conceptsWeak = model.overall.conceptsWeak,
+            averageMasteryPercent = (model.overall.averageMastery * 100).toInt(),
+            unresolvedErrorCount = model.overall.unresolvedErrorCount,
+            weakestConcepts = weakest,
+            reviewDue = reviewDue,
+            topErrorPatterns = topErrors
+        )
+    }
+
     private suspend fun tryLlmPlan(
         config: PlannerState,
         daysLeft: Int,
@@ -170,8 +283,12 @@ object AdaptivePlanner {
         coachingContext: String,
         pyqContext: String,
         checklistContext: String,
-        todayContext: String = ""
+        todayContext: String = "",
+        // Upgrade Blueprint Phase 2 wiring — see buildStudentModelSummary() above.
+        studentModel: StudentModel
     ): List<StudyTask> {
+        val studentModelSummary = buildStudentModelSummary(studentModel)
+
         val systemPrompt = """
 You are an adaptive study planner for competitive exam students.
 Generate a focused daily study plan. Respond ONLY with a valid JSON array, no markdown, no explanation.
@@ -196,6 +313,13 @@ Rules:
   specific (subject, taskType) combinations the student has repeatedly skipped (occurrences >= 3
   in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
   to the aggregate recentSkipRatePercent
+- STUDENT_MODEL, when present, is also deterministic — built from the student's actual imported
+  test results (MasteryEngine/ErrorEngine/RetentionEngine), not a guess. weakestConcepts and
+  reviewDue are real measured gaps; topErrorPatterns are mistakes the student has actually made
+  repeatedly. Prioritize these over PYQ-weightage-only guesses when they exist, and when you do
+  pick a weakestConcepts/reviewDue/topErrorPatterns entry, say so specifically in "reason" (e.g.
+  "42% mastery from last mock" or "3rd CALCULATION error in this concept") rather than a generic
+  weak-topic flag
 """.trimIndent()
 
         val prompt = buildString {
@@ -237,6 +361,13 @@ Rules:
             appendLine("BEHAVIOR_METRICS (JSON, deterministic, authoritative):")
             appendLine(Json.encodeToString(behaviorSnapshot))
             appendLine()
+            // Upgrade Blueprint Phase 2 wiring: same treatment for real test performance —
+            // see buildStudentModelSummary() and the systemPrompt rule above.
+            if (studentModelSummary != null) {
+                appendLine("STUDENT_MODEL (JSON, deterministic, authoritative — from imported test reports):")
+                appendLine(Json.encodeToString(studentModelSummary))
+                appendLine()
+            }
             appendLine("Generate today's plan.")
         }
 
@@ -309,7 +440,9 @@ Rules:
     private fun ruleBasedPlan(
         config: PlannerState,
         daysLeft: Int,
-        studyWindowHours: Float
+        studyWindowHours: Float,
+        // Upgrade Blueprint Phase 2 wiring — see the weakestBySubject block below.
+        studentModel: StudentModel
     ): List<StudyTask> {
         val tasks        = mutableListOf<StudyTask>()
         val sorted       = config.subjects.sortedByDescending { it.weightage }
@@ -324,22 +457,61 @@ Rules:
             else            -> baseDuration
         }
 
-        // Use PYQ weightage to pick top topics per subject
+        // Upgrade Blueprint Phase 2 wiring: per subject, prefer the weakest tracked
+        // concept StudentModel already knows about (real measured mastery from
+        // imported test results) over blind PYQ-rotation topic selection — same
+        // "don't guess what Room already knows" discipline as the LLM path above.
+        // A concept only wins here if RetentionEngine.decide() actually flagged it
+        // (TEACH/REVIEW) — a MOVE_ON concept (well-mastered, low forgetting risk)
+        // falls through to normal rotation even if it happens to be this subject's
+        // lowest-mastery row, since "lowest of the well-mastered" isn't a gap.
+        // Falls straight through to the pre-existing rotation logic untouched when
+        // this subject has no tracked concepts yet (e.g. no report.md imported) —
+        // a fresh install behaves exactly as before this change.
+        val weakestBySubject: Map<String, ConceptSnapshot> = studentModel.concepts.values
+            .filter { it.subject != null }
+            .groupBy { it.subject!! }
+            .mapValues { (_, snapshots) -> snapshots.minByOrNull { it.mastery }!! } // groupBy guarantees a non-empty list per key
+
         val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
-            val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
-            val topic = if (topTopics.isNotEmpty()) {
-                val t = topTopics[(dayOfYear + idx) % topTopics.size]
-                if (daysLeft < 30) "Revision: ${t.first}" else t.first
+            val weakest = weakestBySubject.entries
+                .firstOrNull { it.key.equals(subj.name, ignoreCase = true) }
+                ?.value
+                ?.takeIf { it.retentionDecision != RetentionDecisionSnapshot.MOVE_ON }
+
+            val (topic, rationale) = if (weakest != null) {
+                val label = weakest.topic ?: weakest.chapter ?: subj.name
+                val action = when (weakest.retentionDecision) {
+                    RetentionDecisionSnapshot.TEACH  -> "Teach"
+                    RetentionDecisionSnapshot.REVIEW -> "Review"
+                    RetentionDecisionSnapshot.MOVE_ON -> "Revision" // unreachable, filtered above
+                }
+                val masteryPct = (weakest.mastery * 100).toInt()
+                val reason = buildString {
+                    append("Mastery $masteryPct% from imported test results")
+                    if (weakest.errorCount > 0) append(", ${weakest.errorCount} recorded error(s)")
+                    if (weakest.prerequisiteIssues.isNotEmpty()) append(", traces to a weak prerequisite")
+                }
+                "$action: $label" to reason
             } else {
-                if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
-                else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
+                val t = if (topTopics.isNotEmpty()) {
+                    val picked = topTopics[(dayOfYear + idx) % topTopics.size]
+                    if (daysLeft < 30) "Revision: ${picked.first}" else picked.first
+                } else {
+                    if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                    else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                }
+                t to ""
             }
+
             tasks.add(StudyTask(
                 subject         = subj.name,
                 topic           = topic,
                 durationMinutes = if (idx == 0) duration + 15 else duration,
-                priority        = sorted.size - idx
+                priority        = sorted.size - idx,
+                rationale       = rationale
             ))
         }
         return tasks

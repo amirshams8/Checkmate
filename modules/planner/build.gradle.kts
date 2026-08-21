@@ -16,6 +16,12 @@ android {
 }
 dependencies {
     implementation(project(":modules:core"))
+    // Upgrade Blueprint Phase 2 wiring: AdaptivePlanner now reads StudentModelBuilder.build()
+    // (mastery/error/retention/prerequisite state) instead of only PYQ weightage + behavior
+    // snapshot. Same dependency direction :modules:learning already takes on :modules:core —
+    // :modules:learning depends on neither :modules:planner nor :modules:psyche, so this
+    // doesn't introduce a cycle.
+    implementation(project(":modules:learning"))
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")

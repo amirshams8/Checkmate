@@ -12,6 +12,9 @@ import com.checkmate.core.MentorKnowledge
 import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
@@ -119,7 +122,13 @@ class MentorViewModel : ViewModel() {
         }
     }
 
-    private fun buildSystemPrompt(context: Context, currentQuery: String): String {
+    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
+    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
+    // other suspend call this function already awaits nothing for (buildSystemPrompt
+    // itself did no suspending work before this). Its one call site (send(), above)
+    // already invokes it from inside viewModelScope.launch, so this is a signature-only
+    // change — no call-site rewrite needed.
+    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
         val profile         = ConsultationProfile.load()
         val ledger          = BehaviorLedger.getSummaryForPlanner()
         val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
@@ -150,6 +159,19 @@ class MentorViewModel : ViewModel() {
         val todayContext = TodayContext.getSummaryText()
         val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
 
+        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
+        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
+        // import — see TestResultNormalizer) into one StudentModel, but nothing read
+        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
+        // ledger, blind to actual test performance. buildLearningSummary() below
+        // compacts it into the same plain-text block style as planSummary/ledger.
+        val learningSummary = try {
+            buildLearningSummary(StudentModelBuilder.build(context))
+        } catch (e: Exception) {
+            "" // same fail-open pattern as usageSummary/coachingContext above — a
+               // learning-state read failure shouldn't block the rest of the prompt.
+        }
+
         return buildString {
             appendLine("""
 You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
@@ -160,6 +182,8 @@ Refer to specific topics, chapters, marks gaps, and deadlines.
 You also have access to the full conversation history above — refer to it naturally when relevant.
 If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
 you may briefly flag it — but don't derail the actual question they asked.
+If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
+the student's question, reference them specifically instead of speaking generically.
             """.trimIndent())
             appendLine()
             appendLine("STUDENT PROFILE:")
@@ -170,6 +194,11 @@ you may briefly flag it — but don't derail the actual question they asked.
             appendLine("TODAY'S PLAN:")
             appendLine(planSummary)
             appendLine()
+            if (learningSummary.isNotBlank()) {
+                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
+                appendLine(learningSummary)
+                appendLine()
+            }
             if (todayContext.isNotBlank()) {
                 appendLine("TODAY'S LOGGED UPDATES:")
                 appendLine(todayContext)
@@ -191,6 +220,61 @@ you may briefly flag it — but don't derail the actual question they asked.
                 appendLine()
             }
             appendLine("Respond as Mentor.")
+        }.trim()
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
+     * plain-text block matching the existing planSummary/ledger style — Mentor's
+     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
+     * convention, so this deliberately doesn't reuse AdaptivePlanner's
+     * StudentModelPromptSummary/Json.encodeToString approach.
+     *
+     * Empty-guard: returns "" when no report has ever been imported
+     * (conceptsTracked == 0) — same pattern as the other optional context blocks
+     * above (usageSummary/coachingContext) — so a student who hasn't imported a
+     * mock yet doesn't get a misleading "0 concepts tracked" section.
+     */
+    private fun buildLearningSummary(model: StudentModel): String {
+        if (model.overall.conceptsTracked == 0) return ""
+
+        val overall = model.overall
+        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(5)
+        val topErrors = model.unresolvedErrors.take(5)
+
+        return buildString {
+            appendLine(
+                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
+                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
+                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
+            )
+            if (weakest.isNotEmpty()) {
+                appendLine("Weakest concepts:")
+                weakest.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) " (traces to a weak prerequisite)" else ""
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
+                }
+            }
+            if (reviewDue.isNotEmpty()) {
+                appendLine("Due for review (forgetting risk rising):")
+                reviewDue.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
+                }
+            }
+            if (topErrors.isNotEmpty()) {
+                appendLine("Recurring errors:")
+                topErrors.forEach { e ->
+                    val concept = model.concepts[e.conceptId]
+                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
+                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
+                }
+            }
         }.trim()
     }
 
