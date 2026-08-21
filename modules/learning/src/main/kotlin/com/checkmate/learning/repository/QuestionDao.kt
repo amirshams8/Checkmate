@@ -32,6 +32,11 @@ interface QuestionDao {
     @Query("SELECT * FROM questions WHERE chapter = :chapter")
     suspend fun getByChapter(chapter: String): List<Question>
 
+    // Added for MasteryEngine/ErrorEngine (Upgrade Blueprint Phase 1.5/1.6), which
+    // need every Question row to resolve each QuestionAttempt to its concept.
+    @Query("SELECT * FROM questions")
+    suspend fun getAll(): List<Question>
+
     @Query("SELECT COUNT(*) FROM questions")
     suspend fun count(): Int
 }
@@ -50,6 +55,10 @@ interface QuestionAttemptDao {
 
     @Query("SELECT * FROM question_attempts WHERE studentId = :studentId ORDER BY timestamp ASC")
     suspend fun getAll(studentId: String): List<QuestionAttempt>
+
+    // Added for ErrorEngine (Upgrade Blueprint Phase 1.6).
+    @Query("SELECT * FROM question_attempts WHERE studentId = :studentId AND correct = 0 ORDER BY timestamp ASC")
+    suspend fun getWrongAttempts(studentId: String): List<QuestionAttempt>
 
     @Query("SELECT COUNT(*) FROM question_attempts WHERE studentId = :studentId")
     suspend fun count(studentId: String): Int

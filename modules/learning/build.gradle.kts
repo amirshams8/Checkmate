@@ -18,6 +18,11 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
+    // Added for Phase 1.4 (KnowledgeGraph) — needs ExamSyllabus (Exam -> Subject ->
+    // Chapter -> Topic) as the seed source for Concept rows. Same dependency
+    // direction :modules:planner and :modules:psyche already use (both depend on
+    // :modules:core; core depends on neither).
+    implementation(project(":modules:core"))
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     // Used only for the List<String> Room TypeConverter (conceptIds/concepts) —

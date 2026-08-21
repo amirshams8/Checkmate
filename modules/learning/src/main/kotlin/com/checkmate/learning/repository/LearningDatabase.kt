@@ -5,20 +5,38 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
+import com.checkmate.learning.graph.ConceptDependency
+import com.checkmate.learning.graph.ConceptDependencyDao
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.ErrorPattern
+import com.checkmate.learning.model.ErrorRecord
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.Question
 import com.checkmate.learning.model.QuestionAttempt
 
 /**
- * Upgrade Blueprint Phase 1.1-1.2. Own .db file ("checkmate_learning.db"),
- * separate from BehaviorDatabase ("checkmate_behavior.db") and
- * InterventionDatabase ("checkmate_intervention.db") — same reasoning
- * BehaviorDatabase's own doc gives: unrelated lifecycles, no foreign-key
- * relationship across the three, so no reason to merge them into one file.
+ * Upgrade Blueprint Phase 1.1-1.2 (v1), extended for Phase 1.4-1.7 (v2) with the
+ * knowledge graph (Concept, ConceptDependency), mastery (ConceptMastery), and error
+ * classification (ErrorRecord, ErrorPattern) tables.
+ *
+ * VERSION BUMP NOTE: v1 shipped with no upgrade migration, only
+ * fallbackToDestructiveMigrationOnDowngrade() — "no upgrade path needed yet" was
+ * true until this change. Rather than write a real Migration(1, 2) for a handful of
+ * pre-release local dev installs, this adds fallbackToDestructiveMigration()
+ * alongside the existing downgrade fallback — anyone with a v1 checkmate_learning.db
+ * gets it wiped and rebuilt on next launch. Acceptable now (sideload, active dev, no
+ * real student data at stake yet per the blueprint's Phase 0 framing); write a real
+ * Migration once this app has real users with data worth preserving across schema
+ * changes.
  */
 @Database(
-    entities = [LearningEvent::class, Question::class, QuestionAttempt::class],
-    version = 1,
+    entities = [
+        LearningEvent::class, Question::class, QuestionAttempt::class,
+        Concept::class, ConceptMastery::class, ConceptDependency::class,
+        ErrorRecord::class, ErrorPattern::class
+    ],
+    version = 2,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -27,6 +45,11 @@ abstract class LearningDatabase : RoomDatabase() {
     abstract fun learningEventDao(): LearningEventDao
     abstract fun questionDao(): QuestionDao
     abstract fun questionAttemptDao(): QuestionAttemptDao
+    abstract fun conceptDao(): ConceptDao
+    abstract fun masteryDao(): MasteryDao
+    abstract fun conceptDependencyDao(): ConceptDependencyDao
+    abstract fun errorRecordDao(): ErrorRecordDao
+    abstract fun errorPatternDao(): ErrorPatternDao
 
     companion object {
         @Volatile
@@ -39,9 +62,8 @@ abstract class LearningDatabase : RoomDatabase() {
                     LearningDatabase::class.java,
                     "checkmate_learning.db"
                 )
-                    // Version 1, no upgrade path needed yet — same downgrade-only-destructive
-                    // posture as BehaviorDatabase/InterventionDatabase.
                     .fallbackToDestructiveMigrationOnDowngrade()
+                    .fallbackToDestructiveMigration()
                     .build().also { INSTANCE = it }
             }
     }

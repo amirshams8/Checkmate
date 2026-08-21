@@ -2,6 +2,8 @@ package com.checkmate.learning.testmate
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.learning.engine.ErrorEngine
+import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.LearningEventType
 import com.checkmate.learning.model.LearningIds
@@ -12,14 +14,19 @@ import java.security.MessageDigest
 
 /**
  * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
- * → MasteryEngine → StudentModel → Planner." This is the normalizer — MasteryEngine
- * and the rest of the fold are Phase 1.5+, not built yet (see Checkmate_Upgrade_Blueprint
- * §Phase 1.5-1.7 and the suggested sequencing at the bottom of that doc).
+ * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
+ * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
+ * successful import now also classifies its wrong attempts (ErrorEngine) and
+ * recomputes mastery for every concept touched (MasteryEngine) before returning.
+ * StudentModel/Planner consumption is still Phase 2 — see [NormalizeResult] below
+ * for exactly what this now writes.
  *
  * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
  * This is what turns a report.md dump into that "why": one Question row per
- * question, one QuestionAttempt per attempt, and a LearningEvent per question
- * outcome (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event.
+ * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
+ * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
+ * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
+ * row per concept the report touched.
  *
  * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
  * attempt/event from one import shares [testTimestamp], which defaults to import
@@ -36,7 +43,10 @@ object TestResultNormalizer {
         val questionsWritten: Int,
         val attemptsWritten: Int,
         val eventsWritten: Int,
-        val warnings: List<String>
+        val warnings: List<String>,
+        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
+        val errorsClassified: Int = 0,
+        val conceptsRecomputed: Int = 0
     )
 
     suspend fun normalizeAndPersist(
@@ -147,11 +157,18 @@ object TestResultNormalizer {
         db.questionAttemptDao().insertAll(attempts)
         db.learningEventDao().insertAll(events)
 
+        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
+        // immediately gets its wrong answers classified and its touched concepts'
+        // mastery recomputed, rather than sitting inert until something else reads it.
+        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
+        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
+
         warnings.forEach { Log.w(TAG, it) }
         Log.d(
             TAG,
             "Normalized report '${report.title}': ${questions.size} questions, " +
-                "${attempts.size} attempts, ${events.size} events, ${warnings.size} warning(s)"
+                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
+                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
         )
 
         return NormalizeResult(
@@ -159,7 +176,9 @@ object TestResultNormalizer {
             questionsWritten = questions.size,
             attemptsWritten = attempts.size,
             eventsWritten = events.size,
-            warnings = warnings
+            warnings = warnings,
+            errorsClassified = errorRecords.size,
+            conceptsRecomputed = recomputedMastery.size
         )
     }
 
