@@ -1,5 +1,7 @@
 package com.checkmate.ui.testresults
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -10,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -24,10 +27,24 @@ import com.checkmate.ui.theme.*
  * session result by ID and renders it natively, per spec §4's
  * score/weak-chapters/weak-topics shape. Base URL + token are configured in
  * Settings → Test Platform.
+ *
+ * "Import report.md" section below is separate from the fetch-by-session-ID
+ * flow above — the aggregate fetch shows score/weak-chapters/weak-topics for
+ * display only (TestmateApi's /results endpoint carries no per-question
+ * detail); the file import is what actually feeds the learning module
+ * (MasteryEngine/ErrorEngine/RetentionEngine via TestResultNormalizer). The
+ * two are independent: fetch a result to look at it, and/or import its
+ * report.md (downloaded from TestmateWebScreen's WebView) to let Checkmate
+ * learn from it.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
     val state by vm.state.collectAsState()
+    val context = LocalContext.current
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let { vm.importReport(context, it) } }
 
     Column(
         modifier = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState())
@@ -92,6 +109,112 @@ fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = v
         }
 
         Spacer(Modifier.height(24.dp))
+        HorizontalDivider(color = White10, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 16.dp))
+        Spacer(Modifier.height(20.dp))
+
+        ImportReportSection(
+            state    = state,
+            onPick   = { importLauncher.launch("*/*") },
+            onDismiss = { vm.dismissImportResult() }
+        )
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ImportReportSection(
+    state: TestResultsState,
+    onPick: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Text("Import report.md", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = White90)
+        Text(
+            "Feeds this test's per-question data into Checkmate's learning engine " +
+                "(mastery, error patterns, retention) — download the report from the " +
+                "Test Platform tab first, then pick it here.",
+            fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+        )
+        Button(
+            onClick  = onPick,
+            enabled  = !state.importing,
+            modifier = Modifier.fillMaxWidth(),
+            colors   = ButtonDefaults.buttonColors(containerColor = BgCard),
+            border   = BorderStroke(0.5.dp, White30)
+        ) {
+            if (state.importing) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = AccentGreen, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Importing…", color = White90, fontSize = 13.sp)
+            } else {
+                Icon(Icons.Default.UploadFile, null, tint = AccentGreen, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Pick report.md", color = White90, fontSize = 13.sp)
+            }
+        }
+
+        state.importError?.let { err ->
+            Text(
+                err, fontSize = 12.sp, color = AccentRed,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
+
+        state.importResult?.let { result ->
+            Spacer(Modifier.height(12.dp))
+            ImportResultCard(result, onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun ImportResultCard(
+    result: com.checkmate.learning.testmate.TestResultNormalizer.NormalizeResult,
+    onDismiss: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, if (result.alreadyImported) AccentAmber else AccentGreen)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (result.alreadyImported) "Already imported" else "Imported",
+                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    color = if (result.alreadyImported) AccentAmber else AccentGreen
+                )
+                IconButton(onClick = onDismiss, modifier = Modifier.size(20.dp)) {
+                    Icon(Icons.Default.Close, null, tint = White60, modifier = Modifier.size(16.dp))
+                }
+            }
+            if (result.alreadyImported) {
+                Text(
+                    "This test was already imported — no duplicate attempts written.",
+                    fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 6.dp)
+                )
+            } else {
+                Spacer(Modifier.height(10.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    MiniStat("Questions", "${result.questionsWritten}", AccentGreen)
+                    MiniStat("Attempts", "${result.attemptsWritten}", AccentGreen)
+                    MiniStat("Errors", "${result.errorsClassified}", AccentRed)
+                    MiniStat("Concepts", "${result.conceptsRecomputed}", AccentAmber)
+                }
+            }
+            if (result.warnings.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                result.warnings.forEach { w ->
+                    Text("⚠ $w", fontSize = 11.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
+                }
+            }
+        }
     }
 }
 
