@@ -1,3 +1,384 @@
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/KnowledgeGraph.kt =====
+package com.checkmate.learning.graph
+
+import android.content.Context
+import com.checkmate.core.ExamSyllabus
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.repository.LearningDatabase
+import java.security.MessageDigest
+
+/**
+ * Upgrade Blueprint Phase 1.4 ("Concept-level knowledge graph, not chapter-level
+ * weakness"). See [Concept]'s class doc for the honest limitation on granularity —
+ * one Concept here = one [ExamSyllabus] topic, not a true sub-topic concept, since
+ * nothing in this codebase defines concepts finer than that.
+ */
+object KnowledgeGraph {
+
+    // BUG CAUGHT AGAINST REAL DATA: Testmate's own report.md carries exam strings
+    // like "NEET-2027" (title-embedded year — see the sample
+    // ft-01b-full-test-neet-2027--report.md), but ExamSyllabus's top-level keys are
+    // bare exam names ("NEET", "JEE", ...). Without normalizing, every real import
+    // would key concepts under "neet-2027-..." while seedExamSyllabus("NEET") keys
+    // them under "neet-...", and the two would never join — mastery computed from
+    // real attempts would sit in a completely different set of rows than the
+    // syllabus-seeded prerequisite graph. Stripping a trailing "-YYYY" fixes the
+    // common case. An exam string that doesn't end in a year, or an ExamSyllabus
+    // key that later grows its own year suffix, would need this revisited.
+    private val YEAR_SUFFIX = Regex("""-(19|20)\d{2}$""")
+    // Was private — widened to internal so the one real call site for
+    // seedExamSyllabus (TestResultNormalizer, wiring it in for the first time) can
+    // normalize a report's raw exam string ("NEET-2027") to an ExamSyllabus key
+    // ("NEET") before calling it, without duplicating this regex there.
+    internal fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
+
+    /**
+     * Deterministic id from (exam, chapter, topic) — deliberately NOT subject. See
+     * [com.checkmate.learning.engine.MasteryEngine]'s class doc: real
+     * TestResultNormalizer-imported Questions never carry a subject (report.md has
+     * no subject field), so keying on subject would split a seeded syllabus concept
+     * and its real-import attempts into two rows that never join. `topic` falls
+     * back to `chapter` when null, matching TestReportParser's own dash-to-null
+     * normalization (chapter-level granularity when Testmate reports no topic).
+     */
+    fun conceptId(exam: String, chapter: String, topic: String?): String {
+        val key = "${normalizeExam(exam).lowercase()}|${chapter.trim().lowercase()}|" +
+            "${(topic ?: chapter).trim().lowercase()}"
+        return slugify(key)
+    }
+
+    private fun slugify(raw: String): String {
+        val slug = raw.replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        // Hash suffix guards against two different raw keys slugifying to the same
+        // truncated prefix — cheap insurance, not expected to matter at this data scale.
+        val hash = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
+            .joinToString("") { "%02x".format(it) }.take(8)
+        return "${slug.take(60)}-$hash"
+    }
+
+    /**
+     * Illustrative starter set, per the blueprint's own example ("Rolling Motion
+     * depends on torque, energy, angular velocity"). NOT exhaustive and NOT
+     * validated against the official NTA syllabus tree — the blueprint calls for
+     * versioning the syllabus tree against NTA's published document, which is a
+     * real research task, not something to fabricate here. Extend this list as
+     * that research happens; [seedExamSyllabus] applies whatever's here.
+     */
+    private data class PrerequisiteSeed(
+        val exam: String, val chapter: String, val topic: String,
+        val prerequisiteChapter: String, val prerequisiteTopic: String
+    )
+
+    private val SEED_PREREQUISITES = listOf(
+        // NEET Physics — Mechanics chapter, per ExamSyllabus.
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Laws of Motion"),
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Work Energy Power"),
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Kinematics"),
+        PrerequisiteSeed("NEET", "Mechanics", "Oscillations", "Mechanics", "Work Energy Power"),
+        PrerequisiteSeed("NEET", "Mechanics", "Waves", "Mechanics", "Oscillations"),
+        // NEET Chemistry — Equilibrium and Electrochemistry lean on earlier Physical Chemistry topics.
+        PrerequisiteSeed("NEET", "Physical Chemistry", "Equilibrium", "Physical Chemistry", "Thermodynamics"),
+        PrerequisiteSeed("NEET", "Physical Chemistry", "Electrochemistry", "Physical Chemistry", "Redox Reactions"),
+        // NEET Biology — Biotechnology leans on Genetics and Evolution.
+        PrerequisiteSeed("NEET", "Biology", "Biotechnology", "Biology", "Genetics and Evolution")
+    )
+
+    /**
+     * Inserts one [Concept] row per (subject, chapter, topic) leaf of
+     * ExamSyllabus.data[exam], plus whatever [SEED_PREREQUISITES] edges apply to
+     * that exam. `exam` here must be an ExamSyllabus key ("NEET"), not a
+     * Testmate-report exam string ("NEET-2027") — [conceptId] normalizes both to
+     * the same slug internally, so this still joins correctly with real imported
+     * attempts either way.
+     *
+     * WIRING: called from [com.checkmate.learning.testmate.TestResultNormalizer.normalizeAndPersist]
+     * on every import, using `report.exam` (normalized via [normalizeExam]) as the
+     * exam key — no separate onboarding flow exists to declare a student's exam
+     * ahead of time, but every real import already carries its own exam string, so
+     * seeding opportunistically off that is the actual first real signal available,
+     * not a guess. Safe to call repeatedly for the same exam: [Concept] upsertAll
+     * overwrites identically and [ConceptDependencyDao.insertAll] is
+     * `OnConflictStrategy.IGNORE`, so a re-imported report re-seeding the same exam
+     * is a no-op past the first time, not a duplicate/corruption risk.
+     */
+    suspend fun seedExamSyllabus(context: Context, exam: String) {
+        val subjects = ExamSyllabus.data[exam] ?: return
+        val db = LearningDatabase.getInstance(context)
+
+        val concepts = subjects.flatMap { (subject, chapters) ->
+            chapters.flatMap { (chapter, topics) ->
+                topics.map { topic ->
+                    Concept(
+                        id = conceptId(exam, chapter, topic),
+                        exam = exam,
+                        subject = subject,
+                        chapter = chapter,
+                        topic = topic
+                    )
+                }
+            }
+        }
+        db.conceptDao().upsertAll(concepts)
+
+        val edges = SEED_PREREQUISITES
+            .filter { it.exam == exam }
+            .map {
+                ConceptDependency(
+                    conceptId = conceptId(exam, it.chapter, it.topic),
+                    prerequisiteConceptId = conceptId(exam, it.prerequisiteChapter, it.prerequisiteTopic)
+                )
+            }
+        db.conceptDependencyDao().insertAll(edges)
+    }
+
+    /**
+     * Diagnoses a weak concept as a prerequisite failure where possible, per the
+     * blueprint's "rolling motion failure diagnosed as prerequisite failure"
+     * example. Returns the prerequisite [Concept]s whose mastery is below
+     * [masteryThreshold] — empty if [conceptId] has no seeded prerequisite edges
+     * (e.g. [seedExamSyllabus] was never run for its exam) or none are actually weak.
+     */
+    suspend fun diagnosePrerequisiteFailure(
+        context: Context,
+        studentId: String,
+        conceptId: String,
+        // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
+        // imported directly — avoids a graph<->engine circular reference for one constant.
+        masteryThreshold: Double = 0.75
+    ): List<Concept> {
+        val db = LearningDatabase.getInstance(context)
+        val prerequisiteIds = db.conceptDependencyDao().getPrerequisites(conceptId)
+        if (prerequisiteIds.isEmpty()) return emptyList()
+
+        return prerequisiteIds.mapNotNull { prereqId ->
+            val mastery = db.masteryDao().getByConcept(studentId, prereqId)
+            val isWeak = mastery == null || mastery.mastery < masteryThreshold
+            if (isWeak) db.conceptDao().getById(prereqId) else null
+        }
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/testmate/TestResultNormalizer.kt =====
+package com.checkmate.learning.testmate
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.engine.ErrorEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.LearningEvent
+import com.checkmate.learning.model.LearningEventType
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.Question
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
+import java.security.MessageDigest
+
+/**
+ * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
+ * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
+ * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
+ * successful import now also classifies its wrong attempts (ErrorEngine) and
+ * recomputes mastery for every concept touched (MasteryEngine) before returning.
+ * StudentModel/Planner consumption is still Phase 2 — see [NormalizeResult] below
+ * for exactly what this now writes.
+ *
+ * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
+ * This is what turns a report.md dump into that "why": one Question row per
+ * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
+ * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
+ * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
+ * row per concept the report touched.
+ *
+ * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
+ * attempt/event from one import shares [testTimestamp], which defaults to import
+ * time (now), not actual test time. Pass [testTimestamp] explicitly once there's
+ * a real source for it (e.g. a file-modified date or a user-entered date) — not
+ * guessed here.
+ */
+object TestResultNormalizer {
+
+    private const val TAG = "TestResultNormalizer"
+
+    data class NormalizeResult(
+        val alreadyImported: Boolean,
+        val questionsWritten: Int,
+        val attemptsWritten: Int,
+        val eventsWritten: Int,
+        val warnings: List<String>,
+        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
+        val errorsClassified: Int = 0,
+        val conceptsRecomputed: Int = 0
+    )
+
+    suspend fun normalizeAndPersist(
+        context: Context,
+        reportText: String,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID,
+        source: String = "testmate_report",
+        testTimestamp: Long = System.currentTimeMillis()
+    ): NormalizeResult {
+        val report = TestReportParser.parse(reportText)
+        val warnings = mutableListOf<String>()
+
+        // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
+        // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
+        // this is that call site. Every import already knows its own exam
+        // (report.exam, e.g. "NEET-2027"); normalizing it to an ExamSyllabus key
+        // ("NEET") and seeding here means diagnosePrerequisiteFailure has real
+        // prerequisite edges to walk by the time StudentModelBuilder next runs for
+        // this student, instead of silently finding none because seeding never
+        // happened. Safe on every import, including a duplicate re-import that gets
+        // caught by the idempotency guard below — see seedExamSyllabus's own doc for
+        // why a repeat call is a no-op, not a duplication risk. Fails open: a report
+        // for an exam ExamSyllabus doesn't recognize just returns from
+        // seedExamSyllabus without seeding anything, and the import continues
+        // normally either way.
+        report.exam?.let { examRaw ->
+            KnowledgeGraph.seedExamSyllabus(context, KnowledgeGraph.normalizeExam(examRaw))
+        }
+
+        if (report.questions.isEmpty()) {
+            warnings.add(
+                "No question rows parsed — report format may not match " +
+                    "TestReportParser's expected shape."
+            )
+        }
+        report.attempted?.let { expected ->
+            val actualAttempted = report.questions.count { it.status != ParsedQuestionStatus.SKIPPED }
+            if (actualAttempted != expected) {
+                warnings.add(
+                    "Header says $expected attempted, but $actualAttempted question rows " +
+                        "were non-skipped after parsing."
+                )
+            }
+        }
+
+        val db = LearningDatabase.getInstance(context)
+        val testId = deterministicTestId(report)
+
+        // Idempotency guard: the same report re-imported (e.g. user re-shares the same
+        // file) must not double-count attempts/events. Question ids are deterministic
+        // from (testId, question number), so checking the first one tells us whether
+        // this exact test was already normalized.
+        val firstQuestionId = report.questions.firstOrNull()?.let { deterministicQuestionId(testId, it.number) }
+        if (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) {
+            Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
+            return NormalizeResult(
+                alreadyImported = true,
+                questionsWritten = 0,
+                attemptsWritten = 0,
+                eventsWritten = 0,
+                warnings = warnings
+            )
+        }
+
+        val questions = mutableListOf<Question>()
+        val attempts = mutableListOf<QuestionAttempt>()
+        val events = mutableListOf<LearningEvent>()
+
+        events.add(
+            LearningEvent(
+                studentId = studentId,
+                eventType = LearningEventType.MOCK_COMPLETED,
+                timestamp = testTimestamp,
+                source = source,
+                accuracy = report.scorePercent?.let { it / 100.0 }
+            )
+        )
+
+        for (q in report.questions) {
+            val questionId = deterministicQuestionId(testId, q.number)
+
+            questions.add(
+                Question(
+                    id = questionId,
+                    source = source,
+                    exam = report.exam,
+                    chapter = q.chapter,
+                    topic = q.topic,
+                    correctOption = q.correctOption,
+                    questionText = q.questionText
+                )
+            )
+
+            attempts.add(
+                QuestionAttempt(
+                    studentId = studentId,
+                    questionId = questionId,
+                    timestamp = testTimestamp,
+                    selectedOption = q.selectedOption,
+                    correct = q.status == ParsedQuestionStatus.CORRECT,
+                    timeTakenSeconds = q.timeSeconds
+                )
+            )
+
+            val eventType = when (q.status) {
+                ParsedQuestionStatus.CORRECT -> LearningEventType.QUESTION_CORRECT
+                ParsedQuestionStatus.WRONG -> LearningEventType.QUESTION_WRONG
+                ParsedQuestionStatus.SKIPPED -> LearningEventType.QUESTION_SKIPPED
+            }
+            events.add(
+                LearningEvent(
+                    studentId = studentId,
+                    eventType = eventType,
+                    timestamp = testTimestamp,
+                    chapterId = q.chapter,
+                    topicId = q.topic,
+                    questionId = questionId,
+                    source = source,
+                    duration = q.timeSeconds
+                )
+            )
+        }
+
+        db.questionDao().upsertAll(questions)
+        db.questionAttemptDao().insertAll(attempts)
+        db.learningEventDao().insertAll(events)
+
+        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
+        // immediately gets its wrong answers classified and its touched concepts'
+        // mastery recomputed, rather than sitting inert until something else reads it.
+        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
+        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
+
+        warnings.forEach { Log.w(TAG, it) }
+        Log.d(
+            TAG,
+            "Normalized report '${report.title}': ${questions.size} questions, " +
+                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
+                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
+        )
+
+        return NormalizeResult(
+            alreadyImported = false,
+            questionsWritten = questions.size,
+            attemptsWritten = attempts.size,
+            eventsWritten = events.size,
+            warnings = warnings,
+            errorsClassified = errorRecords.size,
+            conceptsRecomputed = recomputedMastery.size
+        )
+    }
+
+    /**
+     * Stable id derived from the report's own content (exam + title), not a random
+     * UUID — the same report re-imported must resolve to the same testId so the
+     * idempotency guard above actually works.
+     */
+    private fun deterministicTestId(report: ParsedTestReport): String =
+        sha256Hex("${report.exam ?: ""}|${report.title}").take(16)
+
+    private fun deterministicQuestionId(testId: String, questionNumber: Int): String =
+        "$testId-q$questionNumber"
+
+    private fun sha256Hex(input: String): String =
+        MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+}
+
+
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/StudentModel.kt =====
 package com.checkmate.learning.model
 
@@ -1284,3 +1665,5 @@ saying only that a prerequisite gap exists.
         }
     }
 }
+
+
