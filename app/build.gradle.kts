@@ -84,4 +84,5 @@ dependencies {
     implementation(project(":modules:psyche"))
     implementation(project(":modules:planner"))
     implementation(project(":modules:testmate"))
+    implementation(project(":modules:learning"))
 }
