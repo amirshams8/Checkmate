@@ -161,14 +161,26 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   ├── com
 │   │   │   │   │   │   ├── checkmate
 │   │   │   │   │   │   │   ├── learning
+│   │   │   │   │   │   │   │   ├── engine
+│   │   │   │   │   │   │   │   │   ├── ErrorEngine.kt
+│   │   │   │   │   │   │   │   │   ├── MasteryEngine.kt
+│   │   │   │   │   │   │   │   │   ├── RetentionEngine.kt
+│   │   │   │   │   │   │   │   ├── graph
+│   │   │   │   │   │   │   │   │   ├── ConceptDependency.kt
+│   │   │   │   │   │   │   │   │   ├── KnowledgeGraph.kt
 │   │   │   │   │   │   │   │   ├── model
+│   │   │   │   │   │   │   │   │   ├── Concept.kt
+│   │   │   │   │   │   │   │   │   ├── ConceptMastery.kt
+│   │   │   │   │   │   │   │   │   ├── ErrorRecord.kt
 │   │   │   │   │   │   │   │   │   ├── LearningEvent.kt
 │   │   │   │   │   │   │   │   │   ├── Question.kt
 │   │   │   │   │   │   │   │   │   ├── QuestionAttempt.kt
 │   │   │   │   │   │   │   │   ├── repository
 │   │   │   │   │   │   │   │   │   ├── Converters.kt
+│   │   │   │   │   │   │   │   │   ├── ErrorDao.kt
 │   │   │   │   │   │   │   │   │   ├── LearningDatabase.kt
 │   │   │   │   │   │   │   │   │   ├── LearningEventDao.kt
+│   │   │   │   │   │   │   │   │   ├── MasteryDao.kt
 │   │   │   │   │   │   │   │   │   ├── QuestionDao.kt
 │   │   │   │   │   │   │   │   ├── testmate
 │   │   │   │   │   │   │   │   │   ├── TestReportParser.kt
@@ -178,6 +190,9 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   ├── com
 │   │   │   │   │   │   ├── checkmate
 │   │   │   │   │   │   │   ├── learning
+│   │   │   │   │   │   │   │   ├── engine
+│   │   │   │   │   │   │   │   │   ├── MasteryEngineTest.kt
+│   │   │   │   │   │   │   │   │   ├── RetentionEngineTest.kt
 │   │   │   │   │   │   │   │   ├── testmate
 │   │   │   │   │   │   │   │   │   ├── TestReportParserTest.kt
 │   ├── planner
@@ -14699,6 +14714,11 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
+    // Added for Phase 1.4 (KnowledgeGraph) — needs ExamSyllabus (Exam -> Subject ->
+    // Chapter -> Topic) as the seed source for Concept rows. Same dependency
+    // direction :modules:planner and :modules:psyche already use (both depend on
+    // :modules:core; core depends on neither).
+    implementation(project(":modules:core"))
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     // Used only for the List<String> Room TypeConverter (conceptIds/concepts) —
@@ -14715,6 +14735,773 @@ dependencies {
 //===== FILE: modules/learning/src/main/AndroidManifest.xml =====
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/ErrorEngine.kt =====
+package com.checkmate.learning.engine
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.ErrorPattern
+import com.checkmate.learning.model.ErrorRecord
+import com.checkmate.learning.model.ErrorType
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
+
+/**
+ * Upgrade Blueprint Phase 1.6 ("ErrorEngine — classify every wrong answer").
+ *
+ * NOT WIRED: the blueprint's intended split is "LLM proposes classification from
+ * (question metadata + answer + solution + time + error history); deterministic
+ * layer validates/stores." No LLM call happens here — this module has no
+ * dependency on :modules:core's LlmGateway, and Question.explanation is
+ * essentially never populated by TestResultNormalizer (Testmate's report.md
+ * carries no worked solution, only the correct option letter). [classify] below is
+ * a deterministic time-based heuristic only, a placeholder for the real
+ * LLM-proposal path — wire LlmGateway in here once question.explanation has real
+ * content to reason over. Until then this reliably produces CARELESS/TIME_PRESSURE
+ * for the two cases timing alone can actually distinguish, and defaults everything
+ * else to UNKNOWN_CONCEPT rather than guessing a specific wrong bucket it has no
+ * basis for.
+ */
+object ErrorEngine {
+
+    private const val TAG = "ErrorEngine"
+    private const val CARELESS_TIME_SECONDS = 15
+    private const val TIME_PRESSURE_SECONDS = 150
+
+    fun classify(attempt: QuestionAttempt): ErrorType {
+        val t = attempt.timeTakenSeconds
+        return when {
+            t != null && t < CARELESS_TIME_SECONDS -> ErrorType.CARELESS
+            t != null && t > TIME_PRESSURE_SECONDS -> ErrorType.TIME_PRESSURE
+            else -> ErrorType.UNKNOWN_CONCEPT
+        }
+    }
+
+    /**
+     * Classifies every wrong [QuestionAttempt] for [studentId] that doesn't already
+     * have an [ErrorRecord] (idempotent, same re-run-safe discipline as
+     * TestResultNormalizer's import guard), then folds each new classification into
+     * its [ErrorPattern] row — "you've made this mistake 7 times" per the blueprint.
+     */
+    suspend fun classifyAllUnclassified(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): List<ErrorRecord> {
+        val db = LearningDatabase.getInstance(context)
+        val wrongAttempts = db.questionAttemptDao().getWrongAttempts(studentId)
+        if (wrongAttempts.isEmpty()) return emptyList()
+
+        val questionById = db.questionDao().getAll().associateBy { it.id }
+        val newRecords = mutableListOf<ErrorRecord>()
+
+        for (attempt in wrongAttempts) {
+            if (db.errorRecordDao().getByAttempt(attempt.attemptId) != null) continue // already classified
+
+            val question = questionById[attempt.questionId]
+            val conceptId = KnowledgeGraph.conceptId(
+                exam = question?.exam ?: "unknown",
+                chapter = question?.chapter ?: "unknown",
+                topic = question?.topic
+            )
+            val errorType = classify(attempt)
+
+            val record = ErrorRecord(
+                studentId = studentId,
+                attemptId = attempt.attemptId,
+                questionId = attempt.questionId,
+                conceptId = conceptId,
+                errorType = errorType,
+                timestamp = attempt.timestamp
+            )
+            db.errorRecordDao().insert(record)
+            newRecords.add(record)
+            recordPattern(db, studentId, conceptId, errorType, attempt.timestamp)
+        }
+
+        Log.d(TAG, "Classified ${newRecords.size} new wrong attempt(s) for student=$studentId")
+        return newRecords
+    }
+
+    private suspend fun recordPattern(
+        db: LearningDatabase,
+        studentId: String,
+        conceptId: String,
+        errorType: ErrorType,
+        timestamp: Long
+    ) {
+        val existing = db.errorPatternDao().get(studentId, conceptId, errorType)
+        val updated = if (existing == null) {
+            ErrorPattern(
+                studentId = studentId,
+                conceptId = conceptId,
+                errorType = errorType,
+                occurrences = 1,
+                firstSeen = timestamp,
+                lastSeen = timestamp
+            )
+        } else {
+            existing.copy(
+                occurrences = existing.occurrences + 1,
+                lastSeen = maxOf(existing.lastSeen, timestamp)
+            )
+        }
+        db.errorPatternDao().upsert(updated)
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/MasteryEngine.kt =====
+package com.checkmate.learning.engine
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
+
+/**
+ * Upgrade Blueprint Phase 1.5 ("MasteryEngine — deterministic first, no LLM-guessed
+ * scores").
+ *
+ * mastery = 0.35·recentAccuracy + 0.20·lifetimeAccuracy + 0.15·difficultyPerformance
+ *         + 0.15·retention + 0.10·speed + 0.05·confidenceCalibration
+ *
+ * HONEST GAP: two of the six blueprint components have no real data source yet in
+ * this codebase — Question.difficulty is always null (TestResultNormalizer never
+ * sets it; Testmate's report.md carries no difficulty field) and
+ * QuestionAttempt.confidence is always null (nothing captures a stated-confidence
+ * input anywhere). Treating a missing input as 0 would drag every mastery score
+ * down by exactly its weight regardless of actual performance, so missing
+ * components are dropped from the weighted sum and the remaining weights are
+ * renormalized to sum to 1.0 (see [renormalizedMastery]). Wire
+ * Question.difficulty / a real confidence input in here the moment either exists —
+ * nothing else needs to change.
+ *
+ * Concept identity: [KnowledgeGraph.conceptId] keys on (exam, chapter, topic) only —
+ * NOT subject — because TestResultNormalizer-imported Questions never carry a
+ * subject. This means a mastery row can exist for a concept before/without ever
+ * running [KnowledgeGraph.seedExamSyllabus] for that exam — [recomputeAll] below
+ * upserts a minimal [Concept] row itself from whatever Question data it has, so
+ * ConceptMastery always has a matching, queryable Concept row even with zero
+ * syllabus seeding done.
+ */
+object MasteryEngine {
+
+    private const val TAG = "MasteryEngine"
+
+    const val MASTERY_THRESHOLD = 0.75
+    private const val RECENT_WINDOW = 10
+
+    private const val W_RECENT = 0.35
+    private const val W_LIFETIME = 0.20
+    private const val W_DIFFICULTY = 0.15
+    private const val W_RETENTION = 0.15
+    private const val W_SPEED = 0.10
+    private const val W_CONFIDENCE = 0.05
+
+    suspend fun recomputeAll(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): List<ConceptMastery> {
+        val db = LearningDatabase.getInstance(context)
+        val questions = db.questionDao().getAll()
+        val attempts = db.questionAttemptDao().getAll(studentId)
+        if (attempts.isEmpty()) return emptyList()
+
+        val questionById = questions.associateBy { it.id }
+
+        val grouped = attempts.groupBy { attempt ->
+            val q = questionById[attempt.questionId]
+            KnowledgeGraph.conceptId(
+                exam = q?.exam ?: "unknown",
+                chapter = q?.chapter ?: "unknown",
+                topic = q?.topic
+            )
+        }
+
+        val results = mutableListOf<ConceptMastery>()
+        val concepts = mutableListOf<Concept>()
+
+        for ((conceptId, conceptAttempts) in grouped) {
+            val sorted = conceptAttempts.sortedBy { it.timestamp }
+            results.add(computeMastery(studentId, conceptId, sorted))
+
+            val sampleQuestion = questionById[sorted.last().questionId]
+            concepts.add(
+                Concept(
+                    id = conceptId,
+                    exam = sampleQuestion?.exam ?: "unknown",
+                    subject = sampleQuestion?.subject,
+                    chapter = sampleQuestion?.chapter ?: "unknown",
+                    topic = sampleQuestion?.topic ?: sampleQuestion?.chapter ?: "unknown"
+                )
+            )
+        }
+
+        db.conceptDao().upsertAll(concepts)
+        db.masteryDao().upsertAll(results)
+        Log.d(TAG, "Recomputed mastery for ${results.size} concept(s), student=$studentId")
+        return results
+    }
+
+    /** Pure, testable — no DB/context. Exposed for MasteryEngineTest. */
+    fun computeMastery(
+        studentId: String,
+        conceptId: String,
+        attemptsSortedAscending: List<QuestionAttempt>
+    ): ConceptMastery {
+        require(attemptsSortedAscending.isNotEmpty()) { "computeMastery requires at least one attempt" }
+
+        val attemptCount = attemptsSortedAscending.size
+        val lifetimeAccuracy = attemptsSortedAscending.count { it.correct }.toDouble() / attemptCount
+        val recentSlice = attemptsSortedAscending.takeLast(RECENT_WINDOW)
+        val recentAccuracy = recentSlice.count { it.correct }.toDouble() / recentSlice.size
+        val lastSeen = attemptsSortedAscending.last().timestamp
+        val medianTime = median(attemptsSortedAscending.mapNotNull { it.timeTakenSeconds })
+        val speed = speedScore(medianTime)
+        val retention = RetentionEngine.retentionScore(lastSeen, recentAccuracy)
+
+        // difficulty / confidence: see the HONEST GAP note on the class doc. Both null today.
+        val difficultyPerformance: Double? = null
+        val confidenceCalibration: Double? = null
+
+        val mastery = renormalizedMastery(
+            recentAccuracy = recentAccuracy,
+            lifetimeAccuracy = lifetimeAccuracy,
+            difficultyPerformance = difficultyPerformance,
+            retention = retention,
+            speed = speed,
+            confidenceCalibration = confidenceCalibration
+        )
+
+        return ConceptMastery(
+            studentId = studentId,
+            conceptId = conceptId,
+            mastery = mastery,
+            confidence = 0.0,
+            recentAccuracy = recentAccuracy,
+            lifetimeAccuracy = lifetimeAccuracy,
+            difficultyAdjustedAccuracy = difficultyPerformance,
+            medianTimeSeconds = medianTime,
+            attemptCount = attemptCount,
+            lastSeen = lastSeen,
+            lastMastered = if (mastery >= MASTERY_THRESHOLD) lastSeen else null,
+            forgettingRisk = RetentionEngine.forgettingRisk(lastSeen, mastery),
+            errorRate = 1.0 - lifetimeAccuracy,
+            learnedAt = attemptsSortedAscending.first().timestamp,
+            successfulRecallCount = attemptsSortedAscending.count { it.correct },
+            failedRecallCount = attemptsSortedAscending.count { !it.correct },
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+
+    private fun renormalizedMastery(
+        recentAccuracy: Double,
+        lifetimeAccuracy: Double,
+        difficultyPerformance: Double?,
+        retention: Double,
+        speed: Double,
+        confidenceCalibration: Double?
+    ): Double {
+        val components = mutableListOf(
+            W_RECENT to recentAccuracy,
+            W_LIFETIME to lifetimeAccuracy,
+            W_RETENTION to retention,
+            W_SPEED to speed
+        )
+        difficultyPerformance?.let { components.add(W_DIFFICULTY to it) }
+        confidenceCalibration?.let { components.add(W_CONFIDENCE to it) }
+
+        val weightSum = components.sumOf { it.first }
+        return components.sumOf { it.first * it.second } / weightSum
+    }
+
+    /**
+     * No external timing baseline exists anywhere in this codebase (no per-question
+     * expected-time field, no exam-wide pacing constant), so this is a flat heuristic
+     * tuned for single-best-answer NEET/JEE-style MCQs, not a blueprint-specified
+     * formula. Validate against real score correlation before trusting it — same
+     * caveat the blueprint gives for the mastery formula as a whole.
+     */
+    private fun speedScore(medianTimeSeconds: Double?): Double = when {
+        medianTimeSeconds == null -> 0.5 // no timing data — neutral, not penalized
+        medianTimeSeconds <= 60.0 -> 1.0
+        medianTimeSeconds <= 120.0 -> 0.7
+        medianTimeSeconds <= 180.0 -> 0.4
+        else -> 0.2
+    }
+
+    private fun median(values: List<Int>): Double? {
+        if (values.isEmpty()) return null
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2.0 else sorted[mid].toDouble()
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/RetentionEngine.kt =====
+package com.checkmate.learning.engine
+
+import android.content.Context
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
+import kotlin.math.exp
+
+/**
+ * Upgrade Blueprint Phase 1.7 ("RetentionEngine — answers 'does the student *still*
+ * know it,' not 'did they study it'").
+ *
+ * HONEST GAP: the blueprint's retention fields (learned_at, successful_recall_n,
+ * failed_recall, last_review) are stored on
+ * [com.checkmate.learning.model.ConceptMastery] itself (learnedAt /
+ * successfulRecallCount / failedRecallCount / lastSeen) rather than a separate
+ * retention table — the blueprint's own model/ listing for Phase 1.4-1.7 names
+ * Concept.kt, ConceptMastery.kt, ErrorRecord.kt only, no separate retention entity,
+ * so this reuses the mastery row rather than inventing an unlisted file.
+ *
+ * There is no spaced-repetition review scheduler anywhere in this codebase yet (no
+ * SM-2/Leitner implementation) — [retentionScore]/[forgettingRisk] below are a
+ * deliberately simple exponential-decay-by-days-since-last-seen model, explicitly
+ * NOT the "successful_recall_n vs failed_recall" Ebbinghaus-curve fit the blueprint
+ * gestures at. Good enough to feed [decide]'s three-way REVIEW/TEACH/MOVE_ON split;
+ * revisit if/when real forgetting-curve data (repeated recall attempts spaced over
+ * weeks) exists to fit against.
+ */
+object RetentionEngine {
+
+    enum class RetentionDecision { REVIEW, TEACH, MOVE_ON }
+
+    // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
+    // imported directly — RetentionEngine has no dependency on MasteryEngine today
+    // and this avoids introducing one for a single constant.
+    const val HIGH_MASTERY_THRESHOLD = 0.75
+    const val HIGH_RISK_THRESHOLD = 0.5
+
+    /** Days after which, with no further attempts, forgetting risk saturates near 1.0. */
+    private const val DECAY_HALFLIFE_DAYS = 14.0
+    private const val MS_PER_DAY = 86_400_000.0
+
+    /**
+     * 0..1, higher = better retained. Decays from [recentAccuracy] toward 0 as days
+     * since [lastSeen] grow, so a concept nailed once three months ago scores lower
+     * than one nailed yesterday, even with identical accuracy.
+     */
+    fun retentionScore(lastSeen: Long?, recentAccuracy: Double, now: Long = System.currentTimeMillis()): Double {
+        if (lastSeen == null) return 0.0
+        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
+        val decay = exp(-daysSince / DECAY_HALFLIFE_DAYS)
+        return (recentAccuracy * decay).coerceIn(0.0, 1.0)
+    }
+
+    /** Inverse-shaped: rises with time since [lastSeen], damped by how well the concept was known. */
+    fun forgettingRisk(lastSeen: Long?, mastery: Double, now: Long = System.currentTimeMillis()): Double {
+        if (lastSeen == null) return 1.0
+        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
+        val rawRisk = 1.0 - exp(-daysSince / DECAY_HALFLIFE_DAYS)
+        // Well-mastered concepts decay slower than shakily-known ones — scale by
+        // (1 - mastery/2) so a 0.9-mastery concept's risk rises at ~55% the rate of a 0.0-mastery one.
+        return (rawRisk * (1.0 - mastery / 2.0)).coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * Blueprint §1.7 truth table:
+     * HIGH mastery + HIGH forgetting risk -> REVIEW
+     * LOW mastery                        -> TEACH
+     * HIGH mastery + LOW risk            -> MOVE ON
+     */
+    fun decide(mastery: Double, forgettingRisk: Double): RetentionDecision = when {
+        mastery < HIGH_MASTERY_THRESHOLD -> RetentionDecision.TEACH
+        forgettingRisk >= HIGH_RISK_THRESHOLD -> RetentionDecision.REVIEW
+        else -> RetentionDecision.MOVE_ON
+    }
+
+    suspend fun decideAll(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): Map<String, RetentionDecision> {
+        val db = LearningDatabase.getInstance(context)
+        return db.masteryDao().getAll(studentId).associate { it.conceptId to decide(it.mastery, it.forgettingRisk) }
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/ConceptDependency.kt =====
+package com.checkmate.learning.graph
+
+import androidx.room.Dao
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+
+/**
+ * Upgrade Blueprint Phase 1.4. One row per prerequisite edge: [prerequisiteConceptId]
+ * must be understood before [conceptId] can be. See [KnowledgeGraph] for how these
+ * are seeded and [KnowledgeGraph.diagnosePrerequisiteFailure] for how they're used —
+ * e.g. a "Rotational Motion" failure traced back to a weak "Laws of Motion"
+ * prerequisite instead of just flagged as its own isolated weak topic, per the
+ * blueprint's own example.
+ *
+ * [ConceptDependencyDao] lives in this same file rather than a separate
+ * repository/ file: the blueprint's repository/ listing for Phase 1.4-1.7 names
+ * only MasteryDao.kt and ErrorDao.kt, and graph/ already has its own folder per the
+ * blueprint's module tree — same "don't invent an unlisted file" reasoning
+ * QuestionAttemptDao already established (living inside QuestionDao.kt in Phase
+ * 1.1-1.3).
+ */
+@Entity(
+    tableName = "concept_dependencies",
+    primaryKeys = ["conceptId", "prerequisiteConceptId"],
+    indices = [Index(value = ["conceptId"]), Index(value = ["prerequisiteConceptId"])]
+)
+data class ConceptDependency(
+    val conceptId: String,
+    val prerequisiteConceptId: String
+)
+
+@Dao
+interface ConceptDependencyDao {
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(edges: List<ConceptDependency>)
+
+    @Query("SELECT prerequisiteConceptId FROM concept_dependencies WHERE conceptId = :conceptId")
+    suspend fun getPrerequisites(conceptId: String): List<String>
+
+    @Query("SELECT conceptId FROM concept_dependencies WHERE prerequisiteConceptId = :prerequisiteConceptId")
+    suspend fun getDependents(prerequisiteConceptId: String): List<String>
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/KnowledgeGraph.kt =====
+package com.checkmate.learning.graph
+
+import android.content.Context
+import com.checkmate.core.ExamSyllabus
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.repository.LearningDatabase
+import java.security.MessageDigest
+
+/**
+ * Upgrade Blueprint Phase 1.4 ("Concept-level knowledge graph, not chapter-level
+ * weakness"). See [Concept]'s class doc for the honest limitation on granularity —
+ * one Concept here = one [ExamSyllabus] topic, not a true sub-topic concept, since
+ * nothing in this codebase defines concepts finer than that.
+ */
+object KnowledgeGraph {
+
+    // BUG CAUGHT AGAINST REAL DATA: Testmate's own report.md carries exam strings
+    // like "NEET-2027" (title-embedded year — see the sample
+    // ft-01b-full-test-neet-2027--report.md), but ExamSyllabus's top-level keys are
+    // bare exam names ("NEET", "JEE", ...). Without normalizing, every real import
+    // would key concepts under "neet-2027-..." while seedExamSyllabus("NEET") keys
+    // them under "neet-...", and the two would never join — mastery computed from
+    // real attempts would sit in a completely different set of rows than the
+    // syllabus-seeded prerequisite graph. Stripping a trailing "-YYYY" fixes the
+    // common case. An exam string that doesn't end in a year, or an ExamSyllabus
+    // key that later grows its own year suffix, would need this revisited.
+    private val YEAR_SUFFIX = Regex("""-(19|20)\d{2}$""")
+    private fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
+
+    /**
+     * Deterministic id from (exam, chapter, topic) — deliberately NOT subject. See
+     * [com.checkmate.learning.engine.MasteryEngine]'s class doc: real
+     * TestResultNormalizer-imported Questions never carry a subject (report.md has
+     * no subject field), so keying on subject would split a seeded syllabus concept
+     * and its real-import attempts into two rows that never join. `topic` falls
+     * back to `chapter` when null, matching TestReportParser's own dash-to-null
+     * normalization (chapter-level granularity when Testmate reports no topic).
+     */
+    fun conceptId(exam: String, chapter: String, topic: String?): String {
+        val key = "${normalizeExam(exam).lowercase()}|${chapter.trim().lowercase()}|" +
+            "${(topic ?: chapter).trim().lowercase()}"
+        return slugify(key)
+    }
+
+    private fun slugify(raw: String): String {
+        val slug = raw.replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        // Hash suffix guards against two different raw keys slugifying to the same
+        // truncated prefix — cheap insurance, not expected to matter at this data scale.
+        val hash = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
+            .joinToString("") { "%02x".format(it) }.take(8)
+        return "${slug.take(60)}-$hash"
+    }
+
+    /**
+     * Illustrative starter set, per the blueprint's own example ("Rolling Motion
+     * depends on torque, energy, angular velocity"). NOT exhaustive and NOT
+     * validated against the official NTA syllabus tree — the blueprint calls for
+     * versioning the syllabus tree against NTA's published document, which is a
+     * real research task, not something to fabricate here. Extend this list as
+     * that research happens; [seedExamSyllabus] applies whatever's here.
+     */
+    private data class PrerequisiteSeed(
+        val exam: String, val chapter: String, val topic: String,
+        val prerequisiteChapter: String, val prerequisiteTopic: String
+    )
+
+    private val SEED_PREREQUISITES = listOf(
+        // NEET Physics — Mechanics chapter, per ExamSyllabus.
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Laws of Motion"),
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Work Energy Power"),
+        PrerequisiteSeed("NEET", "Mechanics", "Rotational Motion", "Mechanics", "Kinematics"),
+        PrerequisiteSeed("NEET", "Mechanics", "Oscillations", "Mechanics", "Work Energy Power"),
+        PrerequisiteSeed("NEET", "Mechanics", "Waves", "Mechanics", "Oscillations"),
+        // NEET Chemistry — Equilibrium and Electrochemistry lean on earlier Physical Chemistry topics.
+        PrerequisiteSeed("NEET", "Physical Chemistry", "Equilibrium", "Physical Chemistry", "Thermodynamics"),
+        PrerequisiteSeed("NEET", "Physical Chemistry", "Electrochemistry", "Physical Chemistry", "Redox Reactions"),
+        // NEET Biology — Biotechnology leans on Genetics and Evolution.
+        PrerequisiteSeed("NEET", "Biology", "Biotechnology", "Biology", "Genetics and Evolution")
+    )
+
+    /**
+     * Inserts one [Concept] row per (subject, chapter, topic) leaf of
+     * ExamSyllabus.data[exam], plus whatever [SEED_PREREQUISITES] edges apply to
+     * that exam. `exam` here must be an ExamSyllabus key ("NEET"), not a
+     * Testmate-report exam string ("NEET-2027") — [conceptId] normalizes both to
+     * the same slug internally, so this still joins correctly with real imported
+     * attempts either way.
+     *
+     * NOT CALLED ANYWHERE YET: no UI/onboarding flow exists to know which exam(s) a
+     * given student is registered for — same "not wired in" gap
+     * TestResultNormalizer's import flow still has. Call explicitly once that
+     * exists, e.g. `KnowledgeGraph.seedExamSyllabus(context, "NEET")`.
+     */
+    suspend fun seedExamSyllabus(context: Context, exam: String) {
+        val subjects = ExamSyllabus.data[exam] ?: return
+        val db = LearningDatabase.getInstance(context)
+
+        val concepts = subjects.flatMap { (subject, chapters) ->
+            chapters.flatMap { (chapter, topics) ->
+                topics.map { topic ->
+                    Concept(
+                        id = conceptId(exam, chapter, topic),
+                        exam = exam,
+                        subject = subject,
+                        chapter = chapter,
+                        topic = topic
+                    )
+                }
+            }
+        }
+        db.conceptDao().upsertAll(concepts)
+
+        val edges = SEED_PREREQUISITES
+            .filter { it.exam == exam }
+            .map {
+                ConceptDependency(
+                    conceptId = conceptId(exam, it.chapter, it.topic),
+                    prerequisiteConceptId = conceptId(exam, it.prerequisiteChapter, it.prerequisiteTopic)
+                )
+            }
+        db.conceptDependencyDao().insertAll(edges)
+    }
+
+    /**
+     * Diagnoses a weak concept as a prerequisite failure where possible, per the
+     * blueprint's "rolling motion failure diagnosed as prerequisite failure"
+     * example. Returns the prerequisite [Concept]s whose mastery is below
+     * [masteryThreshold] — empty if [conceptId] has no seeded prerequisite edges
+     * (e.g. [seedExamSyllabus] was never run for its exam) or none are actually weak.
+     */
+    suspend fun diagnosePrerequisiteFailure(
+        context: Context,
+        studentId: String,
+        conceptId: String,
+        // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
+        // imported directly — avoids a graph<->engine circular reference for one constant.
+        masteryThreshold: Double = 0.75
+    ): List<Concept> {
+        val db = LearningDatabase.getInstance(context)
+        val prerequisiteIds = db.conceptDependencyDao().getPrerequisites(conceptId)
+        if (prerequisiteIds.isEmpty()) return emptyList()
+
+        return prerequisiteIds.mapNotNull { prereqId ->
+            val mastery = db.masteryDao().getByConcept(studentId, prereqId)
+            val isWeak = mastery == null || mastery.mastery < masteryThreshold
+            if (isWeak) db.conceptDao().getById(prereqId) else null
+        }
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/Concept.kt =====
+package com.checkmate.learning.model
+
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+/**
+ * Upgrade Blueprint Phase 1.4 ("Concept-level knowledge graph, not chapter-level
+ * weakness").
+ *
+ * `id` is a deterministic slug of (exam, chapter, topic) — see
+ * [com.checkmate.learning.graph.KnowledgeGraph.conceptId] — so the same topic
+ * resolves to the same Concept row whether it arrives via
+ * [com.checkmate.learning.graph.KnowledgeGraph.seedExamSyllabus] (which knows
+ * `subject`) or via [com.checkmate.learning.engine.MasteryEngine] bootstrapping a
+ * row from real imported attempt data (which usually doesn't — report.md carries
+ * no subject field at all, only chapter/topic). `subject` is therefore descriptive
+ * only, never part of identity, and may be null on rows MasteryEngine created
+ * itself before any syllabus seeding ever ran.
+ *
+ * HONEST LIMITATION: the blueprint's own example ("Rolling Motion depends on
+ * torque, energy, angular velocity") describes concepts *finer* than
+ * [com.checkmate.core.ExamSyllabus]'s Topic level — nothing in this codebase
+ * defines a sub-topic breakdown, and inventing one here would be fabricating
+ * syllabus content the blueprint explicitly says to version against the real NTA
+ * document instead. One Concept = one ExamSyllabus topic here, or one chapter when
+ * Testmate reports no topic (`topic` then equals `chapter`, matching
+ * TestReportParser's own dash-to-null normalization).
+ */
+@Entity(
+    tableName = "concepts",
+    indices = [Index(value = ["exam"]), Index(value = ["subject"]), Index(value = ["chapter"])]
+)
+data class Concept(
+    @PrimaryKey val id: String,
+    val exam: String,
+    val subject: String? = null,
+    val chapter: String,
+    val topic: String
+)
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/ConceptMastery.kt =====
+package com.checkmate.learning.model
+
+import androidx.room.Entity
+import androidx.room.Index
+
+/**
+ * Upgrade Blueprint Phase 1.5 ("MasteryEngine... Track per concept: mastery,
+ * confidence, recentAccuracy, lifetimeAccuracy, difficultyAdjustedAccuracy,
+ * medianTime, attemptCount, lastSeen, lastMastered, forgettingRisk, errorRate")
+ * plus Phase 1.7's retention fields (learned_at, successful_recall_n, failed_recall,
+ * last_review) — folded into this same row rather than a separate table. The
+ * blueprint's own model/ listing for Phase 1.4-1.7 names Concept.kt,
+ * ConceptMastery.kt, ErrorRecord.kt only, no separate retention entity — see
+ * [com.checkmate.learning.engine.RetentionEngine]'s class doc for the full
+ * reasoning.
+ *
+ * Composite primary key (studentId, conceptId): one row per student per concept,
+ * recomputed IN PLACE by [com.checkmate.learning.engine.MasteryEngine.recomputeAll]
+ * — this is the one entity in :modules:learning that's mutated rather than
+ * appended, because it's a derived aggregate folded over the immutable
+ * QuestionAttempt/LearningEvent history, not a fact in its own right.
+ */
+@Entity(
+    tableName = "concept_mastery",
+    primaryKeys = ["studentId", "conceptId"],
+    indices = [Index(value = ["conceptId"]), Index(value = ["studentId"])]
+)
+data class ConceptMastery(
+    val studentId: String = LearningIds.LOCAL_STUDENT_ID,
+    val conceptId: String,
+    /** 0.0-1.0, the blueprint §1.5 weighted formula (renormalized — see MasteryEngine). */
+    val mastery: Double,
+    /** 0.0-1.0 confidence-calibration score. Always 0.0 today — no stated-confidence input exists anywhere yet. */
+    val confidence: Double = 0.0,
+    val recentAccuracy: Double,
+    val lifetimeAccuracy: Double,
+    /** Null until Question.difficulty carries real data — see MasteryEngine's HONEST GAP note. */
+    val difficultyAdjustedAccuracy: Double? = null,
+    val medianTimeSeconds: Double? = null,
+    val attemptCount: Int,
+    val lastSeen: Long?,
+    /** Timestamp of the last attempt while mastery was >= MasteryEngine.MASTERY_THRESHOLD, else null. */
+    val lastMastered: Long? = null,
+    val forgettingRisk: Double = 0.0,
+    val errorRate: Double = 0.0,
+    /** Phase 1.7: timestamp of the first-ever attempt recorded at this concept. */
+    val learnedAt: Long? = null,
+    val successfulRecallCount: Int = 0,
+    val failedRecallCount: Int = 0,
+    val lastUpdated: Long = System.currentTimeMillis()
+)
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/ErrorRecord.kt =====
+package com.checkmate.learning.model
+
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+import java.util.UUID
+
+/**
+ * Upgrade Blueprint Phase 1.6 ("ErrorEngine — classify every wrong answer").
+ * See [com.checkmate.learning.engine.ErrorEngine]'s class doc: only the CARELESS
+ * and TIME_PRESSURE branches are actually distinguishable by the heuristic
+ * currently wired up. The rest of this enum exists per the blueprint's full list
+ * and is ready for the real LLM-proposal classifier once question.explanation has
+ * content worth reasoning over — Testmate's report.md never populates it today.
+ */
+enum class ErrorType {
+    UNKNOWN_CONCEPT, MISCONCEPTION, FORMULA_RECALL, FORMULA_SELECTION,
+    CALCULATION, UNIT_ERROR, SIGN_ERROR, QUESTION_MISREAD, CARELESS,
+    TIME_PRESSURE, BAD_GUESS
+}
+
+/**
+ * One row per classified wrong [QuestionAttempt] — immutable, same "record, don't
+ * mutate" discipline as [LearningEvent]. `conceptId` is nullable defensively even
+ * though [com.checkmate.learning.graph.KnowledgeGraph.conceptId] always returns a
+ * non-null id in practice (it falls back to "unknown" exam/chapter strings rather
+ * than failing), in case that contract ever changes.
+ */
+@Entity(
+    tableName = "error_records",
+    indices = [
+        Index(value = ["conceptId"]), Index(value = ["questionId"]),
+        Index(value = ["attemptId"]), Index(value = ["errorType"])
+    ]
+)
+data class ErrorRecord(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val studentId: String = LearningIds.LOCAL_STUDENT_ID,
+    val attemptId: String,
+    val questionId: String,
+    val conceptId: String?,
+    val errorType: ErrorType,
+    val timestamp: Long,
+    /** "heuristic" today — see ErrorEngine's NOT WIRED note. Would become "llm" once that path lands. */
+    val classifiedBy: String = "heuristic"
+)
+
+/**
+ * Blueprint §1.6: "Repeated errors become first-class ErrorPattern objects
+ * (concept, type, occurrences, firstSeen, lastSeen, interventions[], resolved)."
+ * One row per (studentId, conceptId, errorType) combination, incremented IN PLACE
+ * by [com.checkmate.learning.engine.ErrorEngine] as matching [ErrorRecord]s get
+ * classified — same derived-aggregate reasoning as [ConceptMastery] for why this
+ * one is mutated rather than appended.
+ */
+@Entity(
+    tableName = "error_patterns",
+    primaryKeys = ["studentId", "conceptId", "errorType"]
+)
+data class ErrorPattern(
+    val studentId: String = LearningIds.LOCAL_STUDENT_ID,
+    val conceptId: String,
+    val errorType: ErrorType,
+    val occurrences: Int = 1,
+    val firstSeen: Long,
+    val lastSeen: Long,
+    /** Intervention labels applied so far. Nothing in this module writes to this yet — Phase 2 territory. */
+    val interventions: List<String> = emptyList(),
+    val resolved: Boolean = false
+)
 
 
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/LearningEvent.kt =====
@@ -14911,13 +15698,15 @@ data class QuestionAttempt(
 package com.checkmate.learning.repository
 
 import androidx.room.TypeConverter
+import com.checkmate.learning.model.ErrorType
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 /**
  * Room has no native column type for List<String> (LearningEvent.conceptIds,
- * Question.concepts) — same gap :modules:psyche works around for its own
+ * Question.concepts, ErrorPattern.interventions) or for enums (ErrorRecord.errorType,
+ * ErrorPattern.errorType) — same gap :modules:psyche works around for its own
  * Json-serialized fields. JSON array rather than a delimiter-joined string so a
  * concept id containing a comma can never corrupt the column.
  */
@@ -14930,6 +15719,67 @@ class Converters {
     @TypeConverter
     fun toStringList(value: String): List<String> =
         if (value.isBlank()) emptyList() else json.decodeFromString(value)
+
+    // Added for ErrorRecord.errorType / ErrorPattern.errorType (Upgrade Blueprint Phase 1.6).
+    @TypeConverter
+    fun fromErrorType(value: ErrorType): String = value.name
+
+    @TypeConverter
+    fun toErrorType(value: String): ErrorType = ErrorType.valueOf(value)
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/repository/ErrorDao.kt =====
+package com.checkmate.learning.repository
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import com.checkmate.learning.model.ErrorPattern
+import com.checkmate.learning.model.ErrorRecord
+import com.checkmate.learning.model.ErrorType
+
+@Dao
+interface ErrorRecordDao {
+
+    @Insert
+    suspend fun insert(record: ErrorRecord)
+
+    // Idempotency check for ErrorEngine.classifyAllUnclassified — mirrors
+    // TestResultNormalizer's "already imported" guard pattern.
+    @Query("SELECT * FROM error_records WHERE attemptId = :attemptId LIMIT 1")
+    suspend fun getByAttempt(attemptId: String): ErrorRecord?
+
+    @Query("SELECT * FROM error_records WHERE studentId = :studentId ORDER BY timestamp ASC")
+    suspend fun getAll(studentId: String): List<ErrorRecord>
+
+    @Query("SELECT * FROM error_records WHERE conceptId = :conceptId ORDER BY timestamp ASC")
+    suspend fun getByConcept(conceptId: String): List<ErrorRecord>
+}
+
+@Dao
+interface ErrorPatternDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(pattern: ErrorPattern)
+
+    @Query(
+        "SELECT * FROM error_patterns WHERE studentId = :studentId AND conceptId = :conceptId " +
+            "AND errorType = :errorType LIMIT 1"
+    )
+    suspend fun get(studentId: String, conceptId: String, errorType: ErrorType): ErrorPattern?
+
+    @Query("SELECT * FROM error_patterns WHERE studentId = :studentId ORDER BY occurrences DESC")
+    suspend fun getAll(studentId: String): List<ErrorPattern>
+
+    // "You've made this mistake 7 times" per the blueprint — unresolved patterns
+    // with the highest occurrence count first.
+    @Query(
+        "SELECT * FROM error_patterns WHERE studentId = :studentId AND resolved = 0 " +
+            "ORDER BY occurrences DESC"
+    )
+    suspend fun getUnresolved(studentId: String): List<ErrorPattern>
 }
 
 
@@ -14941,20 +15791,38 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
+import com.checkmate.learning.graph.ConceptDependency
+import com.checkmate.learning.graph.ConceptDependencyDao
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.ErrorPattern
+import com.checkmate.learning.model.ErrorRecord
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.Question
 import com.checkmate.learning.model.QuestionAttempt
 
 /**
- * Upgrade Blueprint Phase 1.1-1.2. Own .db file ("checkmate_learning.db"),
- * separate from BehaviorDatabase ("checkmate_behavior.db") and
- * InterventionDatabase ("checkmate_intervention.db") — same reasoning
- * BehaviorDatabase's own doc gives: unrelated lifecycles, no foreign-key
- * relationship across the three, so no reason to merge them into one file.
+ * Upgrade Blueprint Phase 1.1-1.2 (v1), extended for Phase 1.4-1.7 (v2) with the
+ * knowledge graph (Concept, ConceptDependency), mastery (ConceptMastery), and error
+ * classification (ErrorRecord, ErrorPattern) tables.
+ *
+ * VERSION BUMP NOTE: v1 shipped with no upgrade migration, only
+ * fallbackToDestructiveMigrationOnDowngrade() — "no upgrade path needed yet" was
+ * true until this change. Rather than write a real Migration(1, 2) for a handful of
+ * pre-release local dev installs, this adds fallbackToDestructiveMigration()
+ * alongside the existing downgrade fallback — anyone with a v1 checkmate_learning.db
+ * gets it wiped and rebuilt on next launch. Acceptable now (sideload, active dev, no
+ * real student data at stake yet per the blueprint's Phase 0 framing); write a real
+ * Migration once this app has real users with data worth preserving across schema
+ * changes.
  */
 @Database(
-    entities = [LearningEvent::class, Question::class, QuestionAttempt::class],
-    version = 1,
+    entities = [
+        LearningEvent::class, Question::class, QuestionAttempt::class,
+        Concept::class, ConceptMastery::class, ConceptDependency::class,
+        ErrorRecord::class, ErrorPattern::class
+    ],
+    version = 2,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -14963,6 +15831,11 @@ abstract class LearningDatabase : RoomDatabase() {
     abstract fun learningEventDao(): LearningEventDao
     abstract fun questionDao(): QuestionDao
     abstract fun questionAttemptDao(): QuestionAttemptDao
+    abstract fun conceptDao(): ConceptDao
+    abstract fun masteryDao(): MasteryDao
+    abstract fun conceptDependencyDao(): ConceptDependencyDao
+    abstract fun errorRecordDao(): ErrorRecordDao
+    abstract fun errorPatternDao(): ErrorPatternDao
 
     companion object {
         @Volatile
@@ -14975,9 +15848,8 @@ abstract class LearningDatabase : RoomDatabase() {
                     LearningDatabase::class.java,
                     "checkmate_learning.db"
                 )
-                    // Version 1, no upgrade path needed yet — same downgrade-only-destructive
-                    // posture as BehaviorDatabase/InterventionDatabase.
                     .fallbackToDestructiveMigrationOnDowngrade()
+                    .fallbackToDestructiveMigration()
                     .build().also { INSTANCE = it }
             }
     }
@@ -15018,6 +15890,62 @@ interface LearningEventDao {
 }
 
 
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/repository/MasteryDao.kt =====
+package com.checkmate.learning.repository
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.model.ConceptMastery
+
+/**
+ * Upgrade Blueprint Phase 1.4/1.5. [ConceptDao] lives in this file alongside
+ * [MasteryDao] rather than its own file — the blueprint's repository/ listing for
+ * this phase names MasteryDao.kt and ErrorDao.kt only; Concept rows exist almost
+ * entirely to be looked up by concept id when reading/writing mastery, so this
+ * follows the same "don't invent an unlisted file" precedent QuestionAttemptDao
+ * already set inside QuestionDao.kt.
+ */
+@Dao
+interface ConceptDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(concept: Concept)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(concepts: List<Concept>)
+
+    @Query("SELECT * FROM concepts WHERE id = :id")
+    suspend fun getById(id: String): Concept?
+
+    @Query("SELECT * FROM concepts WHERE exam = :exam")
+    suspend fun getByExam(exam: String): List<Concept>
+}
+
+@Dao
+interface MasteryDao {
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(mastery: ConceptMastery)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(masteries: List<ConceptMastery>)
+
+    @Query("SELECT * FROM concept_mastery WHERE studentId = :studentId AND conceptId = :conceptId")
+    suspend fun getByConcept(studentId: String, conceptId: String): ConceptMastery?
+
+    @Query("SELECT * FROM concept_mastery WHERE studentId = :studentId")
+    suspend fun getAll(studentId: String): List<ConceptMastery>
+
+    // Retention decisioning (Phase 1.7) reads this to find concepts worth flagging
+    // without pulling every row for students with a large mastery table.
+    @Query("SELECT * FROM concept_mastery WHERE studentId = :studentId AND mastery < :threshold")
+    suspend fun getBelowMastery(studentId: String, threshold: Double): List<ConceptMastery>
+}
+
+
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/repository/QuestionDao.kt =====
 package com.checkmate.learning.repository
 
@@ -15053,6 +15981,11 @@ interface QuestionDao {
     @Query("SELECT * FROM questions WHERE chapter = :chapter")
     suspend fun getByChapter(chapter: String): List<Question>
 
+    // Added for MasteryEngine/ErrorEngine (Upgrade Blueprint Phase 1.5/1.6), which
+    // need every Question row to resolve each QuestionAttempt to its concept.
+    @Query("SELECT * FROM questions")
+    suspend fun getAll(): List<Question>
+
     @Query("SELECT COUNT(*) FROM questions")
     suspend fun count(): Int
 }
@@ -15071,6 +16004,10 @@ interface QuestionAttemptDao {
 
     @Query("SELECT * FROM question_attempts WHERE studentId = :studentId ORDER BY timestamp ASC")
     suspend fun getAll(studentId: String): List<QuestionAttempt>
+
+    // Added for ErrorEngine (Upgrade Blueprint Phase 1.6).
+    @Query("SELECT * FROM question_attempts WHERE studentId = :studentId AND correct = 0 ORDER BY timestamp ASC")
+    suspend fun getWrongAttempts(studentId: String): List<QuestionAttempt>
 
     @Query("SELECT COUNT(*) FROM question_attempts WHERE studentId = :studentId")
     suspend fun count(studentId: String): Int
@@ -15256,6 +16193,8 @@ package com.checkmate.learning.testmate
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.learning.engine.ErrorEngine
+import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.LearningEventType
 import com.checkmate.learning.model.LearningIds
@@ -15266,14 +16205,19 @@ import java.security.MessageDigest
 
 /**
  * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
- * → MasteryEngine → StudentModel → Planner." This is the normalizer — MasteryEngine
- * and the rest of the fold are Phase 1.5+, not built yet (see Checkmate_Upgrade_Blueprint
- * §Phase 1.5-1.7 and the suggested sequencing at the bottom of that doc).
+ * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
+ * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
+ * successful import now also classifies its wrong attempts (ErrorEngine) and
+ * recomputes mastery for every concept touched (MasteryEngine) before returning.
+ * StudentModel/Planner consumption is still Phase 2 — see [NormalizeResult] below
+ * for exactly what this now writes.
  *
  * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
  * This is what turns a report.md dump into that "why": one Question row per
- * question, one QuestionAttempt per attempt, and a LearningEvent per question
- * outcome (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event.
+ * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
+ * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
+ * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
+ * row per concept the report touched.
  *
  * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
  * attempt/event from one import shares [testTimestamp], which defaults to import
@@ -15290,7 +16234,10 @@ object TestResultNormalizer {
         val questionsWritten: Int,
         val attemptsWritten: Int,
         val eventsWritten: Int,
-        val warnings: List<String>
+        val warnings: List<String>,
+        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
+        val errorsClassified: Int = 0,
+        val conceptsRecomputed: Int = 0
     )
 
     suspend fun normalizeAndPersist(
@@ -15401,11 +16348,18 @@ object TestResultNormalizer {
         db.questionAttemptDao().insertAll(attempts)
         db.learningEventDao().insertAll(events)
 
+        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
+        // immediately gets its wrong answers classified and its touched concepts'
+        // mastery recomputed, rather than sitting inert until something else reads it.
+        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
+        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
+
         warnings.forEach { Log.w(TAG, it) }
         Log.d(
             TAG,
             "Normalized report '${report.title}': ${questions.size} questions, " +
-                "${attempts.size} attempts, ${events.size} events, ${warnings.size} warning(s)"
+                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
+                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
         )
 
         return NormalizeResult(
@@ -15413,7 +16367,9 @@ object TestResultNormalizer {
             questionsWritten = questions.size,
             attemptsWritten = attempts.size,
             eventsWritten = events.size,
-            warnings = warnings
+            warnings = warnings,
+            errorsClassified = errorRecords.size,
+            conceptsRecomputed = recomputedMastery.size
         )
     }
 
@@ -15431,6 +16387,134 @@ object TestResultNormalizer {
     private fun sha256Hex(input: String): String =
         MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
             .joinToString("") { "%02x".format(it) }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/MasteryEngineTest.kt =====
+package com.checkmate.learning.engine
+
+import com.checkmate.learning.model.QuestionAttempt
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class MasteryEngineTest {
+
+    private fun attempt(correct: Boolean, timestamp: Long, timeTakenSeconds: Int? = 60) = QuestionAttempt(
+        questionId = "q-fixed",
+        timestamp = timestamp,
+        correct = correct,
+        timeTakenSeconds = timeTakenSeconds,
+        selectedOption = if (correct) "a" else "b"
+    )
+
+    @Test
+    fun `all-correct attempts produce mastery of 1_0`() {
+        val attempts = (1..5).map { attempt(correct = true, timestamp = it.toLong()) }
+        val mastery = MasteryEngine.computeMastery("s1", "concept-1", attempts)
+
+        assertEquals(1.0, mastery.lifetimeAccuracy, 0.0001)
+        assertEquals(1.0, mastery.recentAccuracy, 0.0001)
+        // retention factors in days-since-lastSeen decay, so mastery can be < 1.0
+        // even with perfect accuracy — only accuracy/speed are guaranteed maxed here.
+        assertTrue(mastery.mastery > 0.0)
+    }
+
+    @Test
+    fun `all-wrong attempts produce zero accuracy and nonzero error rate`() {
+        val attempts = (1..5).map { attempt(correct = false, timestamp = it.toLong()) }
+        val mastery = MasteryEngine.computeMastery("s1", "concept-1", attempts)
+
+        assertEquals(0.0, mastery.lifetimeAccuracy, 0.0001)
+        assertEquals(1.0, mastery.errorRate, 0.0001)
+    }
+
+    @Test
+    fun `recentAccuracy only looks at the last 10 attempts`() {
+        // 20 wrong attempts followed by 10 correct ones — recentAccuracy should be 1.0,
+        // lifetimeAccuracy should reflect all 30.
+        val wrongAttempts = (1..20).map { attempt(correct = false, timestamp = it.toLong()) }
+        val correctAttempts = (21..30).map { attempt(correct = true, timestamp = it.toLong()) }
+        val mastery = MasteryEngine.computeMastery("s1", "concept-1", wrongAttempts + correctAttempts)
+
+        assertEquals(1.0, mastery.recentAccuracy, 0.0001)
+        assertEquals(10.0 / 30.0, mastery.lifetimeAccuracy, 0.0001)
+    }
+
+    @Test
+    fun `missing timing data does not crash and falls back to a neutral speed score`() {
+        val attempts = listOf(attempt(correct = true, timestamp = 1L, timeTakenSeconds = null))
+        val mastery = MasteryEngine.computeMastery("s1", "concept-1", attempts)
+
+        assertNull(mastery.medianTimeSeconds)
+        assertTrue(mastery.mastery > 0.0)
+    }
+
+    @Test
+    fun `learnedAt is the first attempt timestamp, lastSeen is the last`() {
+        val attempts = listOf(
+            attempt(correct = false, timestamp = 100L),
+            attempt(correct = true, timestamp = 200L),
+            attempt(correct = true, timestamp = 300L)
+        )
+        val mastery = MasteryEngine.computeMastery("s1", "concept-1", attempts)
+
+        assertEquals(100L, mastery.learnedAt)
+        assertEquals(300L, mastery.lastSeen)
+        assertEquals(2, mastery.successfulRecallCount)
+        assertEquals(1, mastery.failedRecallCount)
+    }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/RetentionEngineTest.kt =====
+package com.checkmate.learning.engine
+
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class RetentionEngineTest {
+
+    @Test
+    fun `low mastery always means TEACH regardless of forgetting risk`() {
+        assertEquals(RetentionEngine.RetentionDecision.TEACH, RetentionEngine.decide(mastery = 0.3, forgettingRisk = 0.0))
+        assertEquals(RetentionEngine.RetentionDecision.TEACH, RetentionEngine.decide(mastery = 0.3, forgettingRisk = 0.9))
+    }
+
+    @Test
+    fun `high mastery with high forgetting risk means REVIEW`() {
+        assertEquals(
+            RetentionEngine.RetentionDecision.REVIEW,
+            RetentionEngine.decide(mastery = 0.9, forgettingRisk = RetentionEngine.HIGH_RISK_THRESHOLD)
+        )
+    }
+
+    @Test
+    fun `high mastery with low forgetting risk means MOVE_ON`() {
+        assertEquals(
+            RetentionEngine.RetentionDecision.MOVE_ON,
+            RetentionEngine.decide(mastery = 0.9, forgettingRisk = 0.1)
+        )
+    }
+
+    @Test
+    fun `retentionScore decays toward zero as days since lastSeen grow`() {
+        val now = 1_000_000_000L
+        val oneDayAgo = now - 86_400_000L
+        val sixtyDaysAgo = now - 60L * 86_400_000L
+
+        val recent = RetentionEngine.retentionScore(oneDayAgo, recentAccuracy = 0.9, now = now)
+        val stale = RetentionEngine.retentionScore(sixtyDaysAgo, recentAccuracy = 0.9, now = now)
+
+        assertEquals(true, recent > stale)
+    }
+
+    @Test
+    fun `null lastSeen means zero retention and maximum forgetting risk`() {
+        assertEquals(0.0, RetentionEngine.retentionScore(null, recentAccuracy = 1.0), 0.0001)
+        assertEquals(1.0, RetentionEngine.forgettingRisk(null, mastery = 1.0), 0.0001)
+    }
 }
 
 
