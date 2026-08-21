@@ -10,6 +10,7 @@ import com.checkmate.learning.model.ErrorPatternSnapshot
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.model.OverallLearningState
 import com.checkmate.learning.model.PrerequisiteIssue
+import com.checkmate.learning.model.PrerequisiteRef
 import com.checkmate.learning.model.RetentionDecisionSnapshot
 import com.checkmate.learning.model.StudentModel
 import com.checkmate.learning.repository.LearningDatabase
@@ -105,7 +106,16 @@ object StudentModelBuilder {
             .filter { it.mastery < MasteryEngine.MASTERY_THRESHOLD }
             .map { it.conceptId }
 
-        val prerequisiteIssuesByConcept = mutableMapOf<String, List<String>>()
+        // CORRECTNESS FIX: previously kept only `.id` from each weak prerequisite's
+        // Concept row (`weakPrereqs.map { it.id }`), throwing away the
+        // subject/chapter/topic diagnosePrerequisiteFailure had already looked up.
+        // A conceptId is a slugified hash (see KnowledgeGraph.conceptId's own doc) —
+        // unreadable to any consumer, and for a prerequisite the student never
+        // personally attempted, un-recoverable afterward (it won't be a key in this
+        // function's own `concepts` map below). Now keeps the full PrerequisiteRef —
+        // see ConceptSnapshot.prerequisiteIssues' own doc for the consumer-facing
+        // reasoning.
+        val prerequisiteIssuesByConcept = mutableMapOf<String, List<PrerequisiteRef>>()
         for (conceptId in weakConceptIds) {
             val weakPrereqs = KnowledgeGraph.diagnosePrerequisiteFailure(
                 context = context,
@@ -113,7 +123,14 @@ object StudentModelBuilder {
                 conceptId = conceptId
             )
             if (weakPrereqs.isNotEmpty()) {
-                prerequisiteIssuesByConcept[conceptId] = weakPrereqs.map { it.id }
+                prerequisiteIssuesByConcept[conceptId] = weakPrereqs.map {
+                    PrerequisiteRef(
+                        conceptId = it.id,
+                        subject = it.subject,
+                        chapter = it.chapter,
+                        topic = it.topic
+                    )
+                }
             }
         }
 
@@ -163,8 +180,8 @@ object StudentModelBuilder {
                     lastSeen = it.lastSeen
                 )
             },
-            weakPrerequisites = prerequisiteIssuesByConcept.map { (conceptId, weakIds) ->
-                PrerequisiteIssue(conceptId, weakIds)
+            weakPrerequisites = prerequisiteIssuesByConcept.map { (conceptId, weakRefs) ->
+                PrerequisiteIssue(conceptId, weakRefs)
             }
         )
 

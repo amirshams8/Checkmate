@@ -13,6 +13,7 @@ import com.checkmate.core.PYQWeightage
 import com.checkmate.core.TodayContext
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.PrerequisiteRef
 import com.checkmate.learning.model.RetentionDecisionSnapshot
 import com.checkmate.learning.model.StudentModel
 import com.checkmate.learning.student.StudentModelBuilder
@@ -185,12 +186,24 @@ object AdaptivePlanner {
     // StudentModel.kt's class doc already draws around StudentModelBuilder itself.
 
     @Serializable
+    private data class WeakPrerequisiteEntry(
+        val label: String,
+        /** Null means the prerequisite has never been personally attempted — not
+         *  "0% mastery." See PrerequisiteRef's own doc: this can legitimately be a
+         *  concept outside the student's `concepts` map. */
+        val masteryPercent: Int?
+    )
+
+    @Serializable
     private data class ConceptEntry(
         val subject: String?,
         val chapter: String?,
         val topic: String?,
         val masteryPercent: Int,
-        val hasWeakPrerequisite: Boolean
+        /** Named, not just flagged — see ConceptSnapshot.prerequisiteIssues'
+         *  CORRECTNESS FIX note. Empty when this concept has no diagnosed weak
+         *  prerequisite. */
+        val weakPrerequisites: List<WeakPrerequisiteEntry>
     )
 
     @Serializable
@@ -218,6 +231,20 @@ object AdaptivePlanner {
     )
 
     /**
+     * Resolves a [PrerequisiteRef] to a display label plus, when available, that
+     * prerequisite's own mastery — looked up from this same [StudentModel]'s
+     * `concepts` map, which only has an entry if the student has actually
+     * attempted it. A never-attempted prerequisite is a real, useful signal in its
+     * own right ("introduce this topic first, not just review it") — surfaced as
+     * `masteryPercent = null` rather than guessed at.
+     */
+    private fun resolvePrerequisite(model: StudentModel, ref: PrerequisiteRef): WeakPrerequisiteEntry {
+        val label = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+        val mastery = model.concepts[ref.conceptId]?.mastery
+        return WeakPrerequisiteEntry(label, mastery?.let { (it * 100).toInt() })
+    }
+
+    /**
      * Compacts a full [StudentModel] into a small, prompt-sized summary: top-8
      * weakest concepts, top-8 review-due concepts, top-8 unresolved error
      * patterns — pre-sorted so the LLM sees the highest-signal rows first
@@ -236,7 +263,7 @@ object AdaptivePlanner {
             chapter = chapter,
             topic = topic,
             masteryPercent = (mastery * 100).toInt(),
-            hasWeakPrerequisite = prerequisiteIssues.isNotEmpty()
+            weakPrerequisites = prerequisiteIssues.map { resolvePrerequisite(model, it) }
         )
 
         val weakest = model.concepts.values
@@ -314,12 +341,18 @@ Rules:
   in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
   to the aggregate recentSkipRatePercent
 - STUDENT_MODEL, when present, is also deterministic — built from the student's actual imported
-  test results (MasteryEngine/ErrorEngine/RetentionEngine), not a guess. weakestConcepts and
-  reviewDue are real measured gaps; topErrorPatterns are mistakes the student has actually made
-  repeatedly. Prioritize these over PYQ-weightage-only guesses when they exist, and when you do
-  pick a weakestConcepts/reviewDue/topErrorPatterns entry, say so specifically in "reason" (e.g.
-  "42% mastery from last mock" or "3rd CALCULATION error in this concept") rather than a generic
+  test results (MasteryEngine/ErrorEngine/RetentionEngine). weakestConcepts and reviewDue are
+  real measured gaps; topErrorPatterns are mistakes the student has actually made repeatedly.
+  Prioritize these over PYQ-weightage-only guesses when they exist, and when you do pick a
+  weakestConcepts/reviewDue/topErrorPatterns entry, say so specifically in "reason" (e.g. "42%
+  mastery from last mock" or "3rd CALCULATION error in this concept") rather than a generic
   weak-topic flag
+- When a weakestConcepts/reviewDue entry has a non-empty weakPrerequisites list, that concept's
+  own failure has been traced to a SPECIFIC weaker prerequisite topic (name given, plus that
+  prerequisite's own mastery — null means never attempted). Prefer assigning the prerequisite
+  itself before the dependent topic when its masteryPercent is null or clearly lower, and name
+  it explicitly in "reason" (e.g. "Rolling Motion attempts are failing — traces to Laws of Motion
+  at 38% mastery, fix that first") rather than assigning the dependent topic again
 """.trimIndent()
 
         val prompt = buildString {
@@ -491,7 +524,15 @@ Rules:
                 val reason = buildString {
                     append("Mastery $masteryPct% from imported test results")
                     if (weakest.errorCount > 0) append(", ${weakest.errorCount} recorded error(s)")
-                    if (weakest.prerequisiteIssues.isNotEmpty()) append(", traces to a weak prerequisite")
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s), not just flag that one exists — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    if (weakest.prerequisiteIssues.isNotEmpty()) {
+                        val names = weakest.prerequisiteIssues.joinToString {
+                            it.topic ?: it.chapter ?: it.subject ?: it.conceptId
+                        }
+                        append(", traces to weak prerequisite(s): $names")
+                    }
                 }
                 "$action: $label" to reason
             } else {

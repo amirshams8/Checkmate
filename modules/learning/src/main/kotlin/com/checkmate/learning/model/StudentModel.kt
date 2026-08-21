@@ -104,11 +104,25 @@ data class ConceptSnapshot(
      *  [StudentModel.unresolvedErrors] which is unresolved-only and student-wide. */
     val errorCount: Int,
     val lastSeen: Long?,
-    /** conceptIds of weak prerequisites, when this concept's own mastery is weak and
-     *  KnowledgeGraph.diagnosePrerequisiteFailure found at least one. Empty for
-     *  well-mastered concepts (never diagnosed) and for weak concepts with no seeded
-     *  prerequisite edges or no weak prerequisites. */
-    val prerequisiteIssues: List<String>
+    /**
+     * Weak prerequisites [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure]
+     * found for this concept, when its own mastery is weak. Empty for well-mastered
+     * concepts (never diagnosed) and for weak concepts with no seeded prerequisite
+     * edges or no weak prerequisites.
+     *
+     * CORRECTNESS FIX: this used to be `List<String>` of bare conceptIds —
+     * diagnosePrerequisiteFailure already looks up each weak prerequisite's full
+     * [Concept] row (subject/chapter/topic) to decide it's weak, but
+     * StudentModelBuilder discarded everything except `.id` before this fix. A
+     * conceptId is a slugified SHA-256-suffixed hash (see KnowledgeGraph.conceptId's
+     * own doc) — completely unreadable in an LLM prompt or a Mentor message, and
+     * worse, un-recoverable for a prerequisite the student never personally
+     * attempted (not present in this StudentModel's own `concepts` map, since that
+     * map only has one entry per concept with an actual ConceptMastery row). Now
+     * carries the same display fields [ConceptSnapshot] itself has, sourced directly
+     * from the Concept row at the one point it's actually available.
+     */
+    val prerequisiteIssues: List<PrerequisiteRef>
 )
 
 /**
@@ -137,6 +151,23 @@ data class ErrorPatternSnapshot(
 )
 
 /**
+ * Display-safe reference to a weak prerequisite concept — see [ConceptSnapshot.prerequisiteIssues]'s
+ * CORRECTNESS FIX note for why this carries subject/chapter/topic instead of a bare
+ * conceptId. `subject`/`chapter`/`topic` come straight from the [Concept] row
+ * [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure] already
+ * looked up — not re-queried here — so they're null only when that Concept row
+ * itself never got its display fields populated (shouldn't happen via
+ * seedExamSyllabus, but kept nullable defensively, matching every other display
+ * field on [ConceptSnapshot]).
+ */
+data class PrerequisiteRef(
+    val conceptId: String,
+    val subject: String?,
+    val chapter: String?,
+    val topic: String?
+)
+
+/**
  * One weak concept whose failure traces back to a weak prerequisite — output of
  * [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure], not
  * re-derived here. E.g. the blueprint's own "Rolling Motion failure traced back to a
@@ -144,5 +175,5 @@ data class ErrorPatternSnapshot(
  */
 data class PrerequisiteIssue(
     val conceptId: String,
-    val weakPrerequisiteConceptIds: List<String>
+    val weakPrerequisites: List<PrerequisiteRef>
 )

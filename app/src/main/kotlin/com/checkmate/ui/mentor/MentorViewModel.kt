@@ -183,7 +183,10 @@ You also have access to the full conversation history above — refer to it natu
 If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
 you may briefly flag it — but don't derail the actual question they asked.
 If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
-the student's question, reference them specifically instead of speaking generically.
+the student's question, reference them specifically instead of speaking generically. When a
+weak concept lists a prerequisite issue, name the specific prerequisite topic (e.g. "your
+Rolling Motion mistakes trace back to Laws of Motion, which is still at 38%") rather than
+saying only that a prerequisite gap exists.
             """.trimIndent())
             appendLine()
             appendLine("STUDENT PROFILE:")
@@ -256,7 +259,18 @@ the student's question, reference them specifically instead of speaking generica
                 appendLine("Weakest concepts:")
                 weakest.forEach { c ->
                     val label = c.topic ?: c.chapter ?: "unknown"
-                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) " (traces to a weak prerequisite)" else ""
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s) and, when known, their own mastery — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) {
+                        val names = c.prerequisiteIssues.joinToString { ref ->
+                            val prereqLabel = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+                            val prereqMastery = model.concepts[ref.conceptId]?.mastery
+                            if (prereqMastery != null) "$prereqLabel (${(prereqMastery * 100).toInt()}%)"
+                            else "$prereqLabel (not yet attempted)"
+                        }
+                        " — traces to weak prerequisite(s): $names"
+                    } else ""
                     appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
                 }
             }
