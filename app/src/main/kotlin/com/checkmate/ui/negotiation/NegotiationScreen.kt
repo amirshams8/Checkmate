@@ -90,144 +90,156 @@ fun NegotiationScreen(
         }
         HorizontalDivider(color = White10, thickness = 0.5.dp)
 
+        // BUGFIX: this used to be `if (state.loading) { Spinner(); return@Column }` — a
+        // non-local early return out of Column's (inline) trailing lambda. state.loading
+        // defaults to true and vm.init() (kicked off by the LaunchedEffect above) flips it
+        // to false within milliseconds, so the very first recomposition of this screen
+        // switched from "compose nothing below the spinner" to "compose the whole rest of
+        // the Column for the first time" — a different set of child groups than the initial
+        // composition produced. That shape is exactly what Google's own compose-runtime
+        // tracker (b/203576696) documents as a trigger for composer-internal group-stack
+        // corruption (IndexOutOfBoundsException in Stack.pop / ComposerImpl.exitGroup on
+        // the next recompose) — which is the crash this was producing when opening
+        // "Talk to Checkmate" from the notification. Fixed by making loading/loaded proper
+        // if/else siblings so every composition of this Column emits the same group shape
+        // for whichever branch is active, with no early exit.
         if (state.loading) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(color = AccentGreen)
             }
-            return@Column
-        }
-
-        state.context?.let { ctx ->
-            if (ctx.recentSkipRatePercent > 0 || ctx.streakDays > 0) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    if (ctx.recentSkipRatePercent > 0) {
-                        ContextChip("Skip rate ${ctx.recentSkipRatePercent}%", AccentAmber)
-                    }
-                    if (ctx.streakDays > 0) {
-                        ContextChip("Streak ${ctx.streakDays}d", AccentGreen)
-                    }
-                }
-            }
-        }
-
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(state.messages) { msg -> NegotiationBubble(msg) }
-            if (state.isSending) {
-                item {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                        Surface(
-                            shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
-                            color = BgCard,
-                            border = BorderStroke(0.5.dp, White10)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
-                                Spacer(Modifier.width(8.dp))
-                                Text("thinking…", fontSize = 13.sp, color = White60)
-                            }
+        } else {
+            state.context?.let { ctx ->
+                if (ctx.recentSkipRatePercent > 0 || ctx.streakDays > 0) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (ctx.recentSkipRatePercent > 0) {
+                            ContextChip("Skip rate ${ctx.recentSkipRatePercent}%", AccentAmber)
+                        }
+                        if (ctx.streakDays > 0) {
+                            ContextChip("Streak ${ctx.streakDays}d", AccentGreen)
                         }
                     }
                 }
             }
-            if (state.resolution != NegotiationResolution.NONE) {
-                item {
-                    Text(
-                        resolutionLabel(state.resolution),
-                        fontSize = 12.sp,
-                        color = White60,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-                    )
+
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(state.messages) { msg -> NegotiationBubble(msg) }
+                if (state.isSending) {
+                    item {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                            Surface(
+                                shape = RoundedCornerShape(topStart = 4.dp, topEnd = 14.dp, bottomEnd = 14.dp, bottomStart = 14.dp),
+                                color = BgCard,
+                                border = BorderStroke(0.5.dp, White10)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("thinking…", fontSize = 13.sp, color = White60)
+                                }
+                            }
+                        }
+                    }
+                }
+                if (state.resolution != NegotiationResolution.NONE) {
+                    item {
+                        Text(
+                            resolutionLabel(state.resolution),
+                            fontSize = 12.sp,
+                            color = White60,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                        )
+                    }
                 }
             }
-        }
 
-        state.sttError?.let {
-            Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
-        }
+            state.sttError?.let {
+                Text(it, fontSize = 11.sp, color = AccentRed, modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp))
+            }
 
-        HorizontalDivider(color = White10, thickness = 0.5.dp)
+            HorizontalDivider(color = White10, thickness = 0.5.dp)
 
-        val actionsEnabled = state.resolution == NegotiationResolution.NONE
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { vm.onStart(context, transactionId, lateMinutes) },
-                enabled = actionsEnabled,
-                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = Color.Black),
-                modifier = Modifier.weight(1f)
-            ) { Text("Start", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+            val actionsEnabled = state.resolution == NegotiationResolution.NONE
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = { vm.onStart(context, transactionId, lateMinutes) },
+                    enabled = actionsEnabled,
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = Color.Black),
+                    modifier = Modifier.weight(1f)
+                ) { Text("Start", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
 
-            OutlinedButton(
-                onClick = { vm.onSnooze(context, transactionId, taskId, lateMinutes) },
-                enabled = actionsEnabled,
-                modifier = Modifier.weight(1f)
-            ) { Text("Snooze 5m", fontSize = 12.sp, color = White90) }
+                OutlinedButton(
+                    onClick = { vm.onSnooze(context, transactionId, taskId, lateMinutes) },
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Snooze 5m", fontSize = 12.sp, color = White90) }
 
-            OutlinedButton(
-                onClick = { vm.onDismiss(context, transactionId) },
-                enabled = actionsEnabled,
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
-                modifier = Modifier.weight(1f)
-            ) { Text("Dismiss", fontSize = 12.sp) }
-        }
+                OutlinedButton(
+                    onClick = { vm.onDismiss(context, transactionId) },
+                    enabled = actionsEnabled,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                    modifier = Modifier.weight(1f)
+                ) { Text("Dismiss", fontSize = 12.sp) }
+            }
 
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedTextField(
-                value = state.inputText,
-                onValueChange = vm::setInput,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Say or type your response…", color = White30, fontSize = 13.sp) },
-                singleLine = false,
-                maxLines = 3,
-                enabled = actionsEnabled,
-                shape = RoundedCornerShape(14.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor = AccentGreen,
-                    focusedTextColor = White90,
-                    unfocusedTextColor = White90
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = state.inputText,
+                    onValueChange = vm::setInput,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Say or type your response…", color = White30, fontSize = 13.sp) },
+                    singleLine = false,
+                    maxLines = 3,
+                    enabled = actionsEnabled,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AccentGreen,
+                        unfocusedBorderColor = White30,
+                        cursorColor = AccentGreen,
+                        focusedTextColor = White90,
+                        unfocusedTextColor = White90
+                    )
                 )
-            )
-            if (state.sttAvailable) {
+                if (state.sttAvailable) {
+                    FloatingActionButton(
+                        onClick = { if (state.isListening) vm.stopListening() else vm.startListening() },
+                        containerColor = if (state.isListening) AccentRed else BgCardAlt,
+                        contentColor = if (state.isListening) Color.White else AccentGreen,
+                        modifier = Modifier.size(46.dp)
+                    ) {
+                        Icon(
+                            if (state.isListening) Icons.Default.MicOff else Icons.Default.Mic,
+                            contentDescription = if (state.isListening) "Stop listening" else "Start listening",
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
                 FloatingActionButton(
-                    onClick = { if (state.isListening) vm.stopListening() else vm.startListening() },
-                    containerColor = if (state.isListening) AccentRed else BgCardAlt,
-                    contentColor = if (state.isListening) Color.White else AccentGreen,
+                    onClick = { vm.send(context) },
+                    containerColor = AccentGreen,
+                    contentColor = Color.Black,
                     modifier = Modifier.size(46.dp)
                 ) {
-                    Icon(
-                        if (state.isListening) Icons.Default.MicOff else Icons.Default.Mic,
-                        contentDescription = if (state.isListening) "Stop listening" else "Start listening",
-                        modifier = Modifier.size(20.dp)
-                    )
+                    Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
                 }
-            }
-            FloatingActionButton(
-                onClick = { vm.send(context) },
-                containerColor = AccentGreen,
-                contentColor = Color.Black,
-                modifier = Modifier.size(46.dp)
-            ) {
-                Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
             }
         }
     }

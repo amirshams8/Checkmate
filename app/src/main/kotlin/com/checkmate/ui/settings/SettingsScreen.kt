@@ -65,73 +65,80 @@ fun WorkModeLockGate(content: @Composable () -> Unit) {
     }
     val locked = remember(tick) { WorkModeManager.settingsLocked() }
 
+    // NOTE: previously this was `if (!locked) { content(); return }` — a bare early
+    // `return` placed before any UI in a @Composable body. Google's own compose-runtime
+    // tracker (b/203576696) flags exactly this shape — an early return that leaves one
+    // branch of the function emitting nothing and the other branch emitting a full UI
+    // subtree — as a trigger for composer group-stack corruption ("Index -1 out of
+    // bounds" / IndexOutOfBoundsException in Stack.pop / ComposerImpl.exitGroup) once a
+    // recomposition flips `locked` across that branch. Restructured as a plain if/else so
+    // both branches are ordinary sibling groups instead of an early function exit.
     if (!locked) {
         content()
-        return
-    }
+    } else {
+        var pin by remember { mutableStateOf("") }
+        var status by remember { mutableStateOf<String?>(null) }
+        var statusColor by remember { mutableStateOf(AccentRed) }
 
-    var pin by remember { mutableStateOf("") }
-    var status by remember { mutableStateOf<String?>(null) }
-    var statusColor by remember { mutableStateOf(AccentRed) }
-
-    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Lock, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
-        }
-        Text(
-            "Blocked Apps, Blocked Websites, Focus Cycle, and the Guardian Telegram Chat ID " +
-                "are locked once a guardian PIN is set — not just during a focus session or the " +
-                "daily ${WorkModeSchedule.LABEL} window. Enter the PIN to make changes.",
-            fontSize = 11.sp, color = White60,
-            modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
-        )
-        OutlinedTextField(
-            value         = pin,
-            onValueChange = { if (it.length <= 6) { pin = it; status = null } },
-            label         = { Text("Guardian PIN", color = White30) },
-            singleLine    = true,
-            modifier      = Modifier.fillMaxWidth(),
-            visualTransformation = PasswordVisualTransformation(),
-            leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
-            trailingIcon  = {
-                IconButton(onClick = {
-                    when (val result = UninstallGuard.unlockWithPin(pin)) {
-                        is UninstallGuard.UnlockResult.Success -> {
-                            status = "Unlocked for 2 minutes"
-                            statusColor = AccentGreen
-                            pin = ""
-                            tick = System.currentTimeMillis()
-                        }
-                        is UninstallGuard.UnlockResult.WrongPin -> {
-                            status = "Incorrect PIN"
-                            statusColor = AccentRed
-                        }
-                        is UninstallGuard.UnlockResult.NoPinConfigured -> {
-                            status = "No PIN generated yet - see Security settings"
-                            statusColor = AccentAmber
-                        }
-                        is UninstallGuard.UnlockResult.LockedOut -> {
-                            status = "Too many wrong attempts - locked for ${result.secondsLeft / 60}m"
-                            statusColor = AccentRed
-                            if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
-                        }
-                    }
-                }) {
-                    Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
-                }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor   = AccentGreen,
-                unfocusedBorderColor = White30,
-                cursorColor          = AccentGreen,
-                focusedTextColor     = White90,
-                unfocusedTextColor   = White90
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Lock, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Locked by guardian", fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium)
+            }
+            Text(
+                "Blocked Apps, Blocked Websites, Focus Cycle, and the Guardian Telegram Chat ID " +
+                    "are locked once a guardian PIN is set — not just during a focus session or the " +
+                    "daily ${WorkModeSchedule.LABEL} window. Enter the PIN to make changes.",
+                fontSize = 11.sp, color = White60,
+                modifier = Modifier.padding(top = 4.dp, bottom = 10.dp)
             )
-        )
-        status?.let {
-            Text(it, fontSize = 11.sp, color = statusColor, modifier = Modifier.padding(top = 6.dp))
+            OutlinedTextField(
+                value         = pin,
+                onValueChange = { if (it.length <= 6) { pin = it; status = null } },
+                label         = { Text("Guardian PIN", color = White30) },
+                singleLine    = true,
+                modifier      = Modifier.fillMaxWidth(),
+                visualTransformation = PasswordVisualTransformation(),
+                leadingIcon   = { Icon(Icons.Default.LockOpen, null, tint = White60) },
+                trailingIcon  = {
+                    IconButton(onClick = {
+                        when (val result = UninstallGuard.unlockWithPin(pin)) {
+                            is UninstallGuard.UnlockResult.Success -> {
+                                status = "Unlocked for 2 minutes"
+                                statusColor = AccentGreen
+                                pin = ""
+                                tick = System.currentTimeMillis()
+                            }
+                            is UninstallGuard.UnlockResult.WrongPin -> {
+                                status = "Incorrect PIN"
+                                statusColor = AccentRed
+                            }
+                            is UninstallGuard.UnlockResult.NoPinConfigured -> {
+                                status = "No PIN generated yet - see Security settings"
+                                statusColor = AccentAmber
+                            }
+                            is UninstallGuard.UnlockResult.LockedOut -> {
+                                status = "Too many wrong attempts - locked for ${result.secondsLeft / 60}m"
+                                statusColor = AccentRed
+                                if (result.justTriggered) GuardianNotifier.notifyPinBruteForce(context)
+                            }
+                        }
+                    }) {
+                        Icon(Icons.Default.LockOpen, null, tint = AccentGreen)
+                    }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            status?.let {
+                Text(it, fontSize = 11.sp, color = statusColor, modifier = Modifier.padding(top = 6.dp))
+            }
         }
     }
 }
@@ -222,20 +229,20 @@ fun SettingsScreen() {
     var showAppSelector     by remember { mutableStateOf(false) }
     var showWebsiteBlocker  by remember { mutableStateOf(false) }
 
-    if (showAppSelector) {
-        AppSelectorScreen(onBack = { showAppSelector = false })
-        return
-    }
-    if (showWebsiteBlocker) {
-        WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
-        return
-    }
-
-    Column(
-        modifier        = Modifier.fillMaxSize().background(BgDark)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
+    // NOTE: previously two `if (...) { Screen(...); return }` guards in a row — each a
+    // bare early return out of a @Composable body before the main content below. Same
+    // composer group-stack risk as WorkModeLockGate above (see its comment / b/203576696):
+    // an early return skips a whole sibling subtree's worth of groups on some
+    // recompositions but not others. Converted to a single exhaustive `when` so exactly
+    // one branch — never an early exit — is ever taken per composition.
+    when {
+        showAppSelector    -> AppSelectorScreen(onBack = { showAppSelector = false })
+        showWebsiteBlocker -> WebsiteBlockerScreen(onBack = { showWebsiteBlocker = false })
+        else -> Column(
+            modifier        = Modifier.fillMaxSize().background(BgDark)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
         Spacer(Modifier.height(20.dp))
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
             Text("Settings", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
@@ -353,6 +360,7 @@ fun SettingsScreen() {
         }
 
         Spacer(Modifier.height(32.dp))
+        }
     }
 }
 
