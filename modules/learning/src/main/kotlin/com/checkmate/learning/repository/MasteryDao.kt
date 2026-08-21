@@ -27,6 +27,12 @@ interface ConceptDao {
     @Query("SELECT * FROM concepts WHERE id = :id")
     suspend fun getById(id: String): Concept?
 
+    // Added for StudentModelBuilder: batches every concept a student has a
+    // ConceptMastery row for into one query instead of one getById call per concept
+    // — the "don't loop DAO.get() per item" fix called out during that PR's review.
+    @Query("SELECT * FROM concepts WHERE id IN (:ids)")
+    suspend fun getByIds(ids: List<String>): List<Concept>
+
     @Query("SELECT * FROM concepts WHERE exam = :exam")
     suspend fun getByExam(exam: String): List<Concept>
 }
