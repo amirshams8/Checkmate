@@ -25,7 +25,11 @@ object KnowledgeGraph {
     // common case. An exam string that doesn't end in a year, or an ExamSyllabus
     // key that later grows its own year suffix, would need this revisited.
     private val YEAR_SUFFIX = Regex("""-(19|20)\d{2}$""")
-    private fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
+    // Was private — widened to internal so the one real call site for
+    // seedExamSyllabus (TestResultNormalizer, wiring it in for the first time) can
+    // normalize a report's raw exam string ("NEET-2027") to an ExamSyllabus key
+    // ("NEET") before calling it, without duplicating this regex there.
+    internal fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
 
     /**
      * Deterministic id from (exam, chapter, topic) — deliberately NOT subject. See
@@ -86,10 +90,15 @@ object KnowledgeGraph {
      * the same slug internally, so this still joins correctly with real imported
      * attempts either way.
      *
-     * NOT CALLED ANYWHERE YET: no UI/onboarding flow exists to know which exam(s) a
-     * given student is registered for — same "not wired in" gap
-     * TestResultNormalizer's import flow still has. Call explicitly once that
-     * exists, e.g. `KnowledgeGraph.seedExamSyllabus(context, "NEET")`.
+     * WIRING: called from [com.checkmate.learning.testmate.TestResultNormalizer.normalizeAndPersist]
+     * on every import, using `report.exam` (normalized via [normalizeExam]) as the
+     * exam key — no separate onboarding flow exists to declare a student's exam
+     * ahead of time, but every real import already carries its own exam string, so
+     * seeding opportunistically off that is the actual first real signal available,
+     * not a guess. Safe to call repeatedly for the same exam: [Concept] upsertAll
+     * overwrites identically and [ConceptDependencyDao.insertAll] is
+     * `OnConflictStrategy.IGNORE`, so a re-imported report re-seeding the same exam
+     * is a no-op past the first time, not a duplicate/corruption risk.
      */
     suspend fun seedExamSyllabus(context: Context, exam: String) {
         val subjects = ExamSyllabus.data[exam] ?: return

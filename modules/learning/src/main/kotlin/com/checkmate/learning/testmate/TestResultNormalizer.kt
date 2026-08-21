@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.checkmate.learning.engine.ErrorEngine
 import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.graph.KnowledgeGraph
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.LearningEventType
 import com.checkmate.learning.model.LearningIds
@@ -58,6 +59,23 @@ object TestResultNormalizer {
     ): NormalizeResult {
         val report = TestReportParser.parse(reportText)
         val warnings = mutableListOf<String>()
+
+        // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
+        // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
+        // this is that call site. Every import already knows its own exam
+        // (report.exam, e.g. "NEET-2027"); normalizing it to an ExamSyllabus key
+        // ("NEET") and seeding here means diagnosePrerequisiteFailure has real
+        // prerequisite edges to walk by the time StudentModelBuilder next runs for
+        // this student, instead of silently finding none because seeding never
+        // happened. Safe on every import, including a duplicate re-import that gets
+        // caught by the idempotency guard below — see seedExamSyllabus's own doc for
+        // why a repeat call is a no-op, not a duplication risk. Fails open: a report
+        // for an exam ExamSyllabus doesn't recognize just returns from
+        // seedExamSyllabus without seeding anything, and the import continues
+        // normally either way.
+        report.exam?.let { examRaw ->
+            KnowledgeGraph.seedExamSyllabus(context, KnowledgeGraph.normalizeExam(examRaw))
+        }
 
         if (report.questions.isEmpty()) {
             warnings.add(
