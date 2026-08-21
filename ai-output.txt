@@ -1,405 +1,887 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsViewModel.kt =====
-package com.checkmate.ui.testresults
+//===== FILE: modules/planner/build.gradle.kts =====
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.kotlin.kapt")
+}
+android {
+    namespace  = "com.checkmate.planner"
+    compileSdk = 35
+    defaultConfig { minSdk = 26; targetSdk = 35 }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation(project(":modules:core"))
+    // Upgrade Blueprint Phase 2 wiring: AdaptivePlanner now reads StudentModelBuilder.build()
+    // (mastery/error/retention/prerequisite state) instead of only PYQ weightage + behavior
+    // snapshot. Same dependency direction :modules:learning already takes on :modules:core —
+    // :modules:learning depends on neither :modules:planner nor :modules:psyche, so this
+    // doesn't introduce a cycle.
+    implementation(project(":modules:learning"))
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    kapt("androidx.room:room-compiler:2.6.1")
+    // Added for the Proactive Trigger Engine (step 7) — no WorkManager dependency
+    // existed anywhere in the project before this; everything else here uses
+    // AlarmManager. This is a deliberate blueprint choice (§2): WorkManager for durable
+    // periodic evaluation, AlarmManager reserved for precise per-task timing (not yet
+    // built — see InterventionTriggerScheduler's doc comment on why it needs no
+    // BootReceiver re-arming, unlike this app's existing AlarmManager schedules).
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/AdaptivePlanner.kt =====
+package com.checkmate.planner
 
 import android.content.Context
-import android.net.Uri
 import android.util.Log
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.learning.testmate.TestResultNormalizer
-import com.checkmate.testmate.TestmateApi
-import com.checkmate.testmate.TestmateResult
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.checkmate.core.BehaviorSnapshot
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.DailyCheckIn
+import com.checkmate.core.DailyChecklist
+import com.checkmate.core.PYQWeightage
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.SubjectConfig
+import com.checkmate.planner.model.TaskType
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.*
 
-private const val TAG = "TestResultsViewModel"
+object AdaptivePlanner {
 
-data class TestResultsState(
-    val sessionId: String = "",
-    val loading: Boolean = false,
-    val result: TestmateResult? = null,
-    val error: String? = null,
-    // ── Upgrade Blueprint wiring gap fix ──
-    // Phase 1 (MasteryEngine/ErrorEngine/RetentionEngine/KnowledgeGraph/
-    // TestResultNormalizer) was fully built but nothing ever called
-    // TestResultNormalizer — TestmateApi's /results endpoint only returns
-    // chapter/topic aggregates, never per-question detail, so there was no
-    // data shape TestResultNormalizer could consume. Rather than add a new
-    // testmate2.com endpoint, this reuses the report.md TestResultNormalizer
-    // already parses (TestReportParser) via a manual file picker (see
-    // TestResultsScreen's "Import report.md" section) — the student downloads
-    // the report from TestmateWebScreen's WebView (already wired to
-    // DownloadManager) and picks it here. No backend change, no
-    // DownloadManager-watching/polling, no push/pull sync layer to maintain
-    // across app updates — just a Storage Access Framework file read.
-    val importing: Boolean = false,
-    val importResult: TestResultNormalizer.NormalizeResult? = null,
-    val importError: String? = null
-)
+    private const val TAG = "AdaptivePlanner"
 
-class TestResultsViewModel : ViewModel() {
-    private val _state = MutableStateFlow(TestResultsState())
-    val state: StateFlow<TestResultsState> = _state.asStateFlow()
+    suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
+        val daysLeft          = daysUntilExam(config.examDate)
+        // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"):
+        // structured deterministic metrics, not a hand-built prose string — see
+        // getBehaviorSnapshot() below.
+        val behaviorSnapshot  = getBehaviorSnapshot()
+        val studyWindowHours  = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
+        val profile           = ConsultationProfile.load()
+        val checkIn           = DailyCheckIn.loadToday()
+        val coachingContext   = CoachingPlannerEntry.upcomingContext(7)
+        val pyqContext         = buildPyqContext(config.examType, checkIn)
+        // FEATURE: Checklist → Planner — same-day lecture/DPP/notes completion
+        // feeds tomorrow's plan so an incomplete checklist skews the next plan
+        // toward catching up on fundamentals rather than piling on new PYQ topics.
+        val checklistContext  = buildChecklistContext()
+        // Mentor v2 (spec 3.7): read TodayContext directly (not folded into the cached
+        // BehaviorSnapshot — see PsycheEngine.refreshBehaviorSummaryCache()'s doc on why)
+        // so a mid-day regenerate always reflects the latest same-day free-text updates
+        // even if refreshBehaviorSummaryCache() hasn't run since the last one (e.g. the
+        // very first plan of the day).
+        val todayContext      = TodayContext.getSummaryText()
 
-    fun onSessionIdChange(value: String) {
-        _state.update { it.copy(sessionId = value, error = null) }
+        // Upgrade Blueprint Phase 2 wiring ("Planner reframe"): StudentModelBuilder.build()
+        // was fully implemented back in Phase 1 (aggregates MasteryEngine/ErrorEngine/
+        // RetentionEngine/KnowledgeGraph, itself fed by every report.md import via
+        // TestResultNormalizer) but nothing ever called it — real test performance was
+        // computed and persisted, then sat unread while the planner kept guessing from
+        // PYQ weightage + behavior alone. This is the first consumer: one snapshot, reused
+        // by both the LLM path (as structured JSON, same "deterministic data, not prose"
+        // discipline as BEHAVIOR_METRICS below) and the rule-based fallback (prefers the
+        // weakest/review-due concept per subject over blind PYQ rotation, when one exists).
+        val studentModel = StudentModelBuilder.build(context)
+
+        // Blueprint 4.1: today's free windows (study window minus school/coaching
+        // blocked slots). Computed once, applied to whichever plan comes out below.
+        val freeSlots = FreeSlotCalculator.computeFreeSlots(
+            profile.blockedSlots, config.studyStartTime, config.studyEndTime
+        )
+
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext, studentModel)
+        if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
+
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours, studentModel), freeSlots)
     }
 
-    fun fetch() {
-        val id = _state.value.sessionId
-        viewModelScope.launch {
-            _state.update { it.copy(loading = true, error = null) }
-            when (val outcome = TestmateApi.fetchResult(id)) {
-                is com.checkmate.testmate.TestmateResultOutcome.Success ->
-                    _state.update { it.copy(loading = false, result = outcome.result, error = null) }
-                is com.checkmate.testmate.TestmateResultOutcome.Error ->
-                    _state.update { it.copy(loading = false, error = outcome.message) }
+    /**
+     * Blueprint 4.2: packs tasks sequentially into today's free slots in the
+     * order they were generated — which is already priority order (highest
+     * subject weightage / PYQ-driven reason first, from both the LLM and
+     * rule-based paths) — so the hardest/highest-priority work naturally lands
+     * in the earliest slots rather than needing a second re-sort here.
+     *
+     * A task that doesn't fit in the slot it's currently pointed at moves the
+     * cursor to the next free slot; a task that doesn't fit anywhere (total
+     * plan exceeds available free time) is returned with scheduledStartTime
+     * left null — HomeScreen's timeline view groups those under "Unscheduled"
+     * instead of silently dropping them.
+     */
+    private fun assignScheduledTimes(
+        tasks: List<StudyTask>,
+        freeSlots: List<FreeSlotCalculator.FreeSlot>
+    ): List<StudyTask> {
+        if (tasks.isEmpty() || freeSlots.isEmpty()) return tasks
+
+        var slotIndex = 0
+        var cursor = freeSlots[0].startMinute
+
+        return tasks.map { task ->
+            while (slotIndex < freeSlots.size && cursor + task.durationMinutes > freeSlots[slotIndex].endMinute) {
+                slotIndex++
+                cursor = if (slotIndex < freeSlots.size) freeSlots[slotIndex].startMinute else -1
+            }
+            if (slotIndex >= freeSlots.size || cursor < 0) {
+                task
+            } else {
+                val scheduled = task.copy(scheduledStartTime = FreeSlotCalculator.formatMinutes(cursor))
+                cursor += task.durationMinutes
+                scheduled
             }
         }
     }
 
     /**
-     * Reads the picked report.md (or .txt — Testmate's export mime type varies by
-     * provider) via SAF, hands the raw text straight to
-     * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
-     * (or the "already imported" idempotency result) in [TestResultsState].
-     * File I/O + normalization both happen off the main thread.
+     * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+     * Reads the structured BehaviorSnapshot PsycheEngine.refreshBehaviorSummaryCache()
+     * serializes into CheckmatePrefs (same cross-module bridge as before — :modules:planner
+     * still can't depend on :modules:psyche directly, see PsycheEngine's own doc on why —
+     * only the payload crossing that bridge changed, from hand-built prose to JSON).
+     *
+     * Falls back to BehaviorSnapshot.EMPTY (all zeros/empty lists) instead of a sentence
+     * like "No behavior data yet" — the LLM gets the same JSON shape whether or not history
+     * exists yet, rather than a special-cased string it would have to treat differently.
      */
-    fun importReport(context: Context, uri: Uri) {
-        viewModelScope.launch {
-            _state.update { it.copy(importing = true, importError = null, importResult = null) }
-            try {
-                val text = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                } ?: throw IllegalStateException("Couldn't open the selected file.")
-
-                if (text.isBlank()) {
-                    _state.update {
-                        it.copy(importing = false, importError = "Selected file is empty.")
-                    }
-                    return@launch
-                }
-
-                val result = withContext(Dispatchers.IO) {
-                    TestResultNormalizer.normalizeAndPersist(context, text)
-                }
-                _state.update { it.copy(importing = false, importResult = result, importError = null) }
-            } catch (e: Exception) {
-                Log.e(TAG, "Report import failed: ${e.message}", e)
-                _state.update {
-                    it.copy(importing = false, importError = "Import failed: ${e.message ?: "unknown error"}")
-                }
-            }
+    private fun getBehaviorSnapshot(): BehaviorSnapshot {
+        val raw = CheckmatePrefs.getString("behavior_snapshot_json", null) ?: return BehaviorSnapshot.EMPTY
+        return try {
+            Json { ignoreUnknownKeys = true }.decodeFromString<BehaviorSnapshot>(raw)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to decode behavior snapshot, using empty: ${e.message}")
+            BehaviorSnapshot.EMPTY
         }
     }
 
-    fun dismissImportResult() {
-        _state.update { it.copy(importResult = null, importError = null) }
+    private fun buildPyqContext(exam: String, checkIn: DailyCheckIn?): String {
+        if (checkIn == null) return ""
+        return checkIn.todayTopics.entries.mapNotNull { (subject, topic) ->
+            val weight = PYQWeightage.findTopicWeightage(exam, topic)
+            if (weight > 0f) "$subject/$topic: PYQ weight ${String.format("%.1f", weight)}%"
+            else null
+        }.joinToString("\n")
     }
-}
 
+    /**
+     * Reads today's checklist completion (lecture/notes/DPP/etc.) so the LLM
+     * planner can react to same-day execution gaps, not just multi-day behavior
+     * trends. Returns "" when the checklist was never touched today — an
+     * untouched checklist means "not used," not "0% complete," and treating it
+     * as a crisis would produce false catch-up plans. Mirrors the same
+     * empty-guard pattern used in buildPyqContext().
+     */
+    private fun buildChecklistContext(): String {
+        val summary = DailyChecklist.getTodaySummaryText()
+        if (summary.isBlank()) return ""
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsScreen.kt =====
-package com.checkmate.ui.testresults
+        val items = DailyChecklist.getTodayItems()
+        if (items.isEmpty()) return ""
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavController
-import com.checkmate.testmate.TestmateWeakArea
-import com.checkmate.ui.theme.*
+        val touched = items.any { it.isDone }
+        // Checklist exists but nothing has been checked off yet today (e.g. it's
+        // early morning) — not a signal of falling behind, so skip it.
+        if (!touched) return ""
 
-/**
- * Phase 6 (test-platform-blueprint.md) surface: pulls a single Testmate
- * session result by ID and renders it natively, per spec §4's
- * score/weak-chapters/weak-topics shape. Base URL + token are configured in
- * Settings → Test Platform.
- *
- * "Import report.md" section below is separate from the fetch-by-session-ID
- * flow above — the aggregate fetch shows score/weak-chapters/weak-topics for
- * display only (TestmateApi's /results endpoint carries no per-question
- * detail); the file import is what actually feeds the learning module
- * (MasteryEngine/ErrorEngine/RetentionEngine via TestResultNormalizer). The
- * two are independent: fetch a result to look at it, and/or import its
- * report.md (downloaded from TestmateWebScreen's WebView) to let Checkmate
- * learn from it.
- */
-@Composable
-fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
-    val state by vm.state.collectAsState()
-    val context = LocalContext.current
+        val doneCount = items.count { it.isDone }
+        val totalCount = items.size
+        val incomplete = items.filter { !it.isDone }.map { it.label }
 
-    val importLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri -> uri?.let { vm.importReport(context, it) } }
-
-    Column(
-        modifier = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState())
-    ) {
-        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+        return buildString {
+            appendLine("Today's checklist: $doneCount/$totalCount complete")
+            if (incomplete.isNotEmpty()) {
+                appendLine("Not done yet: ${incomplete.joinToString()}")
             }
-            Text("Test Results", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = White90)
-        }
+        }.trim()
+    }
 
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Text("Session ID", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
-            OutlinedTextField(
-                value         = state.sessionId,
-                onValueChange = vm::onSessionIdChange,
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                placeholder   = { Text("Paste the Testmate session ID", color = White30, fontSize = 13.sp) },
-                leadingIcon   = { Icon(Icons.Default.Quiz, null, tint = White60) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
+    // ── Upgrade Blueprint Phase 2 wiring: compact StudentModel → LLM prompt ──
+    // StudentModel.concepts can grow to hundreds of rows over a full prep cycle
+    // (:modules:learning's model classes are deliberately not @Serializable — see
+    // StudentModel.kt's own class doc on why it stays a derived, non-persisted read
+    // model — so this hand-builds a small, prompt-sized, @Serializable summary here
+    // rather than dumping the whole thing). Same "own words / own shape" boundary
+    // StudentModel.kt's class doc already draws around StudentModelBuilder itself.
+
+    @Serializable
+    private data class ConceptEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val masteryPercent: Int,
+        val hasWeakPrerequisite: Boolean
+    )
+
+    @Serializable
+    private data class ErrorEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val errorType: String,
+        val occurrences: Int
+    )
+
+    @Serializable
+    private data class StudentModelPromptSummary(
+        val conceptsTracked: Int,
+        val conceptsMastered: Int,
+        val conceptsWeak: Int,
+        val averageMasteryPercent: Int,
+        val unresolvedErrorCount: Int,
+        /** Lowest-mastery concepts first, capped — see class doc above. */
+        val weakestConcepts: List<ConceptEntry>,
+        /** RetentionEngine.decide() == REVIEW, sorted by forgettingRisk desc, capped. */
+        val reviewDue: List<ConceptEntry>,
+        /** StudentModel.unresolvedErrors, already occurrences-desc, capped. */
+        val topErrorPatterns: List<ErrorEntry>
+    )
+
+    /**
+     * Compacts a full [StudentModel] into a small, prompt-sized summary: top-8
+     * weakest concepts, top-8 review-due concepts, top-8 unresolved error
+     * patterns — pre-sorted so the LLM sees the highest-signal rows first
+     * instead of reasoning over a large, unranked blob.
+     *
+     * Returns null when the student has no tracked concepts yet (no report.md
+     * ever imported) — same empty-guard pattern as [buildPyqContext]/
+     * [buildChecklistContext] — so the prompt doesn't grow an empty/misleading
+     * STUDENT_MODEL section before the first mock is imported.
+     */
+    private fun buildStudentModelSummary(model: StudentModel): StudentModelPromptSummary? {
+        if (model.overall.conceptsTracked == 0) return null
+
+        fun ConceptSnapshot.toEntry() = ConceptEntry(
+            subject = subject,
+            chapter = chapter,
+            topic = topic,
+            masteryPercent = (mastery * 100).toInt(),
+            hasWeakPrerequisite = prerequisiteIssues.isNotEmpty()
+        )
+
+        val weakest = model.concepts.values
+            .sortedBy { it.mastery }
+            .take(8)
+            .map { it.toEntry() }
+
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(8)
+            .map { it.toEntry() }
+
+        val topErrors = model.unresolvedErrors.take(8).map { pattern ->
+            val concept = model.concepts[pattern.conceptId]
+            ErrorEntry(
+                subject = concept?.subject,
+                chapter = concept?.chapter,
+                topic = concept?.topic,
+                errorType = pattern.errorType,
+                occurrences = pattern.occurrences
             )
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick  = { vm.fetch() },
-                enabled  = state.sessionId.isNotBlank() && !state.loading,
-                modifier = Modifier.fillMaxWidth(),
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                if (state.loading) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = androidx.compose.ui.graphics.Color.Black, strokeWidth = 2.dp)
+        }
+
+        return StudentModelPromptSummary(
+            conceptsTracked = model.overall.conceptsTracked,
+            conceptsMastered = model.overall.conceptsMastered,
+            conceptsWeak = model.overall.conceptsWeak,
+            averageMasteryPercent = (model.overall.averageMastery * 100).toInt(),
+            unresolvedErrorCount = model.overall.unresolvedErrorCount,
+            weakestConcepts = weakest,
+            reviewDue = reviewDue,
+            topErrorPatterns = topErrors
+        )
+    }
+
+    private suspend fun tryLlmPlan(
+        config: PlannerState,
+        daysLeft: Int,
+        behaviorSnapshot: BehaviorSnapshot,
+        studyWindowHours: Float,
+        profile: com.checkmate.core.ConsultationProfile,
+        checkIn: DailyCheckIn?,
+        coachingContext: String,
+        pyqContext: String,
+        checklistContext: String,
+        todayContext: String = "",
+        // Upgrade Blueprint Phase 2 wiring — see buildStudentModelSummary() above.
+        studentModel: StudentModel
+    ): List<StudyTask> {
+        val studentModelSummary = buildStudentModelSummary(studentModel)
+
+        val systemPrompt = """
+You are an adaptive study planner for competitive exam students.
+Generate a focused daily study plan. Respond ONLY with a valid JSON array, no markdown, no explanation.
+Format: [{"subject":"Biology","topic":"Cell Division","subtopic":"Mitosis stages","durationMinutes":45,"sessionType":"LEARN","priority":"HIGH","reason":"PYQ weight 9%, marked weak"}]
+Rules:
+- Max 5 tasks
+- Total time must fit in ${studyWindowHours.toInt()} hours (minus breaks)
+- Weight tasks by subject priority and PYQ weightage
+- If exam < 30 days: revision-heavy
+- If exam < 7 days: full revision only
+- Keep durations in multiples of 30
+- sessionType must be one of: LEARN, REVISE, PRACTICE, TEST_PREP
+- reason must be specific: mention PYQ %, coaching test dates, weak topic flags
+- If TODAY'S CHECKLIST STATUS shows incomplete fundamentals (lecture notes, DPP, NCERT reading)
+  from earlier today, prioritize catching those up over introducing new topics — an unfinished
+  checklist means the student is behind on today's baseline, not ready for additional load
+- If TODAY'S LOGGED UPDATES mentions something already covered today (e.g. "back from coaching,
+  did Physics 2hrs"), do not re-assign that same subject/topic — build on it or move to the next
+  weak area instead
+- BEHAVIOR_METRICS below is deterministic data computed directly from stored events, not a
+  prose summary — treat every number and list in it as ground truth. subjectPatterns lists
+  specific (subject, taskType) combinations the student has repeatedly skipped (occurrences >= 3
+  in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
+  to the aggregate recentSkipRatePercent
+- STUDENT_MODEL, when present, is also deterministic — built from the student's actual imported
+  test results (MasteryEngine/ErrorEngine/RetentionEngine), not a guess. weakestConcepts and
+  reviewDue are real measured gaps; topErrorPatterns are mistakes the student has actually made
+  repeatedly. Prioritize these over PYQ-weightage-only guesses when they exist, and when you do
+  pick a weakestConcepts/reviewDue/topErrorPatterns entry, say so specifically in "reason" (e.g.
+  "42% mastery from last mock" or "3rd CALCULATION error in this concept") rather than a generic
+  weak-topic flag
+""".trimIndent()
+
+        val prompt = buildString {
+            appendLine("Exam: ${config.examType} | Days until exam: $daysLeft")
+            appendLine("Subjects (name:weight): ${config.subjects.joinToString { "${it.name}:${it.weightage}" }}")
+            appendLine("Study window: ${config.studyStartTime}–${config.studyEndTime} (${studyWindowHours}h)")
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            if (checkIn != null) {
+                appendLine("TODAY'S TOPICS SELECTED:")
+                checkIn.todayTopics.forEach { (subj, topic) -> appendLine("  $subj → $topic") }
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING SCHEDULE:")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (pyqContext.isNotBlank()) {
+                appendLine("PYQ WEIGHTAGE FOR TODAY'S TOPICS:")
+                appendLine(pyqContext)
+                appendLine()
+            }
+            if (checklistContext.isNotBlank()) {
+                appendLine("TODAY'S CHECKLIST STATUS:")
+                appendLine(checklistContext)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES (from Mentor chat / quick-log):")
+                appendLine(todayContext)
+                appendLine()
+            }
+            // Upgrade Blueprint Phase 0 item #2: structured JSON, not a prose sentence — see
+            // getBehaviorSnapshot()/BehaviorSnapshot's own doc for why this crosses the
+            // psyche->planner boundary as data instead of as text.
+            appendLine("BEHAVIOR_METRICS (JSON, deterministic, authoritative):")
+            appendLine(Json.encodeToString(behaviorSnapshot))
+            appendLine()
+            // Upgrade Blueprint Phase 2 wiring: same treatment for real test performance —
+            // see buildStudentModelSummary() and the systemPrompt rule above.
+            if (studentModelSummary != null) {
+                appendLine("STUDENT_MODEL (JSON, deterministic, authoritative — from imported test reports):")
+                appendLine(Json.encodeToString(studentModelSummary))
+                appendLine()
+            }
+            appendLine("Generate today's plan.")
+        }
+
+        return try {
+            val raw = LlmGateway.complete(prompt, systemPrompt)
+            if (raw.isBlank()) return emptyList()
+            val json  = raw.trim().removePrefix("```json").removeSuffix("```").trim()
+            val arr   = JSONArray(json)
+            val tasks = mutableListOf<StudyTask>()
+            for (i in 0 until arr.length()) {
+                tasks.add(arr.getJSONObject(i).toStudyTask())
+            }
+            Log.d(TAG, "LLM generated ${tasks.size} tasks")
+            tasks
+        } catch (e: Exception) {
+            Log.w(TAG, "LLM plan failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Upgrade Blueprint Phase 0 item #1 ("Fix planner information loss"): the system
+     * prompt above already asks the LLM for sessionType/priority/reason on every task (see
+     * its own "Format:"/"Rules:" block), but the parse loop this replaced only ever read
+     * subject/topic/durationMinutes back out — sessionType, priority, and reason were
+     * generated, then silently thrown away. One canonical JSONObject -> StudyTask mapper,
+     * so the field contract exists in exactly one place rather than being re-derived (and
+     * re-forgotten) at any future call site that builds a StudyTask from raw LLM plan JSON.
+     *
+     * Deliberately tolerant of a missing/unrecognized sessionType or priority (optString
+     * with a neutral default, not getString) — a malformed field on one task in the array
+     * shouldn't fail parsing of the whole plan the way a missing *required* field
+     * (subject/topic/durationMinutes, still via getString/getInt) correctly does.
+     */
+    private fun JSONObject.toStudyTask(): StudyTask {
+        val subtopic = if (has("subtopic")) " — ${getString("subtopic")}" else ""
+        return StudyTask(
+            subject         = getString("subject"),
+            topic           = getString("topic") + subtopic,
+            durationMinutes = getInt("durationMinutes"),
+            priority        = mapLlmPriority(optString("priority", "MEDIUM")),
+            taskType        = mapLlmSessionType(optString("sessionType", "")),
+            rationale       = optString("reason", "")
+        )
+    }
+
+    private fun mapLlmPriority(raw: String): Int = when (raw.trim().uppercase()) {
+        "HIGH"   -> 3
+        "MEDIUM" -> 2
+        "LOW"    -> 1
+        else     -> 2 // unrecognized/missing — neutral middle, not silently lowest
+    }
+
+    // sessionType (LEARN/REVISE/PRACTICE/TEST_PREP, per the systemPrompt above) onto the
+    // existing TaskType enum (LECTURE/PRACTICE/REVISION/READING/OTHER) — StudyTask.taskType's
+    // own doc already called this mapping out as owed. TEST_PREP has no exact match; PRACTICE
+    // is the closest existing semantic (timed/applied work, not new teaching).
+    private fun mapLlmSessionType(raw: String): TaskType = when (raw.trim().uppercase()) {
+        "LEARN"     -> TaskType.LECTURE
+        "REVISE"    -> TaskType.REVISION
+        "PRACTICE"  -> TaskType.PRACTICE
+        "TEST_PREP" -> TaskType.PRACTICE
+        else        -> TaskType.OTHER
+    }
+
+    // NOTE: previously took an unused `behaviorSummary: String` param (never referenced in the
+    // body below — the actual behavior signal this function reads is CheckmatePrefs'
+    // "recent_skip_rate", a couple of lines down). Dropped as dead code while touching this
+    // call site for Upgrade Blueprint Phase 0 item #2.
+    private fun ruleBasedPlan(
+        config: PlannerState,
+        daysLeft: Int,
+        studyWindowHours: Float,
+        // Upgrade Blueprint Phase 2 wiring — see the weakestBySubject block below.
+        studentModel: StudentModel
+    ): List<StudyTask> {
+        val tasks        = mutableListOf<StudyTask>()
+        val sorted       = config.subjects.sortedByDescending { it.weightage }
+        val maxTasks     = if (daysLeft < 7) 5 else if (daysLeft < 30) 4 else 3
+        val baseDuration = if (daysLeft < 30) 30 else 45
+
+        val skipRateStr = CheckmatePrefs.getString("recent_skip_rate", "0") ?: "0"
+        val skipRate    = skipRateStr.toFloatOrNull() ?: 0f
+        val duration    = when {
+            skipRate > 0.5f -> (baseDuration - 15).coerceAtLeast(20)
+            skipRate < 0.1f -> (baseDuration + 15).coerceAtMost(60)
+            else            -> baseDuration
+        }
+
+        // Upgrade Blueprint Phase 2 wiring: per subject, prefer the weakest tracked
+        // concept StudentModel already knows about (real measured mastery from
+        // imported test results) over blind PYQ-rotation topic selection — same
+        // "don't guess what Room already knows" discipline as the LLM path above.
+        // A concept only wins here if RetentionEngine.decide() actually flagged it
+        // (TEACH/REVIEW) — a MOVE_ON concept (well-mastered, low forgetting risk)
+        // falls through to normal rotation even if it happens to be this subject's
+        // lowest-mastery row, since "lowest of the well-mastered" isn't a gap.
+        // Falls straight through to the pre-existing rotation logic untouched when
+        // this subject has no tracked concepts yet (e.g. no report.md imported) —
+        // a fresh install behaves exactly as before this change.
+        val weakestBySubject: Map<String, ConceptSnapshot> = studentModel.concepts.values
+            .filter { it.subject != null }
+            .groupBy { it.subject!! }
+            .mapValues { (_, snapshots) -> snapshots.minByOrNull { it.mastery }!! } // groupBy guarantees a non-empty list per key
+
+        val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
+            val weakest = weakestBySubject.entries
+                .firstOrNull { it.key.equals(subj.name, ignoreCase = true) }
+                ?.value
+                ?.takeIf { it.retentionDecision != RetentionDecisionSnapshot.MOVE_ON }
+
+            val (topic, rationale) = if (weakest != null) {
+                val label = weakest.topic ?: weakest.chapter ?: subj.name
+                val action = when (weakest.retentionDecision) {
+                    RetentionDecisionSnapshot.TEACH  -> "Teach"
+                    RetentionDecisionSnapshot.REVIEW -> "Review"
+                    RetentionDecisionSnapshot.MOVE_ON -> "Revision" // unreachable, filtered above
+                }
+                val masteryPct = (weakest.mastery * 100).toInt()
+                val reason = buildString {
+                    append("Mastery $masteryPct% from imported test results")
+                    if (weakest.errorCount > 0) append(", ${weakest.errorCount} recorded error(s)")
+                    if (weakest.prerequisiteIssues.isNotEmpty()) append(", traces to a weak prerequisite")
+                }
+                "$action: $label" to reason
+            } else {
+                val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
+                val t = if (topTopics.isNotEmpty()) {
+                    val picked = topTopics[(dayOfYear + idx) % topTopics.size]
+                    if (daysLeft < 30) "Revision: ${picked.first}" else picked.first
                 } else {
-                    Text("Fetch Result", color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp)
+                    if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                    else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
                 }
+                t to ""
             }
-        }
 
-        state.error?.let { err ->
-            Text(
-                err, fontSize = 12.sp, color = AccentRed,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+            tasks.add(StudyTask(
+                subject         = subj.name,
+                topic           = topic,
+                durationMinutes = if (idx == 0) duration + 15 else duration,
+                priority        = sorted.size - idx,
+                rationale       = rationale
+            ))
+        }
+        return tasks
+    }
+
+    private fun daysUntilExam(dateStr: String): Int {
+        return try {
+            val sdf  = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
+            val exam = sdf.parse(dateStr) ?: return 365
+            val diff = exam.time - System.currentTimeMillis()
+            (diff / (1000 * 60 * 60 * 24)).toInt().coerceAtLeast(0)
+        } catch (_: Exception) { 365 }
+    }
+
+    private fun calculateStudyWindowHours(start: String, end: String): Float {
+        return try {
+            val (sh, sm) = start.split(":").map { it.toInt() }
+            val (eh, em) = end.split(":").map { it.toInt() }
+            val startMin = sh * 60 + sm
+            val endMin   = eh * 60 + em
+            ((endMin - startMin) / 60f).coerceAtLeast(1f)
+        } catch (_: Exception) { 8f }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
+package com.checkmate.ui.mentor
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.AppUsageTracker
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.MentorKnowledge
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+
+private val historyJson = Json { ignoreUnknownKeys = true }
+private const val PREFS_KEY_HISTORY = "mentor_chat_history"
+private const val MAX_PERSISTED_MESSAGES = 40
+
+@Serializable
+data class MentorMessage(
+    val role:    String,
+    val content: String,
+    val ts:      Long = System.currentTimeMillis()
+)
+
+data class MentorUiState(
+    val messages:   List<MentorMessage> = emptyList(),
+    val inputText:  String              = "",
+    val isLoading:  Boolean             = false,
+    val ttsEnabled: Boolean             = CheckmatePrefs.getBoolean("tts_enabled", true)
+)
+
+class MentorViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(MentorUiState())
+    val state: StateFlow<MentorUiState> = _state.asStateFlow()
+
+    init { loadHistory() }
+
+    private fun loadHistory() {
+        val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+        val messages = if (saved != null) {
+            try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+            catch (_: Exception) { emptyList() }
+        } else emptyList()
+
+        val initial = if (messages.isEmpty())
+            listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        else messages
+
+        _state.update { it.copy(messages = initial) }
+    }
+
+    private fun persistHistory(messages: List<MentorMessage>) {
+        val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
+        CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(trimmed))
+    }
+
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank() || _state.value.isLoading) return
+
+        val userMsg = MentorMessage("user", text)
+        val updatedMessages = _state.value.messages + userMsg
+        _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
+        persistHistory(updatedMessages)
+
+        viewModelScope.launch {
+            val response = try {
+                val systemPrompt = buildSystemPrompt(context, text)
+                val history      = buildHistoryForLlm()
+                LlmGateway.complete(history, systemPrompt)
+            } catch (e: Exception) {
+                "I couldn't process that right now. Try again."
+            }
+
+            val assistantMsg = MentorMessage(
+                "assistant",
+                response.ifBlank { "No response. Check your API key in Settings." }
             )
-        }
+            val finalMessages = _state.value.messages + assistantMsg
+            _state.update { it.copy(messages = finalMessages, isLoading = false) }
+            persistHistory(finalMessages)
 
-        state.result?.let { result ->
-            Spacer(Modifier.height(16.dp))
-            ResultSummaryCard(result)
-            if (result.weakChapters.isNotEmpty()) {
-                Spacer(Modifier.height(12.dp))
-                WeakAreasCard("Weak Chapters", result.weakChapters)
-            }
-            if (result.weakTopics.isNotEmpty()) {
-                Spacer(Modifier.height(12.dp))
-                WeakAreasCard("Weak Topics", result.weakTopics)
+            if (_state.value.ttsEnabled && response.isNotBlank()) {
+                val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
+                CheckmateTTS.speak(context, firstSentence)
             }
         }
-
-        Spacer(Modifier.height(24.dp))
-        HorizontalDivider(color = White10, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 16.dp))
-        Spacer(Modifier.height(20.dp))
-
-        ImportReportSection(
-            state    = state,
-            onPick   = { importLauncher.launch("*/*") },
-            onDismiss = { vm.dismissImportResult() }
-        )
-
-        Spacer(Modifier.height(24.dp))
     }
-}
 
-@Composable
-private fun ImportReportSection(
-    state: TestResultsState,
-    onPick: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-        Text("Import report.md", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = White90)
-        Text(
-            "Feeds this test's per-question data into Checkmate's learning engine " +
-                "(mastery, error patterns, retention) — download the report from the " +
-                "Test Platform tab first, then pick it here.",
-            fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
-        )
-        Button(
-            onClick  = onPick,
-            enabled  = !state.importing,
-            modifier = Modifier.fillMaxWidth(),
-            colors   = ButtonDefaults.buttonColors(containerColor = BgCard),
-            border   = BorderStroke(0.5.dp, White30)
-        ) {
-            if (state.importing) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = AccentGreen, strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-                Text("Importing…", color = White90, fontSize = 13.sp)
-            } else {
-                Icon(Icons.Default.UploadFile, null, tint = AccentGreen, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Pick report.md", color = White90, fontSize = 13.sp)
+    fun clearHistory() {
+        val initial = listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        _state.update { it.copy(messages = initial) }
+        // FIX: putString(key, null) crashes on non-null String param — use remove() instead
+        CheckmatePrefs.remove(PREFS_KEY_HISTORY)
+    }
+
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(20)
+        return msgs.joinToString("\n") { msg ->
+            if (msg.role == "user") "Student: ${msg.content}"
+            else "Mentor: ${msg.content}"
+        }
+    }
+
+    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
+    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
+    // other suspend call this function already awaits nothing for (buildSystemPrompt
+    // itself did no suspending work before this). Its one call site (send(), above)
+    // already invokes it from inside viewModelScope.launch, so this is a signature-only
+    // change — no call-site rewrite needed.
+    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
+        val profile         = ConsultationProfile.load()
+        val ledger          = BehaviorLedger.getSummaryForPlanner()
+        val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
+
+        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
+        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
+        // updates, and upcoming coaching tests. These four blocks close that gap.
+        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
+        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
+            todayTasks.joinToString("\n") { t ->
+                val marker = when (t.state) {
+                    TaskState.DONE    -> "[DONE]"
+                    TaskState.SKIPPED -> "[SKIPPED]"
+                    TaskState.ACTIVE  -> "[ACTIVE]"
+                    TaskState.PAUSED  -> "[PAUSED]"
+                    TaskState.PENDING -> "[PENDING]"
+                }
+                val custom = if (t.isCustom) " (custom)" else ""
+                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
             }
         }
 
-        state.importError?.let { err ->
-            Text(
-                err, fontSize = 12.sp, color = AccentRed,
-                modifier = Modifier.padding(top = 10.dp)
+        val usageSummary = try {
+            AppUsageTracker.getTodayUsage(context, limit = 5)
+                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
+        } catch (_: Exception) { "" }
+
+        val todayContext = TodayContext.getSummaryText()
+        val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
+
+        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
+        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
+        // import — see TestResultNormalizer) into one StudentModel, but nothing read
+        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
+        // ledger, blind to actual test performance. buildLearningSummary() below
+        // compacts it into the same plain-text block style as planSummary/ledger.
+        val learningSummary = try {
+            buildLearningSummary(StudentModelBuilder.build(context))
+        } catch (e: Exception) {
+            "" // same fail-open pattern as usageSummary/coachingContext above — a
+               // learning-state read failure shouldn't block the rest of the prompt.
+        }
+
+        return buildString {
+            appendLine("""
+You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
+You have full context about this student. Be specific, direct, and curriculum-aware.
+Keep responses under 5 lines unless a detailed breakdown is needed.
+Never give generic motivation. React to actual data.
+Refer to specific topics, chapters, marks gaps, and deadlines.
+You also have access to the full conversation history above — refer to it naturally when relevant.
+If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
+you may briefly flag it — but don't derail the actual question they asked.
+If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
+the student's question, reference them specifically instead of speaking generically.
+            """.trimIndent())
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            appendLine("BEHAVIOR DATA: $ledger")
+            appendLine()
+            appendLine("TODAY'S PLAN:")
+            appendLine(planSummary)
+            appendLine()
+            if (learningSummary.isNotBlank()) {
+                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
+                appendLine(learningSummary)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES:")
+                appendLine(todayContext)
+                appendLine()
+            }
+            if (usageSummary.isNotBlank()) {
+                appendLine("TODAY'S APP USAGE (top 5):")
+                appendLine(usageSummary)
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING TESTS/LECTURES (next 3 days):")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (knowledgeBlocks.isNotBlank()) {
+                appendLine("RELEVANT KNOWLEDGE:")
+                appendLine(knowledgeBlocks)
+                appendLine()
+            }
+            appendLine("Respond as Mentor.")
+        }.trim()
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
+     * plain-text block matching the existing planSummary/ledger style — Mentor's
+     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
+     * convention, so this deliberately doesn't reuse AdaptivePlanner's
+     * StudentModelPromptSummary/Json.encodeToString approach.
+     *
+     * Empty-guard: returns "" when no report has ever been imported
+     * (conceptsTracked == 0) — same pattern as the other optional context blocks
+     * above (usageSummary/coachingContext) — so a student who hasn't imported a
+     * mock yet doesn't get a misleading "0 concepts tracked" section.
+     */
+    private fun buildLearningSummary(model: StudentModel): String {
+        if (model.overall.conceptsTracked == 0) return ""
+
+        val overall = model.overall
+        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(5)
+        val topErrors = model.unresolvedErrors.take(5)
+
+        return buildString {
+            appendLine(
+                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
+                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
+                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
             )
-        }
-
-        state.importResult?.let { result ->
-            Spacer(Modifier.height(12.dp))
-            ImportResultCard(result, onDismiss)
-        }
-    }
-}
-
-@Composable
-private fun ImportResultCard(
-    result: com.checkmate.learning.testmate.TestResultNormalizer.NormalizeResult,
-    onDismiss: () -> Unit
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, if (result.alreadyImported) AccentAmber else AccentGreen)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    if (result.alreadyImported) "Already imported" else "Imported",
-                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                    color = if (result.alreadyImported) AccentAmber else AccentGreen
-                )
-                IconButton(onClick = onDismiss, modifier = Modifier.size(20.dp)) {
-                    Icon(Icons.Default.Close, null, tint = White60, modifier = Modifier.size(16.dp))
+            if (weakest.isNotEmpty()) {
+                appendLine("Weakest concepts:")
+                weakest.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) " (traces to a weak prerequisite)" else ""
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
                 }
             }
-            if (result.alreadyImported) {
-                Text(
-                    "This test was already imported — no duplicate attempts written.",
-                    fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 6.dp)
-                )
-            } else {
-                Spacer(Modifier.height(10.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    MiniStat("Questions", "${result.questionsWritten}", AccentGreen)
-                    MiniStat("Attempts", "${result.attemptsWritten}", AccentGreen)
-                    MiniStat("Errors", "${result.errorsClassified}", AccentRed)
-                    MiniStat("Concepts", "${result.conceptsRecomputed}", AccentAmber)
+            if (reviewDue.isNotEmpty()) {
+                appendLine("Due for review (forgetting risk rising):")
+                reviewDue.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
                 }
             }
-            if (result.warnings.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                result.warnings.forEach { w ->
-                    Text("⚠ $w", fontSize = 11.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
+            if (topErrors.isNotEmpty()) {
+                appendLine("Recurring errors:")
+                topErrors.forEach { e ->
+                    val concept = model.concepts[e.conceptId]
+                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
+                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
                 }
             }
+        }.trim()
+    }
+
+    companion object {
+        /**
+         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
+         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
+         * directly into the same persisted chat history MentorViewModel reads on init — turning
+         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
+         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
+         * methods above so a message appended here shows up next time MentorScreen is opened.
+         */
+        fun appendProactiveMessage(text: String) {
+            val clean = text.trim()
+            if (clean.isEmpty()) return
+            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+            val existing = if (saved != null) {
+                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+                catch (_: Exception) { emptyList() }
+            } else emptyList()
+            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(updated))
         }
     }
 }
-
-@Composable
-private fun ResultSummaryCard(result: com.checkmate.testmate.TestmateResult) {
-    Surface(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, White10)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(result.testTitle, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "%.0f/%.0f (%.0f%%)".format(result.score, result.totalMarks, result.accuracyPct),
-                fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                color = scoreColor(result.accuracyPct)
-            )
-            result.rankInSession?.let {
-                Text("Rank #$it", fontSize = 12.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
-            }
-            Spacer(Modifier.height(12.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                MiniStat("Correct", "${result.correctCount}", AccentGreen)
-                MiniStat("Wrong", "${result.incorrectCount}", AccentRed)
-                MiniStat("Skipped", "${result.skippedCount}", White60)
-                MiniStat("Avg time", "${result.avgTimePerQuestion.toInt()}s", White60)
-            }
-        }
-    }
-}
-
-@Composable
-private fun WeakAreasCard(title: String, areas: List<TestmateWeakArea>) {
-    Surface(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, White10)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(10.dp))
-            areas.forEach { area ->
-                Column(modifier = Modifier.padding(bottom = 8.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(area.name, fontSize = 13.sp, color = White90)
-                        Text(
-                            "%.0f%% (%d)".format(area.accuracyPct, area.attempted),
-                            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
-                        )
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    LinearProgressIndicator(
-                        progress   = { (area.accuracyPct / 100f).toFloat().coerceIn(0f, 1f) },
-                        modifier   = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
-                        color      = AccentRed,
-                        trackColor = White10
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MiniStat(label: String, value: String, color: androidx.compose.ui.graphics.Color) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = color)
-        Text(label, fontSize = 10.sp, color = White60)
-    }
-}
-
-private fun scoreColor(accuracyPct: Double): androidx.compose.ui.graphics.Color = when {
-    accuracyPct >= 70 -> AccentGreen
-    accuracyPct >= 40 -> AccentAmber
-    else              -> AccentRed
-}
-
-
