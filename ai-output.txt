@@ -1,393 +1,2182 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
-package com.checkmate
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/KnowledgeGraph.kt =====
+package com.checkmate.learning.graph
 
-import android.app.Application
 import android.content.Context
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CheckmateState
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.intervention.InterventionGuardianBridge
-import com.checkmate.planner.intervention.InterventionGuardianGateway
-import com.checkmate.planner.intervention.InterventionNotificationBridge
-import com.checkmate.planner.intervention.InterventionReconciliation
-import com.checkmate.planner.intervention.InterventionTriggerScheduler
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.psyche.BehaviorLedger
-import com.checkmate.service.BehaviorLedgerSyncManager
-import com.checkmate.service.DayHistorySyncManager
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.OutcomeLedgerSyncManager
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.service.StudyStateSyncManager
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.DistractionListener
-import com.checkmate.workmode.ScrollGuard
-import com.checkmate.workmode.UninstallAlertListener
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeScheduleReceiver
+import com.checkmate.core.ExamSyllabus
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.repository.LearningDatabase
+import java.security.MessageDigest
 
-class CheckmateApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        CheckmatePrefs.init(this)
-        CheckmateState.init(this)
-        CheckmateTTS.init(this)
-        // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
-        // opens BehaviorDatabase, imports any pre-upgrade CheckmatePrefs event history
-        // into it once, and loads the in-memory read cache — see BehaviorLedger.init()'s
-        // own doc for why this runs synchronously here, same as CheckmatePrefs.init()
-        // right above. Must run before anything below can call BehaviorLedger or
-        // PsycheEngine (WorkModeManager.init() does, via the skip-rate check).
-        BehaviorLedger.init(this)
+/**
+ * Upgrade Blueprint Phase 1.4 ("Concept-level knowledge graph, not chapter-level
+ * weakness"). See [Concept]'s class doc for the honest limitation on granularity —
+ * one Concept here = one [ExamSyllabus] topic, not a true sub-topic concept, since
+ * nothing in this codebase defines concepts finer than that.
+ */
+object KnowledgeGraph {
 
-        // Reconcile Work Mode with the hardcoded daily schedule (usual
-        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
-        // Sunday/Wednesday) and re-arm the four daily boundary alarms
-        // (AlarmManager repeating alarms don't survive a reboot, hence also
-        // doing this in BootReceiver). This must run after
-        // CheckmateState.init() above.
-        WorkModeManager.init(this)
-        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
-        GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
-        // worker's KV for the on-demand "usage" command (see worker.js).
-        GuardianNotifier.scheduleUsageReports(this)
-        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
-        // guardian report via WhatsApp + Telegram. Previously never
-        // scheduled anywhere, which is why the weekly report never sent.
-        GuardianNotifier.scheduleWeeklyReport(this)
-        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+    // BUG CAUGHT AGAINST REAL DATA: Testmate's own report.md carries exam strings
+    // like "NEET-2027" (title-embedded year — see the sample
+    // ft-01b-full-test-neet-2027--report.md), but ExamSyllabus's top-level keys are
+    // bare exam names ("NEET", "JEE", ...). Without normalizing, every real import
+    // would key concepts under "neet-2027-..." while seedExamSyllabus("NEET") keys
+    // them under "neet-...", and the two would never join — mastery computed from
+    // real attempts would sit in a completely different set of rows than the
+    // syllabus-seeded prerequisite graph. Stripping a trailing "-YYYY" fixes the
+    // common case. An exam string that doesn't end in a year, or an ExamSyllabus
+    // key that later grows its own year suffix, would need this revisited.
+    private val YEAR_SUFFIX = Regex("""-(19|20)\d{2}$""")
+    // Was private — widened to internal so the one real call site for
+    // seedExamSyllabus (TestResultNormalizer, wiring it in for the first time) can
+    // normalize a report's raw exam string ("NEET-2027") to an ExamSyllabus key
+    // ("NEET") before calling it, without duplicating this regex there.
+    internal fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
 
-        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
-        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
-        // where a worker run could find InterventionNotificationBridge.gateway still null
-        // and silently fall back to the deterministic path when a notification was actually
-        // intended. InterventionNotifier is `app`'s implementation — the only module that
-        // can see both Android's NotificationManager and psyche's ContextBuilder at once
-        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
-        InterventionNotificationBridge.gateway = InterventionNotifier
+    /**
+     * Deterministic id from (exam, chapter, topic) — deliberately NOT subject. See
+     * [com.checkmate.learning.engine.MasteryEngine]'s class doc: real
+     * TestResultNormalizer-imported Questions never carry a subject (report.md has
+     * no subject field), so keying on subject would split a seeded syllabus concept
+     * and its real-import attempts into two rows that never join. `topic` falls
+     * back to `chapter` when null, matching TestReportParser's own dash-to-null
+     * normalization (chapter-level granularity when Testmate reports no topic).
+     */
+    fun conceptId(exam: String, chapter: String, topic: String?): String {
+        val key = "${normalizeExam(exam).lowercase()}|${chapter.trim().lowercase()}|" +
+            "${(topic ?: chapter).trim().lowercase()}"
+        return slugify(key)
+    }
 
-        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
-        // intent always resolved the transaction, but nothing downstream ever notified
-        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
-        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
-        // this just gives the intervention pipeline a way to call it without planner
-        // depending on `app` directly.
-        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
-            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
-                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
+    private fun slugify(raw: String): String {
+        val slug = raw.replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        // Hash suffix guards against two different raw keys slugifying to the same
+        // truncated prefix — cheap insurance, not expected to matter at this data scale.
+        val hash = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
+            .joinToString("") { "%02x".format(it) }.take(8)
+        return "${slug.take(60)}-$hash"
+    }
+
+    /**
+     * Topic-level prerequisite graph for NEET and JEE — every (chapter, topic) pair
+     * here is checked at generation time to match an actual leaf in
+     * [ExamSyllabus.data] (no free-floating/typo'd concept names), and the combined
+     * graph is verified acyclic (no topic can trace back to itself through its own
+     * prerequisite chain) before being committed here.
+     *
+     * GRANULARITY MISMATCH BETWEEN NEET AND JEE, BY NECESSITY: NEET chapters now
+     * match [ExamSyllabus]'s real per-unit granularity (rebuilt off the actual
+     * NTA/NMC NEET(UG)-2026 notified syllabus — see that file's doc comment), so
+     * NEET edges here are correspondingly fine-grained but NOT exhaustive: they
+     * cover the between-unit dependency chain (roughly NTA's own unit ordering,
+     * e.g. Kinematics -> Laws Of Motion -> Work Energy And Power) plus a few
+     * additional real cross-links (e.g. Optics also needs Oscillations And Waves,
+     * not just the linear chain), rather than every possible topic-to-topic edge
+     * within 400+ NEET topics — that density wouldn't add real diagnostic signal
+     * over the same unit-level chain. JEE chapters are still the earlier coarser
+     * grouping (e.g. "Mechanics" as one chapter covering many NTA-JEE units) and
+     * haven't had the same real-syllabus rebuild yet — same treatment applies to
+     * JEE if/when needed, matching how [ExamSyllabus]'s own doc comment flags it.
+     *
+     * SCOPE CALL, not an oversight: CUET and SSC CGL are deliberately NOT covered.
+     * CUET's Biology/Chemistry/Physics blocks are the same NEET/JEE content
+     * re-labelled "Class 11 X / Class 12 X" — a real prerequisite tree for it would
+     * just be this same NEET/JEE graph reprojected onto renamed chapters, which
+     * isn't worth a second maintained copy. SSC CGL's chapters (verbal/non-verbal
+     * reasoning, vocabulary, current affairs, static GK) don't have a genuine
+     * prerequisite structure the way STEM concepts do — "Idioms and Phrases" isn't
+     * downstream of "Synonyms and Antonyms" in any real pedagogical sense — so
+     * inventing edges there would be fabricated structure, not curriculum accuracy.
+     * Revisit if CUET/SSC CGL ever need real diagnostic depth of their own.
+     *
+     * [seedExamSyllabus] applies whatever's here; edges for an exam this list
+     * doesn't cover simply produce no ConceptDependency rows for that exam (existing
+     * fail-open behavior, unchanged).
+     */
+    private data class PrerequisiteSeed(
+        val exam: String, val chapter: String, val topic: String,
+        val prerequisiteChapter: String, val prerequisiteTopic: String
+    )
+
+    private val SEED_PREREQUISITES = listOf(
+        // JEE Mathematics — Algebra
+        PrerequisiteSeed("JEE", "Algebra", "Quadratic Equations", "Algebra", "Complex Numbers"),
+        PrerequisiteSeed("JEE", "Algebra", "Sequences and Series", "Algebra", "Quadratic Equations"),
+        PrerequisiteSeed("JEE", "Algebra", "Permutations and Combinations", "Algebra", "Sequences and Series"),
+        PrerequisiteSeed("JEE", "Algebra", "Binomial Theorem", "Algebra", "Permutations and Combinations"),
+        PrerequisiteSeed("JEE", "Algebra", "Matrices and Determinants", "Algebra", "Quadratic Equations"),
+        PrerequisiteSeed("JEE", "Algebra", "Mathematical Induction", "Algebra", "Sequences and Series"),
+        // JEE Mathematics — Trigonometry
+        PrerequisiteSeed("JEE", "Trigonometry", "Trigonometric Equations", "Trigonometry", "Trigonometric Ratios"),
+        PrerequisiteSeed("JEE", "Trigonometry", "Inverse Trigonometry", "Trigonometry", "Trigonometric Ratios"),
+        PrerequisiteSeed("JEE", "Trigonometry", "Properties of Triangles", "Trigonometry", "Trigonometric Ratios"),
+        PrerequisiteSeed("JEE", "Trigonometry", "Properties of Triangles", "Trigonometry", "Inverse Trigonometry"),
+        // JEE Mathematics — Calculus
+        PrerequisiteSeed("JEE", "Calculus", "Differentiation", "Calculus", "Limits and Continuity"),
+        PrerequisiteSeed("JEE", "Calculus", "Applications of Derivatives", "Calculus", "Differentiation"),
+        PrerequisiteSeed("JEE", "Calculus", "Integration", "Calculus", "Differentiation"),
+        PrerequisiteSeed("JEE", "Calculus", "Definite Integrals", "Calculus", "Integration"),
+        PrerequisiteSeed("JEE", "Calculus", "Area Under Curves", "Calculus", "Definite Integrals"),
+        PrerequisiteSeed("JEE", "Calculus", "Differential Equations", "Calculus", "Integration"),
+        // JEE Mathematics — Coordinate Geometry
+        PrerequisiteSeed("JEE", "Coordinate Geometry", "Circles", "Coordinate Geometry", "Straight Lines"),
+        PrerequisiteSeed("JEE", "Coordinate Geometry", "Parabola", "Coordinate Geometry", "Straight Lines"),
+        PrerequisiteSeed("JEE", "Coordinate Geometry", "Ellipse", "Coordinate Geometry", "Parabola"),
+        PrerequisiteSeed("JEE", "Coordinate Geometry", "Hyperbola", "Coordinate Geometry", "Ellipse"),
+        // JEE Mathematics — Vectors and 3D
+        PrerequisiteSeed("JEE", "Vectors and 3D", "3D Geometry", "Vectors and 3D", "Vectors"),
+        PrerequisiteSeed("JEE", "Vectors and 3D", "Planes and Lines in 3D", "Vectors and 3D", "3D Geometry"),
+        // JEE Mathematics — Probability and Statistics
+        PrerequisiteSeed("JEE", "Probability and Statistics", "Bayes Theorem", "Probability and Statistics", "Probability"),
+        PrerequisiteSeed("JEE", "Probability and Statistics", "Random Variables", "Probability and Statistics", "Probability"),
+        PrerequisiteSeed("JEE", "Probability and Statistics", "Statistics", "Probability and Statistics", "Random Variables"),
+        // JEE Physics — Mechanics
+        PrerequisiteSeed("JEE", "Mechanics", "Newton's Laws", "Mechanics", "Kinematics"),
+        PrerequisiteSeed("JEE", "Mechanics", "Work Energy Theorem", "Mechanics", "Newton's Laws"),
+        PrerequisiteSeed("JEE", "Mechanics", "Rotational Dynamics", "Mechanics", "Newton's Laws"),
+        PrerequisiteSeed("JEE", "Mechanics", "Rotational Dynamics", "Mechanics", "Work Energy Theorem"),
+        PrerequisiteSeed("JEE", "Mechanics", "Gravitation", "Mechanics", "Newton's Laws"),
+        PrerequisiteSeed("JEE", "Mechanics", "Gravitation", "Mechanics", "Work Energy Theorem"),
+        PrerequisiteSeed("JEE", "Mechanics", "Fluid Mechanics", "Mechanics", "Work Energy Theorem"),
+        PrerequisiteSeed("JEE", "Mechanics", "Simple Harmonic Motion", "Mechanics", "Newton's Laws"),
+        PrerequisiteSeed("JEE", "Mechanics", "Waves and Sound", "Mechanics", "Simple Harmonic Motion"),
+        // JEE Physics — Thermodynamics
+        PrerequisiteSeed("JEE", "Thermodynamics", "Kinetic Theory", "Mechanics", "Newton's Laws"),
+        PrerequisiteSeed("JEE", "Thermodynamics", "Laws of Thermodynamics", "Thermodynamics", "Kinetic Theory"),
+        PrerequisiteSeed("JEE", "Thermodynamics", "Calorimetry", "Thermodynamics", "Laws of Thermodynamics"),
+        // JEE Physics — Electromagnetism
+        PrerequisiteSeed("JEE", "Electromagnetism", "Current Electricity", "Electromagnetism", "Electrostatics"),
+        PrerequisiteSeed("JEE", "Electromagnetism", "Magnetism", "Electromagnetism", "Current Electricity"),
+        PrerequisiteSeed("JEE", "Electromagnetism", "Electromagnetic Induction", "Electromagnetism", "Magnetism"),
+        PrerequisiteSeed("JEE", "Electromagnetism", "AC Circuits", "Electromagnetism", "Electromagnetic Induction"),
+        PrerequisiteSeed("JEE", "Electromagnetism", "EM Waves", "Electromagnetism", "AC Circuits"),
+        // JEE Physics — Optics and Modern Physics
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Wave Optics", "Optics and Modern Physics", "Ray Optics"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Photoelectric Effect", "Optics and Modern Physics", "Wave Optics"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Photoelectric Effect", "Electromagnetism", "EM Waves"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Atomic Models", "Optics and Modern Physics", "Photoelectric Effect"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Nuclear Physics", "Optics and Modern Physics", "Atomic Models"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Semiconductors", "Electromagnetism", "Current Electricity"),
+        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Semiconductors", "Optics and Modern Physics", "Atomic Models"),
+        // JEE Chemistry — Physical Chemistry
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Bonding", "Physical Chemistry", "Atomic Structure"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Equilibrium", "Physical Chemistry", "Thermodynamics"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Thermodynamics", "Physical Chemistry", "Chemical Bonding"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Electrochemistry", "Physical Chemistry", "Chemical Equilibrium"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Kinetics", "Physical Chemistry", "Chemical Equilibrium"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Solutions", "Physical Chemistry", "Chemical Equilibrium"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Solid State", "Physical Chemistry", "Chemical Bonding"),
+        PrerequisiteSeed("JEE", "Physical Chemistry", "Surface Chemistry", "Physical Chemistry", "Chemical Kinetics"),
+        // JEE Chemistry — Organic Chemistry
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Reaction Mechanisms", "Organic Chemistry", "IUPAC Nomenclature"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Hydrocarbons", "Organic Chemistry", "IUPAC Nomenclature"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Functional Group Chemistry", "Organic Chemistry", "Hydrocarbons"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Functional Group Chemistry", "Organic Chemistry", "Reaction Mechanisms"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Biomolecules", "Organic Chemistry", "Functional Group Chemistry"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Polymers", "Organic Chemistry", "Functional Group Chemistry"),
+        PrerequisiteSeed("JEE", "Organic Chemistry", "Practical Organic Chemistry", "Organic Chemistry", "Functional Group Chemistry"),
+        // JEE Chemistry — Inorganic Chemistry
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Chemical Bonding Advanced", "Inorganic Chemistry", "Periodic Table Trends"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Chemical Bonding Advanced", "Physical Chemistry", "Chemical Bonding"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "s p d f Block Elements", "Inorganic Chemistry", "Periodic Table Trends"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Coordination Chemistry", "Inorganic Chemistry", "s p d f Block Elements"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Coordination Chemistry", "Inorganic Chemistry", "Chemical Bonding Advanced"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Analytical Chemistry", "Inorganic Chemistry", "Coordination Chemistry"),
+        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Metallurgy", "Inorganic Chemistry", "s p d f Block Elements"),
+        // NEET — Kinematics
+        PrerequisiteSeed("NEET", "Kinematics", "Frame of Reference", "Physics And Measurement", "Dimensional Analysis and Applications"),
+        // NEET — Laws Of Motion
+        PrerequisiteSeed("NEET", "Laws Of Motion", "Force and Inertia", "Kinematics", "Uniformly Accelerated Motion"),
+        // NEET — Work Energy And Power
+        PrerequisiteSeed("NEET", "Work Energy And Power", "Work Done by Constant and Variable Force", "Laws Of Motion", "Newton's Second Law of Motion"),
+        // NEET — Rotational Motion
+        PrerequisiteSeed("NEET", "Rotational Motion", "Centre of Mass", "Work Energy And Power", "Work-Energy Theorem"),
+        // NEET — Gravitation
+        PrerequisiteSeed("NEET", "Gravitation", "Universal Law of Gravitation", "Rotational Motion", "Moment of Inertia"),
+        // NEET — Properties Of Solids And Liquids
+        PrerequisiteSeed("NEET", "Properties Of Solids And Liquids", "Elastic Behaviour", "Gravitation", "Universal Law of Gravitation"),
+        // NEET — Thermodynamics
+        PrerequisiteSeed("NEET", "Thermodynamics", "Thermal Equilibrium", "Properties Of Solids And Liquids", "Bernoulli's Principle"),
+        // NEET — Kinetic Theory Of Gases
+        PrerequisiteSeed("NEET", "Kinetic Theory Of Gases", "Equation of State of a Perfect Gas", "Thermodynamics", "First Law of Thermodynamics"),
+        // NEET — Oscillations And Waves
+        PrerequisiteSeed("NEET", "Oscillations And Waves", "Periodic Motion", "Kinetic Theory Of Gases", "Kinetic Interpretation of Temperature"),
+        // NEET — Electrostatics
+        PrerequisiteSeed("NEET", "Electrostatics", "Electric Charges and Conservation of Charge", "Oscillations And Waves", "Simple Harmonic Motion"),
+        // NEET — Current Electricity
+        PrerequisiteSeed("NEET", "Current Electricity", "Electric Current", "Electrostatics", "Gauss's Law and Applications"),
+        // NEET — Magnetic Effects Of Current And Magnetism
+        PrerequisiteSeed("NEET", "Magnetic Effects Of Current And Magnetism", "Biot-Savart Law", "Current Electricity", "Ohm's Law"),
+        // NEET — Electromagnetic Induction And Alternating Currents
+        PrerequisiteSeed("NEET", "Electromagnetic Induction And Alternating Currents", "Faraday's Law", "Magnetic Effects Of Current And Magnetism", "Biot-Savart Law"),
+        // NEET — Electromagnetic Waves
+        PrerequisiteSeed("NEET", "Electromagnetic Waves", "Displacement Current", "Electromagnetic Induction And Alternating Currents", "Faraday's Law"),
+        // NEET — Optics
+        PrerequisiteSeed("NEET", "Optics", "Reflection of Light", "Electromagnetic Waves", "Characteristics of Electromagnetic Waves"),
+        // NEET — Dual Nature Of Matter And Radiation
+        PrerequisiteSeed("NEET", "Dual Nature Of Matter And Radiation", "Photoelectric Effect", "Optics", "Refraction of Light"),
+        // NEET — Atoms And Nuclei
+        PrerequisiteSeed("NEET", "Atoms And Nuclei", "Alpha-Particle Scattering Experiment", "Dual Nature Of Matter And Radiation", "Photoelectric Effect"),
+        // NEET — Electronic Devices
+        PrerequisiteSeed("NEET", "Electronic Devices", "Semiconductors", "Atoms And Nuclei", "Bohr Model and Energy Levels"),
+        // NEET — Optics
+        PrerequisiteSeed("NEET", "Optics", "Wavefront and Huygens' Principle", "Oscillations And Waves", "Wave Motion"),
+        // NEET — Electronic Devices
+        PrerequisiteSeed("NEET", "Electronic Devices", "Semiconductors", "Current Electricity", "Ohm's Law"),
+        // NEET — Atomic Structure
+        PrerequisiteSeed("NEET", "Atomic Structure", "Electromagnetic Radiation and Photoelectric Effect", "Some Basic Concepts In Chemistry", "Mole Concept and Molar Mass"),
+        // NEET — Chemical Bonding And Molecular Structure
+        PrerequisiteSeed("NEET", "Chemical Bonding And Molecular Structure", "Kossel-Lewis Approach", "Atomic Structure", "Quantum Mechanical Model of Atom"),
+        // NEET — Chemical Thermodynamics
+        PrerequisiteSeed("NEET", "Chemical Thermodynamics", "System and Surroundings", "Chemical Bonding And Molecular Structure", "Valence Bond Theory"),
+        // NEET — Equilibrium
+        PrerequisiteSeed("NEET", "Equilibrium", "Dynamic Equilibrium", "Chemical Thermodynamics", "First Law of Thermodynamics"),
+        // NEET — Solutions
+        PrerequisiteSeed("NEET", "Solutions", "Methods of Expressing Concentration", "Equilibrium", "Law of Chemical Equilibrium"),
+        // NEET — Redox Reactions And Electrochemistry
+        PrerequisiteSeed("NEET", "Redox Reactions And Electrochemistry", "Oxidation and Reduction", "Solutions", "Colligative Properties"),
+        // NEET — Chemical Kinetics
+        PrerequisiteSeed("NEET", "Chemical Kinetics", "Rate of a Chemical Reaction", "Redox Reactions And Electrochemistry", "Oxidation Number"),
+        // NEET — Classification Of Elements And Periodicity In Properties
+        PrerequisiteSeed("NEET", "Classification Of Elements And Periodicity In Properties", "Modern Periodic Law", "Chemical Kinetics", "Rate Law and Rate Constant"),
+        // NEET — P-Block Elements
+        PrerequisiteSeed("NEET", "P-Block Elements", "Group 13 to Group 18 Elements", "Classification Of Elements And Periodicity In Properties", "Periodic Trends — Atomic and Ionic Radii"),
+        // NEET — d And f Block Elements
+        PrerequisiteSeed("NEET", "d And f Block Elements", "Transition Elements — Electronic Configuration and Occurrence", "P-Block Elements", "Electronic Configuration Trends"),
+        // NEET — Co-Ordination Compounds
+        PrerequisiteSeed("NEET", "Co-Ordination Compounds", "Werner's Theory", "d And f Block Elements", "Transition Elements — Electronic Configuration and Occurrence"),
+        // NEET — Solutions
+        PrerequisiteSeed("NEET", "Solutions", "Colligative Properties", "Equilibrium", "Law of Chemical Equilibrium"),
+        // NEET — Some Basic Principles Of Organic Chemistry
+        PrerequisiteSeed("NEET", "Some Basic Principles Of Organic Chemistry", "Hybridization and Shapes of Molecules", "Chemical Bonding And Molecular Structure", "Hybridization"),
+        PrerequisiteSeed("NEET", "Some Basic Principles Of Organic Chemistry", "Tetravalency of Carbon", "Purification And Characterisation Of Organic Compounds", "Qualitative Analysis — Detection of N S P Halogens"),
+        // NEET — Hydrocarbons
+        PrerequisiteSeed("NEET", "Hydrocarbons", "Classification Isomerism and Nomenclature of Hydrocarbons", "Some Basic Principles Of Organic Chemistry", "Inductive Effect"),
+        // NEET — Organic Compounds Containing Halogens
+        PrerequisiteSeed("NEET", "Organic Compounds Containing Halogens", "Preparation Properties and Reactions of Haloalkanes and Haloarenes", "Hydrocarbons", "Electrophilic Addition Mechanism"),
+        // NEET — Organic Compounds Containing Oxygen
+        PrerequisiteSeed("NEET", "Organic Compounds Containing Oxygen", "Alcohols — Primary Secondary Tertiary and Dehydration Mechanism", "Organic Compounds Containing Halogens", "Mechanisms of Substitution Reactions"),
+        // NEET — Organic Compounds Containing Nitrogen
+        PrerequisiteSeed("NEET", "Organic Compounds Containing Nitrogen", "Amines — Nomenclature Classification and Basic Character", "Organic Compounds Containing Oxygen", "Aldehydes and Ketones — Nucleophilic Addition"),
+        // NEET — Biomolecules
+        PrerequisiteSeed("NEET", "Biomolecules", "Carbohydrates — Classification Aldoses and Ketoses", "Organic Compounds Containing Nitrogen", "Amines — Nomenclature Classification and Basic Character"),
+        // NEET — Purification And Characterisation Of Organic Compounds
+        PrerequisiteSeed("NEET", "Purification And Characterisation Of Organic Compounds", "Crystallization Sublimation Distillation", "Some Basic Principles Of Organic Chemistry", "Classification by Functional Groups"),
+        // NEET — Co-Ordination Compounds
+        PrerequisiteSeed("NEET", "Co-Ordination Compounds", "IUPAC Nomenclature of Coordination Compounds", "Chemical Bonding And Molecular Structure", "Valence Bond Theory"),
+        // NEET — Structural Organisation In Animals And Plants
+        PrerequisiteSeed("NEET", "Structural Organisation In Animals And Plants", "Morphology and Modifications of Flowering Plants", "Diversity In Living World", "Five Kingdom Classification"),
+        // NEET — Cell Structure And Function
+        PrerequisiteSeed("NEET", "Cell Structure And Function", "Cell Theory", "Structural Organisation In Animals And Plants", "Plant Tissues"),
+        // NEET — Plant Physiology
+        PrerequisiteSeed("NEET", "Plant Physiology", "Photosynthesis as Autotrophic Nutrition", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
+        // NEET — Human Physiology
+        PrerequisiteSeed("NEET", "Human Physiology", "Respiratory System and Mechanism of Breathing", "Plant Physiology", "Photosynthesis as Autotrophic Nutrition"),
+        // NEET — Reproduction
+        PrerequisiteSeed("NEET", "Reproduction", "Flower Structure and Gametophyte Development", "Human Physiology", "Human Heart and Blood Vessels"),
+        // NEET — Genetics And Evolution
+        PrerequisiteSeed("NEET", "Genetics And Evolution", "Mendelian Inheritance", "Reproduction", "Fertilisation and Embryo Development to Blastocyst"),
+        // NEET — Biology And Human Welfare
+        PrerequisiteSeed("NEET", "Biology And Human Welfare", "Pathogens and Parasites Causing Human Diseases", "Genetics And Evolution", "Structure of DNA and RNA"),
+        // NEET — Biotechnology And Its Applications
+        PrerequisiteSeed("NEET", "Biotechnology And Its Applications", "Principles of Biotechnology", "Biology And Human Welfare", "Basic Concepts of Immunology and Vaccines"),
+        PrerequisiteSeed("NEET", "Biotechnology And Its Applications", "Genetic Engineering — Recombinant DNA Technology", "Genetics And Evolution", "Structure of DNA and RNA"),
+        // NEET — Reproduction
+        PrerequisiteSeed("NEET", "Reproduction", "Gametogenesis — Spermatogenesis and Oogenesis", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
+        // NEET — Genetics And Evolution
+        PrerequisiteSeed("NEET", "Genetics And Evolution", "Chromosome Theory of Inheritance", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
+        // NEET — Ecology And Environment
+        PrerequisiteSeed("NEET", "Ecology And Environment", "Ecosystem Patterns and Components", "Structural Organisation In Animals And Plants", "Plant Tissues")
+    )
+
+    /**
+     * Inserts one [Concept] row per (subject, chapter, topic) leaf of
+     * ExamSyllabus.data[exam], plus whatever [SEED_PREREQUISITES] edges apply to
+     * that exam. `exam` here must be an ExamSyllabus key ("NEET"), not a
+     * Testmate-report exam string ("NEET-2027") — [conceptId] normalizes both to
+     * the same slug internally, so this still joins correctly with real imported
+     * attempts either way.
+     *
+     * WIRING: called from [com.checkmate.learning.testmate.TestResultNormalizer.normalizeAndPersist]
+     * on every import, using `report.exam` (normalized via [normalizeExam]) as the
+     * exam key — no separate onboarding flow exists to declare a student's exam
+     * ahead of time, but every real import already carries its own exam string, so
+     * seeding opportunistically off that is the actual first real signal available,
+     * not a guess. Safe to call repeatedly for the same exam: [Concept] upsertAll
+     * overwrites identically and [ConceptDependencyDao.insertAll] is
+     * `OnConflictStrategy.IGNORE`, so a re-imported report re-seeding the same exam
+     * is a no-op past the first time, not a duplicate/corruption risk.
+     */
+    suspend fun seedExamSyllabus(context: Context, exam: String) {
+        val subjects = ExamSyllabus.data[exam] ?: return
+        val db = LearningDatabase.getInstance(context)
+
+        val concepts = subjects.flatMap { (subject, chapters) ->
+            chapters.flatMap { (chapter, topics) ->
+                topics.map { topic ->
+                    Concept(
+                        id = conceptId(exam, chapter, topic),
+                        exam = exam,
+                        subject = subject,
+                        chapter = chapter,
+                        topic = topic
+                    )
+                }
             }
         }
+        db.conceptDao().upsertAll(concepts)
 
-        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
-        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
-        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
-        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
-        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
-        // reconciliation call added to BootReceiver below.
-        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
-        InterventionReconciliation.runAtStartup(this)
-
-        // Step 12 wiring: reinstall-recovery restore for the Outcome Ledger, mirroring
-        // the profile pull pattern (ProfileSyncManager.pullProfileIfLocalEmpty) but at
-        // app startup rather than lazily on a specific screen open — there's no single
-        // "ledger screen" whose open would naturally trigger this the way Planner/
-        // ConsultationProfile do for the profile pull. No-op if the local ledger table
-        // already has rows, or if no sync_code is configured — see
-        // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
-        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
-
-        // "Sync everything" pass: same reinstall-recovery restore, same startup call
-        // site, for the behavior event ledger (BehaviorDatabase — see
-        // BehaviorLedgerSyncManager's own doc for why this is a separate table/sync
-        // manager from the Outcome Ledger above rather than merged into it). No-op if
-        // local rows already exist or no sync_code is configured.
-        BehaviorLedgerSyncManager.pullLedgerIfLocalEmpty(this)
-
-        // Same "sync everything" pass for the two synchronous-OkHttp managers
-        // (StudyStateSyncManager / DayHistorySyncManager — see their own docs).
-        // Backgrounded explicitly, unlike the two calls just above: those two own
-        // an internal IO-scoped coroutine and return immediately regardless of
-        // caller thread, these two block on client.newCall().execute() directly,
-        // and Application.onCreate() itself runs on the main thread.
-        Thread {
-            StudyStateSyncManager.pullStateIfEmpty()
-            DayHistorySyncManager.pullMissingDays()
-        }.start()
-
-        // Wire real screenshot capture via MediaProjection into DistractionGuard
-        // (and ScrollGuard, which reuses the same listener/pipeline for its
-        // "scroll" kind — see ScrollGuard.kt)
-        val distractionListener = object : DistractionListener {
-            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                Thread {
-                    val uri = ScreenCaptureManager.capture(context)
-                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
-                }.start()
-                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
-                // the guardian-facing alert above — this is student-facing, not parent-facing.
-                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
+        val edges = SEED_PREREQUISITES
+            .filter { it.exam == exam }
+            .map {
+                ConceptDependency(
+                    conceptId = conceptId(exam, it.chapter, it.topic),
+                    prerequisiteConceptId = conceptId(exam, it.prerequisiteChapter, it.prerequisiteTopic)
+                )
             }
-        }
-        DistractionGuard.listener = distractionListener
-        ScrollGuard.listener = distractionListener
+        db.conceptDependencyDao().insertAll(edges)
+    }
 
-        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
-        // (via :workmode's UninstallGuard) into GuardianNotifier.
-        UninstallGuard.listener = object : UninstallAlertListener {
-            override fun onGuardedScreenBlocked(context: Context, reason: String) {
-                Thread {
-                    GuardianNotifier.notifyUninstallAttempt(context, reason)
-                }.start()
-            }
+    /**
+     * Diagnoses a weak concept as a prerequisite failure where possible, per the
+     * blueprint's "rolling motion failure diagnosed as prerequisite failure"
+     * example. Returns the prerequisite [Concept]s whose mastery is below
+     * [masteryThreshold] — empty if [conceptId] has no seeded prerequisite edges
+     * (e.g. [seedExamSyllabus] was never run for its exam) or none are actually weak.
+     */
+    suspend fun diagnosePrerequisiteFailure(
+        context: Context,
+        studentId: String,
+        conceptId: String,
+        // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
+        // imported directly — avoids a graph<->engine circular reference for one constant.
+        masteryThreshold: Double = 0.75
+    ): List<Concept> {
+        val db = LearningDatabase.getInstance(context)
+        val prerequisiteIds = db.conceptDependencyDao().getPrerequisites(conceptId)
+        if (prerequisiteIds.isEmpty()) return emptyList()
+
+        return prerequisiteIds.mapNotNull { prereqId ->
+            val mastery = db.masteryDao().getByConcept(studentId, prereqId)
+            val isWeak = mastery == null || mastery.mastery < masteryThreshold
+            if (isWeak) db.conceptDao().getById(prereqId) else null
         }
     }
 }
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/stats/StatsViewModel.kt =====
-package com.checkmate.ui.stats
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/testmate/TestResultNormalizer.kt =====
+package com.checkmate.learning.testmate
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.engine.ErrorEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.LearningEvent
+import com.checkmate.learning.model.LearningEventType
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.Question
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
+import java.security.MessageDigest
+
+/**
+ * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
+ * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
+ * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
+ * successful import now also classifies its wrong attempts (ErrorEngine) and
+ * recomputes mastery for every concept touched (MasteryEngine) before returning.
+ * StudentModel/Planner consumption is still Phase 2 — see [NormalizeResult] below
+ * for exactly what this now writes.
+ *
+ * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
+ * This is what turns a report.md dump into that "why": one Question row per
+ * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
+ * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
+ * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
+ * row per concept the report touched.
+ *
+ * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
+ * attempt/event from one import shares [testTimestamp], which defaults to import
+ * time (now), not actual test time. Pass [testTimestamp] explicitly once there's
+ * a real source for it (e.g. a file-modified date or a user-entered date) — not
+ * guessed here.
+ */
+object TestResultNormalizer {
+
+    private const val TAG = "TestResultNormalizer"
+
+    data class NormalizeResult(
+        val alreadyImported: Boolean,
+        val questionsWritten: Int,
+        val attemptsWritten: Int,
+        val eventsWritten: Int,
+        val warnings: List<String>,
+        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
+        val errorsClassified: Int = 0,
+        val conceptsRecomputed: Int = 0
+    )
+
+    suspend fun normalizeAndPersist(
+        context: Context,
+        reportText: String,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID,
+        source: String = "testmate_report",
+        testTimestamp: Long = System.currentTimeMillis()
+    ): NormalizeResult {
+        val report = TestReportParser.parse(reportText)
+        val warnings = mutableListOf<String>()
+
+        // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
+        // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
+        // this is that call site. Every import already knows its own exam
+        // (report.exam, e.g. "NEET-2027"); normalizing it to an ExamSyllabus key
+        // ("NEET") and seeding here means diagnosePrerequisiteFailure has real
+        // prerequisite edges to walk by the time StudentModelBuilder next runs for
+        // this student, instead of silently finding none because seeding never
+        // happened. Safe on every import, including a duplicate re-import that gets
+        // caught by the idempotency guard below — see seedExamSyllabus's own doc for
+        // why a repeat call is a no-op, not a duplication risk. Fails open: a report
+        // for an exam ExamSyllabus doesn't recognize just returns from
+        // seedExamSyllabus without seeding anything, and the import continues
+        // normally either way.
+        report.exam?.let { examRaw ->
+            KnowledgeGraph.seedExamSyllabus(context, KnowledgeGraph.normalizeExam(examRaw))
+        }
+
+        if (report.questions.isEmpty()) {
+            warnings.add(
+                "No question rows parsed — report format may not match " +
+                    "TestReportParser's expected shape."
+            )
+        }
+        report.attempted?.let { expected ->
+            val actualAttempted = report.questions.count { it.status != ParsedQuestionStatus.SKIPPED }
+            if (actualAttempted != expected) {
+                warnings.add(
+                    "Header says $expected attempted, but $actualAttempted question rows " +
+                        "were non-skipped after parsing."
+                )
+            }
+        }
+
+        val db = LearningDatabase.getInstance(context)
+        val testId = deterministicTestId(report)
+
+        // Idempotency guard: the same report re-imported (e.g. user re-shares the same
+        // file) must not double-count attempts/events. Question ids are deterministic
+        // from (testId, question number), so checking the first one tells us whether
+        // this exact test was already normalized.
+        val firstQuestionId = report.questions.firstOrNull()?.let { deterministicQuestionId(testId, it.number) }
+        if (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) {
+            Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
+            return NormalizeResult(
+                alreadyImported = true,
+                questionsWritten = 0,
+                attemptsWritten = 0,
+                eventsWritten = 0,
+                warnings = warnings
+            )
+        }
+
+        val questions = mutableListOf<Question>()
+        val attempts = mutableListOf<QuestionAttempt>()
+        val events = mutableListOf<LearningEvent>()
+
+        events.add(
+            LearningEvent(
+                studentId = studentId,
+                eventType = LearningEventType.MOCK_COMPLETED,
+                timestamp = testTimestamp,
+                source = source,
+                accuracy = report.scorePercent?.let { it / 100.0 }
+            )
+        )
+
+        for (q in report.questions) {
+            val questionId = deterministicQuestionId(testId, q.number)
+
+            questions.add(
+                Question(
+                    id = questionId,
+                    source = source,
+                    exam = report.exam,
+                    chapter = q.chapter,
+                    topic = q.topic,
+                    correctOption = q.correctOption,
+                    questionText = q.questionText
+                )
+            )
+
+            attempts.add(
+                QuestionAttempt(
+                    studentId = studentId,
+                    questionId = questionId,
+                    timestamp = testTimestamp,
+                    selectedOption = q.selectedOption,
+                    correct = q.status == ParsedQuestionStatus.CORRECT,
+                    timeTakenSeconds = q.timeSeconds
+                )
+            )
+
+            val eventType = when (q.status) {
+                ParsedQuestionStatus.CORRECT -> LearningEventType.QUESTION_CORRECT
+                ParsedQuestionStatus.WRONG -> LearningEventType.QUESTION_WRONG
+                ParsedQuestionStatus.SKIPPED -> LearningEventType.QUESTION_SKIPPED
+            }
+            events.add(
+                LearningEvent(
+                    studentId = studentId,
+                    eventType = eventType,
+                    timestamp = testTimestamp,
+                    chapterId = q.chapter,
+                    topicId = q.topic,
+                    questionId = questionId,
+                    source = source,
+                    duration = q.timeSeconds
+                )
+            )
+        }
+
+        db.questionDao().upsertAll(questions)
+        db.questionAttemptDao().insertAll(attempts)
+        db.learningEventDao().insertAll(events)
+
+        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
+        // immediately gets its wrong answers classified and its touched concepts'
+        // mastery recomputed, rather than sitting inert until something else reads it.
+        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
+        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
+
+        warnings.forEach { Log.w(TAG, it) }
+        Log.d(
+            TAG,
+            "Normalized report '${report.title}': ${questions.size} questions, " +
+                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
+                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
+        )
+
+        return NormalizeResult(
+            alreadyImported = false,
+            questionsWritten = questions.size,
+            attemptsWritten = attempts.size,
+            eventsWritten = events.size,
+            warnings = warnings,
+            errorsClassified = errorRecords.size,
+            conceptsRecomputed = recomputedMastery.size
+        )
+    }
+
+    /**
+     * Stable id derived from the report's own content (exam + title), not a random
+     * UUID — the same report re-imported must resolve to the same testId so the
+     * idempotency guard above actually works.
+     */
+    private fun deterministicTestId(report: ParsedTestReport): String =
+        sha256Hex("${report.exam ?: ""}|${report.title}").take(16)
+
+    private fun deterministicQuestionId(testId: String, questionNumber: Int): String =
+        "$testId-q$questionNumber"
+
+    private fun sha256Hex(input: String): String =
+        MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+}
+
+
+//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/ExamSyllabus.kt =====
+package com.checkmate.core
+
+/**
+ * Official full syllabus for JEE / NEET / CUET (NTA) and SSC CGL (Staff Selection Commission).
+ * Structure: Exam → Subject → Chapter → List<Topic>.
+ *
+ * NEET block is transcribed directly from the NTA/NMC NEET(UG)-2026 notified syllabus
+ * (Public Notice 08.01.2026, Annexure-I). Each "Chapter" here is one official NTA "UNIT"
+ * (e.g. "UNIT 2: KINEMATICS" -> chapter "Kinematics") — this replaces an earlier version
+ * where a handful of broad groupings ("Mechanics", "Physical Chemistry") sat one level too
+ * coarse and stood in as Chapter, with each real NTA unit collapsed into a single flat Topic
+ * under it. That meant "Kinematics" existed only as one topic under "Mechanics", with no way
+ * to distinguish a student's grasp of, say, Projectile Motion from Relative Velocity. Topics
+ * are now the actual granular sub-concepts NTA lists within each unit. JEE/CUET/SSC CGL blocks
+ * are unchanged and still use the coarser grouping — same real-syllabus treatment applies to
+ * them if/when needed.
+ * SSC CGL block reflects the 2026 notification syllabus — Tier 1 (Quantitative Aptitude,
+ * General Intelligence & Reasoning, English Language, General Awareness) plus the
+ * Tier 2 Paper 1 additions (Computer Knowledge, Statistics for JSO posts).
+ */
+object ExamSyllabus {
+
+    val data: Map<String, Map<String, Map<String, List<String>>>> = mapOf(
+
+        "NEET" to mapOf(
+            "Physics" to mapOf(
+                "Physics And Measurement" to listOf("Units and Systems of Measurement", "SI Units", "Fundamental and Derived Units", "Least Count", "Significant Figures", "Errors in Measurement", "Dimensions of Physical Quantities", "Dimensional Analysis and Applications"),
+                "Kinematics" to listOf("Frame of Reference", "Motion in a Straight Line", "Position-Time Graph", "Speed and Velocity", "Uniform and Non-Uniform Motion", "Average Speed and Instantaneous Velocity", "Uniformly Accelerated Motion", "Velocity-Time Graph", "Scalars and Vectors", "Vector Addition and Subtraction", "Scalar and Vector Products", "Unit Vector", "Resolution of a Vector", "Relative Velocity", "Motion in a Plane", "Projectile Motion", "Uniform Circular Motion"),
+                "Laws Of Motion" to listOf("Force and Inertia", "Newton's First Law of Motion", "Momentum", "Newton's Second Law of Motion", "Impulse", "Newton's Third Law of Motion", "Conservation of Linear Momentum", "Equilibrium of Concurrent Forces", "Static and Kinetic Friction", "Laws of Friction", "Rolling Friction", "Centripetal Force", "Vehicle on a Level Circular Road", "Vehicle on a Banked Road"),
+                "Work Energy And Power" to listOf("Work Done by Constant and Variable Force", "Kinetic Energy", "Potential Energy", "Work-Energy Theorem", "Power", "Potential Energy of a Spring", "Conservation of Mechanical Energy", "Conservative and Non-Conservative Forces", "Motion in a Vertical Circle", "Elastic Collisions", "Inelastic Collisions"),
+                "Rotational Motion" to listOf("Centre of Mass", "Torque", "Angular Momentum", "Conservation of Angular Momentum", "Moment of Inertia", "Radius of Gyration", "Parallel and Perpendicular Axes Theorems", "Equilibrium of Rigid Bodies", "Rigid Body Rotation", "Comparison of Linear and Rotational Motion"),
+                "Gravitation" to listOf("Universal Law of Gravitation", "Acceleration Due to Gravity", "Variation of g with Altitude and Depth", "Kepler's Laws of Planetary Motion", "Gravitational Potential Energy", "Gravitational Potential", "Escape Velocity", "Orbital Velocity", "Time Period and Energy of Satellite"),
+                "Properties Of Solids And Liquids" to listOf("Elastic Behaviour", "Stress-Strain Relationship", "Hooke's Law", "Young's Modulus", "Bulk Modulus", "Modulus of Rigidity", "Pressure Due to a Fluid Column", "Pascal's Law", "Viscosity", "Stokes' Law", "Terminal Velocity", "Streamline and Turbulent Flow", "Bernoulli's Principle", "Surface Tension", "Angle of Contact", "Capillary Rise", "Heat and Temperature", "Thermal Expansion", "Specific Heat Capacity", "Calorimetry", "Change of State and Latent Heat", "Heat Transfer — Conduction Convection Radiation"),
+                "Thermodynamics" to listOf("Thermal Equilibrium", "Zeroth Law of Thermodynamics", "Heat Work and Internal Energy", "First Law of Thermodynamics", "Isothermal and Adiabatic Processes", "Second Law of Thermodynamics", "Reversible and Irreversible Processes"),
+                "Kinetic Theory Of Gases" to listOf("Equation of State of a Perfect Gas", "Work Done on Compressing a Gas", "Kinetic Theory Assumptions", "Concept of Pressure", "Kinetic Interpretation of Temperature", "RMS Speed of Gas Molecules", "Degrees of Freedom", "Law of Equipartition of Energy", "Mean Free Path", "Avogadro's Number"),
+                "Oscillations And Waves" to listOf("Periodic Motion", "Displacement as a Function of Time", "Simple Harmonic Motion", "Phase in SHM", "Oscillations of a Spring", "Energy in SHM", "Simple Pendulum", "Wave Motion", "Longitudinal and Transverse Waves", "Speed of Travelling Wave", "Superposition of Waves", "Reflection of Waves", "Standing Waves in Strings and Organ Pipes", "Beats"),
+                "Electrostatics" to listOf("Electric Charges and Conservation of Charge", "Coulomb's Law", "Superposition Principle", "Electric Field Due to a Point Charge", "Electric Field Lines", "Electric Dipole", "Torque on a Dipole", "Electric Flux", "Gauss's Law and Applications", "Electric Potential", "Equipotential Surfaces", "Electrical Potential Energy", "Conductors and Insulators", "Dielectrics and Polarization", "Capacitors and Capacitance", "Combination of Capacitors", "Energy Stored in a Capacitor"),
+                "Current Electricity" to listOf("Electric Current", "Drift Velocity and Mobility", "Ohm's Law", "V-I Characteristics", "Electrical Energy and Power", "Resistivity and Conductivity", "Series and Parallel Combination of Resistors", "Temperature Dependence of Resistance", "Internal Resistance EMF and Terminal Voltage", "Combination of Cells", "Kirchhoff's Laws", "Wheatstone Bridge", "Metre Bridge"),
+                "Magnetic Effects Of Current And Magnetism" to listOf("Biot-Savart Law", "Ampere's Law", "Force on a Moving Charge in Magnetic Field", "Force on a Current-Carrying Conductor", "Force Between Two Parallel Currents", "Torque on a Current Loop", "Moving Coil Galvanometer", "Current Loop as Magnetic Dipole", "Bar Magnet as Equivalent Solenoid", "Magnetic Field Lines", "Magnetic Field Due to a Bar Magnet", "Torque on a Magnetic Dipole", "Para Dia and Ferromagnetic Substances"),
+                "Electromagnetic Induction And Alternating Currents" to listOf("Faraday's Law", "Induced EMF and Current", "Lenz's Law", "Eddy Currents", "Self and Mutual Inductance", "Alternating Current", "Peak and RMS Values", "Reactance and Impedance", "LCR Series Circuit and Resonance", "Power in AC Circuits", "AC Generator", "Transformer"),
+                "Electromagnetic Waves" to listOf("Displacement Current", "Characteristics of Electromagnetic Waves", "Transverse Nature of EM Waves", "Electromagnetic Spectrum", "Applications of EM Waves"),
+                "Optics" to listOf("Reflection of Light", "Spherical Mirrors and Mirror Formula", "Refraction of Light", "Thin Lens Formula and Lens Maker Formula", "Total Internal Reflection", "Magnification", "Power of a Lens", "Combination of Thin Lenses", "Refraction Through a Prism", "Microscope and Telescope", "Wavefront and Huygens' Principle", "Interference and Young's Double Slit Experiment", "Diffraction Due to a Single Slit", "Polarization"),
+                "Dual Nature Of Matter And Radiation" to listOf("Photoelectric Effect", "Einstein's Photoelectric Equation", "Particle Nature of Light", "Matter Waves and de Broglie Relation"),
+                "Atoms And Nuclei" to listOf("Alpha-Particle Scattering Experiment", "Rutherford's Model of Atom", "Bohr Model and Energy Levels", "Hydrogen Spectrum", "Composition and Size of Nucleus", "Mass-Energy Relation", "Binding Energy Per Nucleon", "Nuclear Fission and Fusion"),
+                "Electronic Devices" to listOf("Semiconductors", "Semiconductor Diode I-V Characteristics", "Diode as a Rectifier", "LED Photodiode Solar Cell Zener Diode", "Zener Diode as Voltage Regulator", "Logic Gates"),
+                "Experimental Skills" to listOf("Vernier Calipers", "Screw Gauge", "Simple Pendulum Experiment", "Metre Scale Moments Experiment", "Young's Modulus Experiment", "Surface Tension by Capillary Rise", "Coefficient of Viscosity Experiment", "Speed of Sound Using Resonance Tube", "Specific Heat Capacity by Method of Mixtures", "Resistivity Using Metre Bridge", "Resistance Using Ohm's Law", "Galvanometer Figure of Merit", "Focal Length of Mirrors and Lens", "Angle of Deviation vs Angle of Incidence Prism", "Refractive Index Using Travelling Microscope", "P-N Junction Diode Characteristics", "Zener Diode Characteristics", "Identification of Circuit Components")
+            ),
+            "Chemistry" to mapOf(
+                "Some Basic Concepts In Chemistry" to listOf("Dalton's Atomic Theory", "Atom Molecule Element and Compound", "Laws of Chemical Combination", "Atomic and Molecular Masses", "Mole Concept and Molar Mass", "Percentage Composition", "Empirical and Molecular Formulae", "Chemical Equations and Stoichiometry"),
+                "Atomic Structure" to listOf("Electromagnetic Radiation and Photoelectric Effect", "Hydrogen Spectrum", "Bohr Model of Hydrogen Atom", "Limitations of Bohr's Model", "de Broglie Relationship", "Heisenberg Uncertainty Principle", "Quantum Mechanical Model of Atom", "Atomic Orbitals as Wave Functions", "Quantum Numbers", "Shapes of s p d Orbitals", "Electron Spin", "Aufbau Principle", "Pauli's Exclusion Principle", "Hund's Rule", "Electronic Configuration of Elements"),
+                "Chemical Bonding And Molecular Structure" to listOf("Kossel-Lewis Approach", "Ionic Bonding and Lattice Enthalpy", "Electronegativity and Fajan's Rule", "Dipole Moment", "VSEPR Theory", "Valence Bond Theory", "Hybridization", "Resonance", "Molecular Orbital Theory", "Bonding and Antibonding Orbitals", "Sigma and Pi Bonds", "Bond Order Length and Energy", "Metallic Bonding", "Hydrogen Bonding"),
+                "Chemical Thermodynamics" to listOf("System and Surroundings", "State Functions and Types of Processes", "First Law of Thermodynamics", "Internal Energy and Enthalpy", "Heat Capacity", "Hess's Law", "Enthalpies of Bond Dissociation Combustion Formation", "Second Law of Thermodynamics", "Spontaneity of Processes", "Gibbs Energy and Equilibrium Constant"),
+                "Solutions" to listOf("Methods of Expressing Concentration", "Vapour Pressure and Raoult's Law", "Ideal and Non-Ideal Solutions", "Colligative Properties", "Relative Lowering of Vapour Pressure", "Depression of Freezing Point", "Elevation of Boiling Point", "Osmotic Pressure", "Determination of Molecular Mass", "Van't Hoff Factor"),
+                "Equilibrium" to listOf("Dynamic Equilibrium", "Equilibria Involving Physical Processes", "Henry's Law", "Law of Chemical Equilibrium", "Equilibrium Constants Kp and Kc", "Le Chatelier's Principle", "Weak and Strong Electrolytes", "Acids and Bases — Arrhenius Bronsted-Lowry Lewis", "Ionization Constants", "pH Scale", "Common Ion Effect", "Hydrolysis of Salts", "Solubility Product", "Buffer Solutions"),
+                "Redox Reactions And Electrochemistry" to listOf("Oxidation and Reduction", "Oxidation Number", "Balancing Redox Reactions", "Electrolytic and Metallic Conduction", "Molar Conductivity", "Kohlrausch's Law", "Electrolytic and Galvanic Cells", "Electrode Potential", "Nernst Equation", "Cell Potential and Gibbs Energy", "Dry Cell and Lead Accumulator", "Fuel Cells"),
+                "Chemical Kinetics" to listOf("Rate of a Chemical Reaction", "Factors Affecting Rate of Reaction", "Order and Molecularity", "Rate Law and Rate Constant", "Zero and First Order Reactions", "Half-Life of Reactions", "Effect of Temperature on Rate", "Arrhenius Theory and Activation Energy", "Collision Theory"),
+                "Classification Of Elements And Periodicity In Properties" to listOf("Modern Periodic Law", "s p d f Block Elements", "Periodic Trends — Atomic and Ionic Radii", "Ionization Enthalpy", "Electron Gain Enthalpy", "Valence and Oxidation States", "Chemical Reactivity Trends"),
+                "P-Block Elements" to listOf("Group 13 to Group 18 Elements", "Electronic Configuration Trends", "Physical and Chemical Property Trends", "Anomalous Behaviour of First Element in Each Group"),
+                "d And f Block Elements" to listOf("Transition Elements — Electronic Configuration and Occurrence", "Ionization Enthalpy and Oxidation States of Transition Elements", "Atomic Radii Colour and Catalytic Behaviour", "Magnetic Properties and Complex Formation", "Interstitial Compounds and Alloy Formation", "Preparation and Properties of K2Cr2O7 and KMnO4", "Lanthanoids and Lanthanoid Contraction", "Actinoids"),
+                "Co-Ordination Compounds" to listOf("Werner's Theory", "Ligands Coordination Number and Denticity", "Chelation", "IUPAC Nomenclature of Coordination Compounds", "Isomerism in Coordination Compounds", "Valence Bond Approach", "Crystal Field Theory", "Colour and Magnetic Properties", "Importance of Coordination Compounds"),
+                "Purification And Characterisation Of Organic Compounds" to listOf("Crystallization Sublimation Distillation", "Differential Extraction and Chromatography", "Qualitative Analysis — Detection of N S P Halogens", "Quantitative Analysis — Estimation of C H N Halogens S P", "Empirical and Molecular Formulae Calculation"),
+                "Some Basic Principles Of Organic Chemistry" to listOf("Tetravalency of Carbon", "Hybridization and Shapes of Molecules", "Classification by Functional Groups", "Homologous Series", "Structural and Stereoisomerism", "IUPAC Nomenclature", "Homolytic and Heterolytic Fission", "Free Radicals Carbocations and Carbanions", "Electrophiles and Nucleophiles", "Inductive Effect", "Electromeric Effect", "Resonance and Hyperconjugation", "Substitution Addition Elimination Rearrangement Reactions"),
+                "Hydrocarbons" to listOf("Classification Isomerism and Nomenclature of Hydrocarbons", "Alkanes — Conformations and Halogenation Mechanism", "Alkenes — Geometrical Isomerism", "Electrophilic Addition Mechanism", "Markovnikov's Rule and Peroxide Effect", "Ozonolysis and Polymerization", "Alkynes — Acidic Character and Addition Reactions", "Aromatic Hydrocarbons — Benzene Structure and Aromaticity", "Electrophilic Substitution — Halogenation and Nitration", "Friedel-Crafts Alkylation and Acylation"),
+                "Organic Compounds Containing Halogens" to listOf("Preparation Properties and Reactions of Haloalkanes and Haloarenes", "Nature of C-X Bond", "Mechanisms of Substitution Reactions", "Uses and Environmental Effects of Chloroform Iodoform Freons DDT"),
+                "Organic Compounds Containing Oxygen" to listOf("Alcohols — Primary Secondary Tertiary and Dehydration Mechanism", "Phenols — Acidic Nature and Electrophilic Substitution", "Reimer-Tiemann Reaction", "Ethers — Structure", "Aldehydes and Ketones — Nucleophilic Addition", "Grignard Reagent", "Aldol Condensation and Cannizzaro Reaction", "Haloform Reaction", "Carboxylic Acids — Acidic Strength"),
+                "Organic Compounds Containing Nitrogen" to listOf("Amines — Nomenclature Classification and Basic Character", "Primary Secondary Tertiary Amines", "Diazonium Salts"),
+                "Biomolecules" to listOf("Carbohydrates — Classification Aldoses and Ketoses", "Monosaccharides and Oligosaccharides", "Proteins — Amino Acids and Peptide Bond", "Protein Structure — Primary Secondary Tertiary Quaternary", "Denaturation of Proteins and Enzymes", "Vitamins — Classification and Functions", "Nucleic Acids — DNA and RNA Structure and Function"),
+                "Principles Related To Practical Chemistry" to listOf("Detection of Extra Elements in Organic Compounds", "Detection of Functional Groups", "Preparation of Inorganic Compounds — Mohr's Salt Potash Alum", "Preparation of Organic Compounds — Acetanilide Iodoform", "Titrimetric Exercises — Acid Base and Redox Titrations", "Qualitative Salt Analysis — Cations", "Qualitative Salt Analysis — Anions", "Enthalpy of Solution and Neutralization Experiments", "Preparation of Lyophilic and Lyophobic Sols", "Kinetic Study of Iodide-Peroxide Reaction")
+            ),
+            "Biology" to mapOf(
+                "Diversity In Living World" to listOf("What is Living — Biodiversity and Need for Classification", "Taxonomy and Systematics", "Concept of Species and Taxonomical Hierarchy", "Binomial Nomenclature", "Five Kingdom Classification", "Monera Protista and Fungi", "Lichens Viruses and Viroids", "Classification of Plants — Algae Bryophytes Pteridophytes Gymnosperms", "Classification of Animals — Nonchordates and Chordates"),
+                "Structural Organisation In Animals And Plants" to listOf("Morphology and Modifications of Flowering Plants", "Plant Tissues", "Anatomy of Root Stem Leaf Inflorescence Flower Fruit Seed", "Plant Families — Malvaceae Cruciferae Leguminoceae Compositae Graminae", "Animal Tissues", "Morphology and Anatomy of an Insect — Digestive Circulatory Respiratory Nervous Reproductive Systems"),
+                "Cell Structure And Function" to listOf("Cell Theory", "Prokaryotic and Eukaryotic Cell Structure", "Cell Envelope Cell Membrane Cell Wall", "Cell Organelles — Endoplasmic Reticulum Golgi Bodies Lysosomes Vacuoles", "Mitochondria Ribosomes Plastids Microbodies", "Cytoskeleton Cilia Flagella Centrioles", "Nucleus — Nuclear Membrane Chromatin Nucleolus", "Biomolecules — Proteins Carbohydrates Lipids Nucleic Acids", "Enzymes — Types Properties and Action", "Cell Cycle Mitosis and Meiosis"),
+                "Plant Physiology" to listOf("Photosynthesis as Autotrophic Nutrition", "Site and Pigments of Photosynthesis", "Photochemical and Biosynthetic Phases", "Cyclic and Non-Cyclic Photophosphorylation", "Chemiosmotic Hypothesis", "Photorespiration and C3 C4 Pathways", "Factors Affecting Photosynthesis", "Cellular Respiration — Glycolysis Fermentation TCA Cycle Electron Transport", "Respiratory Quotient", "Seed Germination and Plant Growth Phases", "Differentiation Dedifferentiation Redifferentiation", "Plant Growth Regulators — Auxin Gibberellin Cytokinin Ethylene ABA"),
+                "Human Physiology" to listOf("Respiratory System and Mechanism of Breathing", "Exchange and Transport of Gases", "Respiratory Disorders — Asthma Emphysema", "Composition of Blood and Blood Groups", "Coagulation of Blood", "Composition and Function of Lymph", "Human Heart and Blood Vessels", "Cardiac Cycle and Cardiac Output", "Double Circulation and Regulation of Cardiac Activity", "Circulatory Disorders — Hypertension Coronary Artery Disease", "Modes of Excretion — Ammonotelism Ureotelism Uricotelism", "Human Excretory System Structure", "Urine Formation and Osmoregulation", "Regulation of Kidney Function", "Excretory Disorders — Uraemia Renal Failure Dialysis", "Types of Movement and Skeletal Muscle Contraction", "Skeletal System and Joints", "Muscular and Skeletal Disorders", "Neuron and Nervous System", "Generation and Conduction of Nerve Impulse", "Endocrine Glands and Hormones", "Human Endocrine System", "Hormone Action and Related Disorders"),
+                "Reproduction" to listOf("Flower Structure and Gametophyte Development", "Pollination Types and Agencies", "Outbreeding Devices and Pollen-Pistil Interaction", "Double Fertilization", "Development of Endosperm Embryo Seed and Fruit", "Apomixis Parthenocarpy Polyembryony", "Male and Female Reproductive Systems", "Gametogenesis — Spermatogenesis and Oogenesis", "Menstrual Cycle", "Fertilisation and Embryo Development to Blastocyst", "Pregnancy Placenta and Parturition", "Lactation", "Need for Reproductive Health", "Birth Control and Contraception", "Medical Termination of Pregnancy and Amniocentesis", "Infertility and Assisted Reproductive Technologies"),
+                "Genetics And Evolution" to listOf("Mendelian Inheritance", "Incomplete Dominance Co-Dominance Multiple Alleles", "Pleiotropy and Polygenic Inheritance", "Chromosome Theory of Inheritance", "Sex Determination", "Linkage and Crossing Over", "Sex-Linked Inheritance — Haemophilia Colour Blindness", "Mendelian Disorders — Thalassemia", "Chromosomal Disorders — Down's Turner's Klinefelter's Syndrome", "DNA as Genetic Material", "Structure of DNA and RNA", "DNA Packaging and Replication", "Central Dogma Transcription and Translation", "Genetic Code", "Gene Expression and Regulation — Lac Operon", "Genome and Human Genome Project", "DNA Fingerprinting", "Origin of Life", "Evidence for Biological Evolution", "Darwin's Contribution and Modern Synthetic Theory", "Mutation Recombination and Natural Selection", "Gene Flow and Genetic Drift", "Hardy-Weinberg Principle", "Adaptive Radiation and Human Evolution"),
+                "Biology And Human Welfare" to listOf("Pathogens and Parasites Causing Human Diseases", "Basic Concepts of Immunology and Vaccines", "Cancer HIV and AIDS", "Adolescence Drug and Alcohol Abuse", "Microbes in Household Food Processing", "Microbes in Industrial Production and Sewage Treatment", "Microbes as Biocontrol Agents and Biofertilizers"),
+                "Biotechnology And Its Applications" to listOf("Principles of Biotechnology", "Genetic Engineering — Recombinant DNA Technology", "Human Insulin and Vaccine Production", "Gene Therapy", "Genetically Modified Organisms — Bt Crops", "Transgenic Animals", "Biosafety Issues — Biopiracy and Patents"),
+                "Ecology And Environment" to listOf("Population Interactions — Mutualism Competition Predation Parasitism", "Population Attributes — Growth Birth Rate Death Rate", "Ecosystem Patterns and Components", "Productivity and Decomposition", "Energy Flow", "Ecological Pyramids", "Concept and Patterns of Biodiversity", "Importance and Loss of Biodiversity", "Biodiversity Conservation — Hotspots Red Data Book Biosphere Reserves")
+            )
+        ),
+
+        "JEE" to mapOf(
+            "Mathematics" to mapOf(
+                "Algebra" to listOf(
+                    "Complex Numbers", "Quadratic Equations", "Sequences and Series",
+                    "Permutations and Combinations", "Binomial Theorem",
+                    "Matrices and Determinants", "Mathematical Induction"
+                ),
+                "Trigonometry" to listOf(
+                    "Trigonometric Ratios", "Trigonometric Equations",
+                    "Inverse Trigonometry", "Properties of Triangles"
+                ),
+                "Calculus" to listOf(
+                    "Limits and Continuity", "Differentiation", "Applications of Derivatives",
+                    "Integration", "Definite Integrals", "Differential Equations",
+                    "Area Under Curves"
+                ),
+                "Coordinate Geometry" to listOf(
+                    "Straight Lines", "Circles", "Parabola", "Ellipse", "Hyperbola"
+                ),
+                "Vectors and 3D" to listOf(
+                    "Vectors", "3D Geometry", "Planes and Lines in 3D"
+                ),
+                "Probability and Statistics" to listOf(
+                    "Probability", "Bayes Theorem", "Statistics", "Random Variables"
+                )
+            ),
+            "Physics" to mapOf(
+                "Mechanics" to listOf(
+                    "Kinematics", "Newton's Laws", "Work Energy Theorem",
+                    "Rotational Dynamics", "Gravitation", "Simple Harmonic Motion",
+                    "Waves and Sound", "Fluid Mechanics"
+                ),
+                "Thermodynamics" to listOf(
+                    "Laws of Thermodynamics", "Kinetic Theory", "Calorimetry"
+                ),
+                "Electromagnetism" to listOf(
+                    "Electrostatics", "Current Electricity", "Magnetism",
+                    "Electromagnetic Induction", "AC Circuits", "EM Waves"
+                ),
+                "Optics and Modern Physics" to listOf(
+                    "Ray Optics", "Wave Optics", "Photoelectric Effect",
+                    "Atomic Models", "Nuclear Physics", "Semiconductors"
+                )
+            ),
+            "Chemistry" to mapOf(
+                "Physical Chemistry" to listOf(
+                    "Atomic Structure", "Chemical Bonding", "Thermodynamics",
+                    "Chemical Equilibrium", "Electrochemistry", "Chemical Kinetics",
+                    "Solutions", "Solid State", "Surface Chemistry"
+                ),
+                "Organic Chemistry" to listOf(
+                    "IUPAC Nomenclature", "Reaction Mechanisms",
+                    "Hydrocarbons", "Functional Group Chemistry",
+                    "Biomolecules", "Polymers", "Practical Organic Chemistry"
+                ),
+                "Inorganic Chemistry" to listOf(
+                    "Periodic Table Trends", "Chemical Bonding Advanced",
+                    "s p d f Block Elements", "Coordination Chemistry",
+                    "Analytical Chemistry", "Metallurgy"
+                )
+            )
+        ),
+
+        "CUET" to mapOf(
+            "Biology" to mapOf(
+                "Class 11 Biology" to listOf(
+                    "Diversity of Living World", "Structural Organisation in Animals and Plants",
+                    "Cell Structure and Function", "Plant Physiology", "Human Physiology"
+                ),
+                "Class 12 Biology" to listOf(
+                    "Reproduction", "Genetics and Evolution",
+                    "Biology and Human Welfare", "Biotechnology", "Ecology"
+                )
+            ),
+            "Chemistry" to mapOf(
+                "Class 11 Chemistry" to listOf(
+                    "Basic Chemistry", "States of Matter", "Atomic Structure",
+                    "Thermodynamics", "Equilibrium", "Redox", "Organic Basics"
+                ),
+                "Class 12 Chemistry" to listOf(
+                    "Solid State", "Solutions", "Electrochemistry", "Kinetics",
+                    "Surface Chemistry", "p d f Blocks", "Coordination",
+                    "Haloalkanes", "Alcohols Aldehydes Acids", "Amines", "Biomolecules"
+                )
+            ),
+            "Physics" to mapOf(
+                "Class 11 Physics" to listOf(
+                    "Motion", "Laws of Motion", "Work Energy", "Rotation",
+                    "Gravitation", "Solids and Fluids", "Thermal Physics", "Oscillations", "Waves"
+                ),
+                "Class 12 Physics" to listOf(
+                    "Electrostatics", "Current Electricity", "Magnetism",
+                    "EMI", "AC", "EM Waves", "Optics", "Modern Physics", "Semiconductors"
+                )
+            )
+        ),
+
+        // SSC CGL 2026 — Tier 1 (qualifying) + Tier 2 Paper 1 (final merit) syllabus.
+        // Tier 2 Paper 2 (Statistics) is JSO-specific; Paper 3 (Finance & Economics) is AAO-specific —
+        // both are folded in as subjects so students targeting those posts can track them separately.
+        "SSC CGL" to mapOf(
+            "Quantitative Aptitude" to mapOf(
+                "Number System" to listOf(
+                    "LCM and HCF", "Simplification", "Number Series",
+                    "Surds and Indices", "Divisibility Rules", "Decimal and Fractions"
+                ),
+                "Arithmetic" to listOf(
+                    "Percentage", "Profit and Loss", "Simple Interest", "Compound Interest",
+                    "Ratio and Proportion", "Average", "Time and Work",
+                    "Time Speed and Distance", "Partnership", "Mixture and Alligation",
+                    "Boats and Streams", "Pipes and Cisterns"
+                ),
+                "Algebra" to listOf(
+                    "Linear Equations", "Quadratic Equations", "Algebraic Identities", "Polynomials"
+                ),
+                "Geometry" to listOf(
+                    "Triangles", "Circles and Chords and Tangents", "Quadrilaterals",
+                    "Lines and Angles", "Congruence and Similarity", "Coordinate Geometry Basics"
+                ),
+                "Trigonometry" to listOf(
+                    "Trigonometric Ratios", "Heights and Distances", "Trigonometric Identities",
+                    "Maxima and Minima in Trigonometry"
+                ),
+                "Mensuration" to listOf(
+                    "2D Mensuration — Area and Perimeter", "3D Mensuration — Volume and Surface Area",
+                    "Mensuration of Combined Solids"
+                ),
+                "Data Interpretation" to listOf(
+                    "Bar Graphs", "Pie Charts", "Line Graphs", "Tabulation", "Caselet DI"
+                )
+            ),
+            "General Intelligence & Reasoning" to mapOf(
+                "Verbal Reasoning" to listOf(
+                    "Analogies", "Classification", "Coding-Decoding", "Blood Relations",
+                    "Direction Sense", "Series Completion", "Syllogism",
+                    "Statement and Conclusion", "Word Formation", "Alphabet and Number Test"
+                ),
+                "Non-Verbal Reasoning" to listOf(
+                    "Mirror Images", "Water Images", "Paper Folding and Cutting",
+                    "Embedded Figures", "Figure Series", "Pattern Completion", "Figure Counting"
+                ),
+                "Analytical Reasoning" to listOf(
+                    "Puzzles", "Seating Arrangement", "Logical Venn Diagrams",
+                    "Matrix Based Reasoning", "Input-Output", "Critical Thinking"
+                )
+            ),
+            "English Language" to mapOf(
+                "Grammar" to listOf(
+                    "Spotting Errors", "Sentence Improvement", "Active and Passive Voice",
+                    "Direct and Indirect Speech", "Parts of Speech", "Tenses",
+                    "Subject-Verb Agreement"
+                ),
+                "Vocabulary" to listOf(
+                    "Synonyms and Antonyms", "One Word Substitution",
+                    "Idioms and Phrases", "Spelling Correction", "Homonyms"
+                ),
+                "Reading Comprehension" to listOf(
+                    "Passage Based Questions", "Cloze Test", "Para Jumbles",
+                    "Fill in the Blanks", "Sentence Rearrangement"
+                )
+            ),
+            "General Awareness" to mapOf(
+                "Static GK" to listOf(
+                    "Indian History", "Indian Geography", "Indian Polity and Constitution",
+                    "Indian Economy", "Books Awards and Important Days", "Art and Culture"
+                ),
+                "Current Affairs" to listOf(
+                    "National and International Current Affairs", "Government Schemes",
+                    "Sports", "Awards and Honours", "Appointments and Obituaries"
+                ),
+                "Science" to listOf(
+                    "Physics Basics", "Chemistry Basics", "Biology Basics",
+                    "Science and Technology Current Developments"
+                )
+            ),
+            "Computer Knowledge" to mapOf(
+                "Computer Fundamentals" to listOf(
+                    "Computer Basics and Generations", "MS Office — Word Excel PowerPoint",
+                    "Internet and Networking Basics", "Computer Security and Viruses",
+                    "Operating Systems Basics"
+                )
+            ),
+            "Statistics (JSO Paper 2)" to mapOf(
+                "Descriptive Statistics" to listOf(
+                    "Collection and Classification of Data", "Tabulation and Presentation",
+                    "Measures of Central Tendency", "Measures of Dispersion",
+                    "Correlation and Regression"
+                ),
+                "Probability and Sampling" to listOf(
+                    "Probability Theory", "Random Variables and Distributions",
+                    "Sampling Theory", "Statistical Inference"
+                )
+            ),
+            "Finance & Economics (AAO Paper 3)" to mapOf(
+                "Finance" to listOf(
+                    "Financial Accounting", "Basic Concepts of Accounting",
+                    "Self-Balancing Ledgers", "Depreciation Accounting"
+                ),
+                "Economics and Governance" to listOf(
+                    "Comptroller and Auditor General of India", "Finance Commission",
+                    "Theory of Demand and Supply", "Indian Economy Basics", "Government Budgeting"
+                )
+            )
+        )
+    )
+
+    fun getTopicsForExam(exam: String): List<String> {
+        return data[exam]?.values?.flatMap { it.values.flatten() } ?: emptyList()
+    }
+
+    fun getChaptersForSubject(exam: String, subject: String): List<String> {
+        return data[exam]?.get(subject)?.keys?.toList() ?: emptyList()
+    }
+
+    fun getTopicsForChapter(exam: String, subject: String, chapter: String): List<String> {
+        return data[exam]?.get(subject)?.get(chapter) ?: emptyList()
+    }
+
+    fun getAllSubjectsForExam(exam: String): List<String> {
+        return data[exam]?.keys?.toList() ?: emptyList()
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/model/StudentModel.kt =====
+package com.checkmate.learning.model
+
+/**
+ * Upgrade Blueprint §1.3/§2.1 — "Testmate → TestResultNormalizer → LearningEvents →
+ * MasteryEngine → StudentModel → Planner." Phase 1 (Mastery/Error/Retention/
+ * KnowledgeGraph) is built and already wired into TestResultNormalizer; this is the
+ * shared read model sitting on top of it so Mentor/Planner/Analytics stop each
+ * independently querying MasteryDao/ErrorDao/ConceptDependencyDao and risking three
+ * different pictures of the same student — see
+ * [com.checkmate.learning.student.StudentModelBuilder]'s class doc for the full
+ * architecture reasoning (this was reviewed and refined against an external design
+ * pass before being built, not assumed).
+ *
+ * DELIBERATELY NOT a Room @Entity / persisted table — a derived READ MODEL only.
+ * Persisting this as its own table would create a second copy of state
+ * (ConceptMastery/ErrorPattern/Concept already ARE the source of truth) that could
+ * silently go stale the moment a new LearningEvent lands and nothing remembers to
+ * rebuild it. Instead: Room source data -> [StudentModelBuilder] -> this immutable
+ * snapshot -> consumers. If reality changes, build a new one; nothing here is ever
+ * mutated in place.
+ *
+ * [modelVersion] exists for the day the mastery/retention formula's *meaning*
+ * changes shape (e.g. difficultyPerformance/confidenceCalibration stop being null —
+ * see MasteryEngine's HONEST GAP note) — bump it alongside any such change so a
+ * caller holding an old StudentModel can tell it's semantically stale, not just
+ * time-stale via [generatedAt].
+ *
+ * Scoped to `learning` only for now (mastery/retention/errors/prerequisites) — NOT
+ * behavior (:modules:psyche) or schedule (:modules:planner) state. That's a
+ * deliberate boundary, not an oversight: composing those in later should be an
+ * additive change to [com.checkmate.learning.student.StudentModelBuilder] (more
+ * provider inputs), not a rewrite of this shape or of Mentor/Planner/Analytics as
+ * its consumers.
+ */
+data class StudentModel(
+    val studentId: String,
+    /** Wall-clock time this snapshot was built — "what did the planner actually see
+     *  when it made this decision," per the reviewed design. Not a persistence
+     *  timestamp; this model is never written back to Room. */
+    val generatedAt: Long,
+    val modelVersion: Int = 1,
+    val overall: OverallLearningState,
+    /** Keyed by conceptId. One entry per concept with any ConceptMastery row for
+     *  this student — i.e. every concept ever attempted, whether or not
+     *  [com.checkmate.learning.graph.KnowledgeGraph.seedExamSyllabus] ever ran. */
+    val concepts: Map<String, ConceptSnapshot>,
+    /** Unresolved [ErrorPattern]s only, already sorted by occurrences DESC (carried
+     *  straight through from ErrorPatternDao.getUnresolved's own ordering). */
+    val unresolvedErrors: List<ErrorPatternSnapshot>,
+    /** One entry per weak concept (mastery below MasteryEngine.MASTERY_THRESHOLD)
+     *  that traces back to at least one weak prerequisite. */
+    val weakPrerequisites: List<PrerequisiteIssue>
+)
+
+/**
+ * Coarse, whole-student rollup — the numbers a Mentor greeting or a Planner "how am
+ * I doing overall" view wants without walking every [ConceptSnapshot] itself.
+ * Derived entirely from the [ConceptSnapshot]/[ErrorPatternSnapshot] data already in
+ * the same [StudentModel], not recomputed from Room directly.
+ */
+data class OverallLearningState(
+    val conceptsTracked: Int,
+    val conceptsMastered: Int,
+    val conceptsWeak: Int,
+    /** Simple mean of per-concept mastery, unweighted by attemptCount. A concept
+     *  seen once and a concept seen 50 times count equally here — same "no false
+     *  precision" caution the blueprint gives the ExpectedScore model (§2.3); revisit
+     *  if/when confidence-interval-aware mastery (flagged separately, not part of
+     *  this change) lands. */
+    val averageMastery: Double,
+    val totalAttempts: Int,
+    /** Sum of `occurrences` across unresolved ErrorPatterns, not a distinct-pattern
+     *  count — "you've made mistakes N times," matching the blueprint's own framing. */
+    val unresolvedErrorCount: Int
+)
+
+/**
+ * Per-concept slice of [StudentModel] — copied straight from [ConceptMastery] and
+ * from [com.checkmate.learning.engine.RetentionEngine.decide]'s output, not
+ * recalculated here. See [com.checkmate.learning.student.StudentModelBuilder]'s
+ * class doc: this type aggregates already-derived intelligence, it does not
+ * re-derive it.
+ */
+data class ConceptSnapshot(
+    val conceptId: String,
+    /** Display fields from the matching [Concept] row, when one exists. Null-safe
+     *  because a ConceptMastery row can exist without ever having gone through
+     *  KnowledgeGraph.seedExamSyllabus — see Concept.kt's own class doc. */
+    val exam: String?,
+    val subject: String?,
+    val chapter: String?,
+    val topic: String?,
+    val mastery: Double,
+    /** Always 0.0 today — see ConceptMastery.confidence's own doc. Carried through
+     *  as-is, not fabricated here. */
+    val masteryConfidence: Double,
+    val retentionDecision: RetentionDecisionSnapshot,
+    val forgettingRisk: Double,
+    val attemptCount: Int,
+    val recentAccuracy: Double,
+    val lifetimeAccuracy: Double,
+    /** Sum of occurrences across ALL ErrorPatterns for this concept (resolved +
+     *  unresolved) — a lifetime error count, distinct from
+     *  [StudentModel.unresolvedErrors] which is unresolved-only and student-wide. */
+    val errorCount: Int,
+    val lastSeen: Long?,
+    /**
+     * Weak prerequisites [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure]
+     * found for this concept, when its own mastery is weak. Empty for well-mastered
+     * concepts (never diagnosed) and for weak concepts with no seeded prerequisite
+     * edges or no weak prerequisites.
+     *
+     * CORRECTNESS FIX: this used to be `List<String>` of bare conceptIds —
+     * diagnosePrerequisiteFailure already looks up each weak prerequisite's full
+     * [Concept] row (subject/chapter/topic) to decide it's weak, but
+     * StudentModelBuilder discarded everything except `.id` before this fix. A
+     * conceptId is a slugified SHA-256-suffixed hash (see KnowledgeGraph.conceptId's
+     * own doc) — completely unreadable in an LLM prompt or a Mentor message, and
+     * worse, un-recoverable for a prerequisite the student never personally
+     * attempted (not present in this StudentModel's own `concepts` map, since that
+     * map only has one entry per concept with an actual ConceptMastery row). Now
+     * carries the same display fields [ConceptSnapshot] itself has, sourced directly
+     * from the Concept row at the one point it's actually available.
+     */
+    val prerequisiteIssues: List<PrerequisiteRef>
+)
+
+/**
+ * Plain-data mirror of
+ * [com.checkmate.learning.engine.RetentionEngine.RetentionDecision] — kept as its
+ * own enum here, rather than reusing the engine's directly, so :modules:learning's
+ * model/ package (what Mentor/Planner actually depend on) never needs an import from
+ * engine/ — same "consumers don't need to know where any of this came from"
+ * separation the reviewed design called for.
+ */
+enum class RetentionDecisionSnapshot { REVIEW, TEACH, MOVE_ON }
+
+/**
+ * One unresolved [ErrorPattern] worth surfacing — "you've made this mistake N
+ * times" per the blueprint. `errorType` is the enum's `.name` string rather than
+ * [ErrorType] itself, same reasoning as [RetentionDecisionSnapshot]: keep this
+ * model's public shape free of engine/model-internal enum imports where a plain
+ * string is just as usable by a consumer.
+ */
+data class ErrorPatternSnapshot(
+    val conceptId: String,
+    val errorType: String,
+    val occurrences: Int,
+    val firstSeen: Long,
+    val lastSeen: Long
+)
+
+/**
+ * Display-safe reference to a weak prerequisite concept — see [ConceptSnapshot.prerequisiteIssues]'s
+ * CORRECTNESS FIX note for why this carries subject/chapter/topic instead of a bare
+ * conceptId. `subject`/`chapter`/`topic` come straight from the [Concept] row
+ * [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure] already
+ * looked up — not re-queried here — so they're null only when that Concept row
+ * itself never got its display fields populated (shouldn't happen via
+ * seedExamSyllabus, but kept nullable defensively, matching every other display
+ * field on [ConceptSnapshot]).
+ */
+data class PrerequisiteRef(
+    val conceptId: String,
+    val subject: String?,
+    val chapter: String?,
+    val topic: String?
+)
+
+/**
+ * One weak concept whose failure traces back to a weak prerequisite — output of
+ * [com.checkmate.learning.graph.KnowledgeGraph.diagnosePrerequisiteFailure], not
+ * re-derived here. E.g. the blueprint's own "Rolling Motion failure traced back to a
+ * weak Laws of Motion prerequisite" example.
+ */
+data class PrerequisiteIssue(
+    val conceptId: String,
+    val weakPrerequisites: List<PrerequisiteRef>
+)
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/student/StudentModelBuilder.kt =====
+package com.checkmate.learning.student
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.engine.RetentionEngine
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.ErrorPatternSnapshot
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.OverallLearningState
+import com.checkmate.learning.model.PrerequisiteIssue
+import com.checkmate.learning.model.PrerequisiteRef
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.repository.LearningDatabase
+
+/**
+ * Builds a [StudentModel] snapshot from current Room state.
+ *
+ * ARCHITECTURE (this shape was reviewed and refined against an external design pass
+ * before being built, not assumed from scratch):
+ * ```
+ * MasteryEngine   -> ConceptMastery      \
+ * ErrorEngine     -> ErrorPattern         |
+ * RetentionEngine -> RetentionDecision    +-> StudentModelBuilder -> StudentModel
+ * KnowledgeGraph  -> PrerequisiteIssue    /
+ * ```
+ * This object AGGREGATES already-derived intelligence; it does NOT become another
+ * intelligence engine. Concretely, it never:
+ * - computes mastery itself (that's [MasteryEngine])
+ * - decides REVIEW/TEACH/MOVE_ON itself (that's [RetentionEngine.decide])
+ * - diagnoses prerequisite failures itself (that's
+ *   [KnowledgeGraph.diagnosePrerequisiteFailure])
+ * It only reads their already-persisted/computed output and reshapes it into
+ * [StudentModel]'s flatter, engine-agnostic shape, so Mentor/Planner/Analytics can
+ * all read the SAME student state instead of each independently querying
+ * MasteryDao/ErrorDao and drifting apart.
+ *
+ * DELIBERATELY NOT cached/persisted here — see [StudentModel]'s own class doc for
+ * why. Call [build] fresh whenever a consumer needs current state; don't hold a
+ * built [StudentModel] across a write to LearningDatabase and expect it to still be
+ * accurate.
+ *
+ * SCALE NOTE: batches concept lookups via [com.checkmate.learning.repository.ConceptDao.getByIds]
+ * and error-pattern lookups via a single ErrorPatternDao.getAll call, rather than
+ * one query per concept — the "don't load the entire knowledge graph for every
+ * StudentModel" caution from the reviewed design. Prerequisite diagnosis is the one
+ * exception: it still costs one [KnowledgeGraph.diagnosePrerequisiteFailure] call per
+ * WEAK concept, matching that function's own existing per-concept query shape (it
+ * wasn't changed by this PR). Fine at today's data scale (tens of weak concepts, not
+ * thousands) — batch that path too if/when a student's weak-concept count grows
+ * large enough for it to matter.
+ *
+ * TESTING NOTE: like MasteryEngine/ErrorEngine/RetentionEngine, this repo has no
+ * Robolectric/instrumented-test setup (confirmed against the existing test suite),
+ * so [build] itself — which touches [LearningDatabase.getInstance] directly, same as
+ * every other engine's suspend entry point — isn't unit-tested here, consistent with
+ * those engines' own precedent of only unit-testing their pure/DB-free functions.
+ * Add an instrumented test (or inject the DAOs) if/when this repo grows that infra.
+ */
+object StudentModelBuilder {
+
+    private const val TAG = "StudentModelBuilder"
+
+    suspend fun build(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): StudentModel {
+        val db = LearningDatabase.getInstance(context)
+        val generatedAt = System.currentTimeMillis()
+
+        val masteries = db.masteryDao().getAll(studentId)
+        if (masteries.isEmpty()) {
+            return StudentModel(
+                studentId = studentId,
+                generatedAt = generatedAt,
+                overall = OverallLearningState(
+                    conceptsTracked = 0,
+                    conceptsMastered = 0,
+                    conceptsWeak = 0,
+                    averageMastery = 0.0,
+                    totalAttempts = 0,
+                    unresolvedErrorCount = 0
+                ),
+                concepts = emptyMap(),
+                unresolvedErrors = emptyList(),
+                weakPrerequisites = emptyList()
+            )
+        }
+
+        // Batched: one query for every concept's display fields, not one per row.
+        val conceptIds = masteries.map { it.conceptId }
+        val conceptsById = db.conceptDao().getByIds(conceptIds).associateBy { it.id }
+
+        // Batched: one query for every ErrorPattern this student has (resolved +
+        // unresolved), folded two ways — a per-concept lifetime errorCount, and the
+        // unresolved subset for StudentModel.unresolvedErrors.
+        val allPatterns = db.errorPatternDao().getAll(studentId)
+        val errorCountByConcept: Map<String, Int> = allPatterns
+            .groupBy { it.conceptId }
+            .mapValues { (_, patterns) -> patterns.sumOf { it.occurrences } }
+        val unresolvedPatterns = allPatterns.filter { !it.resolved }
+
+        val weakConceptIds = masteries
+            .filter { it.mastery < MasteryEngine.MASTERY_THRESHOLD }
+            .map { it.conceptId }
+
+        // CORRECTNESS FIX: previously kept only `.id` from each weak prerequisite's
+        // Concept row (`weakPrereqs.map { it.id }`), throwing away the
+        // subject/chapter/topic diagnosePrerequisiteFailure had already looked up.
+        // A conceptId is a slugified hash (see KnowledgeGraph.conceptId's own doc) —
+        // unreadable to any consumer, and for a prerequisite the student never
+        // personally attempted, un-recoverable afterward (it won't be a key in this
+        // function's own `concepts` map below). Now keeps the full PrerequisiteRef —
+        // see ConceptSnapshot.prerequisiteIssues' own doc for the consumer-facing
+        // reasoning.
+        val prerequisiteIssuesByConcept = mutableMapOf<String, List<PrerequisiteRef>>()
+        for (conceptId in weakConceptIds) {
+            val weakPrereqs = KnowledgeGraph.diagnosePrerequisiteFailure(
+                context = context,
+                studentId = studentId,
+                conceptId = conceptId
+            )
+            if (weakPrereqs.isNotEmpty()) {
+                prerequisiteIssuesByConcept[conceptId] = weakPrereqs.map {
+                    PrerequisiteRef(
+                        conceptId = it.id,
+                        subject = it.subject,
+                        chapter = it.chapter,
+                        topic = it.topic
+                    )
+                }
+            }
+        }
+
+        val concepts = masteries.associate { mastery ->
+            val concept = conceptsById[mastery.conceptId]
+            mastery.conceptId to ConceptSnapshot(
+                conceptId = mastery.conceptId,
+                exam = concept?.exam,
+                subject = concept?.subject,
+                chapter = concept?.chapter,
+                topic = concept?.topic,
+                mastery = mastery.mastery,
+                masteryConfidence = mastery.confidence,
+                retentionDecision = RetentionEngine
+                    .decide(mastery.mastery, mastery.forgettingRisk)
+                    .toSnapshot(),
+                forgettingRisk = mastery.forgettingRisk,
+                attemptCount = mastery.attemptCount,
+                recentAccuracy = mastery.recentAccuracy,
+                lifetimeAccuracy = mastery.lifetimeAccuracy,
+                errorCount = errorCountByConcept[mastery.conceptId] ?: 0,
+                lastSeen = mastery.lastSeen,
+                prerequisiteIssues = prerequisiteIssuesByConcept[mastery.conceptId] ?: emptyList()
+            )
+        }
+
+        val overall = OverallLearningState(
+            conceptsTracked = masteries.size,
+            conceptsMastered = masteries.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = weakConceptIds.size,
+            averageMastery = masteries.sumOf { it.mastery } / masteries.size,
+            totalAttempts = masteries.sumOf { it.attemptCount },
+            unresolvedErrorCount = unresolvedPatterns.sumOf { it.occurrences }
+        )
+
+        val model = StudentModel(
+            studentId = studentId,
+            generatedAt = generatedAt,
+            overall = overall,
+            concepts = concepts,
+            unresolvedErrors = unresolvedPatterns.map {
+                ErrorPatternSnapshot(
+                    conceptId = it.conceptId,
+                    errorType = it.errorType.name,
+                    occurrences = it.occurrences,
+                    firstSeen = it.firstSeen,
+                    lastSeen = it.lastSeen
+                )
+            },
+            weakPrerequisites = prerequisiteIssuesByConcept.map { (conceptId, weakRefs) ->
+                PrerequisiteIssue(conceptId, weakRefs)
+            }
+        )
+
+        Log.d(
+            TAG,
+            "Built StudentModel for student=$studentId: ${model.concepts.size} concept(s), " +
+                "${model.unresolvedErrors.size} unresolved error pattern(s), " +
+                "${model.weakPrerequisites.size} prerequisite issue(s)"
+        )
+        return model
+    }
+
+    private fun RetentionEngine.RetentionDecision.toSnapshot(): RetentionDecisionSnapshot = when (this) {
+        RetentionEngine.RetentionDecision.REVIEW -> RetentionDecisionSnapshot.REVIEW
+        RetentionEngine.RetentionDecision.TEACH -> RetentionDecisionSnapshot.TEACH
+        RetentionEngine.RetentionDecision.MOVE_ON -> RetentionDecisionSnapshot.MOVE_ON
+    }
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/AdaptivePlanner.kt =====
+package com.checkmate.planner
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.BehaviorSnapshot
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.DailyCheckIn
+import com.checkmate.core.DailyChecklist
+import com.checkmate.core.PYQWeightage
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.PrerequisiteRef
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.SubjectConfig
+import com.checkmate.planner.model.TaskType
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.*
+
+object AdaptivePlanner {
+
+    private const val TAG = "AdaptivePlanner"
+
+    suspend fun generateDailyPlan(context: Context, config: PlannerState): List<StudyTask> {
+        val daysLeft          = daysUntilExam(config.examDate)
+        // Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth"):
+        // structured deterministic metrics, not a hand-built prose string — see
+        // getBehaviorSnapshot() below.
+        val behaviorSnapshot  = getBehaviorSnapshot()
+        val studyWindowHours  = calculateStudyWindowHours(config.studyStartTime, config.studyEndTime)
+        val profile           = ConsultationProfile.load()
+        val checkIn           = DailyCheckIn.loadToday()
+        val coachingContext   = CoachingPlannerEntry.upcomingContext(7)
+        val pyqContext         = buildPyqContext(config.examType, checkIn)
+        // FEATURE: Checklist → Planner — same-day lecture/DPP/notes completion
+        // feeds tomorrow's plan so an incomplete checklist skews the next plan
+        // toward catching up on fundamentals rather than piling on new PYQ topics.
+        val checklistContext  = buildChecklistContext()
+        // Mentor v2 (spec 3.7): read TodayContext directly (not folded into the cached
+        // BehaviorSnapshot — see PsycheEngine.refreshBehaviorSummaryCache()'s doc on why)
+        // so a mid-day regenerate always reflects the latest same-day free-text updates
+        // even if refreshBehaviorSummaryCache() hasn't run since the last one (e.g. the
+        // very first plan of the day).
+        val todayContext      = TodayContext.getSummaryText()
+
+        // Upgrade Blueprint Phase 2 wiring ("Planner reframe"): StudentModelBuilder.build()
+        // was fully implemented back in Phase 1 (aggregates MasteryEngine/ErrorEngine/
+        // RetentionEngine/KnowledgeGraph, itself fed by every report.md import via
+        // TestResultNormalizer) but nothing ever called it — real test performance was
+        // computed and persisted, then sat unread while the planner kept guessing from
+        // PYQ weightage + behavior alone. This is the first consumer: one snapshot, reused
+        // by both the LLM path (as structured JSON, same "deterministic data, not prose"
+        // discipline as BEHAVIOR_METRICS below) and the rule-based fallback (prefers the
+        // weakest/review-due concept per subject over blind PYQ rotation, when one exists).
+        val studentModel = StudentModelBuilder.build(context)
+
+        // Blueprint 4.1: today's free windows (study window minus school/coaching
+        // blocked slots). Computed once, applied to whichever plan comes out below.
+        val freeSlots = FreeSlotCalculator.computeFreeSlots(
+            profile.blockedSlots, config.studyStartTime, config.studyEndTime
+        )
+
+        val llmPlan = tryLlmPlan(config, daysLeft, behaviorSnapshot, studyWindowHours, profile, checkIn, coachingContext, pyqContext, checklistContext, todayContext, studentModel)
+        if (llmPlan.isNotEmpty()) return assignScheduledTimes(llmPlan, freeSlots)
+
+        return assignScheduledTimes(ruleBasedPlan(config, daysLeft, studyWindowHours, studentModel), freeSlots)
+    }
+
+    /**
+     * Blueprint 4.2: packs tasks sequentially into today's free slots in the
+     * order they were generated — which is already priority order (highest
+     * subject weightage / PYQ-driven reason first, from both the LLM and
+     * rule-based paths) — so the hardest/highest-priority work naturally lands
+     * in the earliest slots rather than needing a second re-sort here.
+     *
+     * A task that doesn't fit in the slot it's currently pointed at moves the
+     * cursor to the next free slot; a task that doesn't fit anywhere (total
+     * plan exceeds available free time) is returned with scheduledStartTime
+     * left null — HomeScreen's timeline view groups those under "Unscheduled"
+     * instead of silently dropping them.
+     */
+    private fun assignScheduledTimes(
+        tasks: List<StudyTask>,
+        freeSlots: List<FreeSlotCalculator.FreeSlot>
+    ): List<StudyTask> {
+        if (tasks.isEmpty() || freeSlots.isEmpty()) return tasks
+
+        var slotIndex = 0
+        var cursor = freeSlots[0].startMinute
+
+        return tasks.map { task ->
+            while (slotIndex < freeSlots.size && cursor + task.durationMinutes > freeSlots[slotIndex].endMinute) {
+                slotIndex++
+                cursor = if (slotIndex < freeSlots.size) freeSlots[slotIndex].startMinute else -1
+            }
+            if (slotIndex >= freeSlots.size || cursor < 0) {
+                task
+            } else {
+                val scheduled = task.copy(scheduledStartTime = FreeSlotCalculator.formatMinutes(cursor))
+                cursor += task.durationMinutes
+                scheduled
+            }
+        }
+    }
+
+    /**
+     * Upgrade Blueprint Phase 0 item #2 ("Stop treating the LLM as source of truth").
+     * Reads the structured BehaviorSnapshot PsycheEngine.refreshBehaviorSummaryCache()
+     * serializes into CheckmatePrefs (same cross-module bridge as before — :modules:planner
+     * still can't depend on :modules:psyche directly, see PsycheEngine's own doc on why —
+     * only the payload crossing that bridge changed, from hand-built prose to JSON).
+     *
+     * Falls back to BehaviorSnapshot.EMPTY (all zeros/empty lists) instead of a sentence
+     * like "No behavior data yet" — the LLM gets the same JSON shape whether or not history
+     * exists yet, rather than a special-cased string it would have to treat differently.
+     */
+    private fun getBehaviorSnapshot(): BehaviorSnapshot {
+        val raw = CheckmatePrefs.getString("behavior_snapshot_json", null) ?: return BehaviorSnapshot.EMPTY
+        return try {
+            Json { ignoreUnknownKeys = true }.decodeFromString<BehaviorSnapshot>(raw)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to decode behavior snapshot, using empty: ${e.message}")
+            BehaviorSnapshot.EMPTY
+        }
+    }
+
+    private fun buildPyqContext(exam: String, checkIn: DailyCheckIn?): String {
+        if (checkIn == null) return ""
+        return checkIn.todayTopics.entries.mapNotNull { (subject, topic) ->
+            val weight = PYQWeightage.findTopicWeightage(exam, topic)
+            if (weight > 0f) "$subject/$topic: PYQ weight ${String.format("%.1f", weight)}%"
+            else null
+        }.joinToString("\n")
+    }
+
+    /**
+     * Reads today's checklist completion (lecture/notes/DPP/etc.) so the LLM
+     * planner can react to same-day execution gaps, not just multi-day behavior
+     * trends. Returns "" when the checklist was never touched today — an
+     * untouched checklist means "not used," not "0% complete," and treating it
+     * as a crisis would produce false catch-up plans. Mirrors the same
+     * empty-guard pattern used in buildPyqContext().
+     */
+    private fun buildChecklistContext(): String {
+        val summary = DailyChecklist.getTodaySummaryText()
+        if (summary.isBlank()) return ""
+
+        val items = DailyChecklist.getTodayItems()
+        if (items.isEmpty()) return ""
+
+        val touched = items.any { it.isDone }
+        // Checklist exists but nothing has been checked off yet today (e.g. it's
+        // early morning) — not a signal of falling behind, so skip it.
+        if (!touched) return ""
+
+        val doneCount = items.count { it.isDone }
+        val totalCount = items.size
+        val incomplete = items.filter { !it.isDone }.map { it.label }
+
+        return buildString {
+            appendLine("Today's checklist: $doneCount/$totalCount complete")
+            if (incomplete.isNotEmpty()) {
+                appendLine("Not done yet: ${incomplete.joinToString()}")
+            }
+        }.trim()
+    }
+
+    // ── Upgrade Blueprint Phase 2 wiring: compact StudentModel → LLM prompt ──
+    // StudentModel.concepts can grow to hundreds of rows over a full prep cycle
+    // (:modules:learning's model classes are deliberately not @Serializable — see
+    // StudentModel.kt's own class doc on why it stays a derived, non-persisted read
+    // model — so this hand-builds a small, prompt-sized, @Serializable summary here
+    // rather than dumping the whole thing). Same "own words / own shape" boundary
+    // StudentModel.kt's class doc already draws around StudentModelBuilder itself.
+
+    @Serializable
+    private data class WeakPrerequisiteEntry(
+        val label: String,
+        /** Null means the prerequisite has never been personally attempted — not
+         *  "0% mastery." See PrerequisiteRef's own doc: this can legitimately be a
+         *  concept outside the student's `concepts` map. */
+        val masteryPercent: Int?
+    )
+
+    @Serializable
+    private data class ConceptEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val masteryPercent: Int,
+        /** Named, not just flagged — see ConceptSnapshot.prerequisiteIssues'
+         *  CORRECTNESS FIX note. Empty when this concept has no diagnosed weak
+         *  prerequisite. */
+        val weakPrerequisites: List<WeakPrerequisiteEntry>
+    )
+
+    @Serializable
+    private data class ErrorEntry(
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val errorType: String,
+        val occurrences: Int
+    )
+
+    @Serializable
+    private data class StudentModelPromptSummary(
+        val conceptsTracked: Int,
+        val conceptsMastered: Int,
+        val conceptsWeak: Int,
+        val averageMasteryPercent: Int,
+        val unresolvedErrorCount: Int,
+        /** Lowest-mastery concepts first, capped — see class doc above. */
+        val weakestConcepts: List<ConceptEntry>,
+        /** RetentionEngine.decide() == REVIEW, sorted by forgettingRisk desc, capped. */
+        val reviewDue: List<ConceptEntry>,
+        /** StudentModel.unresolvedErrors, already occurrences-desc, capped. */
+        val topErrorPatterns: List<ErrorEntry>
+    )
+
+    /**
+     * Resolves a [PrerequisiteRef] to a display label plus, when available, that
+     * prerequisite's own mastery — looked up from this same [StudentModel]'s
+     * `concepts` map, which only has an entry if the student has actually
+     * attempted it. A never-attempted prerequisite is a real, useful signal in its
+     * own right ("introduce this topic first, not just review it") — surfaced as
+     * `masteryPercent = null` rather than guessed at.
+     */
+    private fun resolvePrerequisite(model: StudentModel, ref: PrerequisiteRef): WeakPrerequisiteEntry {
+        val label = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+        val mastery = model.concepts[ref.conceptId]?.mastery
+        return WeakPrerequisiteEntry(label, mastery?.let { (it * 100).toInt() })
+    }
+
+    /**
+     * Compacts a full [StudentModel] into a small, prompt-sized summary: top-8
+     * weakest concepts, top-8 review-due concepts, top-8 unresolved error
+     * patterns — pre-sorted so the LLM sees the highest-signal rows first
+     * instead of reasoning over a large, unranked blob.
+     *
+     * Returns null when the student has no tracked concepts yet (no report.md
+     * ever imported) — same empty-guard pattern as [buildPyqContext]/
+     * [buildChecklistContext] — so the prompt doesn't grow an empty/misleading
+     * STUDENT_MODEL section before the first mock is imported.
+     */
+    private fun buildStudentModelSummary(model: StudentModel): StudentModelPromptSummary? {
+        if (model.overall.conceptsTracked == 0) return null
+
+        fun ConceptSnapshot.toEntry() = ConceptEntry(
+            subject = subject,
+            chapter = chapter,
+            topic = topic,
+            masteryPercent = (mastery * 100).toInt(),
+            weakPrerequisites = prerequisiteIssues.map { resolvePrerequisite(model, it) }
+        )
+
+        val weakest = model.concepts.values
+            .sortedBy { it.mastery }
+            .take(8)
+            .map { it.toEntry() }
+
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(8)
+            .map { it.toEntry() }
+
+        val topErrors = model.unresolvedErrors.take(8).map { pattern ->
+            val concept = model.concepts[pattern.conceptId]
+            ErrorEntry(
+                subject = concept?.subject,
+                chapter = concept?.chapter,
+                topic = concept?.topic,
+                errorType = pattern.errorType,
+                occurrences = pattern.occurrences
+            )
+        }
+
+        return StudentModelPromptSummary(
+            conceptsTracked = model.overall.conceptsTracked,
+            conceptsMastered = model.overall.conceptsMastered,
+            conceptsWeak = model.overall.conceptsWeak,
+            averageMasteryPercent = (model.overall.averageMastery * 100).toInt(),
+            unresolvedErrorCount = model.overall.unresolvedErrorCount,
+            weakestConcepts = weakest,
+            reviewDue = reviewDue,
+            topErrorPatterns = topErrors
+        )
+    }
+
+    private suspend fun tryLlmPlan(
+        config: PlannerState,
+        daysLeft: Int,
+        behaviorSnapshot: BehaviorSnapshot,
+        studyWindowHours: Float,
+        profile: com.checkmate.core.ConsultationProfile,
+        checkIn: DailyCheckIn?,
+        coachingContext: String,
+        pyqContext: String,
+        checklistContext: String,
+        todayContext: String = "",
+        // Upgrade Blueprint Phase 2 wiring — see buildStudentModelSummary() above.
+        studentModel: StudentModel
+    ): List<StudyTask> {
+        val studentModelSummary = buildStudentModelSummary(studentModel)
+
+        val systemPrompt = """
+You are an adaptive study planner for competitive exam students.
+Generate a focused daily study plan. Respond ONLY with a valid JSON array, no markdown, no explanation.
+Format: [{"subject":"Biology","topic":"Cell Division","subtopic":"Mitosis stages","durationMinutes":45,"sessionType":"LEARN","priority":"HIGH","reason":"PYQ weight 9%, marked weak"}]
+Rules:
+- Max 5 tasks
+- Total time must fit in ${studyWindowHours.toInt()} hours (minus breaks)
+- Weight tasks by subject priority and PYQ weightage
+- If exam < 30 days: revision-heavy
+- If exam < 7 days: full revision only
+- Keep durations in multiples of 30
+- sessionType must be one of: LEARN, REVISE, PRACTICE, TEST_PREP
+- reason must be specific: mention PYQ %, coaching test dates, weak topic flags
+- If TODAY'S CHECKLIST STATUS shows incomplete fundamentals (lecture notes, DPP, NCERT reading)
+  from earlier today, prioritize catching those up over introducing new topics — an unfinished
+  checklist means the student is behind on today's baseline, not ready for additional load
+- If TODAY'S LOGGED UPDATES mentions something already covered today (e.g. "back from coaching,
+  did Physics 2hrs"), do not re-assign that same subject/topic — build on it or move to the next
+  weak area instead
+- BEHAVIOR_METRICS below is deterministic data computed directly from stored events, not a
+  prose summary — treat every number and list in it as ground truth. subjectPatterns lists
+  specific (subject, taskType) combinations the student has repeatedly skipped (occurrences >= 3
+  in the last 7 days) — weight tasks in those combinations accordingly instead of only reacting
+  to the aggregate recentSkipRatePercent
+- STUDENT_MODEL, when present, is also deterministic — built from the student's actual imported
+  test results (MasteryEngine/ErrorEngine/RetentionEngine). weakestConcepts and reviewDue are
+  real measured gaps; topErrorPatterns are mistakes the student has actually made repeatedly.
+  Prioritize these over PYQ-weightage-only guesses when they exist, and when you do pick a
+  weakestConcepts/reviewDue/topErrorPatterns entry, say so specifically in "reason" (e.g. "42%
+  mastery from last mock" or "3rd CALCULATION error in this concept") rather than a generic
+  weak-topic flag
+- When a weakestConcepts/reviewDue entry has a non-empty weakPrerequisites list, that concept's
+  own failure has been traced to a SPECIFIC weaker prerequisite topic (name given, plus that
+  prerequisite's own mastery — null means never attempted). Prefer assigning the prerequisite
+  itself before the dependent topic when its masteryPercent is null or clearly lower, and name
+  it explicitly in "reason" (e.g. "Rolling Motion attempts are failing — traces to Laws of Motion
+  at 38% mastery, fix that first") rather than assigning the dependent topic again
+""".trimIndent()
+
+        val prompt = buildString {
+            appendLine("Exam: ${config.examType} | Days until exam: $daysLeft")
+            appendLine("Subjects (name:weight): ${config.subjects.joinToString { "${it.name}:${it.weightage}" }}")
+            appendLine("Study window: ${config.studyStartTime}–${config.studyEndTime} (${studyWindowHours}h)")
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            if (checkIn != null) {
+                appendLine("TODAY'S TOPICS SELECTED:")
+                checkIn.todayTopics.forEach { (subj, topic) -> appendLine("  $subj → $topic") }
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING SCHEDULE:")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (pyqContext.isNotBlank()) {
+                appendLine("PYQ WEIGHTAGE FOR TODAY'S TOPICS:")
+                appendLine(pyqContext)
+                appendLine()
+            }
+            if (checklistContext.isNotBlank()) {
+                appendLine("TODAY'S CHECKLIST STATUS:")
+                appendLine(checklistContext)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES (from Mentor chat / quick-log):")
+                appendLine(todayContext)
+                appendLine()
+            }
+            // Upgrade Blueprint Phase 0 item #2: structured JSON, not a prose sentence — see
+            // getBehaviorSnapshot()/BehaviorSnapshot's own doc for why this crosses the
+            // psyche->planner boundary as data instead of as text.
+            appendLine("BEHAVIOR_METRICS (JSON, deterministic, authoritative):")
+            appendLine(Json.encodeToString(behaviorSnapshot))
+            appendLine()
+            // Upgrade Blueprint Phase 2 wiring: same treatment for real test performance —
+            // see buildStudentModelSummary() and the systemPrompt rule above.
+            if (studentModelSummary != null) {
+                appendLine("STUDENT_MODEL (JSON, deterministic, authoritative — from imported test reports):")
+                appendLine(Json.encodeToString(studentModelSummary))
+                appendLine()
+            }
+            appendLine("Generate today's plan.")
+        }
+
+        return try {
+            val raw = LlmGateway.complete(prompt, systemPrompt)
+            if (raw.isBlank()) return emptyList()
+            val json  = raw.trim().removePrefix("```json").removeSuffix("```").trim()
+            val arr   = JSONArray(json)
+            val tasks = mutableListOf<StudyTask>()
+            for (i in 0 until arr.length()) {
+                tasks.add(arr.getJSONObject(i).toStudyTask())
+            }
+            Log.d(TAG, "LLM generated ${tasks.size} tasks")
+            tasks
+        } catch (e: Exception) {
+            Log.w(TAG, "LLM plan failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Upgrade Blueprint Phase 0 item #1 ("Fix planner information loss"): the system
+     * prompt above already asks the LLM for sessionType/priority/reason on every task (see
+     * its own "Format:"/"Rules:" block), but the parse loop this replaced only ever read
+     * subject/topic/durationMinutes back out — sessionType, priority, and reason were
+     * generated, then silently thrown away. One canonical JSONObject -> StudyTask mapper,
+     * so the field contract exists in exactly one place rather than being re-derived (and
+     * re-forgotten) at any future call site that builds a StudyTask from raw LLM plan JSON.
+     *
+     * Deliberately tolerant of a missing/unrecognized sessionType or priority (optString
+     * with a neutral default, not getString) — a malformed field on one task in the array
+     * shouldn't fail parsing of the whole plan the way a missing *required* field
+     * (subject/topic/durationMinutes, still via getString/getInt) correctly does.
+     */
+    private fun JSONObject.toStudyTask(): StudyTask {
+        val subtopic = if (has("subtopic")) " — ${getString("subtopic")}" else ""
+        return StudyTask(
+            subject         = getString("subject"),
+            topic           = getString("topic") + subtopic,
+            durationMinutes = getInt("durationMinutes"),
+            priority        = mapLlmPriority(optString("priority", "MEDIUM")),
+            taskType        = mapLlmSessionType(optString("sessionType", "")),
+            rationale       = optString("reason", "")
+        )
+    }
+
+    private fun mapLlmPriority(raw: String): Int = when (raw.trim().uppercase()) {
+        "HIGH"   -> 3
+        "MEDIUM" -> 2
+        "LOW"    -> 1
+        else     -> 2 // unrecognized/missing — neutral middle, not silently lowest
+    }
+
+    // sessionType (LEARN/REVISE/PRACTICE/TEST_PREP, per the systemPrompt above) onto the
+    // existing TaskType enum (LECTURE/PRACTICE/REVISION/READING/OTHER) — StudyTask.taskType's
+    // own doc already called this mapping out as owed. TEST_PREP has no exact match; PRACTICE
+    // is the closest existing semantic (timed/applied work, not new teaching).
+    private fun mapLlmSessionType(raw: String): TaskType = when (raw.trim().uppercase()) {
+        "LEARN"     -> TaskType.LECTURE
+        "REVISE"    -> TaskType.REVISION
+        "PRACTICE"  -> TaskType.PRACTICE
+        "TEST_PREP" -> TaskType.PRACTICE
+        else        -> TaskType.OTHER
+    }
+
+    // NOTE: previously took an unused `behaviorSummary: String` param (never referenced in the
+    // body below — the actual behavior signal this function reads is CheckmatePrefs'
+    // "recent_skip_rate", a couple of lines down). Dropped as dead code while touching this
+    // call site for Upgrade Blueprint Phase 0 item #2.
+    private fun ruleBasedPlan(
+        config: PlannerState,
+        daysLeft: Int,
+        studyWindowHours: Float,
+        // Upgrade Blueprint Phase 2 wiring — see the weakestBySubject block below.
+        studentModel: StudentModel
+    ): List<StudyTask> {
+        val tasks        = mutableListOf<StudyTask>()
+        val sorted       = config.subjects.sortedByDescending { it.weightage }
+        val maxTasks     = if (daysLeft < 7) 5 else if (daysLeft < 30) 4 else 3
+        val baseDuration = if (daysLeft < 30) 30 else 45
+
+        val skipRateStr = CheckmatePrefs.getString("recent_skip_rate", "0") ?: "0"
+        val skipRate    = skipRateStr.toFloatOrNull() ?: 0f
+        val duration    = when {
+            skipRate > 0.5f -> (baseDuration - 15).coerceAtLeast(20)
+            skipRate < 0.1f -> (baseDuration + 15).coerceAtMost(60)
+            else            -> baseDuration
+        }
+
+        // Upgrade Blueprint Phase 2 wiring: per subject, prefer the weakest tracked
+        // concept StudentModel already knows about (real measured mastery from
+        // imported test results) over blind PYQ-rotation topic selection — same
+        // "don't guess what Room already knows" discipline as the LLM path above.
+        // A concept only wins here if RetentionEngine.decide() actually flagged it
+        // (TEACH/REVIEW) — a MOVE_ON concept (well-mastered, low forgetting risk)
+        // falls through to normal rotation even if it happens to be this subject's
+        // lowest-mastery row, since "lowest of the well-mastered" isn't a gap.
+        // Falls straight through to the pre-existing rotation logic untouched when
+        // this subject has no tracked concepts yet (e.g. no report.md imported) —
+        // a fresh install behaves exactly as before this change.
+        val weakestBySubject: Map<String, ConceptSnapshot> = studentModel.concepts.values
+            .filter { it.subject != null }
+            .groupBy { it.subject!! }
+            .mapValues { (_, snapshots) -> snapshots.minByOrNull { it.mastery }!! } // groupBy guarantees a non-empty list per key
+
+        val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
+            val weakest = weakestBySubject.entries
+                .firstOrNull { it.key.equals(subj.name, ignoreCase = true) }
+                ?.value
+                ?.takeIf { it.retentionDecision != RetentionDecisionSnapshot.MOVE_ON }
+
+            val (topic, rationale) = if (weakest != null) {
+                val label = weakest.topic ?: weakest.chapter ?: subj.name
+                val action = when (weakest.retentionDecision) {
+                    RetentionDecisionSnapshot.TEACH  -> "Teach"
+                    RetentionDecisionSnapshot.REVIEW -> "Review"
+                    RetentionDecisionSnapshot.MOVE_ON -> "Revision" // unreachable, filtered above
+                }
+                val masteryPct = (weakest.mastery * 100).toInt()
+                val reason = buildString {
+                    append("Mastery $masteryPct% from imported test results")
+                    if (weakest.errorCount > 0) append(", ${weakest.errorCount} recorded error(s)")
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s), not just flag that one exists — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    if (weakest.prerequisiteIssues.isNotEmpty()) {
+                        val names = weakest.prerequisiteIssues.joinToString {
+                            it.topic ?: it.chapter ?: it.subject ?: it.conceptId
+                        }
+                        append(", traces to weak prerequisite(s): $names")
+                    }
+                }
+                "$action: $label" to reason
+            } else {
+                val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
+                val t = if (topTopics.isNotEmpty()) {
+                    val picked = topTopics[(dayOfYear + idx) % topTopics.size]
+                    if (daysLeft < 30) "Revision: ${picked.first}" else picked.first
+                } else {
+                    if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                    else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                }
+                t to ""
+            }
+
+            tasks.add(StudyTask(
+                subject         = subj.name,
+                topic           = topic,
+                durationMinutes = if (idx == 0) duration + 15 else duration,
+                priority        = sorted.size - idx,
+                rationale       = rationale
+            ))
+        }
+        return tasks
+    }
+
+    private fun daysUntilExam(dateStr: String): Int {
+        return try {
+            val sdf  = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
+            val exam = sdf.parse(dateStr) ?: return 365
+            val diff = exam.time - System.currentTimeMillis()
+            (diff / (1000 * 60 * 60 * 24)).toInt().coerceAtLeast(0)
+        } catch (_: Exception) { 365 }
+    }
+
+    private fun calculateStudyWindowHours(start: String, end: String): Float {
+        return try {
+            val (sh, sm) = start.split(":").map { it.toInt() }
+            val (eh, em) = end.split(":").map { it.toInt() }
+            val startMin = sh * 60 + sm
+            val endMin   = eh * 60 + em
+            ((endMin - startMin) / 60f).coerceAtLeast(1f)
+        } catch (_: Exception) { 8f }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
+package com.checkmate.ui.mentor
 
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.core.AppUsageTracker
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.MentorKnowledge
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.planner.intervention.InterventionStats
-import com.checkmate.planner.intervention.OutcomeLedgerStats
+import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
-import com.checkmate.service.DayHistorySyncManager
-import com.checkmate.workmode.WorkModeSchedule
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Locale
-import kotlin.math.roundToInt
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 
-data class StatsState(
-    val streakDays:           Int                      = 0,
-    val todayCompletion:      Int                      = 0,
-    val weekCompletion:       Int                      = 0,
-    val weeklyData:           List<Pair<String, Int>>  = emptyList(),
-    val subjectStats:         List<Pair<String, Int>>  = emptyList(),
-    val attentionChecksPassed: Int                     = 0,
-    val attentionChecksMissed: Int                     = 0,
-    val avgFocusMinutes:      Int                      = 0,
-    // Blueprint 2.6 — actual focus time, pause count/rate
-    val actualFocusMinutesToday: Int                   = 0,
-    val avgPausesPerSession:  Float                    = 0f,
-    val pauseRatePercent:     Int                      = 0,
-    // Blueprint 10.3 — single 0-100 focus score (Work Mode adherence + completion)
-    val focusScore:           Int                      = 0,
-    // App usage (Digital Wellbeing-style)
-    val hasUsageAccess:       Boolean                  = true,
-    val appUsageToday:        List<Pair<String, Int>>  = emptyList(), // label -> minutes
-    val totalScreenMinutesToday: Int                   = 0,
-    val screenTimeHistory:    List<Pair<String, Int>>  = emptyList(),  // day -> minutes
-    // ── Consistency calendar (green/yellow/red dots per day) ──────────────
-    val consistencyMonthLabel: String                             = "",
-    val consistencyMonth:      Map<Int, PlanStore.DayStudyStatus> = emptyMap(),
-    // "No tasks in plan == no study": consecutive days (ending yesterday) with nothing
-    // planned or nothing completed. 0 means no gap right now.
-    val consecutiveMissedDays: Int                                = 0,
-    // Step 14 (Blueprint §26 "Baseline intervention statistics"): read model over the
-    // Step 12 Outcome Ledger. Defaults to InterventionStats.EMPTY (totalResolved == 0)
-    // until loadInterventionStats() below actually runs — the screen uses that as the
-    // signal to hide the card entirely rather than show an all-zero one, same posture as
-    // the consecutiveMissedDays warning card already does for its own condition.
-    val interventionStats: InterventionStats = InterventionStats.EMPTY
+private val historyJson = Json { ignoreUnknownKeys = true }
+private const val PREFS_KEY_HISTORY = "mentor_chat_history"
+private const val MAX_PERSISTED_MESSAGES = 40
+
+@Serializable
+data class MentorMessage(
+    val role:    String,
+    val content: String,
+    val ts:      Long = System.currentTimeMillis()
 )
 
-class StatsViewModel : ViewModel() {
-    private val _state = MutableStateFlow(StatsState())
-    val state: StateFlow<StatsState> = _state.asStateFlow()
+data class MentorUiState(
+    val messages:   List<MentorMessage> = emptyList(),
+    val inputText:  String              = "",
+    val isLoading:  Boolean             = false,
+    val ttsEnabled: Boolean             = CheckmatePrefs.getBoolean("tts_enabled", true)
+)
 
-    init { loadStats() }
+class MentorViewModel : ViewModel() {
 
-    private fun loadStats() {
+    private val _state = MutableStateFlow(MentorUiState())
+    val state: StateFlow<MentorUiState> = _state.asStateFlow()
+
+    init { loadHistory() }
+
+    private fun loadHistory() {
+        val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+        val messages = if (saved != null) {
+            try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+            catch (_: Exception) { emptyList() }
+        } else emptyList()
+
+        val initial = if (messages.isEmpty())
+            listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        else messages
+
+        _state.update { it.copy(messages = initial) }
+    }
+
+    private fun persistHistory(messages: List<MentorMessage>) {
+        val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
+        CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(trimmed))
+    }
+
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank() || _state.value.isLoading) return
+
+        val userMsg = MentorMessage("user", text)
+        val updatedMessages = _state.value.messages + userMsg
+        _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
+        persistHistory(updatedMessages)
+
         viewModelScope.launch {
-            // "Sync everything" pass: merge in any day-history (plan/checklist/
-            // check-in) this device is missing BEFORE reading PlanStore below, so
-            // a day synced from another device shows up in this same load's
-            // streak/weekly/monthly numbers instead of only after the next
-            // reload. Per-day merge, never overwrites a day already present
-            // locally — see DayHistorySyncManager.pullMissingDays' own doc.
-            withContext(Dispatchers.IO) { DayHistorySyncManager.pullMissingDays() }
+            val response = try {
+                val systemPrompt = buildSystemPrompt(context, text)
+                val history      = buildHistoryForLlm()
+                LlmGateway.complete(history, systemPrompt)
+            } catch (e: Exception) {
+                "I couldn't process that right now. Try again."
+            }
 
-            val streak       = PlanStore.getStreakDays()
-            val todayPct     = PlanStore.getTodayCompletionPercent()
-            val weekPct      = PlanStore.getWeekCompletionPercent()
-            val weekly       = PlanStore.getWeeklyData()
-            val subjectData  = PlanStore.getSubjectStats()
-            val ledger       = BehaviorLedger.getAttentionStats()
-            val pauseStats   = PlanStore.getPauseStats()
+            val assistantMsg = MentorMessage(
+                "assistant",
+                response.ifBlank { "No response. Check your API key in Settings." }
+            )
+            val finalMessages = _state.value.messages + assistantMsg
+            _state.update { it.copy(messages = finalMessages, isLoading = false) }
+            persistHistory(finalMessages)
 
-            // Consistency calendar: current month's per-day status, plus how many days in a
-            // row nothing's been studied — see PlanStore.DayStudyStatus doc for why an empty
-            // plan counts the same as a missed day here.
-            val cal = Calendar.getInstance()
-            val monthMap = PlanStore.getMonthConsistency(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH))
-            val monthLabel = SimpleDateFormat("MMMM yyyy", Locale.getDefault()).format(cal.time)
-            val missedStreak = PlanStore.getConsecutiveMissedDays()
+            if (_state.value.ttsEnabled && response.isNotBlank()) {
+                val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
+                CheckmateTTS.speak(context, firstSentence)
+            }
+        }
+    }
 
-            _state.update { it.copy(
-                streakDays              = streak,
-                todayCompletion         = todayPct,
-                weekCompletion          = weekPct,
-                weeklyData               = weekly,
-                subjectStats            = subjectData,
-                attentionChecksPassed   = ledger.checksPassed,
-                attentionChecksMissed   = ledger.checksMissed,
-                avgFocusMinutes         = ledger.avgFocusMinutes,
-                actualFocusMinutesToday = pauseStats.actualFocusMinutesToday,
-                avgPausesPerSession     = pauseStats.avgPausesPerSession,
-                pauseRatePercent        = pauseStats.pauseRatePercent,
-                consistencyMonthLabel   = monthLabel,
-                consistencyMonth        = monthMap,
-                consecutiveMissedDays   = missedStreak
-            )}
+    fun clearHistory() {
+        val initial = listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        _state.update { it.copy(messages = initial) }
+        // FIX: putString(key, null) crashes on non-null String param — use remove() instead
+        CheckmatePrefs.remove(PREFS_KEY_HISTORY)
+    }
 
-            // Backup the Consistency tab snapshot to the sync code (fire-and-forget,
-            // no-op with no sync code) and, if this device has no study history yet
-            // (fresh install), restore the synced snapshot instead of showing all
-            // zeros. Never overrides real local numbers — see
-            // StatsSyncManager.looksEmpty()/pullStats() docs. Screen-usage-time
-            // fields are excluded from sync entirely and untouched here.
-            withContext(Dispatchers.IO) {
-                StatsSyncManager.pushStats(_state.value)
-                if (StatsSyncManager.looksEmpty(_state.value)) {
-                    StatsSyncManager.pullStats(_state.value)?.let { restored ->
-                        _state.update { restored }
-                    }
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(20)
+        return msgs.joinToString("\n") { msg ->
+            if (msg.role == "user") "Student: ${msg.content}"
+            else "Mentor: ${msg.content}"
+        }
+    }
+
+    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
+    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
+    // other suspend call this function already awaits nothing for (buildSystemPrompt
+    // itself did no suspending work before this). Its one call site (send(), above)
+    // already invokes it from inside viewModelScope.launch, so this is a signature-only
+    // change — no call-site rewrite needed.
+    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
+        val profile         = ConsultationProfile.load()
+        val ledger          = BehaviorLedger.getSummaryForPlanner()
+        val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
+
+        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
+        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
+        // updates, and upcoming coaching tests. These four blocks close that gap.
+        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
+        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
+            todayTasks.joinToString("\n") { t ->
+                val marker = when (t.state) {
+                    TaskState.DONE    -> "[DONE]"
+                    TaskState.SKIPPED -> "[SKIPPED]"
+                    TaskState.ACTIVE  -> "[ACTIVE]"
+                    TaskState.PAUSED  -> "[PAUSED]"
+                    TaskState.PENDING -> "[PENDING]"
                 }
-                // Opportunistic backup, same trigger as StatsSyncManager's own push
-                // just above — a Stats-tab open doubles as a day-history backup
-                // point in addition to the nightly EOD push (GuardianNotifier.
-                // sendEndOfDaySummary).
-                DayHistorySyncManager.pushHistory()
+                val custom = if (t.isCustom) " (custom)" else ""
+                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
             }
         }
+
+        val usageSummary = try {
+            AppUsageTracker.getTodayUsage(context, limit = 5)
+                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
+        } catch (_: Exception) { "" }
+
+        val todayContext = TodayContext.getSummaryText()
+        val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
+
+        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
+        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
+        // import — see TestResultNormalizer) into one StudentModel, but nothing read
+        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
+        // ledger, blind to actual test performance. buildLearningSummary() below
+        // compacts it into the same plain-text block style as planSummary/ledger.
+        val learningSummary = try {
+            buildLearningSummary(StudentModelBuilder.build(context))
+        } catch (e: Exception) {
+            "" // same fail-open pattern as usageSummary/coachingContext above — a
+               // learning-state read failure shouldn't block the rest of the prompt.
+        }
+
+        return buildString {
+            appendLine("""
+You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
+You have full context about this student. Be specific, direct, and curriculum-aware.
+Keep responses under 5 lines unless a detailed breakdown is needed.
+Never give generic motivation. React to actual data.
+Refer to specific topics, chapters, marks gaps, and deadlines.
+You also have access to the full conversation history above — refer to it naturally when relevant.
+If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
+you may briefly flag it — but don't derail the actual question they asked.
+If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
+the student's question, reference them specifically instead of speaking generically. When a
+weak concept lists a prerequisite issue, name the specific prerequisite topic (e.g. "your
+Rolling Motion mistakes trace back to Laws of Motion, which is still at 38%") rather than
+saying only that a prerequisite gap exists.
+            """.trimIndent())
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            appendLine("BEHAVIOR DATA: $ledger")
+            appendLine()
+            appendLine("TODAY'S PLAN:")
+            appendLine(planSummary)
+            appendLine()
+            if (learningSummary.isNotBlank()) {
+                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
+                appendLine(learningSummary)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES:")
+                appendLine(todayContext)
+                appendLine()
+            }
+            if (usageSummary.isNotBlank()) {
+                appendLine("TODAY'S APP USAGE (top 5):")
+                appendLine(usageSummary)
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING TESTS/LECTURES (next 3 days):")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (knowledgeBlocks.isNotBlank()) {
+                appendLine("RELEVANT KNOWLEDGE:")
+                appendLine(knowledgeBlocks)
+                appendLine()
+            }
+            appendLine("Respond as Mentor.")
+        }.trim()
     }
 
     /**
-     * Loads on-device app usage history (today's breakdown + 7-day screen
-     * time), plus the Blueprint 10.3 focus score, which needs the same
-     * UsageStatsManager access. Called from StatsScreen with the composable's
-     * Context. Safe to call repeatedly (e.g. on resume).
-     */
-    fun loadAppUsage(context: Context) {
-        viewModelScope.launch {
-            val granted = AppUsageTracker.hasUsageAccess(context)
-            if (!granted) {
-                // No usage access -> Work Mode adherence can't be measured; fall back to
-                // completion rate alone so the score still means something instead of 0.
-                _state.update { it.copy(
-                    hasUsageAccess = false,
-                    focusScore     = it.todayCompletion
-                ) }
-                return@launch
-            }
-            val (today, history) = withContext(Dispatchers.IO) {
-                val today = AppUsageTracker.getTodayUsage(context, limit = 6)
-                    .map { it.label to (it.foregroundMillis / 60_000L).toInt() }
-                val history = AppUsageTracker.getScreenTimeHistory(context, days = 7)
-                    .map { it.dayLabel to (it.totalMillis / 60_000L).toInt() }
-                today to history
-            }
-            val totalMinutes = AppUsageTracker.getTodayTotalMillis(context).let { (it / 60_000L).toInt() }
-            val adherencePercent = withContext(Dispatchers.IO) { computeWorkModeAdherencePercent(context) }
-            val score = ((_state.value.todayCompletion + adherencePercent) / 2f).roundToInt().coerceIn(0, 100)
-            _state.update { it.copy(
-                hasUsageAccess          = true,
-                appUsageToday           = today,
-                totalScreenMinutesToday = totalMinutes,
-                screenTimeHistory       = history,
-                focusScore              = score
-            )}
-        }
-    }
-
-    /**
-     * Blueprint 10.3: "Work Mode adherence" half of the focus score. Measures
-     * how much of today's already-elapsed WorkModeSchedule locked window(s)
-     * (00:00-05:00 every day, +01:00-15:10 on Sun/Wed, +19:00-now every day)
-     * had non-Checkmate app usage recorded — i.e. usage during hours the
-     * student was supposed to be blocked out. 0 usage during locked time ->
-     * 100% adherence; usage filling the whole locked window so far -> 0%.
+     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
+     * plain-text block matching the existing planSummary/ledger style — Mentor's
+     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
+     * convention, so this deliberately doesn't reuse AdaptivePlanner's
+     * StudentModelPromptSummary/Json.encodeToString approach.
      *
-     * Lives in :app (not AppUsageTracker in :core) because it needs both
-     * AppUsageTracker (:core) and WorkModeSchedule (:workmode) — :core can't
-     * depend on :workmode (workmode already depends on core), so this can only
-     * be composed at a layer that depends on both, which :app does.
+     * Empty-guard: returns "" when no report has ever been imported
+     * (conceptsTracked == 0) — same pattern as the other optional context blocks
+     * above (usageSummary/coachingContext) — so a student who hasn't imported a
+     * mock yet doesn't get a misleading "0 concepts tracked" section.
      */
-    private fun computeWorkModeAdherencePercent(context: Context): Int {
-        val now = Calendar.getInstance()
-        val dayStart = (now.clone() as Calendar).apply {
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-        }
-        val nowMillis = now.timeInMillis
+    private fun buildLearningSummary(model: StudentModel): String {
+        if (model.overall.conceptsTracked == 0) return ""
 
-        fun rangeMillis(startHour: Int, startMinute: Int, endHour: Int, endMinute: Int): Pair<Long, Long>? {
-            val start = (dayStart.clone() as Calendar).apply {
-                set(Calendar.HOUR_OF_DAY, startHour); set(Calendar.MINUTE, startMinute)
-            }.timeInMillis
-            val end = (dayStart.clone() as Calendar).apply {
-                set(Calendar.HOUR_OF_DAY, endHour); set(Calendar.MINUTE, endMinute)
-            }.timeInMillis
-            val clippedEnd = end.coerceAtMost(nowMillis)
-            return if (clippedEnd > start) start to clippedEnd else null
-        }
+        val overall = model.overall
+        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(5)
+        val topErrors = model.unresolvedErrors.take(5)
 
-        val ranges = mutableListOf<Pair<Long, Long>>()
-
-        // Tail of last night's usual 19:00-05:00 window, always present every day.
-        rangeMillis(0, 0, WorkModeSchedule.END_HOUR, 0)?.let { ranges.add(it) }
-
-        // Sun/Wed extra window: 01:00-15:10 — only the part beyond END_HOUR is new
-        // (00:00-END_HOUR is already covered by the range above).
-        if (now.get(Calendar.DAY_OF_WEEK) == Calendar.SUNDAY || now.get(Calendar.DAY_OF_WEEK) == Calendar.WEDNESDAY) {
-            rangeMillis(
-                WorkModeSchedule.END_HOUR, 0,
-                WorkModeSchedule.SPECIAL_END_HOUR, WorkModeSchedule.SPECIAL_END_MINUTE
-            )?.let { ranges.add(it) }
-        }
-
-        // Start of tonight's usual window: 19:00 onward, clipped to now.
-        rangeMillis(WorkModeSchedule.START_HOUR, 0, 24, 0)?.let { ranges.add(it) }
-
-        val lockedElapsedMillis = ranges.sumOf { it.second - it.first }
-        if (lockedElapsedMillis <= 0L) return 100 // no locked window has elapsed yet today
-
-        val usedDuringLockedMillis = ranges.sumOf { (s, e) -> AppUsageTracker.getUsageMillisInRange(context, s, e) }
-        val adherence = 1f - (usedDuringLockedMillis.toFloat() / lockedElapsedMillis.toFloat())
-        return (adherence.coerceIn(0f, 1f) * 100).roundToInt()
+        return buildString {
+            appendLine(
+                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
+                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
+                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
+            )
+            if (weakest.isNotEmpty()) {
+                appendLine("Weakest concepts:")
+                weakest.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s) and, when known, their own mastery — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) {
+                        val names = c.prerequisiteIssues.joinToString { ref ->
+                            val prereqLabel = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+                            val prereqMastery = model.concepts[ref.conceptId]?.mastery
+                            if (prereqMastery != null) "$prereqLabel (${(prereqMastery * 100).toInt()}%)"
+                            else "$prereqLabel (not yet attempted)"
+                        }
+                        " — traces to weak prerequisite(s): $names"
+                    } else ""
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
+                }
+            }
+            if (reviewDue.isNotEmpty()) {
+                appendLine("Due for review (forgetting risk rising):")
+                reviewDue.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
+                }
+            }
+            if (topErrors.isNotEmpty()) {
+                appendLine("Recurring errors:")
+                topErrors.forEach { e ->
+                    val concept = model.concepts[e.conceptId]
+                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
+                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
+                }
+            }
+        }.trim()
     }
 
-    /**
-     * Step 14 (Blueprint §26 "Baseline intervention statistics"). Separate load function,
-     * same pattern as [loadAppUsage] just above — needs a Context (for
-     * [InterventionDatabase.getInstance]) that only the Composable has, so it's called from
-     * its own LaunchedEffect in StatsScreen rather than folded into [loadStats]'s init-time
-     * call. Safe to call repeatedly (e.g. on resume), same as loadAppUsage.
-     *
-     * This is purely a read model — see [OutcomeLedgerStats]'s own doc for why "Learning
-     * comes after measurement" (§25 principle 7) means nothing here feeds back into
-     * trigger sensitivity, policy, or strategy selection. That's Step 15, not this.
-     */
-    fun loadInterventionStats(context: Context) {
-        viewModelScope.launch {
-            val stats = withContext(Dispatchers.IO) {
-                val dao = InterventionDatabase.getInstance(context).outcomeLedgerDao()
-                OutcomeLedgerStats.compute(dao)
-            }
-            _state.update { it.copy(interventionStats = stats) }
+    companion object {
+        /**
+         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
+         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
+         * directly into the same persisted chat history MentorViewModel reads on init — turning
+         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
+         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
+         * methods above so a message appended here shows up next time MentorScreen is opened.
+         */
+        fun appendProactiveMessage(text: String) {
+            val clean = text.trim()
+            if (clean.isEmpty()) return
+            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+            val existing = if (saved != null) {
+                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+                catch (_: Exception) { emptyList() }
+            } else emptyList()
+            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(updated))
         }
     }
 }
+
+
