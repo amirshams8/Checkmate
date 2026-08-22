@@ -137,7 +137,16 @@ object TestResultNormalizer {
                     chapter = q.chapter,
                     topic = q.topic,
                     correctOption = q.correctOption,
-                    questionText = q.questionText
+                    questionText = q.questionText,
+                    // ADDED: options/explanation now flow through from the parser —
+                    // previously dropped even though Question.explanation already
+                    // existed as a column, because TestReportParser had nowhere to
+                    // read them from until Testmate's report started emitting them.
+                    // This is the actual evidence ErrorEngine needs (see Question.kt's
+                    // doc on `options`); nothing downstream that only reads
+                    // correctOption/questionText is affected by these being populated.
+                    explanation = q.explanation,
+                    options = q.options
                 )
             )
 

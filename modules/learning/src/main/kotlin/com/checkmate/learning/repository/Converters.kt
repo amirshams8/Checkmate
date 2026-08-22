@@ -8,10 +8,11 @@ import kotlinx.serialization.json.Json
 
 /**
  * Room has no native column type for List<String> (LearningEvent.conceptIds,
- * Question.concepts, ErrorPattern.interventions) or for enums (ErrorRecord.errorType,
- * ErrorPattern.errorType) — same gap :modules:psyche works around for its own
- * Json-serialized fields. JSON array rather than a delimiter-joined string so a
- * concept id containing a comma can never corrupt the column.
+ * Question.concepts, ErrorPattern.interventions), for Map<String, String>
+ * (Question.options), or for enums (ErrorRecord.errorType, ErrorPattern.errorType)
+ * — same gap :modules:psyche works around for its own Json-serialized fields.
+ * JSON rather than a delimiter-joined string so option text containing a comma
+ * or pipe can never corrupt the column.
  */
 class Converters {
     private val json = Json { ignoreUnknownKeys = true }
@@ -22,6 +23,17 @@ class Converters {
     @TypeConverter
     fun toStringList(value: String): List<String> =
         if (value.isBlank()) emptyList() else json.decodeFromString(value)
+
+    // Added for Question.options (Upgrade Blueprint Phase 1.6 evidence pipeline) —
+    // nullable, unlike the List<String> pair above, since "no options" (numeric/
+    // subjective questions) is a real, common case rather than "not yet imported."
+    @TypeConverter
+    fun fromOptionsMap(value: Map<String, String>?): String? =
+        value?.let { json.encodeToString(it) }
+
+    @TypeConverter
+    fun toOptionsMap(value: String?): Map<String, String>? =
+        value?.takeIf { it.isNotBlank() }?.let { json.decodeFromString(it) }
 
     // Added for ErrorRecord.errorType / ErrorPattern.errorType (Upgrade Blueprint Phase 1.6).
     @TypeConverter

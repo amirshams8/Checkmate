@@ -45,5 +45,15 @@ data class Question(
     val correctOption: String? = null,
     val questionText: String? = null,
     val explanation: String? = null,
+    /**
+     * ADDED: full option-letter -> option-text set (e.g. "a" -> "10 min, 90 km/h"),
+     * sourced from Testmate's report `Options:` line (see
+     * [com.checkmate.learning.testmate.TestReportParser]). Null for numeric/subjective
+     * questions, which have no fixed option set, and for any question imported before
+     * this field existed. This is the evidence gap flagged in markdown-export.ts's own
+     * doc comment: without it, ErrorEngine can only classify a wrong answer by timing,
+     * with no way to reason about *why* the specific wrong option was chosen.
+     */
+    val options: Map<String, String>? = null,
     val officialSource: String? = null
 )
