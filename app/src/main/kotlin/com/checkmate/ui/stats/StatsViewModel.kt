@@ -9,6 +9,7 @@ import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionStats
 import com.checkmate.planner.intervention.OutcomeLedgerStats
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.DayHistorySyncManager
 import com.checkmate.workmode.WorkModeSchedule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
@@ -61,6 +62,14 @@ class StatsViewModel : ViewModel() {
 
     private fun loadStats() {
         viewModelScope.launch {
+            // "Sync everything" pass: merge in any day-history (plan/checklist/
+            // check-in) this device is missing BEFORE reading PlanStore below, so
+            // a day synced from another device shows up in this same load's
+            // streak/weekly/monthly numbers instead of only after the next
+            // reload. Per-day merge, never overwrites a day already present
+            // locally — see DayHistorySyncManager.pullMissingDays' own doc.
+            withContext(Dispatchers.IO) { DayHistorySyncManager.pullMissingDays() }
+
             val streak       = PlanStore.getStreakDays()
             val todayPct     = PlanStore.getTodayCompletionPercent()
             val weekPct      = PlanStore.getWeekCompletionPercent()
@@ -107,6 +116,11 @@ class StatsViewModel : ViewModel() {
                         _state.update { restored }
                     }
                 }
+                // Opportunistic backup, same trigger as StatsSyncManager's own push
+                // just above — a Stats-tab open doubles as a day-history backup
+                // point in addition to the nightly EOD push (GuardianNotifier.
+                // sendEndOfDaySummary).
+                DayHistorySyncManager.pushHistory()
             }
         }
     }
@@ -227,3 +241,106 @@ class StatsViewModel : ViewModel() {
         }
     }
 }
+
+
+//===== WORKERFILE: reports-studystate-dayhistory-routes.js (add to the steep-band-1bd0 Worker project via Wrangler — NOT part of this Android repo) =====
+// Three new routes for the same Worker your existing /profile, /tasks, /stats,
+// /outcomes routes already live in. Same KV binding those use (referred to
+// below as KV — swap in your actual binding name from wrangler.toml).
+// Each route: POST writes, GET reads, keyed by "code" (the same sync_code
+// value the app already sends to every other route).
+//
+// Drop these three blocks into your existing router alongside the other
+// routes' handlers, using whatever routing style the rest of the Worker
+// already uses (raw `if (url.pathname === "/x")` switch, or a router lib) —
+// shown here as plain async functions you can wire in either way.
+
+// ── /reports — LearningReportSyncManager ───────────────────────────────────
+// Append-only list, deduped by reportId (a content hash the app computes) —
+// NOT a last-write-wins single blob like /profile.
+async function handleReports(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, reportId, pushedAt, reportText } = await request.json();
+    if (!code || !reportId || !reportText) {
+      return new Response("Missing code/reportId/reportText", { status: 400 });
+    }
+    const key = `reports:${code}`;
+    const existing = JSON.parse((await KV.get(key)) || "[]");
+    if (!existing.some((r) => r.reportId === reportId)) {
+      existing.push({ reportId, pushedAt, reportText });
+      await KV.put(key, JSON.stringify(existing));
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const reports = JSON.parse((await KV.get(`reports:${code}`)) || "[]");
+    return new Response(JSON.stringify({ reports }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// ── /studystate — StudyStateSyncManager ─────────────────────────────────────
+// Single blob, same shape as /profile: { code, updatedAt, state: { mentor_chat_history?, checklist_template?, coaching_planner_entries? } }
+async function handleStudyState(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, state } = await request.json();
+    if (!code || !state) return new Response("Missing code/state", { status: 400 });
+    await KV.put(`studystate:${code}`, JSON.stringify(state));
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const state = JSON.parse((await KV.get(`studystate:${code}`)) || "{}");
+    return new Response(JSON.stringify({ state }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// ── /dayhistory — DayHistorySyncManager ─────────────────────────────────────
+// Single blob, whole-history-replace on push (the app itself only ever sends
+// its full locally-known set): { code, updatedAt, plans: {dayKey: json}, checklists: {dayKey: json}, checkins: {dayKey: json} }
+async function handleDayHistory(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, plans, checklists, checkins } = await request.json();
+    if (!code) return new Response("Missing code", { status: 400 });
+    await KV.put(
+      `dayhistory:${code}`,
+      JSON.stringify({ plans: plans || {}, checklists: checklists || {}, checkins: checkins || {} })
+    );
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const raw = await KV.get(`dayhistory:${code}`);
+    const data = JSON.parse(raw || '{"plans":{},"checklists":{},"checkins":{}}');
+    return new Response(JSON.stringify(data), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// Wire into your existing fetch handler's routing, e.g.:
+//   if (url.pathname === "/reports")    return handleReports(request, env.YOUR_KV_BINDING);
+//   if (url.pathname === "/studystate") return handleStudyState(request, env.YOUR_KV_BINDING);
+//   if (url.pathname === "/dayhistory") return handleDayHistory(request, env.YOUR_KV_BINDING);

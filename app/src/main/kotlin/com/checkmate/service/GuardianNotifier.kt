@@ -201,6 +201,27 @@ object GuardianNotifier {
         // OutcomeLedgerSyncManager's own doc), so there's no reason for its own schedule.
         // No-op internally if no sync_code is configured.
         OutcomeLedgerSyncManager.pushLedger(context)
+
+        // "Sync everything" pass: same once-a-day piggyback for the behavior event
+        // ledger — see BehaviorLedgerSyncManager's own doc. No-op if no sync_code
+        // is configured.
+        BehaviorLedgerSyncManager.pushLedger(context)
+
+        // Same nightly cadence for the remaining bounded "current state" blobs
+        // (Mentor history, checklist template, coaching entries — see
+        // StudyStateSyncManager's own doc) and for the full day-by-day plan/
+        // checklist/check-in history (see DayHistorySyncManager's own doc).
+        // Unlike OutcomeLedgerSyncManager/BehaviorLedgerSyncManager above (which
+        // own their own IO-scoped coroutine internally), these two use plain
+        // synchronous OkHttp calls, same style as ProfileSyncManager — so they're
+        // backgrounded here explicitly, matching the Telegram send's Thread{}
+        // wrap just above. sendEndOfDaySummary() itself runs on EodSummaryReceiver's
+        // onReceive (main thread, no background dispatch of its own), so skipping
+        // this wrap would throw NetworkOnMainThreadException.
+        Thread {
+            StudyStateSyncManager.pushState()
+            DayHistorySyncManager.pushHistory()
+        }.start()
     }
 
     /**

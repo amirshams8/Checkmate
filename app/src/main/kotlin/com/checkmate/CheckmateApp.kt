@@ -12,6 +12,7 @@ import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.BehaviorLedgerSyncManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
@@ -95,6 +96,24 @@ class CheckmateApp : Application() {
         // already has rows, or if no sync_code is configured — see
         // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
         OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // "Sync everything" pass: same reinstall-recovery restore, same startup call
+        // site, for the behavior event ledger (BehaviorDatabase — see
+        // BehaviorLedgerSyncManager's own doc for why this is a separate table/sync
+        // manager from the Outcome Ledger above rather than merged into it). No-op if
+        // local rows already exist or no sync_code is configured.
+        BehaviorLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // Same "sync everything" pass for the two synchronous-OkHttp managers
+        // (StudyStateSyncManager / DayHistorySyncManager — see their own docs).
+        // Backgrounded explicitly, unlike the two calls just above: those two own
+        // an internal IO-scoped coroutine and return immediately regardless of
+        // caller thread, these two block on client.newCall().execute() directly,
+        // and Application.onCreate() itself runs on the main thread.
+        Thread {
+            StudyStateSyncManager.pullStateIfEmpty()
+            DayHistorySyncManager.pullMissingDays()
+        }.start()
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
         // (and ScrollGuard, which reuses the same listener/pipeline for its

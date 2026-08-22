@@ -22,4 +22,15 @@ object CheckmatePrefs {
     fun putLong(key: String, value: Long)       { if (ready()) prefs.edit().putLong(key, value).apply() }
     fun getLong(key: String, def: Long = 0L): Long = if (ready()) prefs.getLong(key, def) else def
     fun remove(key: String)                     { if (ready()) prefs.edit().remove(key).apply() }
+
+    /**
+     * All stored keys starting with [prefix] — e.g. "plan_" -> every day that has a
+     * saved plan. Added for DayHistorySyncManager, which has no other way to discover
+     * which day keys exist locally: PlanStore/DailyChecklist/DailyCheckIn each derive
+     * a single day's key on demand (todayKey()/keyForDay()) but keep no index of which
+     * days were ever written, so syncing "all history" requires reading SharedPreferences'
+     * own key set directly rather than asking those objects for a list they don't have.
+     */
+    fun allKeysWithPrefix(prefix: String): Set<String> =
+        if (ready()) prefs.all.keys.filter { it.startsWith(prefix) }.toSet() else emptySet()
 }
