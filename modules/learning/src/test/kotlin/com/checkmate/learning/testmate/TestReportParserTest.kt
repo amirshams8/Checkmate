@@ -11,14 +11,11 @@ import org.junit.Test
  * untouched by the Options:/Explanation: format change, so this preserves that
  * existing regression coverage rather than re-deriving it.
  *
- * Question rows below are a verbatim excerpt (Q1, Q108, Q180 — one SKIPPED, one
- * WRONG, one CORRECT) from a real Testmate export
- * (fortnightly-test-for-neet-2026-rm-p1-ft-01a-report.md), matching the new shape
- * confirmed against markdown-export.ts's `buildTestReportMarkdown`. The one
- * exception: the `Explanation:` line under Q108 is fabricated for test coverage
- * — no report we have yet contains a populated explanation, but the line's own
- * shape (`  Explanation: ${q.explanation}`, WRONG-only) is verified against the
- * exporter source, not guessed.
+ * Question rows below are a verbatim excerpt from real Testmate exports — Q1/Q180
+ * from fortnightly-test-for-neet-2026-rm-p1-ft-01a-report.md (SKIPPED, CORRECT),
+ * Q2 from ft-02b-neet-2027--report.md (WRONG, with a real populated Explanation:
+ * line — confirming the explanation import path is actually live end-to-end, not
+ * just that the parser matches the exporter's line shape).
  */
 class TestReportParserTest {
 
@@ -37,11 +34,11 @@ class TestReportParserTest {
           Q: Two cities X and Y are connected by a regular bus service with a bus leaving in either direction every T min. A girl is driving scooty with a speed of 60 km/h in the direction X to Y notices that a bus goes past her every 30 minutes in the direction of her motion, and every 10 minutes in the opposite direction. Choose the correct option for the period T of the bus service and the speed (assumed constant) of the buses.
           Options: a) 10 min, 90 km/h | b) 15 min, 120 km/h | c) 9 min, 40 km/h | d) 25 min, 100 km/h
           Your answer: — | Correct: b) 15 min, 120 km/h
-        Q108 [Cell: The Unit of Life/—] — WRONG — time 11s
-          Q: Read the following statements and choose the correct option. Assertion (A): Mitochondria can synthesise some of its own proteins. Reason (R): Both inner and outer membrane of the mitochondria have enzymes.
-          Options: a) Both (A) and (R) are true and (R) is the correct explanation of (A) | b) Both (A) and (R) are true but (R) is not the correct explanation of (A) | c) Only (A) is true but (R) is false | d) Both (A) and (R) are false
-          Your answer: c) Only (A) is true but (R) is false | Correct: b) Both (A) and (R) are true but (R) is not the correct explanation of (A)
-          Explanation: Both membranes carry distinct enzyme sets, so (R) being true doesn't establish that it explains (A) — (R) is true but isn't the reason (A) is true.
+        Q2 [Laws of Motion/—] — WRONG — time 8s
+          Q: The ratio a1/a2 of accelerations of 1 kg masses in the two systems shown (pulleys and strings ideal, g = 10 m/s²) is
+          Options: a) 1/5 | b) 2/3 | c) 3/5 | d) 1/3
+          Your answer: c) 3/5 | Correct: a) 1/5
+          Explanation: System 1: a1 = (40-10)/5 = 6 m/s² (four blocks total, 1kg pulled by 4kg via massless pulley system giving net force 40-10 over mass 5). System 2: a2 = (40-10)/1 = 30 m/s² (1 kg pulled by 40N force directly). a1/a2 = 6/30 = 1/5.
         Q180 [Biomolecules-I (Upto polysaccharides)/—] — CORRECT — time 13s
           Q: Assertion(A): If you add iodine solution to a sample containing starch, it gives blue colour. Reason(R): Starch forms helical secondary structures in which it can hold I2 molecules. In the light of above statements, choose the correct option.
           Options: a) Both (A) and (R) are true and (R) is the correct explanation of (A) | b) Both (A) and (R) are true but (R) is not the correct explanation of (A) | c) (A) is true, (R) is false | d) (A) is false, (R) is true
@@ -96,23 +93,23 @@ class TestReportParserTest {
         assertNull(questions[0].selectedOption) // SKIPPED -> "—"
         assertEquals("b", questions[0].correctOption)
         assertEquals("c", questions[1].selectedOption)
-        assertEquals("b", questions[1].correctOption)
+        assertEquals("a", questions[1].correctOption)
         assertEquals("a", questions[2].selectedOption)
         assertEquals("a", questions[2].correctOption)
     }
 
     @Test
     fun `parses the full option set from the Options line`() {
-        val q2 = TestReportParser.parse(sample).questions[1] // Q108
+        val q2 = TestReportParser.parse(sample).questions[1] // Q2 (FT-02B)
         assertEquals(4, q2.options?.size)
-        assertEquals("Both (A) and (R) are false", q2.options?.get("d"))
+        assertEquals("1/3", q2.options?.get("d"))
     }
 
     @Test
     fun `captures explanation only for WRONG questions`() {
         val questions = TestReportParser.parse(sample).questions
         assertNull(questions[0].explanation) // SKIPPED
-        assertTrue(questions[1].explanation!!.startsWith("Both membranes carry distinct enzyme sets"))
+        assertTrue(questions[1].explanation!!.startsWith("System 1: a1 = (40-10)/5"))
         assertNull(questions[2].explanation) // CORRECT
     }
 
