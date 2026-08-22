@@ -23,6 +23,8 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── CheckmateDeviceAdminReceiver.kt
 │   │   │   │   │   │   ├── service
 │   │   │   │   │   │   │   ├── AttentionCycleService.kt
+│   │   │   │   │   │   │   ├── BehaviorLedgerSyncManager.kt
+│   │   │   │   │   │   │   ├── DayHistorySyncManager.kt
 │   │   │   │   │   │   │   ├── FloatingAttentionService.kt
 │   │   │   │   │   │   │   ├── GuardianNotifier.kt
 │   │   │   │   │   │   │   ├── InterventionActionReceiver.kt
@@ -37,6 +39,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── ReminderService.kt
 │   │   │   │   │   │   │   ├── ScreenCaptureManager.kt
 │   │   │   │   │   │   │   ├── StatusReporter.kt
+│   │   │   │   │   │   │   ├── StudyStateSyncManager.kt
 │   │   │   │   │   │   │   ├── TaskSyncManager.kt
 │   │   │   │   │   │   │   ├── TelegramAlertBot.kt
 │   │   │   │   │   │   ├── ui
@@ -729,6 +732,7 @@ import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.BehaviorLedgerSyncManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
@@ -812,6 +816,24 @@ class CheckmateApp : Application() {
         // already has rows, or if no sync_code is configured — see
         // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
         OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // "Sync everything" pass: same reinstall-recovery restore, same startup call
+        // site, for the behavior event ledger (BehaviorDatabase — see
+        // BehaviorLedgerSyncManager's own doc for why this is a separate table/sync
+        // manager from the Outcome Ledger above rather than merged into it). No-op if
+        // local rows already exist or no sync_code is configured.
+        BehaviorLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // Same "sync everything" pass for the two synchronous-OkHttp managers
+        // (StudyStateSyncManager / DayHistorySyncManager — see their own docs).
+        // Backgrounded explicitly, unlike the two calls just above: those two own
+        // an internal IO-scoped coroutine and return immediately regardless of
+        // caller thread, these two block on client.newCall().execute() directly,
+        // and Application.onCreate() itself runs on the main thread.
+        Thread {
+            StudyStateSyncManager.pullStateIfEmpty()
+            DayHistorySyncManager.pullMissingDays()
+        }.start()
 
         // Wire real screenshot capture via MediaProjection into DistractionGuard
         // (and ScrollGuard, which reuses the same listener/pipeline for its
@@ -1302,6 +1324,344 @@ class AttentionCycleService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/BehaviorLedgerSyncManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.psyche.db.BehaviorDatabase
+import com.checkmate.psyche.db.BehaviorEventEntity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+/**
+ * BehaviorLedgerSyncManager — backs up/restores [BehaviorEventEntity] rows (the
+ * Room-backed behavior event log — see BehaviorDatabase's own doc on why this
+ * replaced the old CheckmatePrefs JSON blob) to the same Cloudflare Worker + KV
+ * that [ProfileSyncManager]/[OutcomeLedgerSyncManager] already use, keyed by the
+ * same "sync_code".
+ *
+ * Same reinstall-recovery posture as [OutcomeLedgerSyncManager], not live sync:
+ *   - [pushLedger] — whole-table push, fire-and-forget. The table is capped at
+ *     200 rows (see BehaviorEventDao.trimToNewest), so unlike day-history data
+ *     this never grows unbounded — pushing the whole thing every time is cheap
+ *     regardless of how long the student's been using the app.
+ *   - [pullLedgerIfLocalEmpty] — restores ONLY if the local table is genuinely
+ *     empty (fresh install / BehaviorDatabase's fallbackToDestructiveMigrationOnDowngrade
+ *     wipe) — never merges into or overwrites real local history. Call once at
+ *     [com.checkmate.CheckmateApp] startup, same call site as
+ *     [OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty].
+ *
+ * Room DAO access is suspend, so — same posture as [OutcomeLedgerSyncManager] —
+ * this object owns its own [CoroutineScope] rather than pushing coroutine
+ * management onto every call site.
+ */
+object BehaviorLedgerSyncManager {
+
+    private const val TAG = "BehaviorLedgerSyncManager"
+    private const val BEHAVIOR_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/behavior"
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    private fun syncCode(): String? =
+        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
+
+    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
+    fun isEnabled(): Boolean = syncCode() != null
+
+    /**
+     * Pushes the entire local behavior event log up under the configured sync
+     * code. No-op if no sync code is set. Fire-and-forget, same call-site shape
+     * as [OutcomeLedgerSyncManager.pushLedger].
+     */
+    fun pushLedger(context: Context) {
+        val code = syncCode() ?: return
+        val appContext = context.applicationContext
+        scope.launch {
+            try {
+                val dao = BehaviorDatabase.getInstance(appContext).behaviorEventDao()
+                val events = dao.getAll()
+                val eventsJson = JSONArray().apply { events.forEach { put(it.toJson()) } }
+                val payload = JSONObject().apply {
+                    put("code", code)
+                    put("updatedAt", System.currentTimeMillis())
+                    put("events", eventsJson)
+                }
+                val body = payload.toString().toRequestBody("application/json".toMediaType())
+                val response = client.newCall(Request.Builder().url(BEHAVIOR_URL).post(body).build()).execute()
+                Log.d(TAG, "pushLedger: ${response.code} (${events.size} events)")
+                response.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "pushLedger exception: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Restores the synced behavior log into the local Room table, but ONLY if
+     * this device's local table is genuinely empty — never merges into or
+     * overwrites real local history. Fire-and-forget like [pushLedger]; pass
+     * [onResult] if a caller needs to know whether a restore happened
+     * (CheckmateApp's startup call doesn't).
+     */
+    fun pullLedgerIfLocalEmpty(context: Context, onResult: ((restored: Boolean) -> Unit)? = null) {
+        val code = syncCode()
+        if (code == null) {
+            onResult?.invoke(false)
+            return
+        }
+        val appContext = context.applicationContext
+        scope.launch {
+            val restored = try {
+                val dao = BehaviorDatabase.getInstance(appContext).behaviorEventDao()
+                if (dao.count() > 0) {
+                    false // real local history already exists — don't clobber it
+                } else {
+                    val request = Request.Builder().url("$BEHAVIOR_URL?code=$code").get().build()
+                    val response = client.newCall(request).execute()
+                    val bodyStr = response.body?.string()
+                    response.close()
+                    if (!response.isSuccessful || bodyStr.isNullOrBlank()) {
+                        false
+                    } else {
+                        val eventsArr = JSONObject(bodyStr).optJSONArray("events")
+                        if (eventsArr == null || eventsArr.length() == 0) {
+                            false
+                        } else {
+                            for (i in 0 until eventsArr.length()) {
+                                eventsArr.optJSONObject(i)?.toBehaviorEventEntity()?.let { dao.insert(it) }
+                            }
+                            dao.trimToNewest(200) // keep the same 200-row cap intact after a bulk restore
+                            Log.d(TAG, "pullLedgerIfLocalEmpty: restored ${eventsArr.length()} events from sync code")
+                            true
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "pullLedgerIfLocalEmpty exception: ${e.message}")
+                false
+            }
+            onResult?.invoke(restored)
+        }
+    }
+
+    // ── Manual (de)serialization ──────────────────────────────────────────
+    // BehaviorEventEntity isn't a kotlinx.serialization @Serializable type — Room
+    // entities in this codebase generally aren't — so this mirrors
+    // OutcomeLedgerSyncManager's manual JSONObject approach. id (the Room
+    // autogenerate primary key) is deliberately NOT round-tripped: a restored row
+    // gets a fresh local id via @Insert's autoGenerate, same as any other insert.
+    private fun BehaviorEventEntity.toJson(): JSONObject = JSONObject().apply {
+        put("subject", subject)
+        put("topic", topic)
+        put("state", state)
+        put("timestamp", timestamp)
+        put("focusMinutes", focusMinutes)
+        put("checksPassed", checksPassed)
+        put("checksMissed", checksMissed)
+        put("taskType", taskType)
+        put("distractionApp", distractionApp ?: JSONObject.NULL)
+    }
+
+    private fun JSONObject.toBehaviorEventEntity(): BehaviorEventEntity? = try {
+        BehaviorEventEntity(
+            subject = getString("subject"),
+            topic = getString("topic"),
+            state = getString("state"),
+            timestamp = getLong("timestamp"),
+            focusMinutes = optInt("focusMinutes", 0),
+            checksPassed = optInt("checksPassed", 0),
+            checksMissed = optInt("checksMissed", 0),
+            taskType = optString("taskType", "OTHER"),
+            distractionApp = if (isNull("distractionApp")) null else optString("distractionApp", null)
+        )
+    } catch (e: Exception) {
+        Log.w(TAG, "toBehaviorEventEntity parse failure: ${e.message}")
+        null
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/DayHistorySyncManager.kt =====
+package com.checkmate.service
+
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+/**
+ * DayHistorySyncManager — the bigger of the two "sync everything" pieces
+ * ([StudyStateSyncManager] is the smaller one). Backs up the full day-by-day
+ * history that every existing sync manager deliberately left out:
+ *   - "plan_<dayKey>"          (PlanStore — one full task list per day)
+ *   - "checklist_<dayKey>"     (DailyChecklist — daily done/not-done state;
+ *                               NOT "checklist_template", which is bounded
+ *                               "current state" and lives in StudyStateSyncManager)
+ *   - "daily_checkin_<dayKey>" (DailyCheckIn — one check-in record per day)
+ *
+ * StatsSyncManager's own doc already flagged this exact gap: "it does NOT
+ * reconstruct history for streak/calendar math ... that would mean syncing
+ * every plan_<day> key, a bigger job." This is that bigger job.
+ *
+ * DIFFERENT MERGE MODEL from every other sync manager here, and deliberately
+ * so: PlanStore/DailyChecklist/DailyCheckIn keep no index of which day keys
+ * exist (see CheckmatePrefs.allKeysWithPrefix's own doc) and day-history is
+ * naturally sparse rather than all-or-nothing, so:
+ *   - [pushHistory] pushes every locally known day (discovered via
+ *     CheckmatePrefs.allKeysWithPrefix, not a Room table) as one JSON object
+ *     keyed by day, whole-history-replace on the KV side.
+ *   - [pullMissingDays] merges IN only the days this device doesn't already
+ *     have locally, per key — never a single "local table is empty" check
+ *     like [OutcomeLedgerSyncManager]/[BehaviorLedgerSyncManager] use, since a
+ *     device could legitimately have some days locally and be missing others
+ *     (e.g. it just joined an existing sync_code partway through the
+ *     student's history).
+ *
+ * At realistic personal-use scale (a year or two of daily entries, each a few
+ * KB) the whole history is still comfortably inside one KV value and one
+ * Worker request body, so a full push every time — same choice
+ * [OutcomeLedgerSyncManager]/[BehaviorLedgerSyncManager] made for their own
+ * bounded tables — stays simpler than a per-day delta/diff scheme.
+ *
+ * Synchronous OkHttp calls, same style as [ProfileSyncManager]/
+ * [StudyStateSyncManager] — callers MUST run this off the main thread (see
+ * GuardianNotifier.sendEndOfDaySummary's Thread{} wrap).
+ */
+object DayHistorySyncManager {
+
+    private const val TAG = "DayHistorySyncManager"
+    private const val HISTORY_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/dayhistory"
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build()
+
+    private fun syncCode(): String? =
+        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
+
+    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
+    fun isEnabled(): Boolean = syncCode() != null
+
+    /**
+     * Pushes every locally known day's plan/checklist/check-in data. No-op if
+     * no sync code is set, or if there's genuinely nothing local yet. Must be
+     * called from a background thread.
+     */
+    fun pushHistory() {
+        val code = syncCode() ?: return
+        try {
+            val plans = JSONObject()
+            CheckmatePrefs.allKeysWithPrefix("plan_").forEach { key ->
+                CheckmatePrefs.getString(key, null)?.let { plans.put(key.removePrefix("plan_"), it) }
+            }
+            val checklists = JSONObject()
+            CheckmatePrefs.allKeysWithPrefix("checklist_")
+                .filterNot { it == "checklist_template" }
+                .forEach { key ->
+                    CheckmatePrefs.getString(key, null)?.let { checklists.put(key.removePrefix("checklist_"), it) }
+                }
+            val checkins = JSONObject()
+            CheckmatePrefs.allKeysWithPrefix("daily_checkin_").forEach { key ->
+                CheckmatePrefs.getString(key, null)?.let { checkins.put(key.removePrefix("daily_checkin_"), it) }
+            }
+
+            if (plans.length() == 0 && checklists.length() == 0 && checkins.length() == 0) return
+
+            val payload = JSONObject().apply {
+                put("code", code)
+                put("updatedAt", System.currentTimeMillis())
+                put("plans", plans)
+                put("checklists", checklists)
+                put("checkins", checkins)
+            }
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(Request.Builder().url(HISTORY_URL).post(body).build()).execute()
+            Log.d(
+                TAG,
+                "pushHistory: ${response.code} (${plans.length()} plan days, " +
+                    "${checklists.length()} checklist days, ${checkins.length()} check-ins)"
+            )
+            response.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "pushHistory exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Fills in ONLY the days this device doesn't already have locally — per-day
+     * merge, never overwrites an existing plan_<day>/checklist_<day>/
+     * daily_checkin_<day> entry. Safe to call every time (e.g. alongside
+     * [StatsViewModel]'s existing load-time sync calls) since it's a strict
+     * no-clobber merge, not a "restore once" operation. Must be called from a
+     * background thread.
+     */
+    fun pullMissingDays() {
+        val code = syncCode() ?: return
+        try {
+            val request = Request.Builder().url("$HISTORY_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return
+
+            val obj = JSONObject(bodyStr)
+            var restored = 0
+
+            obj.optJSONObject("plans")?.let { plans ->
+                plans.keys().asSequence().forEach { dayKey ->
+                    val prefKey = "plan_$dayKey"
+                    if (CheckmatePrefs.getString(prefKey, null) == null) {
+                        CheckmatePrefs.putString(prefKey, plans.getString(dayKey)); restored++
+                    }
+                }
+            }
+            obj.optJSONObject("checklists")?.let { checklists ->
+                checklists.keys().asSequence().forEach { dayKey ->
+                    val prefKey = "checklist_$dayKey"
+                    if (CheckmatePrefs.getString(prefKey, null) == null) {
+                        CheckmatePrefs.putString(prefKey, checklists.getString(dayKey)); restored++
+                    }
+                }
+            }
+            obj.optJSONObject("checkins")?.let { checkins ->
+                checkins.keys().asSequence().forEach { dayKey ->
+                    val prefKey = "daily_checkin_$dayKey"
+                    if (CheckmatePrefs.getString(prefKey, null) == null) {
+                        CheckmatePrefs.putString(prefKey, checkins.getString(dayKey)); restored++
+                    }
+                }
+            }
+            if (restored > 0) Log.d(TAG, "pullMissingDays: restored $restored day-history entries from sync code")
+        } catch (e: Exception) {
+            Log.w(TAG, "pullMissingDays exception: ${e.message}")
+        }
+    }
 }
 
 
@@ -1932,6 +2292,27 @@ object GuardianNotifier {
         // OutcomeLedgerSyncManager's own doc), so there's no reason for its own schedule.
         // No-op internally if no sync_code is configured.
         OutcomeLedgerSyncManager.pushLedger(context)
+
+        // "Sync everything" pass: same once-a-day piggyback for the behavior event
+        // ledger — see BehaviorLedgerSyncManager's own doc. No-op if no sync_code
+        // is configured.
+        BehaviorLedgerSyncManager.pushLedger(context)
+
+        // Same nightly cadence for the remaining bounded "current state" blobs
+        // (Mentor history, checklist template, coaching entries — see
+        // StudyStateSyncManager's own doc) and for the full day-by-day plan/
+        // checklist/check-in history (see DayHistorySyncManager's own doc).
+        // Unlike OutcomeLedgerSyncManager/BehaviorLedgerSyncManager above (which
+        // own their own IO-scoped coroutine internally), these two use plain
+        // synchronous OkHttp calls, same style as ProfileSyncManager — so they're
+        // backgrounded here explicitly, matching the Telegram send's Thread{}
+        // wrap just above. sendEndOfDaySummary() itself runs on EodSummaryReceiver's
+        // onReceive (main thread, no background dispatch of its own), so skipping
+        // this wrap would throw NetworkOnMainThreadException.
+        Thread {
+            StudyStateSyncManager.pushState()
+            DayHistorySyncManager.pushHistory()
+        }.start()
     }
 
     /**
@@ -3946,6 +4327,145 @@ object StatusReporter {
             response.close()
         } catch (e: Exception) {
             Log.e(TAG, "pushUsageReport exception: ${e.message}")
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/StudyStateSyncManager.kt =====
+package com.checkmate.service
+
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+/**
+ * StudyStateSyncManager — "sync everything" pass, third and last piece alongside
+ * [BehaviorLedgerSyncManager] and the pre-existing [OutcomeLedgerSyncManager]/
+ * [ProfileSyncManager]/[TaskSyncManager]/[StatsSyncManager].
+ *
+ * Backs up the remaining small "current state" blobs that weren't covered by any
+ * existing sync manager, same Cloudflare Worker + KV, same "sync_code":
+ *   - mentor_chat_history   (MentorViewModel — capped at 40 messages)
+ *   - checklist_template    (DailyChecklist — master item list, not the daily
+ *                            done/not-done state, which is day-history — see
+ *                            DayHistorySyncManager for that)
+ *   - coaching_planner_entries (CoachingPlannerEntry — coaching-test countdown list)
+ *
+ * Same reinstall-recovery posture as ProfileSyncManager, one flat blob, guarded
+ * per-field so a partially-configured device (e.g. one that customized the
+ * checklist template but never used Mentor) doesn't get one field silently
+ * overwritten by another field's absence.
+ *
+ * NOT wired into every individual edit call site (MentorViewModel.sendMessage,
+ * the Checklist template editor, CoachingPlannerEntry.addEntry) — those live in
+ * three different screens/modules and none of this data changes more than a few
+ * times a day, so [pushState] instead piggybacks on the same once-daily EOD
+ * summary cadence [BehaviorLedgerSyncManager]/[OutcomeLedgerSyncManager] already
+ * use (see GuardianNotifier.sendEndOfDaySummary). [pullStateIfEmpty] is called
+ * once at [com.checkmate.CheckmateApp] startup, same call site as those two.
+ *
+ * Synchronous OkHttp calls, matching [ProfileSyncManager]'s style (these are
+ * plain CheckmatePrefs string reads, no suspend DAO calls involved) — callers
+ * must run this off the main thread, which both wiring points already do.
+ */
+object StudyStateSyncManager {
+
+    private const val TAG = "StudyStateSyncManager"
+    private const val STATE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/studystate"
+
+    private const val KEY_MENTOR_HISTORY = "mentor_chat_history"
+    private const val KEY_CHECKLIST_TEMPLATE = "checklist_template"
+    private const val KEY_COACHING_ENTRIES = "coaching_planner_entries"
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
+
+    private fun syncCode(): String? =
+        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
+
+    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
+    fun isEnabled(): Boolean = syncCode() != null
+
+    /**
+     * Pushes whichever of the three fields have local values (a device that's
+     * never opened Mentor simply omits that field rather than pushing blank
+     * over a possibly-already-synced value). No-op if no sync code is set.
+     * Must be called from a background thread.
+     */
+    fun pushState() {
+        val code = syncCode() ?: return
+        try {
+            val state = JSONObject()
+            CheckmatePrefs.getString(KEY_MENTOR_HISTORY, null)?.let { state.put("mentor_chat_history", it) }
+            CheckmatePrefs.getString(KEY_CHECKLIST_TEMPLATE, null)?.let { state.put("checklist_template", it) }
+            CheckmatePrefs.getString(KEY_COACHING_ENTRIES, null)?.let { state.put("coaching_planner_entries", it) }
+
+            if (state.length() == 0) return // nothing local to push yet
+
+            val payload = JSONObject().apply {
+                put("code", code)
+                put("updatedAt", System.currentTimeMillis())
+                put("state", state)
+            }
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(Request.Builder().url(STATE_URL).post(body).build()).execute()
+            Log.d(TAG, "pushState: ${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "pushState exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Restores each of the three fields independently, but ONLY where the local
+     * value for that specific field is unset — a device that already has its own
+     * checklist template keeps it even if this restores a fresh Mentor history.
+     * Must be called from a background thread.
+     */
+    fun pullStateIfEmpty() {
+        val code = syncCode() ?: return
+        val needMentor    = CheckmatePrefs.getString(KEY_MENTOR_HISTORY, null) == null
+        val needChecklist = CheckmatePrefs.getString(KEY_CHECKLIST_TEMPLATE, null) == null
+        val needCoaching  = CheckmatePrefs.getString(KEY_COACHING_ENTRIES, null) == null
+        if (!needMentor && !needChecklist && !needCoaching) return // nothing to restore
+
+        try {
+            val request = Request.Builder().url("$STATE_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return
+
+            val state = JSONObject(bodyStr).optJSONObject("state") ?: return
+            var restoredAny = false
+
+            if (needMentor) {
+                state.optString("mentor_chat_history", "").takeIf { it.isNotBlank() }?.let {
+                    CheckmatePrefs.putString(KEY_MENTOR_HISTORY, it); restoredAny = true
+                }
+            }
+            if (needChecklist) {
+                state.optString("checklist_template", "").takeIf { it.isNotBlank() }?.let {
+                    CheckmatePrefs.putString(KEY_CHECKLIST_TEMPLATE, it); restoredAny = true
+                }
+            }
+            if (needCoaching) {
+                state.optString("coaching_planner_entries", "").takeIf { it.isNotBlank() }?.let {
+                    CheckmatePrefs.putString(KEY_COACHING_ENTRIES, it); restoredAny = true
+                }
+            }
+            if (restoredAny) Log.d(TAG, "pullStateIfEmpty: restored fields from sync code")
+        } catch (e: Exception) {
+            Log.w(TAG, "pullStateIfEmpty exception: ${e.message}")
         }
     }
 }
@@ -10870,6 +11390,7 @@ import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionStats
 import com.checkmate.planner.intervention.OutcomeLedgerStats
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.DayHistorySyncManager
 import com.checkmate.workmode.WorkModeSchedule
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
@@ -10922,6 +11443,14 @@ class StatsViewModel : ViewModel() {
 
     private fun loadStats() {
         viewModelScope.launch {
+            // "Sync everything" pass: merge in any day-history (plan/checklist/
+            // check-in) this device is missing BEFORE reading PlanStore below, so
+            // a day synced from another device shows up in this same load's
+            // streak/weekly/monthly numbers instead of only after the next
+            // reload. Per-day merge, never overwrites a day already present
+            // locally — see DayHistorySyncManager.pullMissingDays' own doc.
+            withContext(Dispatchers.IO) { DayHistorySyncManager.pullMissingDays() }
+
             val streak       = PlanStore.getStreakDays()
             val todayPct     = PlanStore.getTodayCompletionPercent()
             val weekPct      = PlanStore.getWeekCompletionPercent()
@@ -10968,6 +11497,11 @@ class StatsViewModel : ViewModel() {
                         _state.update { restored }
                     }
                 }
+                // Opportunistic backup, same trigger as StatsSyncManager's own push
+                // just above — a Stats-tab open doubles as a day-history backup
+                // point in addition to the nightly EOD push (GuardianNotifier.
+                // sendEndOfDaySummary).
+                DayHistorySyncManager.pushHistory()
             }
         }
     }
@@ -11088,6 +11622,109 @@ class StatsViewModel : ViewModel() {
         }
     }
 }
+
+
+//===== WORKERFILE: reports-studystate-dayhistory-routes.js (add to the steep-band-1bd0 Worker project via Wrangler — NOT part of this Android repo) =====
+// Three new routes for the same Worker your existing /profile, /tasks, /stats,
+// /outcomes routes already live in. Same KV binding those use (referred to
+// below as KV — swap in your actual binding name from wrangler.toml).
+// Each route: POST writes, GET reads, keyed by "code" (the same sync_code
+// value the app already sends to every other route).
+//
+// Drop these three blocks into your existing router alongside the other
+// routes' handlers, using whatever routing style the rest of the Worker
+// already uses (raw `if (url.pathname === "/x")` switch, or a router lib) —
+// shown here as plain async functions you can wire in either way.
+
+// ── /reports — LearningReportSyncManager ───────────────────────────────────
+// Append-only list, deduped by reportId (a content hash the app computes) —
+// NOT a last-write-wins single blob like /profile.
+async function handleReports(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, reportId, pushedAt, reportText } = await request.json();
+    if (!code || !reportId || !reportText) {
+      return new Response("Missing code/reportId/reportText", { status: 400 });
+    }
+    const key = `reports:${code}`;
+    const existing = JSON.parse((await KV.get(key)) || "[]");
+    if (!existing.some((r) => r.reportId === reportId)) {
+      existing.push({ reportId, pushedAt, reportText });
+      await KV.put(key, JSON.stringify(existing));
+    }
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const reports = JSON.parse((await KV.get(`reports:${code}`)) || "[]");
+    return new Response(JSON.stringify({ reports }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// ── /studystate — StudyStateSyncManager ─────────────────────────────────────
+// Single blob, same shape as /profile: { code, updatedAt, state: { mentor_chat_history?, checklist_template?, coaching_planner_entries? } }
+async function handleStudyState(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, state } = await request.json();
+    if (!code || !state) return new Response("Missing code/state", { status: 400 });
+    await KV.put(`studystate:${code}`, JSON.stringify(state));
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const state = JSON.parse((await KV.get(`studystate:${code}`)) || "{}");
+    return new Response(JSON.stringify({ state }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// ── /dayhistory — DayHistorySyncManager ─────────────────────────────────────
+// Single blob, whole-history-replace on push (the app itself only ever sends
+// its full locally-known set): { code, updatedAt, plans: {dayKey: json}, checklists: {dayKey: json}, checkins: {dayKey: json} }
+async function handleDayHistory(request, KV) {
+  const url = new URL(request.url);
+
+  if (request.method === "POST") {
+    const { code, plans, checklists, checkins } = await request.json();
+    if (!code) return new Response("Missing code", { status: 400 });
+    await KV.put(
+      `dayhistory:${code}`,
+      JSON.stringify({ plans: plans || {}, checklists: checklists || {}, checkins: checkins || {} })
+    );
+    return new Response("OK", { status: 200 });
+  }
+
+  if (request.method === "GET") {
+    const code = url.searchParams.get("code");
+    if (!code) return new Response("Missing code", { status: 400 });
+    const raw = await KV.get(`dayhistory:${code}`);
+    const data = JSON.parse(raw || '{"plans":{},"checklists":{},"checkins":{}}');
+    return new Response(JSON.stringify(data), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+// Wire into your existing fetch handler's routing, e.g.:
+//   if (url.pathname === "/reports")    return handleReports(request, env.YOUR_KV_BINDING);
+//   if (url.pathname === "/studystate") return handleStudyState(request, env.YOUR_KV_BINDING);
+//   if (url.pathname === "/dayhistory") return handleDayHistory(request, env.YOUR_KV_BINDING);
 
 
 //===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsScreen.kt =====
@@ -13243,6 +13880,17 @@ object CheckmatePrefs {
     fun putLong(key: String, value: Long)       { if (ready()) prefs.edit().putLong(key, value).apply() }
     fun getLong(key: String, def: Long = 0L): Long = if (ready()) prefs.getLong(key, def) else def
     fun remove(key: String)                     { if (ready()) prefs.edit().remove(key).apply() }
+
+    /**
+     * All stored keys starting with [prefix] — e.g. "plan_" -> every day that has a
+     * saved plan. Added for DayHistorySyncManager, which has no other way to discover
+     * which day keys exist locally: PlanStore/DailyChecklist/DailyCheckIn each derive
+     * a single day's key on demand (todayKey()/keyForDay()) but keep no index of which
+     * days were ever written, so syncing "all history" requires reading SharedPreferences'
+     * own key set directly rather than asking those objects for a list they don't have.
+     */
+    fun allKeysWithPrefix(prefix: String): Set<String> =
+        if (ready()) prefs.all.keys.filter { it.startsWith(prefix) }.toSet() else emptySet()
 }
 
 
