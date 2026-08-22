@@ -240,3 +240,4 @@ class StatsViewModel : ViewModel() {
             _state.update { it.copy(interventionStats = stats) }
         }
     }
+}

@@ -13,11 +13,13 @@ import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.service.BehaviorLedgerSyncManager
+import com.checkmate.service.DayHistorySyncManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.service.StudyStateSyncManager
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.ScrollGuard
