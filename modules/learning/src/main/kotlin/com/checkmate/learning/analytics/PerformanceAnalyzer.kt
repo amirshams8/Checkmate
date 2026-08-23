@@ -20,6 +20,19 @@ import com.checkmate.learning.model.StudentModel
  * that reasoning belongs to `LearningDecisionEngine`/`ScoreGainEstimator`, per the
  * same "don't let this layer decide what the next layer should decide" boundary
  * [StudentModel] already draws around itself.
+ *
+ * SUBJECT-RESOLUTION FIX (test-report wiring pass): [subjectAccuracy] used to
+ * group on [ConceptSnapshot.subject] directly, which is null for essentially
+ * every real-imported concept (see that field's own doc — TestResultNormalizer
+ * never sets it). [toTopicImpact] already resolves a real subject via
+ * [ConceptWeightage.resolveWeightage]'s fuzzy fallback; [subjectAccuracy] just
+ * wasn't using it, so a real import's Physics/Chemistry/Biology questions could
+ * be correctly attributed in [PerformanceReport.topicImpacts] and simultaneously
+ * invisible in [PerformanceReport.subjectAccuracy] — the one place a student
+ * actually wants to see "how did I do in each subject." Both now call the same
+ * [ConceptSnapshot.resolvedSubject] helper, so a concept is excluded from
+ * subjectAccuracy only when fuzzy resolution genuinely can't place it anywhere —
+ * not merely because the raw import never carried a subject to begin with.
  */
 object PerformanceAnalyzer {
 
@@ -79,9 +92,11 @@ object PerformanceAnalyzer {
         val examType: String,
         val generatedAt: Long,
         /** Attempt-count-weighted per subject, sorted by attemptCount descending.
-         *  Concepts with a null [ConceptSnapshot.subject] (the real-import majority
-         *  — see [StudentModel]'s own doc) are excluded from this rollup since they
-         *  can't be attributed to one subject; they still appear in [topicImpacts]. */
+         *  A concept is excluded from this rollup only when
+         *  [ConceptWeightage.resolveWeightage]'s fuzzy fallback can't place it
+         *  under any subject at all — NOT merely because the raw import never
+         *  carried a subject (see this class's own doc on the subject-resolution
+         *  fix). It still appears in [topicImpacts] either way. */
         val subjectAccuracy: List<SubjectAccuracy>,
         /** Every attempted concept, sorted by [TopicImpact.marksAtStakeGap] descending —
          *  highest exam-value weakness first. */
@@ -98,9 +113,12 @@ object PerformanceAnalyzer {
             .map { it.toTopicImpact(examType) }
             .sortedByDescending { it.marksAtStakeGap }
 
+        // Group by the SAME fuzzy-resolved subject toTopicImpact uses above, not
+        // the raw ConceptSnapshot.subject — see class doc.
         val subjectAccuracy = concepts
-            .filter { it.subject != null && it.attemptCount > 0 }
-            .groupBy { it.subject!! }
+            .filter { it.attemptCount > 0 }
+            .mapNotNull { c -> c.resolvedSubject(examType)?.let { subject -> subject to c } }
+            .groupBy({ it.first }, { it.second })
             .map { (subject, group) -> group.toSubjectAccuracy(subject) }
             .sortedByDescending { it.attemptCount }
 
@@ -121,10 +139,23 @@ object PerformanceAnalyzer {
         )
     }
 
-    private fun ConceptSnapshot.toTopicImpact(examType: String): TopicImpact {
+    /**
+     * Shared resolution step for both [toTopicImpact] and [analyze]'s
+     * subjectAccuracy grouping — factored out so the two can never again silently
+     * diverge on which subject a concept belongs to (that divergence was exactly
+     * the bug this pass fixes).
+     */
+    private fun ConceptSnapshot.resolveAgainstWeightage(examType: String): ConceptWeightage.WeightageResolution {
         val chapterKey = chapter ?: topic ?: ""
         val topicKey = topic ?: chapter ?: ""
-        val resolution = ConceptWeightage.resolveWeightage(examType, subject, chapterKey, topicKey)
+        return ConceptWeightage.resolveWeightage(examType, subject, chapterKey, topicKey)
+    }
+
+    private fun ConceptSnapshot.resolvedSubject(examType: String): String? =
+        resolveAgainstWeightage(examType).subjectResolved
+
+    private fun ConceptSnapshot.toTopicImpact(examType: String): TopicImpact {
+        val resolution = resolveAgainstWeightage(examType)
         val stakeTotal = ConceptWeightage.marksAtStake(examType, resolution)
         val gap = stakeTotal * (1.0 - mastery)
 

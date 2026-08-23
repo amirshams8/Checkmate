@@ -123,4 +123,27 @@ object ConceptWeightage {
     /** Convenience: resolve + marksAtStake in one call. */
     fun marksAtStake(exam: String, subject: String?, chapter: String, topic: String): Double =
         marksAtStake(exam, resolveWeightage(exam, subject, chapter, topic))
+
+    /**
+     * Real per-question scoring pattern — SubjectScoreCalculator's "actual marks a
+     * student would recognize" tally needs the literal +/- pattern, not the
+     * proportional-marks abstraction above. Same honest-gap discipline as
+     * [EXAM_TOTAL_MARKS]: only NEET/JEE Main are filled in with their real,
+     * currently-stable +4/-1 pattern. An unmapped exam returns 0 for both, which is
+     * deliberately indistinguishable from "no negative marking" — callers can't tell
+     * the difference either, same caveat as [marksAtStake] for an unmapped exam.
+     */
+    private val EXAM_MARKS_PER_QUESTION: Map<String, Int> = mapOf(
+        "NEET" to 4,
+        "JEE" to 4
+    )
+
+    private val EXAM_NEGATIVE_MARKS_PER_WRONG: Map<String, Int> = mapOf(
+        "NEET" to 1,
+        "JEE" to 1
+    )
+
+    fun marksPerQuestion(exam: String): Int = EXAM_MARKS_PER_QUESTION[exam] ?: 0
+
+    fun negativeMarksPerWrong(exam: String): Int = EXAM_NEGATIVE_MARKS_PER_WRONG[exam] ?: 0
 }

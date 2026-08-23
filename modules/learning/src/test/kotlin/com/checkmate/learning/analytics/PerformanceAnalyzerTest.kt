@@ -96,8 +96,16 @@ class PerformanceAnalyzerTest {
         assertTrue(report.topicImpacts.first().marksAtStakeGap > report.topicImpacts.last().marksAtStakeGap)
     }
 
+    /**
+     * Replaces the old "concepts with no subject are excluded from subjectAccuracy"
+     * test — that behavior was the bug (see PerformanceAnalyzer's own doc on the
+     * subject-resolution fix). "Current Electricity" is the same fixture
+     * ConceptWeightageTest uses to prove fuzzy resolution finds Physics for a
+     * real-imported concept (subject == null) — this test proves subjectAccuracy
+     * now benefits from that same resolution, not just topicImpacts.
+     */
     @Test
-    fun `concepts with no subject still appear in topicImpacts but are excluded from subjectAccuracy`() {
+    fun `a real-import concept with no subject is included in subjectAccuracy via fuzzy resolution`() {
         val realImport = concept(
             id = "c-real-import", subject = null, chapter = "Current Electricity",
             topic = "Current Electricity", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
@@ -106,7 +114,31 @@ class PerformanceAnalyzerTest {
         val report = PerformanceAnalyzer.analyze(studentModel(listOf(realImport)), examType = "NEET")
 
         assertEquals(1, report.topicImpacts.size)
+        assertEquals(1, report.subjectAccuracy.size)
+        assertEquals("Physics", report.subjectAccuracy.first().subject)
+        assertEquals(6, report.subjectAccuracy.first().attemptCount)
+    }
+
+    /**
+     * The fix narrows exclusion to "fuzzy resolution genuinely found nothing," not
+     * "raw subject was null" — this fixture (same as
+     * ConceptWeightageTest's "unresolvable topic" case) can't be placed under any
+     * subject at all, so it's still correctly excluded from subjectAccuracy while
+     * remaining visible in topicImpacts (with zero marksAtStake, per
+     * ConceptWeightage's own "unresolved -> 0, not an error" contract).
+     */
+    @Test
+    fun `a concept unresolvable by fuzzy matching stays out of subjectAccuracy but still appears in topicImpacts`() {
+        val unresolvable = concept(
+            id = "c-unresolvable", subject = null, chapter = "Not A Real Chapter",
+            topic = "Not A Real Topic", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
+        )
+
+        val report = PerformanceAnalyzer.analyze(studentModel(listOf(unresolvable)), examType = "NEET")
+
+        assertEquals(1, report.topicImpacts.size)
         assertTrue(report.subjectAccuracy.isEmpty())
+        assertEquals(0.0, report.topicImpacts.first().marksAtStakeGap, 0.001)
     }
 
     @Test

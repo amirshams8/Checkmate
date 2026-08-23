@@ -5,6 +5,8 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateResult
@@ -38,7 +40,18 @@ data class TestResultsState(
     // across app updates — just a Storage Access Framework file read.
     val importing: Boolean = false,
     val importResult: TestResultNormalizer.NormalizeResult? = null,
-    val importError: String? = null
+    val importError: String? = null,
+    // ── Test-report wiring pass ──
+    // Closes normalizeAndPersist() -> StudentModelBuilder.build() ->
+    // PerformanceAnalyzer.analyze() -> PerformanceReport, the second half of the
+    // loop the import above only started. Deliberately separate loading/error
+    // state from importing/importError above: a successful import that commits
+    // to Room is real and final the moment importResult is set, regardless of
+    // whether analysis afterward succeeds — see importReport's own doc on why
+    // analysis failure never rolls back or hides importResult.
+    val analyzing: Boolean = false,
+    val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
+    val analysisError: String? = null
 )
 
 class TestResultsViewModel : ViewModel() {
@@ -66,12 +79,27 @@ class TestResultsViewModel : ViewModel() {
      * Reads the picked report.md (or .txt — Testmate's export mime type varies by
      * provider) via SAF, hands the raw text straight to
      * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
-     * (or the "already imported" idempotency result) in [TestResultsState].
-     * File I/O + normalization both happen off the main thread.
+     * (or the "already imported" idempotency result) in [TestResultsState]. File
+     * I/O + normalization both happen off the main thread.
+     *
+     * Test-report wiring pass: once (and only once) normalizeAndPersist has
+     * actually committed — success or already-imported, both mean Room state is
+     * current — this chains into [buildPerformanceReport], closing
+     * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
+     * -> PerformanceReport. The two stages update state independently:
+     * `importResult` is set and `importing` flips false as soon as persistence
+     * succeeds, full stop; analysis runs after that as a separate concern, and if
+     * it fails, only `analysisError` is set — the already-committed import is
+     * never rolled back or hidden because a derived-view step afterward broke.
      */
     fun importReport(context: Context, uri: Uri) {
         viewModelScope.launch {
-            _state.update { it.copy(importing = true, importError = null, importResult = null) }
+            _state.update {
+                it.copy(
+                    importing = true, importError = null, importResult = null,
+                    performanceReport = null, analysisError = null
+                )
+            }
             try {
                 val text = withContext(Dispatchers.IO) {
                     context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
@@ -87,7 +115,10 @@ class TestResultsViewModel : ViewModel() {
                 val result = withContext(Dispatchers.IO) {
                     TestResultNormalizer.normalizeAndPersist(context, text)
                 }
+                // Persistence has committed — this is final regardless of what
+                // buildPerformanceReport below does with it.
                 _state.update { it.copy(importing = false, importResult = result, importError = null) }
+                buildPerformanceReport(context, result.examType)
             } catch (e: Exception) {
                 Log.e(TAG, "Report import failed: ${e.message}", e)
                 _state.update {
@@ -97,7 +128,48 @@ class TestResultsViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Runs after a committed import (fresh or already-imported — both mean Room
+     * reflects this test). Reads current Room state fresh via
+     * [StudentModelBuilder.build] rather than anything cached from the import
+     * step, per [com.checkmate.learning.model.StudentModel]'s own "never hold a
+     * built StudentModel across a Room write" rule. `examType` comes straight from
+     * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
+     * guesses an exam identifier itself.
+     *
+     * Launched as its own coroutine (not inline in importReport's try block) so an
+     * analysis failure can only ever set [TestResultsState.analysisError] — it has
+     * no path back to importReport's own try/catch and can't turn a successful
+     * import into a failed one.
+     */
+    private fun buildPerformanceReport(context: Context, examType: String?) {
+        if (examType == null) {
+            _state.update {
+                it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(analyzing = true, analysisError = null) }
+            try {
+                val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+                val report = PerformanceAnalyzer.analyze(studentModel, examType)
+                _state.update { it.copy(analyzing = false, performanceReport = report) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Performance analysis failed: ${e.message}", e)
+                _state.update {
+                    it.copy(
+                        analyzing = false,
+                        analysisError = "Couldn't build performance report: ${e.message ?: "unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
     fun dismissImportResult() {
-        _state.update { it.copy(importResult = null, importError = null) }
+        _state.update {
+            it.copy(importResult = null, importError = null, performanceReport = null, analysisError = null)
+        }
     }
 }
