@@ -1,294 +1,470 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/testmate/TestResultNormalizer.kt =====
-package com.checkmate.learning.testmate
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/analytics/ConceptWeightage.kt =====
+package com.checkmate.learning.analytics
 
-import android.content.Context
-import android.util.Log
-import com.checkmate.learning.analytics.ScoredQuestionFact
-import com.checkmate.learning.analytics.SubjectScore
-import com.checkmate.learning.analytics.SubjectScoreCalculator
-import com.checkmate.learning.engine.ErrorEngine
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.graph.KnowledgeGraph
-import com.checkmate.learning.model.LearningEvent
-import com.checkmate.learning.model.LearningEventType
-import com.checkmate.learning.model.LearningIds
-import com.checkmate.learning.model.Question
-import com.checkmate.learning.model.QuestionAttempt
-import com.checkmate.learning.repository.LearningDatabase
-import java.security.MessageDigest
+import com.checkmate.core.PYQWeightage
 
 /**
- * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
- * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
- * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
- * successful import now also classifies its wrong attempts (ErrorEngine) and
- * recomputes mastery for every concept touched (MasteryEngine) before returning.
+ * Upgrade Blueprint Phase 2 prerequisite ("step 0.5" — flagged during the Phase 1/2
+ * cross-check, before [PerformanceAnalyzer] and the ScoreGainEstimator it feeds).
+ * Bridges a learning-module concept (identified by exam/subject/chapter/topic — see
+ * [com.checkmate.learning.graph.KnowledgeGraph.conceptId]) to [PYQWeightage]'s
+ * (exam, subject, topic)-keyed data plus a per-exam marks scale, so downstream
+ * consumers get a real "marks at stake" number instead of only a 0-1 mastery score.
  *
- * Test-report wiring pass: [NormalizeResult] now also carries the canonical exam
- * key and a per-test, real-scoring [SubjectScore] breakdown — see that class's own
- * doc — so [com.checkmate.ui.testresults.TestResultsViewModel] doesn't need to
- * re-parse the report or guess an exam identifier to build a
- * [com.checkmate.learning.analytics.PerformanceAnalyzer.PerformanceReport]
- * afterward. StudentModel/PerformanceAnalyzer consumption itself still happens at
- * the caller, not here — this stays a Room-write + immediate-derived-metadata step,
- * not a place that also builds the full cross-test StudentModel.
- *
- * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
- * This is what turns a report.md dump into that "why": one Question row per
- * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
- * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
- * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
- * row per concept the report touched.
- *
- * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
- * attempt/event from one import shares [testTimestamp], which defaults to import
- * time (now), not actual test time. Pass [testTimestamp] explicitly once there's
- * a real source for it (e.g. a file-modified date or a user-entered date) — not
- * guessed here.
+ * WHY THIS DIDN'T ALREADY EXIST: [com.checkmate.learning.graph.KnowledgeGraph.conceptId]
+ * deliberately excludes subject from concept identity (see its own doc — real
+ * TestResultNormalizer imports never carry a subject), so nothing in
+ * :modules:learning has ever needed to resolve a concept back to a PYQWeightage row
+ * before now. ScoreGainEstimator's expectedGain formula (blueprint §2.2) needs
+ * marksAtStake, which needs weightage, which needs this lookup — hence its own file
+ * rather than an inline one-off inside the estimator.
  */
-object TestResultNormalizer {
+object ConceptWeightage {
 
-    private const val TAG = "TestResultNormalizer"
-
-    data class NormalizeResult(
-        val alreadyImported: Boolean,
-        /**
-         * Canonical [com.checkmate.core.ExamSyllabus]/[com.checkmate.core.PYQWeightage]
-         * exam key (e.g. "NEET"), normalized from the report's raw exam string (e.g.
-         * "NEET-2027") via [KnowledgeGraph.normalizeExam] — the same normalization
-         * [seedExamSyllabus] itself already applies. Null only when the report's
-         * title carried no parseable exam suffix at all (see [TestReportParser]).
-         * Populated on every parse, including an [alreadyImported] short-circuit,
-         * since the exam string comes from parsing alone, before the idempotency
-         * check runs.
-         */
-        val examType: String?,
-        val title: String? = null,
-        val scoreObtained: Double? = null,
-        val scoreTotal: Double? = null,
-        val scorePercent: Double? = null,
-        /** Real +marks/-marks tally per subject for THIS test, resolved via
-         *  [SubjectScoreCalculator] — populated on every parse, same reasoning as
-         *  [examType] above. Empty if [examType] is null (nothing to resolve
-         *  subjects against) or no question resolved to a known subject. */
-        val subjectScores: List<SubjectScore> = emptyList(),
-        val questionsWritten: Int,
-        val attemptsWritten: Int,
-        val eventsWritten: Int,
-        val warnings: List<String>,
-        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
-        val errorsClassified: Int = 0,
-        val conceptsRecomputed: Int = 0
-    )
-
-    suspend fun normalizeAndPersist(
-        context: Context,
-        reportText: String,
-        studentId: String = LearningIds.LOCAL_STUDENT_ID,
-        source: String = "testmate_report",
-        testTimestamp: Long = System.currentTimeMillis()
-    ): NormalizeResult {
-        val report = TestReportParser.parse(reportText)
-        val warnings = mutableListOf<String>()
-
-        // Computed once, reused for seedExamSyllabus below AND surfaced on
-        // NormalizeResult — see that field's own doc on why this must happen before
-        // the idempotency check, not after.
-        val normalizedExam = report.exam?.let { KnowledgeGraph.normalizeExam(it) }
-        val subjectScores = normalizedExam?.let { exam ->
-            SubjectScoreCalculator.compute(exam, report.questions.map { it.toScoredQuestionFact() })
-        } ?: emptyList()
-
-        // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
-        // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
-        // this is that call site. Every import already knows its own exam
-        // (report.exam, e.g. "NEET-2027"); normalizing it to an ExamSyllabus key
-        // ("NEET") and seeding here means diagnosePrerequisiteFailure has real
-        // prerequisite edges to walk by the time StudentModelBuilder next runs for
-        // this student, instead of silently finding none because seeding never
-        // happened. Safe on every import, including a duplicate re-import that gets
-        // caught by the idempotency guard below — see seedExamSyllabus's own doc for
-        // why a repeat call is a no-op, not a duplication risk. Fails open: a report
-        // for an exam ExamSyllabus doesn't recognize just returns from
-        // seedExamSyllabus without seeding anything, and the import continues
-        // normally either way.
-        normalizedExam?.let { KnowledgeGraph.seedExamSyllabus(context, it) }
-
-        if (report.questions.isEmpty()) {
-            warnings.add(
-                "No question rows parsed — report format may not match " +
-                    "TestReportParser's expected shape."
-            )
-        }
-        report.attempted?.let { expected ->
-            val actualAttempted = report.questions.count { it.status != ParsedQuestionStatus.SKIPPED }
-            if (actualAttempted != expected) {
-                warnings.add(
-                    "Header says $expected attempted, but $actualAttempted question rows " +
-                        "were non-skipped after parsing."
-                )
-            }
-        }
-
-        val db = LearningDatabase.getInstance(context)
-        val testId = deterministicTestId(report)
-
-        // Idempotency guard: the same report re-imported (e.g. user re-shares the same
-        // file) must not double-count attempts/events. Question ids are deterministic
-        // from (testId, question number), so checking the first one tells us whether
-        // this exact test was already normalized.
-        val firstQuestionId = report.questions.firstOrNull()?.let { deterministicQuestionId(testId, it.number) }
-        if (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) {
-            Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
-            return NormalizeResult(
-                alreadyImported = true,
-                examType = normalizedExam,
-                title = report.title,
-                scoreObtained = report.scoreObtained,
-                scoreTotal = report.scoreTotal,
-                scorePercent = report.scorePercent,
-                subjectScores = subjectScores,
-                questionsWritten = 0,
-                attemptsWritten = 0,
-                eventsWritten = 0,
-                warnings = warnings
-            )
-        }
-
-        val questions = mutableListOf<Question>()
-        val attempts = mutableListOf<QuestionAttempt>()
-        val events = mutableListOf<LearningEvent>()
-
-        events.add(
-            LearningEvent(
-                studentId = studentId,
-                eventType = LearningEventType.MOCK_COMPLETED,
-                timestamp = testTimestamp,
-                source = source,
-                accuracy = report.scorePercent?.let { it / 100.0 }
-            )
-        )
-
-        for (q in report.questions) {
-            val questionId = deterministicQuestionId(testId, q.number)
-
-            questions.add(
-                Question(
-                    id = questionId,
-                    source = source,
-                    exam = report.exam,
-                    chapter = q.chapter,
-                    topic = q.topic,
-                    correctOption = q.correctOption,
-                    questionText = q.questionText,
-                    // ADDED: options/explanation now flow through from the parser —
-                    // previously dropped even though Question.explanation already
-                    // existed as a column, because TestReportParser had nowhere to
-                    // read them from until Testmate's report started emitting them.
-                    // This is the actual evidence ErrorEngine needs (see Question.kt's
-                    // doc on `options`); nothing downstream that only reads
-                    // correctOption/questionText is affected by these being populated.
-                    explanation = q.explanation,
-                    options = q.options
-                )
-            )
-
-            // A QuestionAttempt row means "the student attempted this question" —
-            // SKIPPED questions never should have produced one. Previously every
-            // question got a row with correct=false, so ErrorEngine's
-            // `WHERE correct = 0` query (getWrongAttempts) counted every skip as a
-            // wrong answer alongside real ones (confirmed against a real 180-question
-            // Testmate report: 175 skips + 5 wrong were both landing in
-            // getWrongAttempts, producing "Attempts: 180 / Errors: 180" instead of the
-            // true 5/5). Question and LearningEvent still get a row for every
-            // question, skipped or not — only the attempt table is affected.
-            if (q.status != ParsedQuestionStatus.SKIPPED) {
-                attempts.add(
-                    QuestionAttempt(
-                        studentId = studentId,
-                        questionId = questionId,
-                        timestamp = testTimestamp,
-                        selectedOption = q.selectedOption,
-                        correct = q.status == ParsedQuestionStatus.CORRECT,
-                        timeTakenSeconds = q.timeSeconds
-                    )
-                )
-            }
-
-            val eventType = when (q.status) {
-                ParsedQuestionStatus.CORRECT -> LearningEventType.QUESTION_CORRECT
-                ParsedQuestionStatus.WRONG -> LearningEventType.QUESTION_WRONG
-                ParsedQuestionStatus.SKIPPED -> LearningEventType.QUESTION_SKIPPED
-            }
-            events.add(
-                LearningEvent(
-                    studentId = studentId,
-                    eventType = eventType,
-                    timestamp = testTimestamp,
-                    chapterId = q.chapter,
-                    topicId = q.topic,
-                    questionId = questionId,
-                    source = source,
-                    duration = q.timeSeconds
-                )
-            )
-        }
-
-        db.questionDao().upsertAll(questions)
-        db.questionAttemptDao().insertAll(attempts)
-        db.learningEventDao().insertAll(events)
-
-        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
-        // immediately gets its wrong answers classified and its touched concepts'
-        // mastery recomputed, rather than sitting inert until something else reads it.
-        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
-        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
-
-        warnings.forEach { Log.w(TAG, it) }
-        Log.d(
-            TAG,
-            "Normalized report '${report.title}': ${questions.size} questions, " +
-                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
-                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
-        )
-
-        return NormalizeResult(
-            alreadyImported = false,
-            examType = normalizedExam,
-            title = report.title,
-            scoreObtained = report.scoreObtained,
-            scoreTotal = report.scoreTotal,
-            scorePercent = report.scorePercent,
-            subjectScores = subjectScores,
-            questionsWritten = questions.size,
-            attemptsWritten = attempts.size,
-            eventsWritten = events.size,
-            warnings = warnings,
-            errorsClassified = errorRecords.size,
-            conceptsRecomputed = recomputedMastery.size
-        )
+    /** How a [WeightageResolution] was reached — surfaced for debugging rather than
+     *  discarded, so "why did this resolve/not resolve" is never a re-derivation. */
+    enum class ResolutionMethod {
+        EXACT_SUBJECT_TOPIC, EXACT_SUBJECT_CHAPTER, EXACT_CANONICAL, ALIAS, TOKEN_OVERLAP, UNRESOLVED
     }
 
-    private fun ParsedQuestionResult.toScoredQuestionFact() = ScoredQuestionFact(
-        chapter = chapter,
-        topic = topic,
-        correct = status == ParsedQuestionStatus.CORRECT,
-        attempted = status != ParsedQuestionStatus.SKIPPED
+    /**
+     * Result of resolving a concept against [PYQWeightage]. `subjectResolved` is the
+     * subject the weightage was actually found under — which, for a real-imported
+     * concept (subject == null going in, see class doc), is the ONLY way to learn
+     * which subject a topic belongs to at all, since [PYQWeightage.findTopicWeightage]
+     * itself only returns a bare Float. `weightagePercent` is 0f and `method` is
+     * [ResolutionMethod.UNRESOLVED] when nothing matched at any tier —
+     * `subjectResolved` falls back to the input `subject` in that case (may still be
+     * null). `matchedKey` is the literal PYQWeightage key that was matched, null only
+     * when unresolved.
+     */
+    data class WeightageResolution(
+        val subjectResolved: String?,
+        val weightagePercent: Float,
+        val matchedKey: String? = null,
+        val method: ResolutionMethod = ResolutionMethod.UNRESOLVED
     )
 
     /**
-     * Stable id derived from the report's own content (exam + title), not a random
-     * UUID — the same report re-imported must resolve to the same testId so the
-     * idempotency guard above actually works.
+     * Real Testmate chapter names that map to a PYQWeightage key but share too
+     * little vocabulary for [tokenOverlapScore] to catch on its own (e.g. "Laws of
+     * Motion" vs "Mechanics — Newton's Laws" — one shared word, jaccard 0.25).
+     * Each entry is manually verified against the actual NEET syllabus, not
+     * inferred — see resolveWeightage's KDoc for why this tier exists and what it
+     * deliberately does NOT cover. Keys are pre-[normalize]d fragments; values are
+     * the exact PYQWeightage key to resolve to (looked up across every subject in
+     * the exam via [findCanonical]).
+     *
+     * KNOWN GAP, LEFT DELIBERATELY UNMAPPED (see [resolveWeightage] tier order —
+     * these fall through to UNRESOLVED rather than guessing):
+     *  - "Motion in a Plane" — NEET's PYQWeightage Physics table only has a 1D
+     *    "Kinematics" entry; aliasing 2D motion to it would overstate confidence
+     *    in a topic-level weightage that doesn't actually exist for it.
+     *  - "Classification of Elements and Periodicity in Properties" — no
+     *    Chemistry key represents this chapter; the nearest keys (p/s/d-Block
+     *    Elements) are compound-specific, not periodicity-specific.
+     *  - "Breathing & Exchange of Gases-I (...)" — arguably part of the
+     *    "Human Physiology" PYQ bucket, but that bucket is undifferentiated
+     *    enough (it also covers circulation, excretion, neural control, etc.)
+     *    that aliasing this one respiration sub-chapter to it would attribute
+     *    that whole bucket's weight to a fraction of what it actually covers.
+     *  Add real PYQ evidence before aliasing any of these three, per the same
+     *  "0 is the correct unknown-value default" discipline used everywhere else
+     *  in this file.
      */
-    private fun deterministicTestId(report: ParsedTestReport): String =
-        sha256Hex("${report.exam ?: ""}|${report.title}").take(16)
+    private val ALIASES: Map<String, Map<String, String>> = mapOf(
+        "NEET" to mapOf(
+            normalize("Motion in a Straight Line") to "Kinematics",
+            normalize("Laws of Motion") to "Mechanics — Newton's Laws",
+            normalize("Structure of Atom") to "Atomic Structure",
+            normalize("The Living World") to "Diversity of Living World",
+            normalize("Cell Cycle & Cell Division") to "Cell Division",
+            // The real Testmate chapter carries extra trailing content
+            // ("Lipids, Nucleic acids, Enzymes, Cofactors") beyond the
+            // parenthetical/roman-numeral suffix that [normalize] strips, so this
+            // needs its own entry — "Biomolecules-I (Upto polysaccharides)" does
+            // NOT need one, since normalize alone reduces it to "biomolecules"
+            // and matches PYQWeightage's "Biomolecules" key exactly (tier 3).
+            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Biomolecules"
+        )
+    )
 
-    private fun deterministicQuestionId(testId: String, questionNumber: Int): String =
-        "$testId-q$questionNumber"
+    /** Generic connective words stripped before token-overlap comparison — NOT
+     *  overfit to this app's chapter names, so it stays safe to reuse for JEE/SSC
+     *  chapters later. */
+    private val STOPWORDS = setOf("of", "in", "a", "an", "the", "and", "to", "for", "on", "at", "or")
 
-    private fun sha256Hex(input: String): String =
-        MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
-            .joinToString("") { "%02x".format(it) }
+    /** Lowercase, drop parentheticals and a trailing roman/arabic chapter-part
+     *  suffix ("-I", "-II", "-2"), fold "&" to "and", strip remaining punctuation,
+     *  collapse whitespace. Deliberately does NOT stem words (see [tokenOverlapScore]
+     *  doc on why "Electricity" must never match "Electric"). */
+    private fun normalize(raw: String): String {
+        if (raw.isBlank()) return ""
+        var s = raw.lowercase()
+        s = s.replace(Regex("\\([^)]*\\)"), " ")
+        s = s.replace(Regex("-(i{1,3}|iv|v|[0-9]+)\\b"), " ")
+        s = s.replace("&", " and ")
+        s = s.replace(Regex("[^a-z0-9\\s]"), " ")
+        s = s.replace(Regex("\\s+"), " ").trim()
+        return s
+    }
+
+    private fun tokens(normalized: String): Set<String> =
+        normalized.split(" ").filter { it.isNotBlank() && it.length > 2 && it !in STOPWORDS }.toSet()
+
+    /**
+     * Plain word-set Jaccard overlap — deliberately NOT stemmed or substring-based.
+     * A substring test (the original bug) or a stemmed match would let
+     * "Electricity" match "Electric" and "Current Electricity" bleed into
+     * "Electric Potential" — two genuinely different NEET topics. Whole-word
+     * comparison only, so a match means the fragments actually share concepts,
+     * not just a common prefix.
+     */
+    private fun tokenOverlapScore(a: Set<String>, b: Set<String>): Double {
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        val intersection = a.intersect(b).size
+        val union = a.union(b).size
+        return intersection.toDouble() / union
+    }
+
+    /** Conservative on purpose — chosen so real overlapping-but-distinct NEET
+     *  topics (e.g. "Current Electricity" vs "Electric Potential") score 0, while
+     *  genuine paraphrases (e.g. "Cell Cycle & Cell Division" vs "Cell Division",
+     *  jaccard 0.67) still pass. See ConceptWeightageTest for the boundary cases
+     *  this threshold was picked against. */
+    private const val FUZZY_MIN_JACCARD = 0.6
+
+    private fun findCanonical(examData: Map<String, Map<String, Float>>, key: String): WeightageResolution? {
+        for ((subj, topics) in examData) {
+            val hit = topics[key]
+            if (hit != null) return WeightageResolution(subj, hit, key, ResolutionMethod.EXACT_CANONICAL)
+        }
+        return null
+    }
+
+    /**
+     * Five-tier fallback, most to least specific:
+     *  1. Exact (exam, subject, topic) — only reachable when `subject` is non-null,
+     *     i.e. almost always a syllabus-seeded [com.checkmate.learning.model.Concept]
+     *     (see [com.checkmate.learning.graph.KnowledgeGraph.seedExamSyllabus]), not a
+     *     real-import one.
+     *  2. Exact (exam, subject, chapter) — some [PYQWeightage] entries are actually
+     *     chapter-level names (that data predates [com.checkmate.core.ExamSyllabus]'s
+     *     2026 NEET rebuild into per-unit topics — see that file's own doc), so
+     *     chapter often *is* the PYQWeightage "topic" key for those rows.
+     *  3. Exact canonical match — [normalize] both the report fragment and every
+     *     PYQWeightage key in the exam, compare for equality. Catches naming noise
+     *     (case, punctuation, a trailing "-I"/"-II" chapter-part suffix) without
+     *     guessing at word-level semantics at all.
+     *  4. Explicit [ALIASES] lookup — hand-verified chapter-name mappings that
+     *     don't share enough vocabulary for tier 5 to find on its own (e.g. "Laws
+     *     of Motion" → "Mechanics — Newton's Laws"). Deliberately outranks tier 5:
+     *     a curated mapping should never be second-guessed by an automatic one.
+     *  5. Conservative token-overlap fuzzy match — real word-set Jaccard overlap
+     *     (see [tokenOverlapScore]) across every subject in the exam, topic
+     *     fragment first, then chapter fragment. Replaces the old bidirectional
+     *     substring scan, which required the (short) PYQWeightage key to contain
+     *     the (long, specific) report chapter string as a literal substring —
+     *     structurally near-impossible whenever the report string was longer than
+     *     its PYQWeightage counterpart, which was every real chapter name.
+     *
+     * `weightagePercent` is 0f (not an error) when nothing matches at any tier —
+     * same "no signal still needs a value" discipline [PYQWeightage.getWeightage]
+     * itself already uses. `subjectResolved` falls back to the input `subject` in
+     * that case (may still be null). See [ALIASES]'s KDoc for the three real NEET
+     * chapters left deliberately unresolved rather than force-matched.
+     */
+    fun resolveWeightage(exam: String, subject: String?, chapter: String, topic: String): WeightageResolution {
+        if (subject != null) {
+            val exact = PYQWeightage.getWeightage(exam, subject, topic)
+            if (exact > 0f) return WeightageResolution(subject, exact, topic, ResolutionMethod.EXACT_SUBJECT_TOPIC)
+            val chapterLevel = PYQWeightage.getWeightage(exam, subject, chapter)
+            if (chapterLevel > 0f) {
+                return WeightageResolution(subject, chapterLevel, chapter, ResolutionMethod.EXACT_SUBJECT_CHAPTER)
+            }
+        }
+
+        val examData = PYQWeightage.data[exam].orEmpty()
+        val normTopic = normalize(topic)
+        val normChapter = normalize(chapter)
+        val allKeys = examData.values.flatMap { it.keys }
+
+        // normalize() is a no-op on an already-clean key, so comparing normalized
+        // forms subsumes a literal exact match too — no separate literal check needed.
+        if (normTopic.isNotBlank()) {
+            allKeys.firstOrNull { normalize(it) == normTopic }?.let { key -> findCanonical(examData, key)?.let { return it } }
+        }
+        if (normChapter.isNotBlank()) {
+            allKeys.firstOrNull { normalize(it) == normChapter }?.let { key -> findCanonical(examData, key)?.let { return it } }
+        }
+
+        val examAliases = ALIASES[exam].orEmpty()
+        (examAliases[normTopic] ?: examAliases[normChapter])?.let { canonicalKey ->
+            findCanonical(examData, canonicalKey)
+                ?.let { return it.copy(method = ResolutionMethod.ALIAS) }
+        }
+
+        fun fuzzy(fragment: String): WeightageResolution? {
+            val fragTokens = tokens(normalize(fragment))
+            if (fragTokens.isEmpty()) return null
+            var best: Triple<String, String, Float>? = null // subject, key, value
+            var bestScore = FUZZY_MIN_JACCARD
+            for ((subj, topicsMap) in examData) {
+                for ((key, value) in topicsMap) {
+                    val score = tokenOverlapScore(fragTokens, tokens(normalize(key)))
+                    if (score >= bestScore) {
+                        bestScore = score
+                        best = Triple(subj, key, value)
+                    }
+                }
+            }
+            return best?.let { (subj, key, value) -> WeightageResolution(subj, value, key, ResolutionMethod.TOKEN_OVERLAP) }
+        }
+
+        return fuzzy(topic) ?: fuzzy(chapter) ?: WeightageResolution(subject, 0f, null, ResolutionMethod.UNRESOLVED)
+    }
+
+    /**
+     * Per-exam total marks. HONEST GAP: only NEET and JEE Main are filled in with
+     * real current-pattern numbers — SSC CGL Tier 1's marking scheme varies by
+     * post/year enough that a single constant here would be more misleading than
+     * useful, so it's left unmapped (returns 0, same "0 is the correct
+     * unknown-value default" call as [resolveWeightage]). Revisit if/when SSC CGL
+     * prep is actually being tracked, not guessed at now.
+     */
+    private val EXAM_TOTAL_MARKS: Map<String, Int> = mapOf(
+        "NEET" to 720,
+        "JEE" to 300
+    )
+
+    /**
+     * Real per-subject share of the total paper — NOT an equal split.
+     * NEET: Physics 180 + Chemistry 180 + Biology 360 (Botany+Zoology combined
+     * under one "Biology" paper section) out of 720 = 25 / 25 / 50.
+     * JEE Main: Physics/Chemistry/Mathematics ~100 marks each of 300.
+     * Keyed on [PYQWeightage]'s own subject names, since that's what
+     * [resolveWeightage] returns in `subjectResolved`.
+     */
+    private val EXAM_SUBJECT_SHARE_PERCENT: Map<String, Map<String, Float>> = mapOf(
+        "NEET" to mapOf("Physics" to 25f, "Chemistry" to 25f, "Biology" to 50f),
+        "JEE" to mapOf("Physics" to 33.34f, "Chemistry" to 33.33f, "Mathematics" to 33.33f)
+    )
+
+    fun totalMarks(exam: String): Int = EXAM_TOTAL_MARKS[exam] ?: 0
+
+    fun subjectSharePercent(exam: String, subject: String?): Float {
+        if (subject == null) return 0f
+        return EXAM_SUBJECT_SHARE_PERCENT[exam]?.get(subject) ?: 0f
+    }
+
+    /**
+     * Full marks-at-stake for a topic if the exam paper matched [PYQWeightage]'s
+     * historical proportions exactly: `totalMarks(exam) * subjectShare% * topic
+     * weightage%`. Returns 0.0 whenever either share or weightage is unresolved —
+     * "unknown" should never silently become "zero risk" further downstream, but
+     * this class only reports the number; callers (PerformanceAnalyzer) are
+     * responsible for not treating a 0.0 marksAtStake as a confirmed non-issue when
+     * `resolution.weightagePercent == 0f` also holds.
+     */
+    fun marksAtStake(exam: String, resolution: WeightageResolution): Double {
+        val share = subjectSharePercent(exam, resolution.subjectResolved)
+        if (share <= 0f || resolution.weightagePercent <= 0f) return 0.0
+        val subjectMarks = totalMarks(exam) * (share / 100.0)
+        return subjectMarks * (resolution.weightagePercent / 100.0)
+    }
+
+    /** Convenience: resolve + marksAtStake in one call. */
+    fun marksAtStake(exam: String, subject: String?, chapter: String, topic: String): Double =
+        marksAtStake(exam, resolveWeightage(exam, subject, chapter, topic))
+
+    /**
+     * Real per-question scoring pattern — SubjectScoreCalculator's "actual marks a
+     * student would recognize" tally needs the literal +/- pattern, not the
+     * proportional-marks abstraction above. Same honest-gap discipline as
+     * [EXAM_TOTAL_MARKS]: only NEET/JEE Main are filled in with their real,
+     * currently-stable +4/-1 pattern. An unmapped exam returns 0 for both, which is
+     * deliberately indistinguishable from "no negative marking" — callers can't tell
+     * the difference either, same caveat as [marksAtStake] for an unmapped exam.
+     */
+    private val EXAM_MARKS_PER_QUESTION: Map<String, Int> = mapOf(
+        "NEET" to 4,
+        "JEE" to 4
+    )
+
+    private val EXAM_NEGATIVE_MARKS_PER_WRONG: Map<String, Int> = mapOf(
+        "NEET" to 1,
+        "JEE" to 1
+    )
+
+    fun marksPerQuestion(exam: String): Int = EXAM_MARKS_PER_QUESTION[exam] ?: 0
+
+    fun negativeMarksPerWrong(exam: String): Int = EXAM_NEGATIVE_MARKS_PER_WRONG[exam] ?: 0
 }
+
+
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ConceptWeightageTest.kt =====
+package com.checkmate.learning.analytics
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ConceptWeightageTest {
+
+    @Test
+    fun `exact subject+topic match resolves without falling back`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = "Physics", chapter = "Electrostatics", topic = "Electrostatics"
+        )
+        assertEquals("Physics", r.subjectResolved)
+        assertEquals(9.0f, r.weightagePercent, 0.001f)
+    }
+
+    @Test
+    fun `null subject falls back to fuzzy match and infers the subject`() {
+        // Mirrors a real TestResultNormalizer import: subject is never set.
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Current Electricity", topic = "Ohm's Law"
+        )
+        assertEquals("Physics", r.subjectResolved)
+        assertTrue(r.weightagePercent > 0f)
+    }
+
+    @Test
+    fun `unresolvable topic returns zero weightage, not a crash`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Not A Real Chapter", topic = "Not A Real Topic"
+        )
+        assertEquals(0f, r.weightagePercent, 0.001f)
+    }
+
+    @Test
+    fun `marksAtStake scales total exam marks by subject share and topic weightage`() {
+        // NEET Biology is 50% of 720 = 360; Human Physiology is 12% of that subject.
+        val marks = ConceptWeightage.marksAtStake(
+            exam = "NEET", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology"
+        )
+        assertEquals(360.0 * 0.12, marks, 0.5)
+    }
+
+    @Test
+    fun `unresolved subject share yields zero marksAtStake instead of a wrong guess`() {
+        val marks = ConceptWeightage.marksAtStake(
+            exam = "SSC CGL", subject = "Quantitative Aptitude", chapter = "Algebra", topic = "Algebra"
+        )
+        assertEquals(0.0, marks, 0.001)
+    }
+
+    // ---- Real FT-02B / FT-01B report.md fixtures (see ai-output history) ----
+    // Testmate's own report never carries a topic, so every real call site passes
+    // the same string as both `chapter` and `topic` (see TestResultNormalizer /
+    // PerformanceAnalyzer.resolveAgainstWeightage) — mirrored here rather than
+    // testing chapter/topic independently.
+
+    @Test
+    fun `Laws of Motion resolves via alias, not fuzzy overlap`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Laws of Motion", topic = "Laws of Motion"
+        )
+        assertEquals("Physics", r.subjectResolved)
+        assertEquals("Mechanics — Newton's Laws", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+        assertEquals(7.0f, r.weightagePercent, 0.001f)
+    }
+
+    @Test
+    fun `Structure of Atom resolves via alias, not fuzzy overlap`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Structure of Atom", topic = "Structure of Atom"
+        )
+        assertEquals("Chemistry", r.subjectResolved)
+        assertEquals("Atomic Structure", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+    }
+
+    @Test
+    fun `The Living World resolves via alias`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "The Living World", topic = "The Living World"
+        )
+        assertEquals("Biology", r.subjectResolved)
+        assertEquals("Diversity of Living World", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+    }
+
+    @Test
+    fun `Cell Cycle and Cell Division resolves via alias`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Cell Cycle & Cell Division", topic = "Cell Cycle & Cell Division"
+        )
+        assertEquals("Biology", r.subjectResolved)
+        assertEquals("Cell Division", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+    }
+
+    @Test
+    fun `Biomolecules-I chapter resolves via normalization alone, no alias needed`() {
+        // Real FT-01B chapter string — normalize() strips the "(Upto polysaccharides)"
+        // parenthetical and the "-I" suffix down to exactly "Biomolecules".
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null,
+            chapter = "Biomolecules-I (Upto polysaccharides)", topic = "Biomolecules-I (Upto polysaccharides)"
+        )
+        assertEquals("Biology", r.subjectResolved)
+        assertEquals("Biomolecules", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.EXACT_CANONICAL, r.method)
+    }
+
+    @Test
+    fun `Biomolecules-II long chapter needs its explicit alias, not normalization`() {
+        // Real FT-02B chapter string — has trailing content beyond the
+        // parenthetical/suffix ("Lipids, Nucleic acids, Enzymes, Cofactors"), so
+        // normalize() alone does NOT reduce it to "Biomolecules"; the alias tier does.
+        val chapter = "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"
+        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
+        assertEquals("Biology", r.subjectResolved)
+        assertEquals("Biomolecules", r.matchedKey)
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+    }
+
+    @Test
+    fun `Motion in a Plane stays unresolved — no 2D-motion PYQ entry exists`() {
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Motion in a Plane", topic = "Motion in a Plane"
+        )
+        assertEquals(0f, r.weightagePercent, 0.001f)
+        assertEquals(ConceptWeightage.ResolutionMethod.UNRESOLVED, r.method)
+    }
+
+    @Test
+    fun `Classification of Elements and Periodicity stays unresolved — no matching key`() {
+        val chapter = "Classification of Elements and Periodicity in Properties"
+        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
+        assertEquals(0f, r.weightagePercent, 0.001f)
+        assertEquals(ConceptWeightage.ResolutionMethod.UNRESOLVED, r.method)
+    }
+
+    @Test
+    fun `Breathing and Exchange of Gases stays unresolved — bucket too coarse to alias safely`() {
+        val chapter = "Breathing & Exchange of Gases-I (Upto mechanism of breathing)"
+        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
+        assertEquals(0f, r.weightagePercent, 0.001f)
+        assertEquals(ConceptWeightage.ResolutionMethod.UNRESOLVED, r.method)
+    }
+
+    @Test
+    fun `conservative fuzzy match never lets an unrelated Electric topic bleed into Current Electricity`() {
+        // Guards the exact false-positive risk the fuzzy tier was designed against:
+        // whole-word overlap only, no stemming, so "Electricity" never matches
+        // "Electric" and this stays UNRESOLVED rather than guessing "Current Electricity".
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Electric Potential Only", topic = "Electric Potential Only"
+        )
+        assertEquals(0f, r.weightagePercent, 0.001f)
+        assertEquals(ConceptWeightage.ResolutionMethod.UNRESOLVED, r.method)
+    }
+}
+
 
