@@ -5,8 +5,10 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateApi
@@ -63,7 +65,15 @@ data class TestResultsState(
     // performanceReport) because it's a downstream DECISION-shaped view over
     // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
     // own class doc on that boundary.
-    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList()
+    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList(),
+    // ── ScorePredictor wiring pass ──
+    // Blueprint §2.3. Built from the SAME PerformanceReport + StudentModel as
+    // scoreGainEstimates above — never a separate StudentModelBuilder.build/
+    // PerformanceAnalyzer.analyze call, same "one Room read, three derived views"
+    // discipline. targetScore comes from ConsultationProfile (the Student Profile
+    // screen's own "Target Score" field), not invented here. Null until analysis
+    // has run at least once.
+    val expectedScore: ScorePredictor.ExpectedScore? = null
 )
 
 class TestResultsViewModel : ViewModel() {
@@ -110,7 +120,8 @@ class TestResultsViewModel : ViewModel() {
             _state.update {
                 it.copy(
                     importing = true, importError = null, importResult = null,
-                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList()
+                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                    expectedScore = null
                 )
             }
             try {
@@ -156,6 +167,14 @@ class TestResultsViewModel : ViewModel() {
      * `scoreGainEstimates` can never reflect a different Room snapshot than
      * `performanceReport` does. Both are set together in one state update.
      *
+     * ScorePredictor wiring pass (Blueprint §2.3): [ScorePredictor.predictFromReport]
+     * runs against that same `studentModel`/`report` too — third derived view over
+     * one Room read, same discipline as the ScoreGainEstimator call right above it.
+     * `targetScore` comes from [ConsultationProfile.load] (the Student Profile
+     * screen's own field, defaults to 650 if never set) — read fresh here, not
+     * cached, so a target the student just edited is reflected on the very next
+     * analysis run.
+     *
      * Launched as its own coroutine (not inline in importReport's try block) so an
      * analysis failure can only ever set [TestResultsState.analysisError] — it has
      * no path back to importReport's own try/catch and can't turn a successful
@@ -174,8 +193,13 @@ class TestResultsViewModel : ViewModel() {
                 val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
                 val report = PerformanceAnalyzer.analyze(studentModel, examType)
                 val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+                val targetScore = ConsultationProfile.load().targetScore
+                val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
                 _state.update {
-                    it.copy(analyzing = false, performanceReport = report, scoreGainEstimates = estimates)
+                    it.copy(
+                        analyzing = false, performanceReport = report,
+                        scoreGainEstimates = estimates, expectedScore = expectedScore
+                    )
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Performance analysis failed: ${e.message}", e)
@@ -193,7 +217,8 @@ class TestResultsViewModel : ViewModel() {
         _state.update {
             it.copy(
                 importResult = null, importError = null,
-                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList()
+                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                expectedScore = null
             )
         }
     }

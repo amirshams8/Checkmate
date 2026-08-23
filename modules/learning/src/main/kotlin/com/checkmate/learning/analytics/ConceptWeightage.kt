@@ -310,6 +310,17 @@ object ConceptWeightage {
     }
 
     /**
+     * ScorePredictor wiring pass (Blueprint §2.3): a subject-by-subject expected
+     * score needs the FULL set of subjects an exam is scored on — including ones
+     * a given [com.checkmate.learning.model.StudentModel] has zero tracked
+     * concepts for — not just whatever subjects happen to show up in one
+     * student's [PerformanceAnalyzer.TopicImpact] list. [EXAM_SUBJECT_SHARE_PERCENT]
+     * already has this; it just had no public accessor before now. One function,
+     * no behavior change to any existing caller.
+     */
+    fun subjectsForExam(exam: String): Set<String> = EXAM_SUBJECT_SHARE_PERCENT[exam]?.keys.orEmpty()
+
+    /**
      * Full marks-at-stake for a topic if the exam paper matched [PYQWeightage]'s
      * historical proportions exactly: `totalMarks(exam) * subjectShare% * topic
      * weightage%`. Returns 0.0 whenever either share or weightage is unresolved —

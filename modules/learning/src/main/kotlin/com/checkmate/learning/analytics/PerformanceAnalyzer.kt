@@ -13,8 +13,8 @@ import com.checkmate.learning.model.StudentModel
  * intelligence, see that class's own doc on why consumers build on it rather than
  * re-folding raw [com.checkmate.learning.model.LearningEvent]/
  * [com.checkmate.learning.model.QuestionAttempt] history themselves — into the
- * accuracy/trend/topic-impact evidence [ScoreGainEstimator] and `ScorePredictor`
- * (both still to be built) consume next.
+ * accuracy/trend/topic-impact evidence [ScoreGainEstimator] and [ScorePredictor]
+ * consume next.
  *
  * DELIBERATE SCOPE LIMIT: this module produces EVIDENCE, not DECISIONS. No
  * expectedGain, no probability-of-improvement, no ranked "study this next" list —

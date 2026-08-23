@@ -21,6 +21,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.analytics.SubjectScore
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateWeakArea
@@ -60,6 +61,14 @@ import com.checkmate.ui.theme.*
  * alongside marks-at-stake, the ranked expectedGain itself, and a confidence
  * label — the blueprint's own "Repair rolling motion — +4.2 marks" framing,
  * not a re-sorted mastery list.
+ *
+ * ScorePredictor wiring pass (Blueprint §2.3): [PerformanceReportCard] now also
+ * renders an [ExpectedScoreCard] — Expected/Range/Target/Gap plus a bottleneck
+ * breakdown, per the blueprint's own worked example. Explicitly labeled
+ * "Estimated performance" in the UI itself (not just in code comments), per
+ * [ScorePredictor.ExpectedScore]'s own "no false precision" caution — this is a
+ * first-pass heuristic model, not a validated predictor, and the screen should
+ * never imply otherwise.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
@@ -212,7 +221,7 @@ private fun ImportReportSection(
         val importResult = state.importResult
         if (report != null && importResult != null) {
             Spacer(Modifier.height(12.dp))
-            PerformanceReportCard(importResult, report, state.scoreGainEstimates)
+            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore)
         }
     }
 }
@@ -285,7 +294,8 @@ private fun ImportResultCard(
 private fun PerformanceReportCard(
     importResult: TestResultNormalizer.NormalizeResult,
     report: PerformanceAnalyzer.PerformanceReport,
-    estimates: List<ScoreGainEstimator.ScoreGainEstimate>
+    estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
+    expectedScore: ScorePredictor.ExpectedScore?
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -336,6 +346,13 @@ private fun PerformanceReportCard(
                 opportunities.forEachIndexed { index, estimate -> OpportunityRow(index + 1, estimate) }
             }
 
+            expectedScore?.let { es ->
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                ExpectedScoreSection(es)
+            }
+
             Spacer(Modifier.height(16.dp))
             HorizontalDivider(color = White10, thickness = 0.5.dp)
             Spacer(Modifier.height(12.dp))
@@ -343,6 +360,55 @@ private fun PerformanceReportCard(
             Spacer(Modifier.height(6.dp))
             Text(trendLabel(report.overallTrend, report.overallTrendDelta), fontSize = 12.sp, color = White60)
         }
+    }
+}
+
+/**
+ * ScorePredictor wiring pass (Blueprint §2.3): "Expected: 638, Range: 617–659,
+ * Target: 680, Gap: 42" plus the bottleneck breakdown, per the blueprint's own
+ * worked example. "Estimated performance" is shown as its own label (not buried
+ * in a tooltip or code comment) — [ScorePredictor.ExpectedScore]'s own class doc
+ * is explicit that this is a first-pass heuristic, not a validated predictor,
+ * and the UI shouldn't imply more certainty than the model actually has.
+ */
+@Composable
+private fun ExpectedScoreSection(es: ScorePredictor.ExpectedScore) {
+    Text("Expected score", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+    Text(
+        "Estimated performance — not a guarantee",
+        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+    )
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        MiniStat("Expected", "%.0f".format(es.expected), White90)
+        MiniStat("Range", "%.0f–%.0f".format(es.rangeLow, es.rangeHigh), White60)
+        MiniStat("Target", "${es.target}", AccentGreen)
+        MiniStat("Gap", "%.0f".format(es.gap), if (es.gap > 0.0) AccentAmber else AccentGreen)
+    }
+    if (es.bottlenecks.isNotEmpty()) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Where the gap comes from", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = White60
+        )
+        Spacer(Modifier.height(6.dp))
+        es.bottlenecks.forEach { b -> BottleneckRow(b) }
+    }
+}
+
+@Composable
+private fun BottleneckRow(b: ScorePredictor.BottleneckContribution) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            b.label.replaceFirstChar { it.uppercase() },
+            fontSize = 12.sp, color = White90, modifier = Modifier.weight(1f)
+        )
+        Text(
+            "+%.0f marks".format(b.marks),
+            fontSize = 12.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
+            color = AccentAmber
+        )
     }
 }
 
