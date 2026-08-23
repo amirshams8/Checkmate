@@ -19,6 +19,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.SubjectScore
+import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateWeakArea
 import com.checkmate.ui.theme.*
 
@@ -36,6 +39,17 @@ import com.checkmate.ui.theme.*
  * two are independent: fetch a result to look at it, and/or import its
  * report.md (downloaded from TestmateWebScreen's WebView) to let Checkmate
  * learn from it.
+ *
+ * Test-report wiring pass: a successful (or already-imported) report import now
+ * also renders a [PerformanceReportCard] — the first screen showing the
+ * StudentModel -> PerformanceAnalyzer pipeline's actual output, not just raw
+ * import counts. Deliberately faithful to what the analyzer produces: no
+ * cross-test history section here (PerformanceReport is a derived view over
+ * current Room state only — see TestResultsViewModel's own doc — not a stored
+ * snapshot), so "Trend" below reflects this student's overall recent-vs-lifetime
+ * accuracy shift across every concept, not a literal previous-test-vs-this-test
+ * comparison. That comparison needs a persisted report history, which is
+ * explicitly out of scope for this pass.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
@@ -165,12 +179,37 @@ private fun ImportReportSection(
             Spacer(Modifier.height(12.dp))
             ImportResultCard(result, onDismiss)
         }
+
+        // Test-report wiring: the analyzer output, rendered right under the raw
+        // import counts above it — same test, next level of detail down.
+        if (state.analyzing) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Building performance report…", fontSize = 12.sp, color = White60)
+            }
+        }
+        state.analysisError?.let { err ->
+            Text(
+                err, fontSize = 12.sp, color = AccentAmber,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
+        val report = state.performanceReport
+        val importResult = state.importResult
+        if (report != null && importResult != null) {
+            Spacer(Modifier.height(12.dp))
+            PerformanceReportCard(importResult, report)
+        }
     }
 }
 
 @Composable
 private fun ImportResultCard(
-    result: com.checkmate.learning.testmate.TestResultNormalizer.NormalizeResult,
+    result: TestResultNormalizer.NormalizeResult,
     onDismiss: () -> Unit
 ) {
     Surface(
@@ -216,6 +255,121 @@ private fun ImportResultCard(
             }
         }
     }
+}
+
+/**
+ * Test-report wiring pass. Four layers, per the reviewed mockup: overall
+ * score (from [TestResultNormalizer.NormalizeResult], the report's own literal
+ * numbers), subject performance (real +4/-1 scoring via [SubjectScore]), biggest
+ * opportunities (top [PerformanceAnalyzer.TopicImpact]s, already sorted by
+ * marksAtStakeGap descending — first 5 shown), and overall trend. Deliberately
+ * plain: no charts, no color-coded deltas beyond what MiniStat/scoreColor already
+ * give the rest of this screen — render what the analyzer produced, not a
+ * reinterpretation of it.
+ */
+@Composable
+private fun PerformanceReportCard(
+    importResult: TestResultNormalizer.NormalizeResult,
+    report: PerformanceAnalyzer.PerformanceReport
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, AccentGreen)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                importResult.title ?: "Test Result",
+                fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90
+            )
+            Spacer(Modifier.height(4.dp))
+
+            val obtained = importResult.scoreObtained
+            val total = importResult.scoreTotal
+            val percent = importResult.scorePercent
+            if (obtained != null && total != null) {
+                Text(
+                    "%.0f/%.0f".format(obtained, total),
+                    fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    color = percent?.let { scoreColor(it) } ?: White90
+                )
+                percent?.let {
+                    Text(
+                        "%.1f%%".format(it), fontSize = 13.sp, color = White60,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+
+            if (importResult.subjectScores.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                Text("Subject performance", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(8.dp))
+                importResult.subjectScores.forEach { s -> SubjectScoreRow(s) }
+            }
+
+            if (report.topicImpacts.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                Text("Biggest opportunities", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(8.dp))
+                report.topicImpacts
+                    .filter { it.marksAtStakeGap > 0.0 }
+                    .take(5)
+                    .forEachIndexed { index, impact -> OpportunityRow(index + 1, impact) }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = White10, thickness = 0.5.dp)
+            Spacer(Modifier.height(12.dp))
+            Text("Trend", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(6.dp))
+            Text(trendLabel(report.overallTrend, report.overallTrendDelta), fontSize = 12.sp, color = White60)
+        }
+    }
+}
+
+@Composable
+private fun SubjectScoreRow(score: SubjectScore) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(score.subject, fontSize = 13.sp, color = White90)
+        Text(
+            "${score.marksObtained}/${score.marksTotal}",
+            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun OpportunityRow(rank: Int, impact: PerformanceAnalyzer.TopicImpact) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "$rank. ${impact.topic ?: impact.chapter ?: "Unknown topic"}",
+            fontSize = 13.sp, color = White90, modifier = Modifier.weight(1f)
+        )
+        Text(
+            "%.0f%% mastery".format(impact.mastery * 100),
+            fontSize = 11.sp, color = White60, fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+private fun trendLabel(trend: PerformanceAnalyzer.PerformanceTrend, delta: Double): String = when (trend) {
+    PerformanceAnalyzer.PerformanceTrend.IMPROVING -> "Improving — recent accuracy is %.0f%% above your overall average.".format(delta * 100)
+    PerformanceAnalyzer.PerformanceTrend.DECLINING -> "Declining — recent accuracy is %.0f%% below your overall average.".format(-delta * 100)
+    PerformanceAnalyzer.PerformanceTrend.STABLE -> "Stable — recent accuracy is in line with your overall average."
+    PerformanceAnalyzer.PerformanceTrend.INSUFFICIENT_DATA -> "Not enough attempts yet to call a trend."
 }
 
 @Composable

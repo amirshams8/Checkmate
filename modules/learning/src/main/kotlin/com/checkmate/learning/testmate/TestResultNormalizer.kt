@@ -2,6 +2,9 @@ package com.checkmate.learning.testmate
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.learning.analytics.ScoredQuestionFact
+import com.checkmate.learning.analytics.SubjectScore
+import com.checkmate.learning.analytics.SubjectScoreCalculator
 import com.checkmate.learning.engine.ErrorEngine
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.graph.KnowledgeGraph
@@ -19,8 +22,15 @@ import java.security.MessageDigest
  * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
  * successful import now also classifies its wrong attempts (ErrorEngine) and
  * recomputes mastery for every concept touched (MasteryEngine) before returning.
- * StudentModel/Planner consumption is still Phase 2 — see [NormalizeResult] below
- * for exactly what this now writes.
+ *
+ * Test-report wiring pass: [NormalizeResult] now also carries the canonical exam
+ * key and a per-test, real-scoring [SubjectScore] breakdown — see that class's own
+ * doc — so [com.checkmate.ui.testresults.TestResultsViewModel] doesn't need to
+ * re-parse the report or guess an exam identifier to build a
+ * [com.checkmate.learning.analytics.PerformanceAnalyzer.PerformanceReport]
+ * afterward. StudentModel/PerformanceAnalyzer consumption itself still happens at
+ * the caller, not here — this stays a Room-write + immediate-derived-metadata step,
+ * not a place that also builds the full cross-test StudentModel.
  *
  * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
  * This is what turns a report.md dump into that "why": one Question row per
@@ -41,6 +51,26 @@ object TestResultNormalizer {
 
     data class NormalizeResult(
         val alreadyImported: Boolean,
+        /**
+         * Canonical [com.checkmate.core.ExamSyllabus]/[com.checkmate.core.PYQWeightage]
+         * exam key (e.g. "NEET"), normalized from the report's raw exam string (e.g.
+         * "NEET-2027") via [KnowledgeGraph.normalizeExam] — the same normalization
+         * [seedExamSyllabus] itself already applies. Null only when the report's
+         * title carried no parseable exam suffix at all (see [TestReportParser]).
+         * Populated on every parse, including an [alreadyImported] short-circuit,
+         * since the exam string comes from parsing alone, before the idempotency
+         * check runs.
+         */
+        val examType: String?,
+        val title: String? = null,
+        val scoreObtained: Double? = null,
+        val scoreTotal: Double? = null,
+        val scorePercent: Double? = null,
+        /** Real +marks/-marks tally per subject for THIS test, resolved via
+         *  [SubjectScoreCalculator] — populated on every parse, same reasoning as
+         *  [examType] above. Empty if [examType] is null (nothing to resolve
+         *  subjects against) or no question resolved to a known subject. */
+        val subjectScores: List<SubjectScore> = emptyList(),
         val questionsWritten: Int,
         val attemptsWritten: Int,
         val eventsWritten: Int,
@@ -60,6 +90,14 @@ object TestResultNormalizer {
         val report = TestReportParser.parse(reportText)
         val warnings = mutableListOf<String>()
 
+        // Computed once, reused for seedExamSyllabus below AND surfaced on
+        // NormalizeResult — see that field's own doc on why this must happen before
+        // the idempotency check, not after.
+        val normalizedExam = report.exam?.let { KnowledgeGraph.normalizeExam(it) }
+        val subjectScores = normalizedExam?.let { exam ->
+            SubjectScoreCalculator.compute(exam, report.questions.map { it.toScoredQuestionFact() })
+        } ?: emptyList()
+
         // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
         // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
         // this is that call site. Every import already knows its own exam
@@ -73,9 +111,7 @@ object TestResultNormalizer {
         // for an exam ExamSyllabus doesn't recognize just returns from
         // seedExamSyllabus without seeding anything, and the import continues
         // normally either way.
-        report.exam?.let { examRaw ->
-            KnowledgeGraph.seedExamSyllabus(context, KnowledgeGraph.normalizeExam(examRaw))
-        }
+        normalizedExam?.let { KnowledgeGraph.seedExamSyllabus(context, it) }
 
         if (report.questions.isEmpty()) {
             warnings.add(
@@ -105,6 +141,12 @@ object TestResultNormalizer {
             Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
             return NormalizeResult(
                 alreadyImported = true,
+                examType = normalizedExam,
+                title = report.title,
+                scoreObtained = report.scoreObtained,
+                scoreTotal = report.scoreTotal,
+                scorePercent = report.scorePercent,
+                subjectScores = subjectScores,
                 questionsWritten = 0,
                 attemptsWritten = 0,
                 eventsWritten = 0,
@@ -200,6 +242,12 @@ object TestResultNormalizer {
 
         return NormalizeResult(
             alreadyImported = false,
+            examType = normalizedExam,
+            title = report.title,
+            scoreObtained = report.scoreObtained,
+            scoreTotal = report.scoreTotal,
+            scorePercent = report.scorePercent,
+            subjectScores = subjectScores,
             questionsWritten = questions.size,
             attemptsWritten = attempts.size,
             eventsWritten = events.size,
@@ -208,6 +256,13 @@ object TestResultNormalizer {
             conceptsRecomputed = recomputedMastery.size
         )
     }
+
+    private fun ParsedQuestionResult.toScoredQuestionFact() = ScoredQuestionFact(
+        chapter = chapter,
+        topic = topic,
+        correct = status == ParsedQuestionStatus.CORRECT,
+        attempted = status != ParsedQuestionStatus.SKIPPED
+    )
 
     /**
      * Stable id derived from the report's own content (exam + title), not a random
