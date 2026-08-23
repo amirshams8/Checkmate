@@ -192,16 +192,27 @@ object TestResultNormalizer {
                 )
             )
 
-            attempts.add(
-                QuestionAttempt(
-                    studentId = studentId,
-                    questionId = questionId,
-                    timestamp = testTimestamp,
-                    selectedOption = q.selectedOption,
-                    correct = q.status == ParsedQuestionStatus.CORRECT,
-                    timeTakenSeconds = q.timeSeconds
+            // A QuestionAttempt row means "the student attempted this question" —
+            // SKIPPED questions never should have produced one. Previously every
+            // question got a row with correct=false, so ErrorEngine's
+            // `WHERE correct = 0` query (getWrongAttempts) counted every skip as a
+            // wrong answer alongside real ones (confirmed against a real 180-question
+            // Testmate report: 175 skips + 5 wrong were both landing in
+            // getWrongAttempts, producing "Attempts: 180 / Errors: 180" instead of the
+            // true 5/5). Question and LearningEvent still get a row for every
+            // question, skipped or not — only the attempt table is affected.
+            if (q.status != ParsedQuestionStatus.SKIPPED) {
+                attempts.add(
+                    QuestionAttempt(
+                        studentId = studentId,
+                        questionId = questionId,
+                        timestamp = testTimestamp,
+                        selectedOption = q.selectedOption,
+                        correct = q.status == ParsedQuestionStatus.CORRECT,
+                        timeTakenSeconds = q.timeSeconds
+                    )
                 )
-            )
+            }
 
             val eventType = when (q.status) {
                 ParsedQuestionStatus.CORRECT -> LearningEventType.QUESTION_CORRECT
