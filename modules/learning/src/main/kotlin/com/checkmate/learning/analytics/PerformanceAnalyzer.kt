@@ -1,5 +1,6 @@
 package com.checkmate.learning.analytics
 
+import com.checkmate.core.PYQWeightage
 import com.checkmate.learning.model.ConceptSnapshot
 import com.checkmate.learning.model.StudentModel
 
@@ -17,7 +18,7 @@ import com.checkmate.learning.model.StudentModel
  *
  * DELIBERATE SCOPE LIMIT: this module produces EVIDENCE, not DECISIONS. No
  * expectedGain, no probability-of-improvement, no ranked "study this next" list —
- * that reasoning belongs to `LearningDecisionEngine`/`ScoreGainEstimator`, per the
+ * that reasoning belongs to `LearningDecisionEngine`/[ScoreGainEstimator], per the
  * same "don't let this layer decide what the next layer should decide" boundary
  * [StudentModel] already draws around itself.
  *
@@ -33,6 +34,16 @@ import com.checkmate.learning.model.StudentModel
  * [ConceptSnapshot.resolvedSubject] helper, so a concept is excluded from
  * subjectAccuracy only when fuzzy resolution genuinely can't place it anywhere —
  * not merely because the raw import never carried a subject to begin with.
+ *
+ * WEIGHTAGE-CONFIDENCE PASS (this session — gates ScoreGainEstimator): [TopicImpact]
+ * used to carry `weightagePercent` but silently drop the [PYQWeightage.Confidence]
+ * that [ConceptWeightage.WeightageResolution] already resolves alongside it —
+ * PYQWeightage's own class doc flagged this exact gap ("surfaced instead of
+ * discarded so a downstream consumer (ScoreGainEstimator, eventually) can tell
+ * 'well-evidenced' apart from 'single hand-typed guess'"). [toTopicImpact] now
+ * carries `resolution.confidence` straight through instead of discarding it, so
+ * [ScoreGainEstimator] can factor real evidence strength into its own confidence
+ * label instead of re-deriving or guessing at it.
  */
 object PerformanceAnalyzer {
 
@@ -63,7 +74,10 @@ object PerformanceAnalyzer {
      * exactly (see [ConceptWeightage.marksAtStake]); `marksAtStakeGap` is the
      * portion of that NOT yet secured (`marksAtStakeTotal * (1 - mastery)`) — the
      * number [ScoreGainEstimator] will rank candidates against, sorted descending
-     * here so the highest-value gaps are already first.
+     * here so the highest-value gaps are already first. `weightageConfidence`
+     * mirrors the [PYQWeightage.WeightageEntry] that `weightagePercent` came from
+     * (see class doc's WEIGHTAGE-CONFIDENCE PASS note) — [PYQWeightage.Confidence.ESTIMATED]
+     * (the safe default) when the underlying chapter never resolved at all.
      */
     data class TopicImpact(
         val conceptId: String,
@@ -73,6 +87,7 @@ object PerformanceAnalyzer {
         val mastery: Double,
         val attemptCount: Int,
         val weightagePercent: Float,
+        val weightageConfidence: PYQWeightage.Confidence,
         val marksAtStakeTotal: Double,
         val marksAtStakeGap: Double,
         val trend: PerformanceTrend,
@@ -167,6 +182,7 @@ object PerformanceAnalyzer {
             mastery = mastery,
             attemptCount = attemptCount,
             weightagePercent = resolution.weightagePercent,
+            weightageConfidence = resolution.confidence,
             marksAtStakeTotal = stakeTotal,
             marksAtStakeGap = gap,
             trend = classifyTrend(recentAccuracy, lifetimeAccuracy, attemptCount),
