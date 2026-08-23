@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.SubjectScore
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateWeakArea
@@ -43,13 +44,22 @@ import com.checkmate.ui.theme.*
  * Test-report wiring pass: a successful (or already-imported) report import now
  * also renders a [PerformanceReportCard] — the first screen showing the
  * StudentModel -> PerformanceAnalyzer pipeline's actual output, not just raw
- * import counts. Deliberately faithful to what the analyzer produces: no
+ * import counts. Deliberately faithful to what the analyzer produced: no
  * cross-test history section here (PerformanceReport is a derived view over
  * current Room state only — see TestResultsViewModel's own doc — not a stored
  * snapshot), so "Trend" below reflects this student's overall recent-vs-lifetime
  * accuracy shift across every concept, not a literal previous-test-vs-this-test
  * comparison. That comparison needs a persisted report history, which is
  * explicitly out of scope for this pass.
+ *
+ * ScoreGainEstimator wiring pass (Blueprint §2.2): "Biggest opportunities" used
+ * to render [PerformanceAnalyzer.TopicImpact] directly — three concepts at
+ * identical "13% mastery" with no way to tell why one outranks another beyond
+ * list order. [OpportunityRow] now renders [ScoreGainEstimator.ScoreGainEstimate]
+ * instead: mastery is still shown (nothing here hides the underlying number),
+ * alongside marks-at-stake, the ranked expectedGain itself, and a confidence
+ * label — the blueprint's own "Repair rolling motion — +4.2 marks" framing,
+ * not a re-sorted mastery list.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
@@ -202,7 +212,7 @@ private fun ImportReportSection(
         val importResult = state.importResult
         if (report != null && importResult != null) {
             Spacer(Modifier.height(12.dp))
-            PerformanceReportCard(importResult, report)
+            PerformanceReportCard(importResult, report, state.scoreGainEstimates)
         }
     }
 }
@@ -258,19 +268,24 @@ private fun ImportResultCard(
 }
 
 /**
- * Test-report wiring pass. Four layers, per the reviewed mockup: overall
- * score (from [TestResultNormalizer.NormalizeResult], the report's own literal
- * numbers), subject performance (real +4/-1 scoring via [SubjectScore]), biggest
- * opportunities (top [PerformanceAnalyzer.TopicImpact]s, already sorted by
- * marksAtStakeGap descending — first 5 shown), and overall trend. Deliberately
- * plain: no charts, no color-coded deltas beyond what MiniStat/scoreColor already
- * give the rest of this screen — render what the analyzer produced, not a
- * reinterpretation of it.
+ * Test-report wiring pass, updated by the ScoreGainEstimator wiring pass. Four
+ * layers, per the reviewed mockup: overall score (from
+ * [TestResultNormalizer.NormalizeResult], the report's own literal numbers),
+ * subject performance (real +4/-1 scoring via [SubjectScore]), biggest
+ * opportunities (top [ScoreGainEstimator.ScoreGainEstimate]s, already sorted by
+ * expectedGain descending — first 5 shown), and overall trend. `report` is still
+ * passed through for the Trend section (overallTrend/overallTrendDelta live only
+ * on [PerformanceAnalyzer.PerformanceReport]) even though topicImpacts itself is
+ * no longer rendered directly here — [estimates] is the ranked view built on top
+ * of it. Deliberately plain: no charts, no color-coded deltas beyond what
+ * MiniStat/scoreColor/confidence coloring already give the rest of this screen —
+ * render what the analyzer/estimator produced, not a reinterpretation of it.
  */
 @Composable
 private fun PerformanceReportCard(
     importResult: TestResultNormalizer.NormalizeResult,
-    report: PerformanceAnalyzer.PerformanceReport
+    report: PerformanceAnalyzer.PerformanceReport,
+    estimates: List<ScoreGainEstimator.ScoreGainEstimate>
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -311,16 +326,14 @@ private fun PerformanceReportCard(
                 importResult.subjectScores.forEach { s -> SubjectScoreRow(s) }
             }
 
-            if (report.topicImpacts.isNotEmpty()) {
+            val opportunities = estimates.filter { it.expectedGain > 0.0 }.take(5)
+            if (opportunities.isNotEmpty()) {
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider(color = White10, thickness = 0.5.dp)
                 Spacer(Modifier.height(12.dp))
                 Text("Biggest opportunities", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
                 Spacer(Modifier.height(8.dp))
-                report.topicImpacts
-                    .filter { it.marksAtStakeGap > 0.0 }
-                    .take(5)
-                    .forEachIndexed { index, impact -> OpportunityRow(index + 1, impact) }
+                opportunities.forEachIndexed { index, estimate -> OpportunityRow(index + 1, estimate) }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -347,22 +360,62 @@ private fun SubjectScoreRow(score: SubjectScore) {
     }
 }
 
+/**
+ * ScoreGainEstimator wiring pass. Replaces the old single-line "13% mastery"
+ * row — top line is the ranked headline (topic + expectedGain, the number this
+ * list is actually sorted by); second line keeps mastery visible (nothing here
+ * hides it) alongside marks-at-stake and a confidence label, so a student can
+ * see both "how ranked" and "how sure" in one glance, per
+ * ScoreGainEstimator.EstimateConfidence's own "well-evidenced vs single
+ * hand-typed guess" framing.
+ */
 @Composable
-private fun OpportunityRow(rank: Int, impact: PerformanceAnalyzer.TopicImpact) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            "$rank. ${impact.topic ?: impact.chapter ?: "Unknown topic"}",
-            fontSize = 13.sp, color = White90, modifier = Modifier.weight(1f)
-        )
-        Text(
-            "%.0f%% mastery".format(impact.mastery * 100),
-            fontSize = 11.sp, color = White60, fontFamily = FontFamily.Monospace
-        )
+private fun OpportunityRow(rank: Int, estimate: ScoreGainEstimator.ScoreGainEstimate) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "$rank. ${estimate.topic ?: estimate.chapter ?: "Unknown topic"}",
+                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                "+%.1f marks".format(estimate.expectedGain),
+                fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                color = AccentGreen
+            )
+        }
+        Spacer(Modifier.height(2.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "%.0f%% mastery · ~%.0f marks at stake".format(estimate.mastery * 100, estimate.marksAtStake),
+                fontSize = 11.sp, color = White60, fontFamily = FontFamily.Monospace
+            )
+            Text(
+                confidenceLabel(estimate.confidence),
+                fontSize = 11.sp, color = confidenceColor(estimate.confidence)
+            )
+        }
     }
+}
+
+private fun confidenceLabel(confidence: ScoreGainEstimator.EstimateConfidence): String = when (confidence) {
+    ScoreGainEstimator.EstimateConfidence.LOW -> "Low confidence"
+    ScoreGainEstimator.EstimateConfidence.MEDIUM -> "Medium confidence"
+    ScoreGainEstimator.EstimateConfidence.HIGH -> "High confidence"
+}
+
+private fun confidenceColor(confidence: ScoreGainEstimator.EstimateConfidence): androidx.compose.ui.graphics.Color = when (confidence) {
+    ScoreGainEstimator.EstimateConfidence.LOW -> White60
+    ScoreGainEstimator.EstimateConfidence.MEDIUM -> AccentAmber
+    ScoreGainEstimator.EstimateConfidence.HIGH -> AccentGreen
 }
 
 private fun trendLabel(trend: PerformanceAnalyzer.PerformanceTrend, delta: Double): String = when (trend) {

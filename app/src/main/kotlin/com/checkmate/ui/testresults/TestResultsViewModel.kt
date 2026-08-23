@@ -6,6 +6,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateApi
@@ -51,7 +52,18 @@ data class TestResultsState(
     // analysis failure never rolls back or hides importResult.
     val analyzing: Boolean = false,
     val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
-    val analysisError: String? = null
+    val analysisError: String? = null,
+    // ── ScoreGainEstimator wiring pass ──
+    // Blueprint §2.2. Built from the SAME PerformanceReport + StudentModel this
+    // buildPerformanceReport call already produced — never recomputed
+    // separately, so this can never drift out of sync with performanceReport
+    // (same "one source of truth per Room read" discipline StudentModel's own
+    // doc requires). Ranked highest-expectedGain first; empty until analysis
+    // has run at least once. Kept as its own field (not folded into
+    // performanceReport) because it's a downstream DECISION-shaped view over
+    // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
+    // own class doc on that boundary.
+    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList()
 )
 
 class TestResultsViewModel : ViewModel() {
@@ -86,18 +98,19 @@ class TestResultsViewModel : ViewModel() {
      * actually committed — success or already-imported, both mean Room state is
      * current — this chains into [buildPerformanceReport], closing
      * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
-     * -> PerformanceReport. The two stages update state independently:
-     * `importResult` is set and `importing` flips false as soon as persistence
-     * succeeds, full stop; analysis runs after that as a separate concern, and if
-     * it fails, only `analysisError` is set — the already-committed import is
-     * never rolled back or hidden because a derived-view step afterward broke.
+     * -> PerformanceReport -> ScoreGainEstimator.rankFromReport. The stages update
+     * state independently: `importResult` is set and `importing` flips false as
+     * soon as persistence succeeds, full stop; analysis (and the ranking built on
+     * top of it) runs after that as a separate concern, and if it fails, only
+     * `analysisError` is set — the already-committed import is never rolled back
+     * or hidden because a derived-view step afterward broke.
      */
     fun importReport(context: Context, uri: Uri) {
         viewModelScope.launch {
             _state.update {
                 it.copy(
                     importing = true, importError = null, importResult = null,
-                    performanceReport = null, analysisError = null
+                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList()
                 )
             }
             try {
@@ -137,6 +150,12 @@ class TestResultsViewModel : ViewModel() {
      * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
      * guesses an exam identifier itself.
      *
+     * ScoreGainEstimator wiring pass: [ScoreGainEstimator.rankFromReport] runs
+     * against the SAME `studentModel`/`report` this function just built — not a
+     * second `StudentModelBuilder.build`/`PerformanceAnalyzer.analyze` call — so
+     * `scoreGainEstimates` can never reflect a different Room snapshot than
+     * `performanceReport` does. Both are set together in one state update.
+     *
      * Launched as its own coroutine (not inline in importReport's try block) so an
      * analysis failure can only ever set [TestResultsState.analysisError] — it has
      * no path back to importReport's own try/catch and can't turn a successful
@@ -154,7 +173,10 @@ class TestResultsViewModel : ViewModel() {
             try {
                 val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
                 val report = PerformanceAnalyzer.analyze(studentModel, examType)
-                _state.update { it.copy(analyzing = false, performanceReport = report) }
+                val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+                _state.update {
+                    it.copy(analyzing = false, performanceReport = report, scoreGainEstimates = estimates)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Performance analysis failed: ${e.message}", e)
                 _state.update {
@@ -169,7 +191,10 @@ class TestResultsViewModel : ViewModel() {
 
     fun dismissImportResult() {
         _state.update {
-            it.copy(importResult = null, importError = null, performanceReport = null, analysisError = null)
+            it.copy(
+                importResult = null, importError = null,
+                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList()
+            )
         }
     }
 }
