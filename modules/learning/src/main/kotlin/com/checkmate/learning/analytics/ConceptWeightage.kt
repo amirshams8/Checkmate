@@ -7,7 +7,7 @@ import com.checkmate.core.PYQWeightage
  * cross-check, before [PerformanceAnalyzer] and the ScoreGainEstimator it feeds).
  * Bridges a learning-module concept (identified by exam/subject/chapter/topic — see
  * [com.checkmate.learning.graph.KnowledgeGraph.conceptId]) to [PYQWeightage]'s
- * (exam, subject, topic)-keyed data plus a per-exam marks scale, so downstream
+ * (exam, subject, chapter)-keyed data plus a per-exam marks scale, so downstream
  * consumers get a real "marks at stake" number instead of only a 0-1 mastery score.
  *
  * WHY THIS DIDN'T ALREADY EXIST: [com.checkmate.learning.graph.KnowledgeGraph.conceptId]
@@ -17,6 +17,15 @@ import com.checkmate.core.PYQWeightage
  * before now. ScoreGainEstimator's expectedGain formula (blueprint §2.2) needs
  * marksAtStake, which needs weightage, which needs this lookup — hence its own file
  * rather than an inline one-off inside the estimator.
+ *
+ * CANONICAL-CHAPTER REBUILD (this session — see PYQWeightage's own doc for the full
+ * rationale): [PYQWeightage]'s NEET tables are now keyed on the exact chapter
+ * strings from [com.checkmate.core.ExamSyllabus], not a hand-typed, independently-
+ * evolved vocabulary. That means most of what used to require an [ALIASES] entry
+ * now resolves at tier 2 (exact chapter) or tier 3 (canonical normalize) instead —
+ * [ALIASES] below is smaller and every remaining entry is one [tokenOverlapScore]
+ * genuinely can't bridge on its own, exactly the bar the tier was always meant to
+ * hold to.
  */
 object ConceptWeightage {
 
@@ -35,56 +44,95 @@ object ConceptWeightage {
      * [ResolutionMethod.UNRESOLVED] when nothing matched at any tier —
      * `subjectResolved` falls back to the input `subject` in that case (may still be
      * null). `matchedKey` is the literal PYQWeightage key that was matched, null only
-     * when unresolved.
+     * when unresolved. `confidence` mirrors the matched [PYQWeightage.WeightageEntry]'s
+     * own confidence — [PYQWeightage.Confidence.ESTIMATED] (the safe default) when
+     * unresolved, since there's no entry to inherit confidence from.
      */
     data class WeightageResolution(
         val subjectResolved: String?,
         val weightagePercent: Float,
         val matchedKey: String? = null,
-        val method: ResolutionMethod = ResolutionMethod.UNRESOLVED
+        val method: ResolutionMethod = ResolutionMethod.UNRESOLVED,
+        val confidence: PYQWeightage.Confidence = PYQWeightage.Confidence.ESTIMATED
     )
 
     /**
-     * Real Testmate chapter names that map to a PYQWeightage key but share too
-     * little vocabulary for [tokenOverlapScore] to catch on its own (e.g. "Laws of
-     * Motion" vs "Mechanics — Newton's Laws" — one shared word, jaccard 0.25).
-     * Each entry is manually verified against the actual NEET syllabus, not
-     * inferred — see resolveWeightage's KDoc for why this tier exists and what it
-     * deliberately does NOT cover. Keys are pre-[normalize]d fragments; values are
-     * the exact PYQWeightage key to resolve to (looked up across every subject in
-     * the exam via [findCanonical]).
+     * Real (and real-adjacent, coaching-institute-style) chapter names that map to a
+     * [PYQWeightage] key but share too little vocabulary for [tokenOverlapScore] to
+     * catch on its own. Each entry is manually verified against the actual NEET
+     * syllabus, not inferred — see resolveWeightage's KDoc for why this tier exists
+     * and what it deliberately does NOT cover. Keys are pre-[normalize]d fragments;
+     * values are the exact PYQWeightage key to resolve to (looked up across every
+     * subject in the exam via [findCanonical]).
      *
-     * KNOWN GAP, LEFT DELIBERATELY UNMAPPED (see [resolveWeightage] tier order —
-     * these fall through to UNRESOLVED rather than guessing):
-     *  - "Motion in a Plane" — NEET's PYQWeightage Physics table only has a 1D
-     *    "Kinematics" entry; aliasing 2D motion to it would overstate confidence
-     *    in a topic-level weightage that doesn't actually exist for it.
-     *  - "Classification of Elements and Periodicity in Properties" — no
-     *    Chemistry key represents this chapter; the nearest keys (p/s/d-Block
-     *    Elements) are compound-specific, not periodicity-specific.
-     *  - "Breathing & Exchange of Gases-I (...)" — arguably part of the
-     *    "Human Physiology" PYQ bucket, but that bucket is undifferentiated
-     *    enough (it also covers circulation, excretion, neural control, etc.)
-     *    that aliasing this one respiration sub-chapter to it would attribute
-     *    that whole bucket's weight to a fraction of what it actually covers.
-     *  Add real PYQ evidence before aliasing any of these three, per the same
-     *  "0 is the correct unknown-value default" discipline used everywhere else
-     *  in this file.
+     * Grouped by why the alias exists:
+     *  1. Pre-2026-syllabus / coaching-institute names for a chapter that WAS
+     *     renamed or merged in ExamSyllabus's 2026 rebuild.
+     *  2. A real topic that lives INSIDE a broader canonical chapter, reported as
+     *     if it were its own chapter — see the "Breathing & Exchange of Gases"
+     *     entry's own comment for the coarse-bucket caveat that applies to it
+     *     specifically.
+     *  3. Legacy PYQWeightage topic names from BEFORE this session's canonical
+     *     rebuild, kept resolvable here so a report using them doesn't regress
+     *     from "resolved" to "unresolved" just because the underlying table
+     *     changed shape.
      */
     private val ALIASES: Map<String, Map<String, String>> = mapOf(
         "NEET" to mapOf(
+            // --- Group 1: pre-2026 / alternate chapter names -------------------
             normalize("Motion in a Straight Line") to "Kinematics",
-            normalize("Laws of Motion") to "Mechanics — Newton's Laws",
             normalize("Structure of Atom") to "Atomic Structure",
-            normalize("The Living World") to "Diversity of Living World",
-            normalize("Cell Cycle & Cell Division") to "Cell Division",
-            // The real Testmate chapter carries extra trailing content
-            // ("Lipids, Nucleic acids, Enzymes, Cofactors") beyond the
-            // parenthetical/roman-numeral suffix that [normalize] strips, so this
-            // needs its own entry — "Biomolecules-I (Upto polysaccharides)" does
-            // NOT need one, since normalize alone reduces it to "biomolecules"
-            // and matches PYQWeightage's "Biomolecules" key exactly (tier 3).
-            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Biomolecules"
+            normalize("The Living World") to "Diversity In Living World",
+            normalize("Structural Organisation") to "Structural Organisation In Animals And Plants",
+            normalize("Cell Cycle & Cell Division") to "Cell Structure And Function",
+            // Extra trailing content beyond what normalize()'s parenthetical/suffix
+            // stripping handles alone — see Biomolecules-I vs -II note lower down.
+            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Cell Structure And Function",
+
+            // --- Group 2: real topic reported as its own chapter ----------------
+            // Motion in a Plane / Projectile Motion / Relative Velocity are real
+            // topics WITHIN the canonical "Kinematics" NTA unit (see ExamSyllabus).
+            // No longer a coverage gap now that PYQWeightage's Kinematics entry is
+            // keyed at the (correct, 2D-inclusive) chapter level.
+            normalize("Motion in a Plane") to "Kinematics",
+            // "Breathing & Exchange of Gases" is a real topic WITHIN the canonical
+            // "Human Physiology" NTA unit, not a chapter of its own. DELIBERATE
+            // COARSE-BUCKET ALIAS: Human Physiology also covers circulation,
+            // excretion, neural and endocrine content, so this over-attributes that
+            // whole chapter's weight to one respiration sub-topic. A caller reading
+            // `confidence` off the resolved entry sees MEDIUM/ESTIMATED rather than
+            // HIGH for exactly this reason — treat the resulting weightage as a
+            // rough upper bound, not a respiration-only figure. Revisit if/when
+            // PYQWeightage ever gets topic-level (not just chapter-level) granularity.
+            normalize("Breathing & Exchange of Gases") to "Human Physiology",
+
+            // --- Group 3: legacy pre-rebuild PYQWeightage topic names -----------
+            normalize("Biodiversity") to "Ecology And Environment",
+            normalize("Environmental Issues") to "Ecology And Environment",
+            normalize("Animal Kingdom") to "Diversity In Living World",
+            normalize("Plant Kingdom") to "Diversity In Living World",
+            normalize("Biological Classification") to "Diversity In Living World",
+            normalize("Microbes in Human Welfare") to "Biology And Human Welfare",
+            normalize("Strategies for Enhancement") to "Biology And Human Welfare",
+            normalize("Cell Biology") to "Cell Structure And Function",
+            normalize("Cell Division") to "Cell Structure And Function",
+            normalize("Properties of Matter") to "Properties Of Solids And Liquids",
+            normalize("Magnetism") to "Magnetic Effects Of Current And Magnetism",
+            normalize("AC Circuits") to "Electromagnetic Induction And Alternating Currents",
+            normalize("Waves and Sound") to "Oscillations And Waves",
+            normalize("Simple Harmonic Motion") to "Oscillations And Waves",
+            normalize("Semiconductors") to "Electronic Devices",
+            // Old table's single "Modern Physics" bucket spanned two canonical
+            // chapters (Dual Nature Of Matter And Radiation + Atoms And Nuclei).
+            // A one-to-many legacy key can't alias cleanly to both — Atoms And
+            // Nuclei picked as the larger/more central of the two.
+            normalize("Modern Physics") to "Atoms And Nuclei",
+            normalize("Chemical Bonding") to "Chemical Bonding And Molecular Structure",
+            normalize("Coordination Compounds") to "Co-Ordination Compounds",
+            normalize("Aldehydes Ketones Acids") to "Organic Compounds Containing Oxygen",
+            normalize("Alcohols Phenols Ethers") to "Organic Compounds Containing Oxygen",
+            normalize("Haloalkanes") to "Organic Compounds Containing Halogens",
+            normalize("Amines") to "Organic Compounds Containing Nitrogen"
         )
     )
 
@@ -133,10 +181,15 @@ object ConceptWeightage {
      *  this threshold was picked against. */
     private const val FUZZY_MIN_JACCARD = 0.6
 
-    private fun findCanonical(examData: Map<String, Map<String, Float>>, key: String): WeightageResolution? {
+    private fun findCanonical(
+        examData: Map<String, Map<String, PYQWeightage.WeightageEntry>>,
+        key: String
+    ): WeightageResolution? {
         for ((subj, topics) in examData) {
             val hit = topics[key]
-            if (hit != null) return WeightageResolution(subj, hit, key, ResolutionMethod.EXACT_CANONICAL)
+            if (hit != null) {
+                return WeightageResolution(subj, hit.percent, key, ResolutionMethod.EXACT_CANONICAL, hit.confidence)
+            }
         }
         return null
     }
@@ -147,39 +200,37 @@ object ConceptWeightage {
      *     i.e. almost always a syllabus-seeded [com.checkmate.learning.model.Concept]
      *     (see [com.checkmate.learning.graph.KnowledgeGraph.seedExamSyllabus]), not a
      *     real-import one.
-     *  2. Exact (exam, subject, chapter) — some [PYQWeightage] entries are actually
-     *     chapter-level names (that data predates [com.checkmate.core.ExamSyllabus]'s
-     *     2026 NEET rebuild into per-unit topics — see that file's own doc), so
-     *     chapter often *is* the PYQWeightage "topic" key for those rows.
+     *  2. Exact (exam, subject, chapter) — now the common case for a real Testmate
+     *     import that already uses NTA's own chapter wording, since PYQWeightage's
+     *     NEET keys are the exact ExamSyllabus chapter strings (see PYQWeightage's
+     *     own doc on the canonical-chapter rebuild this tier now benefits from).
      *  3. Exact canonical match — [normalize] both the report fragment and every
      *     PYQWeightage key in the exam, compare for equality. Catches naming noise
      *     (case, punctuation, a trailing "-I"/"-II" chapter-part suffix) without
      *     guessing at word-level semantics at all.
      *  4. Explicit [ALIASES] lookup — hand-verified chapter-name mappings that
-     *     don't share enough vocabulary for tier 5 to find on its own (e.g. "Laws
-     *     of Motion" → "Mechanics — Newton's Laws"). Deliberately outranks tier 5:
-     *     a curated mapping should never be second-guessed by an automatic one.
+     *     don't share enough vocabulary for tier 5 to find on its own. Deliberately
+     *     outranks tier 5: a curated mapping should never be second-guessed by an
+     *     automatic one.
      *  5. Conservative token-overlap fuzzy match — real word-set Jaccard overlap
      *     (see [tokenOverlapScore]) across every subject in the exam, topic
-     *     fragment first, then chapter fragment. Replaces the old bidirectional
-     *     substring scan, which required the (short) PYQWeightage key to contain
-     *     the (long, specific) report chapter string as a literal substring —
-     *     structurally near-impossible whenever the report string was longer than
-     *     its PYQWeightage counterpart, which was every real chapter name.
+     *     fragment first, then chapter fragment.
      *
      * `weightagePercent` is 0f (not an error) when nothing matches at any tier —
      * same "no signal still needs a value" discipline [PYQWeightage.getWeightage]
      * itself already uses. `subjectResolved` falls back to the input `subject` in
-     * that case (may still be null). See [ALIASES]'s KDoc for the three real NEET
-     * chapters left deliberately unresolved rather than force-matched.
+     * that case (may still be null). See [ALIASES]'s KDoc for the aliases kept
+     * deliberately coarse rather than force-matched to a precise figure.
      */
     fun resolveWeightage(exam: String, subject: String?, chapter: String, topic: String): WeightageResolution {
         if (subject != null) {
-            val exact = PYQWeightage.getWeightage(exam, subject, topic)
-            if (exact > 0f) return WeightageResolution(subject, exact, topic, ResolutionMethod.EXACT_SUBJECT_TOPIC)
-            val chapterLevel = PYQWeightage.getWeightage(exam, subject, chapter)
-            if (chapterLevel > 0f) {
-                return WeightageResolution(subject, chapterLevel, chapter, ResolutionMethod.EXACT_SUBJECT_CHAPTER)
+            val exactTopic = PYQWeightage.getEntry(exam, subject, topic)
+            if (exactTopic != null && exactTopic.percent > 0f) {
+                return WeightageResolution(subject, exactTopic.percent, topic, ResolutionMethod.EXACT_SUBJECT_TOPIC, exactTopic.confidence)
+            }
+            val exactChapter = PYQWeightage.getEntry(exam, subject, chapter)
+            if (exactChapter != null && exactChapter.percent > 0f) {
+                return WeightageResolution(subject, exactChapter.percent, chapter, ResolutionMethod.EXACT_SUBJECT_CHAPTER, exactChapter.confidence)
             }
         }
 
@@ -206,18 +257,20 @@ object ConceptWeightage {
         fun fuzzy(fragment: String): WeightageResolution? {
             val fragTokens = tokens(normalize(fragment))
             if (fragTokens.isEmpty()) return null
-            var best: Triple<String, String, Float>? = null // subject, key, value
+            var best: Triple<String, String, PYQWeightage.WeightageEntry>? = null
             var bestScore = FUZZY_MIN_JACCARD
             for ((subj, topicsMap) in examData) {
-                for ((key, value) in topicsMap) {
+                for ((key, entry) in topicsMap) {
                     val score = tokenOverlapScore(fragTokens, tokens(normalize(key)))
                     if (score >= bestScore) {
                         bestScore = score
-                        best = Triple(subj, key, value)
+                        best = Triple(subj, key, entry)
                     }
                 }
             }
-            return best?.let { (subj, key, value) -> WeightageResolution(subj, value, key, ResolutionMethod.TOKEN_OVERLAP) }
+            return best?.let { (subj, key, entry) ->
+                WeightageResolution(subj, entry.percent, key, ResolutionMethod.TOKEN_OVERLAP, entry.confidence)
+            }
         }
 
         return fuzzy(topic) ?: fuzzy(chapter) ?: WeightageResolution(subject, 0f, null, ResolutionMethod.UNRESOLVED)
