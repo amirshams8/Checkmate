@@ -9,6 +9,7 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateApi
@@ -73,7 +74,16 @@ data class TestResultsState(
     // discipline. targetScore comes from ConsultationProfile (the Student Profile
     // screen's own "Target Score" field), not invented here. Null until analysis
     // has run at least once.
-    val expectedScore: ScorePredictor.ExpectedScore? = null
+    val expectedScore: ScorePredictor.ExpectedScore? = null,
+    // ── LearningDecisionEngine wiring pass (Blueprint §2.4) ──
+    // The frontier piece: everything above this line is EVIDENCE (PerformanceReport)
+    // or a DECISION-shaped ranking over one dimension at a time (scoreGainEstimates
+    // ranks by marks, expectedScore explains a gap) — this is the first field that's
+    // an actual ranked, typed ACTION ("what should this student do next"), built
+    // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
+    // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
+    // read, N derived views" doc). Null until analysis has run at least once.
+    val decisionReport: LearningDecisionEngine.DecisionReport? = null
 )
 
 class TestResultsViewModel : ViewModel() {
@@ -121,7 +131,7 @@ class TestResultsViewModel : ViewModel() {
                 it.copy(
                     importing = true, importError = null, importResult = null,
                     performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                    expectedScore = null
+                    expectedScore = null, decisionReport = null
                 )
             }
             try {
@@ -175,6 +185,11 @@ class TestResultsViewModel : ViewModel() {
      * cached, so a target the student just edited is reflected on the very next
      * analysis run.
      *
+     * LearningDecisionEngine wiring pass (Blueprint §2.4): [LearningDecisionEngine.decideFromReport]
+     * runs against the SAME `report`/`studentModel`/`estimates`/`expectedScore` this
+     * call already built — fourth derived view over one Room read, same "never
+     * recompute what's already in hand" discipline as the two calls above it.
+     *
      * Launched as its own coroutine (not inline in importReport's try block) so an
      * analysis failure can only ever set [TestResultsState.analysisError] — it has
      * no path back to importReport's own try/catch and can't turn a successful
@@ -195,10 +210,14 @@ class TestResultsViewModel : ViewModel() {
                 val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
                 val targetScore = ConsultationProfile.load().targetScore
                 val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
+                val decisionReport = LearningDecisionEngine.decideFromReport(
+                    report, studentModel, estimates, expectedScore
+                )
                 _state.update {
                     it.copy(
                         analyzing = false, performanceReport = report,
-                        scoreGainEstimates = estimates, expectedScore = expectedScore
+                        scoreGainEstimates = estimates, expectedScore = expectedScore,
+                        decisionReport = decisionReport
                     )
                 }
             } catch (e: Exception) {
@@ -218,7 +237,7 @@ class TestResultsViewModel : ViewModel() {
             it.copy(
                 importResult = null, importError = null,
                 performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                expectedScore = null
+                expectedScore = null, decisionReport = null
             )
         }
     }

@@ -23,6 +23,7 @@ import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.analytics.SubjectScore
+import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.testmate.TestResultNormalizer
 import com.checkmate.testmate.TestmateWeakArea
 import com.checkmate.ui.theme.*
@@ -69,6 +70,15 @@ import com.checkmate.ui.theme.*
  * [ScorePredictor.ExpectedScore]'s own "no false precision" caution — this is a
  * first-pass heuristic model, not a validated predictor, and the screen should
  * never imply otherwise.
+ *
+ * LearningDecisionEngine wiring pass (Blueprint §2.4): [PerformanceReportCard]
+ * now also renders [RecommendedNextSection] — the ranked, typed action list
+ * [LearningDecisionEngine] produces on top of everything above it. This is
+ * still a read-only display: tapping a row does nothing yet (there's no
+ * `StudyTask`-mutating wiring behind it — that's Blueprint §2.5, deliberately
+ * not started, see [LearningDecisionEngine]'s own class doc on that boundary).
+ * The point of surfacing it here now is the same "don't let evidence sit
+ * un-acted-on" reasoning every prior wiring pass in this file already follows.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
@@ -221,7 +231,7 @@ private fun ImportReportSection(
         val importResult = state.importResult
         if (report != null && importResult != null) {
             Spacer(Modifier.height(12.dp))
-            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore)
+            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore, state.decisionReport)
         }
     }
 }
@@ -289,13 +299,19 @@ private fun ImportResultCard(
  * of it. Deliberately plain: no charts, no color-coded deltas beyond what
  * MiniStat/scoreColor/confidence coloring already give the rest of this screen —
  * render what the analyzer/estimator produced, not a reinterpretation of it.
+ *
+ * LearningDecisionEngine wiring pass: `decisionReport` renders as
+ * [RecommendedNextSection] between "Biggest opportunities" and the Expected
+ * score block — reads naturally in that order ("here's what's weak, here's
+ * what's worth doing about it, here's the score math behind the target").
  */
 @Composable
 private fun PerformanceReportCard(
     importResult: TestResultNormalizer.NormalizeResult,
     report: PerformanceAnalyzer.PerformanceReport,
     estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
-    expectedScore: ScorePredictor.ExpectedScore?
+    expectedScore: ScorePredictor.ExpectedScore?,
+    decisionReport: LearningDecisionEngine.DecisionReport?
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -346,6 +362,13 @@ private fun PerformanceReportCard(
                 opportunities.forEachIndexed { index, estimate -> OpportunityRow(index + 1, estimate) }
             }
 
+            decisionReport?.candidates?.takeIf { it.isNotEmpty() }?.let { candidates ->
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                RecommendedNextSection(candidates)
+            }
+
             expectedScore?.let { es ->
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider(color = White10, thickness = 0.5.dp)
@@ -361,6 +384,68 @@ private fun PerformanceReportCard(
             Text(trendLabel(report.overallTrend, report.overallTrendDelta), fontSize = 12.sp, color = White60)
         }
     }
+}
+
+/**
+ * LearningDecisionEngine wiring pass (Blueprint §2.4): the ranked,
+ * typed-action list — deliberately distinct from [OpportunityRow] above it,
+ * which ranks by marks alone. Each row shows WHICH kind of action
+ * ([LearningDecisionEngine.LearningInterventionIntent]) the engine picked, not
+ * just another weak-topic name — the same "don't let the LLM choose the
+ * intervention" discipline the blueprint itself insists on: this list is
+ * produced entirely deterministically, before any LLM sees it. Read-only for
+ * now — see [PerformanceReportCard]'s own doc on why tapping a row doesn't do
+ * anything yet.
+ */
+@Composable
+private fun RecommendedNextSection(candidates: List<LearningDecisionEngine.CandidateIntervention>) {
+    Text("Recommended next", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+    Text(
+        "Ranked by the decision engine — not just by mastery",
+        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+    )
+    candidates.forEachIndexed { index, candidate -> CandidateRow(index + 1, candidate) }
+}
+
+@Composable
+private fun CandidateRow(rank: Int, candidate: LearningDecisionEngine.CandidateIntervention) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    intentLabel(candidate.intent),
+                    fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = AccentAmber
+                )
+                Text(
+                    "$rank. ${candidate.topic ?: candidate.chapter ?: candidate.subject ?: "Overall plan"}",
+                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90
+                )
+            }
+            if (candidate.durationMinutes > 0) {
+                Text(
+                    "${candidate.durationMinutes}m",
+                    fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = White60
+                )
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        Text(candidate.rationale, fontSize = 11.sp, color = White60)
+    }
+}
+
+private fun intentLabel(intent: LearningDecisionEngine.LearningInterventionIntent): String = when (intent) {
+    LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT -> "REPAIR"
+    LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC -> "DIAGNOSE"
+    LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET -> "PRACTICE SET"
+    LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> "RETENTION CHECK"
+    LearningDecisionEngine.LearningInterventionIntent.START_MOCK -> "TAKE A MOCK"
+    LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> "REPLAN TODAY"
+    LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY -> "STEP DOWN DIFFICULTY"
+    LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> "STEP UP DIFFICULTY"
 }
 
 /**
