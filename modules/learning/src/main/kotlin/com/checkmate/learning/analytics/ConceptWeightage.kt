@@ -67,11 +67,14 @@ object ConceptWeightage {
      *
      * Grouped by why the alias exists:
      *  1. Pre-2026-syllabus / coaching-institute names for a chapter that WAS
-     *     renamed or merged in ExamSyllabus's 2026 rebuild.
+     *     renamed or merged in ExamSyllabus's 2026 rebuild — a genuine 1:1 rename,
+     *     so the matched entry's own confidence is trustworthy as-is.
      *  2. A real topic that lives INSIDE a broader canonical chapter, reported as
-     *     if it were its own chapter — see the "Breathing & Exchange of Gases"
-     *     entry's own comment for the coarse-bucket caveat that applies to it
-     *     specifically.
+     *     if it were its own chapter — this over-attributes that whole chapter's
+     *     weight to one sub-topic, so every key in this group is also listed in
+     *     [COARSE_BUCKET_ALIASES] to force its resolved confidence down to
+     *     [PYQWeightage.Confidence.ESTIMATED] regardless of what the matched entry
+     *     itself claims (see that set's own doc, and resolveWeightage's ALIAS branch).
      *  3. Legacy PYQWeightage topic names from BEFORE this session's canonical
      *     rebuild, kept resolvable here so a report using them doesn't regress
      *     from "resolved" to "unresolved" just because the underlying table
@@ -85,26 +88,38 @@ object ConceptWeightage {
             normalize("The Living World") to "Diversity In Living World",
             normalize("Structural Organisation") to "Structural Organisation In Animals And Plants",
             normalize("Cell Cycle & Cell Division") to "Cell Structure And Function",
-            // Extra trailing content beyond what normalize()'s parenthetical/suffix
-            // stripping handles alone — see Biomolecules-I vs -II note lower down.
-            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Cell Structure And Function",
 
             // --- Group 2: real topic reported as its own chapter ----------------
             // Motion in a Plane / Projectile Motion / Relative Velocity are real
             // topics WITHIN the canonical "Kinematics" NTA unit (see ExamSyllabus).
             // No longer a coverage gap now that PYQWeightage's Kinematics entry is
-            // keyed at the (correct, 2D-inclusive) chapter level.
+            // keyed at the (correct, 2D-inclusive) chapter level. NOT in
+            // COARSE_BUCKET_ALIASES: Kinematics' own topic list (see ExamSyllabus)
+            // is essentially just straight-line + planar motion, so the chapter-level
+            // figure genuinely does describe this fragment, unlike the two entries
+            // below.
             normalize("Motion in a Plane") to "Kinematics",
             // "Breathing & Exchange of Gases" is a real topic WITHIN the canonical
             // "Human Physiology" NTA unit, not a chapter of its own. DELIBERATE
             // COARSE-BUCKET ALIAS: Human Physiology also covers circulation,
-            // excretion, neural and endocrine content, so this over-attributes that
-            // whole chapter's weight to one respiration sub-topic. A caller reading
-            // `confidence` off the resolved entry sees MEDIUM/ESTIMATED rather than
-            // HIGH for exactly this reason — treat the resulting weightage as a
-            // rough upper bound, not a respiration-only figure. Revisit if/when
-            // PYQWeightage ever gets topic-level (not just chapter-level) granularity.
+            // excretion, neural and endocrine content (see ExamSyllabus — 23 other
+            // topics), so this over-attributes that whole chapter's weight to one
+            // respiration sub-topic. Listed in COARSE_BUCKET_ALIASES below so
+            // `confidence` on the resolved entry is forced to ESTIMATED — treat the
+            // resulting weightage as a rough upper bound, not a respiration-only
+            // figure. Revisit if/when PYQWeightage ever gets topic-level (not just
+            // chapter-level) granularity.
             normalize("Breathing & Exchange of Gases") to "Human Physiology",
+            // Extra trailing content beyond what normalize()'s parenthetical/suffix
+            // stripping handles alone — see Biomolecules-I vs -II note lower down.
+            // MISCLASSIFIED AS GROUP 1 UNTIL THIS PASS: "Cell Structure And Function"
+            // has 10 distinct topics under it in ExamSyllabus (cell theory, membrane,
+            // organelles, nucleus, cell cycle, etc.) — Biomolecules-II's actual
+            // content ("Proteins... Lipids, Nucleic acids, Enzymes, Cofactors") maps
+            // to only 2 of them ("Biomolecules" and "Enzymes"). This was never a
+            // clean rename; it's the same coarse-bucket shape as Breathing above,
+            // just mislabeled. Same COARSE_BUCKET_ALIASES treatment now applies.
+            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Cell Structure And Function",
 
             // --- Group 3: legacy pre-rebuild PYQWeightage topic names -----------
             normalize("Biodiversity") to "Ecology And Environment",
@@ -134,6 +149,23 @@ object ConceptWeightage {
             normalize("Haloalkanes") to "Organic Compounds Containing Halogens",
             normalize("Amines") to "Organic Compounds Containing Nitrogen"
         )
+    )
+
+    /**
+     * Group-2 [ALIASES] entries specifically — a real topic living inside a much
+     * broader canonical chapter, where inheriting that chapter's own `confidence`
+     * would overstate how precisely the resolved percentage describes this one
+     * fragment. [resolveWeightage]'s ALIAS branch forces `confidence` to
+     * [PYQWeightage.Confidence.ESTIMATED] for any key in this set, regardless of
+     * what the matched [PYQWeightage.WeightageEntry] itself claims — so even if
+     * "Human Physiology" or "Cell Structure And Function" later gets upgraded to
+     * real per-chapter PYQ data (HIGH confidence), Breathing and Biomolecules-II
+     * don't silently inherit a precision they don't actually have. Values here are
+     * pre-[normalize]d, same as [ALIASES]'s own keys.
+     */
+    private val COARSE_BUCKET_ALIASES: Set<String> = setOf(
+        normalize("Breathing & Exchange of Gases"),
+        normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors")
     )
 
     /** Generic connective words stripped before token-overlap comparison — NOT
@@ -211,7 +243,9 @@ object ConceptWeightage {
      *  4. Explicit [ALIASES] lookup — hand-verified chapter-name mappings that
      *     don't share enough vocabulary for tier 5 to find on its own. Deliberately
      *     outranks tier 5: a curated mapping should never be second-guessed by an
-     *     automatic one.
+     *     automatic one. Confidence is forced to [PYQWeightage.Confidence.ESTIMATED]
+     *     for any [COARSE_BUCKET_ALIASES] entry, overriding whatever the matched
+     *     chapter's own confidence is — see that set's doc.
      *  5. Conservative token-overlap fuzzy match — real word-set Jaccard overlap
      *     (see [tokenOverlapScore]) across every subject in the exam, topic
      *     fragment first, then chapter fragment.
@@ -249,9 +283,22 @@ object ConceptWeightage {
         }
 
         val examAliases = ALIASES[exam].orEmpty()
-        (examAliases[normTopic] ?: examAliases[normChapter])?.let { canonicalKey ->
-            findCanonical(examData, canonicalKey)
-                ?.let { return it.copy(method = ResolutionMethod.ALIAS) }
+        val matchedAliasKey = normTopic.takeIf { examAliases.containsKey(it) }
+            ?: normChapter.takeIf { examAliases.containsKey(it) }
+        matchedAliasKey?.let { aliasKey ->
+            val canonicalKey = examAliases.getValue(aliasKey)
+            findCanonical(examData, canonicalKey)?.let { resolved ->
+                // Group-2 coarse-bucket aliases (see COARSE_BUCKET_ALIASES doc) never
+                // inherit the matched chapter's own confidence — that confidence
+                // describes the WHOLE chapter, not the narrower fragment being
+                // aliased to it, so it would overstate precision here.
+                val confidence = if (aliasKey in COARSE_BUCKET_ALIASES) {
+                    PYQWeightage.Confidence.ESTIMATED
+                } else {
+                    resolved.confidence
+                }
+                return resolved.copy(method = ResolutionMethod.ALIAS, confidence = confidence)
+            }
         }
 
         fun fuzzy(fragment: String): WeightageResolution? {

@@ -136,11 +136,21 @@ class ConceptWeightageTest {
         // normalize() alone does NOT reduce it to bare "Biomolecules"; only the
         // explicit alias (which routes it to Biology's "Cell Structure And
         // Function") catches it.
+        //
+        // COARSE-BUCKET FIX (this pass): "Cell Structure And Function" has 10
+        // distinct topics in ExamSyllabus; Biomolecules-II's content maps to only
+        // 2 of them. This alias is now in COARSE_BUCKET_ALIASES, so it must NOT
+        // inherit "Cell Structure And Function"'s own MEDIUM confidence — same
+        // treatment as the Breathing coarse-bucket alias below.
         val chapter = "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"
         val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
         assertEquals("Biology", r.subjectResolved)
         assertEquals("Cell Structure And Function", r.matchedKey)
         assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+        assertEquals(
+            "coarse-bucket alias must be forced to ESTIMATED, not inherit the chapter's own MEDIUM confidence",
+            PYQWeightage.Confidence.ESTIMATED, r.confidence
+        )
     }
 
     @Test
@@ -176,19 +186,40 @@ class ConceptWeightageTest {
     fun `Breathing and Exchange of Gases now resolves via a deliberate coarse-bucket alias`() {
         // Previously left UNRESOLVED (session-report gap #3). Still a genuine
         // coarse-bucket attribution (Human Physiology also covers circulation,
-        // excretion, neural, endocrine content) — the resolved entry's confidence
-        // is deliberately NOT HIGH, so a caller can tell this isn't a precise
-        // respiration-only figure. See ALIASES' own doc for the reasoning.
+        // excretion, neural, endocrine content).
+        //
+        // TIGHTENED (this pass): confidence used to just happen to be ESTIMATED
+        // because "Human Physiology"'s own default confidence was ESTIMATED — an
+        // accident of that entry's current definition, not a guarantee. Now
+        // explicitly forced via COARSE_BUCKET_ALIASES regardless of what the
+        // matched chapter's own confidence is, so this stays true even if Human
+        // Physiology is later upgraded with real per-chapter PYQ data.
         val chapter = "Breathing & Exchange of Gases-I (Upto mechanism of breathing)"
         val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
         assertEquals("Biology", r.subjectResolved)
         assertEquals("Human Physiology", r.matchedKey)
         assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
         assertTrue(r.weightagePercent > 0f)
-        assertTrue(
-            "coarse-bucket alias must not silently claim HIGH confidence",
-            r.confidence != PYQWeightage.Confidence.HIGH
+        assertEquals(
+            "coarse-bucket alias must be forced to ESTIMATED, not just happen to inherit it",
+            PYQWeightage.Confidence.ESTIMATED, r.confidence
         )
+    }
+
+    @Test
+    fun `Motion in a Plane is not treated as a coarse-bucket alias — Kinematics genuinely covers it`() {
+        // Guards against COARSE_BUCKET_ALIASES over-applying: unlike Breathing and
+        // Biomolecules-II, "Motion in a Plane" resolving to "Kinematics" is NOT a
+        // narrow-fragment-standing-in-for-a-broad-chapter situation — Kinematics'
+        // own topic list in ExamSyllabus is essentially just straight-line and
+        // planar motion, so the chapter-level figure genuinely describes it. This
+        // alias should keep whatever confidence "Kinematics" itself carries, not
+        // get forced down to ESTIMATED.
+        val r = ConceptWeightage.resolveWeightage(
+            exam = "NEET", subject = null, chapter = "Motion in a Plane", topic = "Motion in a Plane"
+        )
+        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
+        assertEquals(PYQWeightage.Confidence.MEDIUM, r.confidence)
     }
 
     @Test
