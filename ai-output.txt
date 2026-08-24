@@ -1,672 +1,1647 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/analytics/ConceptWeightage.kt =====
-package com.checkmate.learning.analytics
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/LearningDecisionEngine.kt =====
+package com.checkmate.learning.engine
 
-import com.checkmate.core.PYQWeightage
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
 
 /**
- * Upgrade Blueprint Phase 2 prerequisite ("step 0.5" — flagged during the Phase 1/2
- * cross-check, before [PerformanceAnalyzer] and the ScoreGainEstimator it feeds).
- * Bridges a learning-module concept (identified by exam/subject/chapter/topic — see
- * [com.checkmate.learning.graph.KnowledgeGraph.conceptId]) to [PYQWeightage]'s
- * (exam, subject, chapter)-keyed data plus a per-exam marks scale, so downstream
- * consumers get a real "marks at stake" number instead of only a 0-1 mastery score.
+ * Upgrade Blueprint Phase 2.4 ("Extend the existing intervention pipeline, don't
+ * replace it") — the actual decision layer everything upstream of this file has
+ * been building evidence for.
  *
- * WHY THIS DIDN'T ALREADY EXIST: [com.checkmate.learning.graph.KnowledgeGraph.conceptId]
- * deliberately excludes subject from concept identity (see its own doc — real
- * TestResultNormalizer imports never carry a subject), so nothing in
- * :modules:learning has ever needed to resolve a concept back to a PYQWeightage row
- * before now. ScoreGainEstimator's expectedGain formula (blueprint §2.2) needs
- * marksAtStake, which needs weightage, which needs this lookup — hence its own file
- * rather than an inline one-off inside the estimator.
+ * The question this file answers is deliberately narrow, per the blueprint's own
+ * framing: "What should this student do NEXT?" — not "what's weak" (already
+ * answered by [PerformanceAnalyzer]) and not "what's worth marks" (already
+ * answered by [ScoreGainEstimator]/[ScorePredictor]). Those stay upstream,
+ * EVIDENCE-shaped; this is the first (and, deliberately, only) file allowed to
+ * turn that evidence into a ranked, typed action — same "don't let this layer
+ * decide what the next layer should decide" boundary [PerformanceAnalyzer]'s own
+ * class doc already draws for itself.
  *
- * CANONICAL-CHAPTER REBUILD (this session — see PYQWeightage's own doc for the full
- * rationale): [PYQWeightage]'s NEET tables are now keyed on the exact chapter
- * strings from [com.checkmate.core.ExamSyllabus], not a hand-typed, independently-
- * evolved vocabulary. That means most of what used to require an [ALIASES] entry
- * now resolves at tier 2 (exact chapter) or tier 3 (canonical normalize) instead —
- * [ALIASES] below is smaller and every remaining entry is one [tokenOverlapScore]
- * genuinely can't bridge on its own, exactly the bar the tier was always meant to
- * hold to.
+ * DETERMINISTIC BY DESIGN — no LLM call anywhere in this file, and none should
+ * ever be added. Per the blueprint's own architecture:
+ * ```
+ * deterministic engines -> CandidateInterventions -> LearningDecisionEngine
+ *     -> ranked action -> LLM -> explanation / tutoring / wording
+ * ```
+ * The LLM becomes the teacher, not the decision-maker — it explains and delivers
+ * whatever [CandidateIntervention] this engine already ranked first; it never
+ * proposes or reorders candidates itself. If a future pass wants an LLM-proposed
+ * adjustment to any ranking term below, that goes through the same "LLM proposes,
+ * deterministic layer validates" discipline the blueprint applies everywhere else
+ * (Phase 0 item 2), not a blind hand-off of the ranking itself.
+ *
+ * SCOPE OF THIS PASS: produces the ranked [CandidateIntervention] list only — the
+ * "ranked action" box in the diagram above. Wiring these into the existing
+ * behavior-intervention pipeline (`InterventionIntent -> ActionExecutor ->
+ * PolicyValidator -> TaskEscrow -> TaskMutator -> TriggerEvaluator ->
+ * InterventionTransaction -> Reconciliation`) as first-class, executable
+ * `StudyTask`-mutating actions is Blueprint §2.5 ("make plan changes
+ * transactional") — a separate, larger integration into `:modules:planner`'s
+ * escrow/commit/rollback machinery, deliberately not started here. That pipeline
+ * today only knows how to execute five narrow, already-audited behavior actions
+ * (see [com.checkmate.planner.intervention.PermittedAction]); teaching it to
+ * safely mutate a `StudyTask` into a `REPAIR_CONCEPT` session (create a task?
+ * retarget an existing one? at what priority relative to what's already
+ * scheduled?) is its own design pass with its own PolicyValidator rules, not an
+ * incidental addition to this one. What's built here is the missing input that
+ * pass will eventually consume — surfaced to the student directly in the
+ * meantime (see `TestResultsViewModel`/`TestResultsScreen` wiring).
+ *
+ * INTENT TAXONOMY: exactly the eight intents Blueprint §2.4 names —
+ * [LearningInterventionIntent.REPAIR_CONCEPT], [LearningInterventionIntent.START_DIAGNOSTIC],
+ * [LearningInterventionIntent.ASSIGN_TARGETED_SET], [LearningInterventionIntent.SCHEDULE_RETENTION_TEST],
+ * [LearningInterventionIntent.START_MOCK], [LearningInterventionIntent.REPLAN_DAY],
+ * [LearningInterventionIntent.REDUCE_DIFFICULTY], [LearningInterventionIntent.INCREASE_DIFFICULTY].
+ * No new intent invented here, none dropped.
+ *
+ * HONEST GAP: every classification rule below (which intent fits which signal
+ * shape) is a first-pass heuristic, same as every other engine in this codebase —
+ * flagged the same way [ScoreGainEstimator]/[ScorePredictor] flag their own
+ * weights. Priority scores mix two genuinely different units on one axis: concept-
+ * level candidates rank by [ScoreGainEstimator.ScoreGainEstimate.expectedGain]
+ * (marks per [SESSION_MINUTES]-minute block — a real, if uncalibrated, rate), while
+ * whole-student candidates ([LearningInterventionIntent.START_MOCK],
+ * [LearningInterventionIntent.REPLAN_DAY]) have no natural per-session mark rate at
+ * all and are scaled onto the same axis relative to the strongest concept-level
+ * candidate in the same report (see [macroCandidates]) purely so ranking has
+ * something to sort against — not because the two numbers mean the same thing.
+ * Not validated against real outcomes; that validation, not intuition, is the bar
+ * for retuning any constant here.
  */
-object ConceptWeightage {
+object LearningDecisionEngine {
 
-    /** How a [WeightageResolution] was reached — surfaced for debugging rather than
-     *  discarded, so "why did this resolve/not resolve" is never a re-derivation. */
-    enum class ResolutionMethod {
-        EXACT_SUBJECT_TOPIC, EXACT_SUBJECT_CHAPTER, EXACT_CANONICAL, ALIAS, TOKEN_OVERLAP, UNRESOLVED
+    /** How many ranked candidates a caller sees — enough for a "here's what's next
+     *  and what's after that" view without dumping every weak topic as a
+     *  duplicate-shaped action. */
+    private const val MAX_CANDIDATES = 5
+
+    /** How many of [ScoreGainEstimator]'s top-ranked estimates get turned into
+     *  candidates at all, before targeted-set collapsing and final ranking trim
+     *  this down further — wider than [MAX_CANDIDATES] so a chapter with several
+     *  weak topics still has enough raw material to collapse into one
+     *  [LearningInterventionIntent.ASSIGN_TARGETED_SET] instead of losing topics
+     *  to the pool cutoff before grouping even runs. */
+    private const val CONCEPT_CANDIDATE_POOL = 10
+
+    /** Kept numerically in sync with [RetentionEngine.HIGH_MASTERY_THRESHOLD] /
+     *  [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] by hand, not
+     *  imported — same "not worth a cross-file dependency for one constant"
+     *  convention [ScorePredictor.WEAK_MASTERY_THRESHOLD] already establishes. */
+    private const val HIGH_MASTERY_THRESHOLD = 0.75
+
+    /** Kept in sync with [ScorePredictor.ERROR_HEAVY_THRESHOLD] by hand, same
+     *  "repeated errors become a distinct signal, not just low mastery" framing. */
+    private const val ERROR_HEAVY_THRESHOLD = 3
+
+    /** Fraction of attempts on a concept that must have produced an error before
+     *  the failure mode looks like "the difficulty tier itself is miscalibrated"
+     *  rather than ordinary not-yet-mastered weakness — the extra bar
+     *  [LearningInterventionIntent.REDUCE_DIFFICULTY] needs beyond plain
+     *  [ERROR_HEAVY_THRESHOLD], since most weak concepts should stay
+     *  [LearningInterventionIntent.REPAIR_CONCEPT] rather than being read as a
+     *  difficulty problem. */
+    private const val REDUCE_DIFFICULTY_ERROR_RATE = 0.6
+
+    /** Below this many total attempts across the whole student model, every
+     *  ranked estimate above is running on evidence too thin to trust — a fresh
+     *  mock generates more real signal per hour than another repair guess.
+     *  First-pass threshold, not calibrated against real outcomes. */
+    private const val THIN_DATA_ATTEMPT_THRESHOLD = 20
+
+    /** Minimum weak topics sharing a (subject, chapter) before they're collapsed
+     *  into one [LearningInterventionIntent.ASSIGN_TARGETED_SET] candidate instead
+     *  of appearing as that many separate [LearningInterventionIntent.REPAIR_CONCEPT]
+     *  candidates — three near-duplicate "repair X" rows for the same chapter is
+     *  noise, not three distinct decisions. */
+    private const val MIN_TOPICS_FOR_TARGETED_SET = 3
+
+    private const val DIAGNOSTIC_MINUTES = 15
+    private const val RETENTION_TEST_MINUTES = 10
+    private const val MOCK_MINUTES = 60
+    private const val MAX_TARGETED_SET_MINUTES = 90
+
+    /** What share of the strongest concept-level candidate's priority a macro
+     *  (whole-student) candidate is scaled to when its own trigger condition is
+     *  only barely met — see [macroCandidates] and this class's own HONEST GAP
+     *  note on mixing units. */
+    private const val MIN_MACRO_PRIORITY_SHARE = 0.3
+
+    enum class LearningInterventionIntent {
+        REPAIR_CONCEPT,
+        START_DIAGNOSTIC,
+        ASSIGN_TARGETED_SET,
+        SCHEDULE_RETENTION_TEST,
+        START_MOCK,
+        REPLAN_DAY,
+        REDUCE_DIFFICULTY,
+        INCREASE_DIFFICULTY
     }
 
     /**
-     * Result of resolving a concept against [PYQWeightage]. `subjectResolved` is the
-     * subject the weightage was actually found under — which, for a real-imported
-     * concept (subject == null going in, see class doc), is the ONLY way to learn
-     * which subject a topic belongs to at all, since [PYQWeightage.findTopicWeightage]
-     * itself only returns a bare Float. `weightagePercent` is 0f and `method` is
-     * [ResolutionMethod.UNRESOLVED] when nothing matched at any tier —
-     * `subjectResolved` falls back to the input `subject` in that case (may still be
-     * null). `matchedKey` is the literal PYQWeightage key that was matched, null only
-     * when unresolved. `confidence` mirrors the matched [PYQWeightage.WeightageEntry]'s
-     * own confidence — [PYQWeightage.Confidence.ESTIMATED] (the safe default) when
-     * unresolved, since there's no entry to inherit confidence from.
+     * One ranked, typed thing the student could do next. `conceptId` is null for
+     * candidates that aren't about one specific concept ([ASSIGN_TARGETED_SET]
+     * names a chapter instead; [START_MOCK]/[REPLAN_DAY] are whole-student).
+     * `expectedGain` is the real marks-per-session number for concept-level
+     * candidates and `0.0` for ones that don't have a comparable per-session mark
+     * rate (see class doc) — `priorityScore` is what [decideFromReport] actually
+     * sorts on, kept separate from `expectedGain` so a caller can always show the
+     * real evidence-backed number alongside the rank, never a synthetic one
+     * dressed up as marks.
      */
-    data class WeightageResolution(
-        val subjectResolved: String?,
-        val weightagePercent: Float,
-        val matchedKey: String? = null,
-        val method: ResolutionMethod = ResolutionMethod.UNRESOLVED,
-        val confidence: PYQWeightage.Confidence = PYQWeightage.Confidence.ESTIMATED
+    data class CandidateIntervention(
+        val intent: LearningInterventionIntent,
+        val conceptId: String?,
+        val subject: String?,
+        val chapter: String?,
+        val topic: String?,
+        val durationMinutes: Int,
+        val expectedGain: Double,
+        val priorityScore: Double,
+        val rationale: String
     )
 
+    data class DecisionReport(
+        val studentId: String,
+        val examType: String,
+        val generatedAt: Long,
+        /** Ranked highest-[CandidateIntervention.priorityScore] first, capped at
+         *  [MAX_CANDIDATES]. */
+        val candidates: List<CandidateIntervention>
+    )
+
+    /** Runs [PerformanceAnalyzer.analyze]/[ScoreGainEstimator.rank]/[ScorePredictor.predict]
+     *  itself — see [ScoreGainEstimator.rank]'s own doc for why this convenience
+     *  overload exists alongside [decideFromReport]. */
+    fun decide(studentModel: StudentModel, examType: String, targetScore: Int): DecisionReport {
+        val report = PerformanceAnalyzer.analyze(studentModel, examType)
+        val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+        val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
+        return decideFromReport(report, studentModel, estimates, expectedScore)
+    }
+
     /**
-     * Real (and real-adjacent, coaching-institute-style) chapter names that map to a
-     * [PYQWeightage] key but share too little vocabulary for [tokenOverlapScore] to
-     * catch on its own. Each entry is manually verified against the actual NEET
-     * syllabus, not inferred — see resolveWeightage's KDoc for why this tier exists
-     * and what it deliberately does NOT cover. Keys are pre-[normalize]d fragments;
-     * values are the exact PYQWeightage key to resolve to (looked up across every
-     * subject in the exam via [findCanonical]).
-     *
-     * Grouped by why the alias exists:
-     *  1. Pre-2026-syllabus / coaching-institute names for a chapter that WAS
-     *     renamed or merged in ExamSyllabus's 2026 rebuild — a genuine 1:1 rename,
-     *     so the matched entry's own confidence is trustworthy as-is.
-     *  2. A real topic that lives INSIDE a broader canonical chapter, reported as
-     *     if it were its own chapter — this over-attributes that whole chapter's
-     *     weight to one sub-topic, so every key in this group is also listed in
-     *     [COARSE_BUCKET_ALIASES] to force its resolved confidence down to
-     *     [PYQWeightage.Confidence.ESTIMATED] regardless of what the matched entry
-     *     itself claims (see that set's own doc, and resolveWeightage's ALIAS branch).
-     *  3. Legacy PYQWeightage topic names from BEFORE this session's canonical
-     *     rebuild, kept resolvable here so a report using them doesn't regress
-     *     from "resolved" to "unresolved" just because the underlying table
-     *     changed shape.
+     * Same as [decide] but against an already-built [PerformanceAnalyzer.PerformanceReport]/
+     * [ScoreGainEstimator.ScoreGainEstimate] list/[ScorePredictor.ExpectedScore] —
+     * for a caller (e.g. `TestResultsViewModel`) that already built all three off
+     * one Room read, so this can never silently diverge from what's already on
+     * screen. Same "one Room read, N derived views" discipline
+     * [ScorePredictor.predictFromReport] itself follows.
      */
-    private val ALIASES: Map<String, Map<String, String>> = mapOf(
-        "NEET" to mapOf(
-            // --- Group 1: pre-2026 / alternate chapter names -------------------
-            normalize("Motion in a Straight Line") to "Kinematics",
-            normalize("Structure of Atom") to "Atomic Structure",
-            normalize("The Living World") to "Diversity In Living World",
-            normalize("Structural Organisation") to "Structural Organisation In Animals And Plants",
-            normalize("Cell Cycle & Cell Division") to "Cell Structure And Function",
+    fun decideFromReport(
+        report: PerformanceAnalyzer.PerformanceReport,
+        studentModel: StudentModel,
+        estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
+        expectedScore: ScorePredictor.ExpectedScore
+    ): DecisionReport {
+        val diagnostics = diagnosticCandidates(studentModel, report)
+        val concepts = collapseIntoTargetedSets(conceptCandidates(studentModel, estimates))
+        val conceptLevel = diagnostics + concepts
+        val ceiling = conceptLevel.maxOfOrNull { it.priorityScore } ?: 0.0
+        val macro = macroCandidates(studentModel, report, ceiling)
 
-            // --- Group 2: real topic reported as its own chapter ----------------
-            // Motion in a Plane / Projectile Motion / Relative Velocity are real
-            // topics WITHIN the canonical "Kinematics" NTA unit (see ExamSyllabus).
-            // No longer a coverage gap now that PYQWeightage's Kinematics entry is
-            // keyed at the (correct, 2D-inclusive) chapter level. NOT in
-            // COARSE_BUCKET_ALIASES: Kinematics' own topic list (see ExamSyllabus)
-            // is essentially just straight-line + planar motion, so the chapter-level
-            // figure genuinely does describe this fragment, unlike the two entries
-            // below.
-            normalize("Motion in a Plane") to "Kinematics",
-            // "Breathing & Exchange of Gases" is a real topic WITHIN the canonical
-            // "Human Physiology" NTA unit, not a chapter of its own. DELIBERATE
-            // COARSE-BUCKET ALIAS: Human Physiology also covers circulation,
-            // excretion, neural and endocrine content (see ExamSyllabus — 23 other
-            // topics), so this over-attributes that whole chapter's weight to one
-            // respiration sub-topic. Listed in COARSE_BUCKET_ALIASES below so
-            // `confidence` on the resolved entry is forced to ESTIMATED — treat the
-            // resulting weightage as a rough upper bound, not a respiration-only
-            // figure. Revisit if/when PYQWeightage ever gets topic-level (not just
-            // chapter-level) granularity.
-            normalize("Breathing & Exchange of Gases") to "Human Physiology",
-            // Extra trailing content beyond what normalize()'s parenthetical/suffix
-            // stripping handles alone — see Biomolecules-I vs -II note lower down.
-            // MISCLASSIFIED AS GROUP 1 UNTIL THIS PASS: "Cell Structure And Function"
-            // has 10 distinct topics under it in ExamSyllabus (cell theory, membrane,
-            // organelles, nucleus, cell cycle, etc.) — Biomolecules-II's actual
-            // content ("Proteins... Lipids, Nucleic acids, Enzymes, Cofactors") maps
-            // to only 2 of them ("Biomolecules" and "Enzymes"). This was never a
-            // clean rename; it's the same coarse-bucket shape as Breathing above,
-            // just mislabeled. Same COARSE_BUCKET_ALIASES treatment now applies.
-            normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors") to "Cell Structure And Function",
+        val ranked = (conceptLevel + macro)
+            .sortedByDescending { it.priorityScore }
+            .take(MAX_CANDIDATES)
 
-            // --- Group 3: legacy pre-rebuild PYQWeightage topic names -----------
-            normalize("Biodiversity") to "Ecology And Environment",
-            normalize("Environmental Issues") to "Ecology And Environment",
-            normalize("Animal Kingdom") to "Diversity In Living World",
-            normalize("Plant Kingdom") to "Diversity In Living World",
-            normalize("Biological Classification") to "Diversity In Living World",
-            normalize("Microbes in Human Welfare") to "Biology And Human Welfare",
-            normalize("Strategies for Enhancement") to "Biology And Human Welfare",
-            normalize("Cell Biology") to "Cell Structure And Function",
-            normalize("Cell Division") to "Cell Structure And Function",
-            normalize("Properties of Matter") to "Properties Of Solids And Liquids",
-            normalize("Magnetism") to "Magnetic Effects Of Current And Magnetism",
-            normalize("AC Circuits") to "Electromagnetic Induction And Alternating Currents",
-            normalize("Waves and Sound") to "Oscillations And Waves",
-            normalize("Simple Harmonic Motion") to "Oscillations And Waves",
-            normalize("Semiconductors") to "Electronic Devices",
-            // Old table's single "Modern Physics" bucket spanned two canonical
-            // chapters (Dual Nature Of Matter And Radiation + Atoms And Nuclei).
-            // A one-to-many legacy key can't alias cleanly to both — Atoms And
-            // Nuclei picked as the larger/more central of the two.
-            normalize("Modern Physics") to "Atoms And Nuclei",
-            normalize("Chemical Bonding") to "Chemical Bonding And Molecular Structure",
-            normalize("Coordination Compounds") to "Co-Ordination Compounds",
-            normalize("Aldehydes Ketones Acids") to "Organic Compounds Containing Oxygen",
-            normalize("Alcohols Phenols Ethers") to "Organic Compounds Containing Oxygen",
-            normalize("Haloalkanes") to "Organic Compounds Containing Halogens",
-            normalize("Amines") to "Organic Compounds Containing Nitrogen"
+        return DecisionReport(
+            studentId = studentModel.studentId,
+            examType = report.examType,
+            generatedAt = System.currentTimeMillis(),
+            candidates = ranked
         )
-    )
-
-    /**
-     * Group-2 [ALIASES] entries specifically — a real topic living inside a much
-     * broader canonical chapter, where inheriting that chapter's own `confidence`
-     * would overstate how precisely the resolved percentage describes this one
-     * fragment. [resolveWeightage]'s ALIAS branch forces `confidence` to
-     * [PYQWeightage.Confidence.ESTIMATED] for any key in this set, regardless of
-     * what the matched [PYQWeightage.WeightageEntry] itself claims — so even if
-     * "Human Physiology" or "Cell Structure And Function" later gets upgraded to
-     * real per-chapter PYQ data (HIGH confidence), Breathing and Biomolecules-II
-     * don't silently inherit a precision they don't actually have. Values here are
-     * pre-[normalize]d, same as [ALIASES]'s own keys.
-     */
-    private val COARSE_BUCKET_ALIASES: Set<String> = setOf(
-        normalize("Breathing & Exchange of Gases"),
-        normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors")
-    )
-
-    /** Generic connective words stripped before token-overlap comparison — NOT
-     *  overfit to this app's chapter names, so it stays safe to reuse for JEE/SSC
-     *  chapters later. */
-    private val STOPWORDS = setOf("of", "in", "a", "an", "the", "and", "to", "for", "on", "at", "or")
-
-    /** Lowercase, drop parentheticals and a trailing roman/arabic chapter-part
-     *  suffix ("-I", "-II", "-2"), fold "&" to "and", strip remaining punctuation,
-     *  collapse whitespace. Deliberately does NOT stem words (see [tokenOverlapScore]
-     *  doc on why "Electricity" must never match "Electric"). */
-    private fun normalize(raw: String): String {
-        if (raw.isBlank()) return ""
-        var s = raw.lowercase()
-        s = s.replace(Regex("\\([^)]*\\)"), " ")
-        s = s.replace(Regex("-(i{1,3}|iv|v|[0-9]+)\\b"), " ")
-        s = s.replace("&", " and ")
-        s = s.replace(Regex("[^a-z0-9\\s]"), " ")
-        s = s.replace(Regex("\\s+"), " ").trim()
-        return s
-    }
-
-    private fun tokens(normalized: String): Set<String> =
-        normalized.split(" ").filter { it.isNotBlank() && it.length > 2 && it !in STOPWORDS }.toSet()
-
-    /**
-     * Plain word-set Jaccard overlap — deliberately NOT stemmed or substring-based.
-     * A substring test (the original bug) or a stemmed match would let
-     * "Electricity" match "Electric" and "Current Electricity" bleed into
-     * "Electric Potential" — two genuinely different NEET topics. Whole-word
-     * comparison only, so a match means the fragments actually share concepts,
-     * not just a common prefix.
-     */
-    private fun tokenOverlapScore(a: Set<String>, b: Set<String>): Double {
-        if (a.isEmpty() || b.isEmpty()) return 0.0
-        val intersection = a.intersect(b).size
-        val union = a.union(b).size
-        return intersection.toDouble() / union
-    }
-
-    /** Conservative on purpose — chosen so real overlapping-but-distinct NEET
-     *  topics (e.g. "Current Electricity" vs "Electric Potential") score 0, while
-     *  genuine paraphrases (e.g. "Cell Cycle & Cell Division" vs "Cell Division",
-     *  jaccard 0.67) still pass. See ConceptWeightageTest for the boundary cases
-     *  this threshold was picked against. */
-    private const val FUZZY_MIN_JACCARD = 0.6
-
-    private fun findCanonical(
-        examData: Map<String, Map<String, PYQWeightage.WeightageEntry>>,
-        key: String
-    ): WeightageResolution? {
-        for ((subj, topics) in examData) {
-            val hit = topics[key]
-            if (hit != null) {
-                return WeightageResolution(subj, hit.percent, key, ResolutionMethod.EXACT_CANONICAL, hit.confidence)
-            }
-        }
-        return null
     }
 
     /**
-     * Five-tier fallback, most to least specific:
-     *  1. Exact (exam, subject, topic) — only reachable when `subject` is non-null,
-     *     i.e. almost always a syllabus-seeded [com.checkmate.learning.model.Concept]
-     *     (see [com.checkmate.learning.graph.KnowledgeGraph.seedExamSyllabus]), not a
-     *     real-import one.
-     *  2. Exact (exam, subject, chapter) — now the common case for a real Testmate
-     *     import that already uses NTA's own chapter wording, since PYQWeightage's
-     *     NEET keys are the exact ExamSyllabus chapter strings (see PYQWeightage's
-     *     own doc on the canonical-chapter rebuild this tier now benefits from).
-     *  3. Exact canonical match — [normalize] both the report fragment and every
-     *     PYQWeightage key in the exam, compare for equality. Catches naming noise
-     *     (case, punctuation, a trailing "-I"/"-II" chapter-part suffix) without
-     *     guessing at word-level semantics at all.
-     *  4. Explicit [ALIASES] lookup — hand-verified chapter-name mappings that
-     *     don't share enough vocabulary for tier 5 to find on its own. Deliberately
-     *     outranks tier 5: a curated mapping should never be second-guessed by an
-     *     automatic one. Confidence is forced to [PYQWeightage.Confidence.ESTIMATED]
-     *     for any [COARSE_BUCKET_ALIASES] entry, overriding whatever the matched
-     *     chapter's own confidence is — see that set's doc.
-     *  5. Conservative token-overlap fuzzy match — real word-set Jaccard overlap
-     *     (see [tokenOverlapScore]) across every subject in the exam, topic
-     *     fragment first, then chapter fragment.
-     *
-     * `weightagePercent` is 0f (not an error) when nothing matches at any tier —
-     * same "no signal still needs a value" discipline [PYQWeightage.getWeightage]
-     * itself already uses. `subjectResolved` falls back to the input `subject` in
-     * that case (may still be null). See [ALIASES]'s KDoc for the aliases kept
-     * deliberately coarse rather than force-matched to a precise figure.
+     * [LearningInterventionIntent.START_DIAGNOSTIC] candidates — one per weak
+     * prerequisite the student has never independently attempted (no entry in
+     * [StudentModel.concepts] at all). A prerequisite the student HAS attempted
+     * already has its own [ScoreGainEstimator] ranking and belongs to
+     * [conceptCandidates] as an ordinary [LearningInterventionIntent.REPAIR_CONCEPT]
+     * — diagnosing something already directly evidenced would just repeat work
+     * [ScoreGainEstimator] already did. `priorityScore` sums the
+     * [PerformanceAnalyzer.TopicImpact.marksAtStakeGap] of every downstream weak
+     * concept that traces back to this prerequisite (Blueprint §1.4's own
+     * "Rolling Motion failure traced back to a weak Laws of Motion prerequisite"
+     * example) — same unit as concept-level `expectedGain` in spirit (marks at
+     * stake), but NOT the same calculation (no time-cost division, no
+     * probability-of-improvement term — there's no attempt data yet to derive
+     * either from). Flagged per class doc as a first-pass approximation, not a
+     * true apples-to-apples comparison.
      */
-    fun resolveWeightage(exam: String, subject: String?, chapter: String, topic: String): WeightageResolution {
-        if (subject != null) {
-            val exactTopic = PYQWeightage.getEntry(exam, subject, topic)
-            if (exactTopic != null && exactTopic.percent > 0f) {
-                return WeightageResolution(subject, exactTopic.percent, topic, ResolutionMethod.EXACT_SUBJECT_TOPIC, exactTopic.confidence)
-            }
-            val exactChapter = PYQWeightage.getEntry(exam, subject, chapter)
-            if (exactChapter != null && exactChapter.percent > 0f) {
-                return WeightageResolution(subject, exactChapter.percent, chapter, ResolutionMethod.EXACT_SUBJECT_CHAPTER, exactChapter.confidence)
-            }
-        }
+    private fun diagnosticCandidates(
+        studentModel: StudentModel,
+        report: PerformanceAnalyzer.PerformanceReport
+    ): List<CandidateIntervention> {
+        val gapByConceptId = report.topicImpacts.associate { it.conceptId to it.marksAtStakeGap }
+        val downstreamGaps = mutableMapOf<String, MutableList<Double>>()
+        val refByPrereqId = mutableMapOf<String, com.checkmate.learning.model.PrerequisiteRef>()
 
-        val examData = PYQWeightage.data[exam].orEmpty()
-        val normTopic = normalize(topic)
-        val normChapter = normalize(chapter)
-        val allKeys = examData.values.flatMap { it.keys }
-
-        // normalize() is a no-op on an already-clean key, so comparing normalized
-        // forms subsumes a literal exact match too — no separate literal check needed.
-        if (normTopic.isNotBlank()) {
-            allKeys.firstOrNull { normalize(it) == normTopic }?.let { key -> findCanonical(examData, key)?.let { return it } }
-        }
-        if (normChapter.isNotBlank()) {
-            allKeys.firstOrNull { normalize(it) == normChapter }?.let { key -> findCanonical(examData, key)?.let { return it } }
-        }
-
-        val examAliases = ALIASES[exam].orEmpty()
-        val matchedAliasKey = normTopic.takeIf { examAliases.containsKey(it) }
-            ?: normChapter.takeIf { examAliases.containsKey(it) }
-        matchedAliasKey?.let { aliasKey ->
-            val canonicalKey = examAliases.getValue(aliasKey)
-            findCanonical(examData, canonicalKey)?.let { resolved ->
-                // Group-2 coarse-bucket aliases (see COARSE_BUCKET_ALIASES doc) never
-                // inherit the matched chapter's own confidence — that confidence
-                // describes the WHOLE chapter, not the narrower fragment being
-                // aliased to it, so it would overstate precision here.
-                val confidence = if (aliasKey in COARSE_BUCKET_ALIASES) {
-                    PYQWeightage.Confidence.ESTIMATED
-                } else {
-                    resolved.confidence
-                }
-                return resolved.copy(method = ResolutionMethod.ALIAS, confidence = confidence)
+        for (issue in studentModel.weakPrerequisites) {
+            val downstreamGap = gapByConceptId[issue.conceptId] ?: 0.0
+            for (ref in issue.weakPrerequisites) {
+                if (studentModel.concepts.containsKey(ref.conceptId)) continue
+                downstreamGaps.getOrPut(ref.conceptId) { mutableListOf() }.add(downstreamGap)
+                refByPrereqId.putIfAbsent(ref.conceptId, ref)
             }
         }
 
-        fun fuzzy(fragment: String): WeightageResolution? {
-            val fragTokens = tokens(normalize(fragment))
-            if (fragTokens.isEmpty()) return null
-            var best: Triple<String, String, PYQWeightage.WeightageEntry>? = null
-            var bestScore = FUZZY_MIN_JACCARD
-            for ((subj, topicsMap) in examData) {
-                for ((key, entry) in topicsMap) {
-                    val score = tokenOverlapScore(fragTokens, tokens(normalize(key)))
-                    if (score >= bestScore) {
-                        bestScore = score
-                        best = Triple(subj, key, entry)
-                    }
-                }
-            }
-            return best?.let { (subj, key, entry) ->
-                WeightageResolution(subj, entry.percent, key, ResolutionMethod.TOKEN_OVERLAP, entry.confidence)
-            }
+        return downstreamGaps.map { (prereqConceptId, gaps) ->
+            val ref = refByPrereqId.getValue(prereqConceptId)
+            val totalDownstreamValue = gaps.sum()
+            val label = ref.topic ?: ref.chapter ?: "this prerequisite"
+            CandidateIntervention(
+                intent = LearningInterventionIntent.START_DIAGNOSTIC,
+                conceptId = prereqConceptId,
+                subject = ref.subject,
+                chapter = ref.chapter,
+                topic = ref.topic,
+                durationMinutes = DIAGNOSTIC_MINUTES,
+                expectedGain = 0.0,
+                priorityScore = totalDownstreamValue,
+                rationale = "Untested prerequisite ($label) behind ${gaps.size} weak concept(s) worth " +
+                    "~%.1f marks — diagnose it before repairing those directly.".format(totalDownstreamValue)
+            )
         }
-
-        return fuzzy(topic) ?: fuzzy(chapter) ?: WeightageResolution(subject, 0f, null, ResolutionMethod.UNRESOLVED)
     }
 
     /**
-     * Per-exam total marks. HONEST GAP: only NEET and JEE Main are filled in with
-     * real current-pattern numbers — SSC CGL Tier 1's marking scheme varies by
-     * post/year enough that a single constant here would be more misleading than
-     * useful, so it's left unmapped (returns 0, same "0 is the correct
-     * unknown-value default" call as [resolveWeightage]). Revisit if/when SSC CGL
-     * prep is actually being tracked, not guessed at now.
+     * One candidate per top-[CONCEPT_CANDIDATE_POOL] [ScoreGainEstimator] estimate
+     * with positive `expectedGain` — [classifyIntent] picks which of the six
+     * concept-scoped intents fits each concept's own mastery/retention/error
+     * signal shape (see that function's own doc), everything else about the
+     * candidate (`expectedGain`, `priorityScore`) is the estimate's own number,
+     * unmodified — this function decides WHICH action, [ScoreGainEstimator]
+     * already decided HOW MUCH it's worth.
      */
-    private val EXAM_TOTAL_MARKS: Map<String, Int> = mapOf(
-        "NEET" to 720,
-        "JEE" to 300
-    )
+    private fun conceptCandidates(
+        studentModel: StudentModel,
+        estimates: List<ScoreGainEstimator.ScoreGainEstimate>
+    ): List<CandidateIntervention> {
+        val dominantErrorByConceptId = studentModel.unresolvedErrors
+            .groupBy { it.conceptId }
+            .mapValues { (_, patterns) -> patterns.maxByOrNull { it.occurrences }?.errorType }
 
-    /**
-     * Real per-subject share of the total paper — NOT an equal split.
-     * NEET: Physics 180 + Chemistry 180 + Biology 360 (Botany+Zoology combined
-     * under one "Biology" paper section) out of 720 = 25 / 25 / 50.
-     * JEE Main: Physics/Chemistry/Mathematics ~100 marks each of 300.
-     * Keyed on [PYQWeightage]'s own subject names, since that's what
-     * [resolveWeightage] returns in `subjectResolved`.
-     */
-    private val EXAM_SUBJECT_SHARE_PERCENT: Map<String, Map<String, Float>> = mapOf(
-        "NEET" to mapOf("Physics" to 25f, "Chemistry" to 25f, "Biology" to 50f),
-        "JEE" to mapOf("Physics" to 33.34f, "Chemistry" to 33.33f, "Mathematics" to 33.33f)
-    )
-
-    fun totalMarks(exam: String): Int = EXAM_TOTAL_MARKS[exam] ?: 0
-
-    fun subjectSharePercent(exam: String, subject: String?): Float {
-        if (subject == null) return 0f
-        return EXAM_SUBJECT_SHARE_PERCENT[exam]?.get(subject) ?: 0f
+        return estimates
+            .filter { it.expectedGain > 0.0 }
+            .take(CONCEPT_CANDIDATE_POOL)
+            .mapNotNull { estimate ->
+                val snapshot = studentModel.concepts[estimate.conceptId] ?: return@mapNotNull null
+                val dominantError = dominantErrorByConceptId[estimate.conceptId]
+                val intent = classifyIntent(snapshot, dominantError)
+                CandidateIntervention(
+                    intent = intent,
+                    conceptId = estimate.conceptId,
+                    subject = estimate.subject,
+                    chapter = estimate.chapter,
+                    topic = estimate.topic,
+                    durationMinutes = durationFor(intent, estimate),
+                    expectedGain = estimate.expectedGain,
+                    priorityScore = estimate.expectedGain,
+                    rationale = rationaleFor(intent, estimate, snapshot, dominantError)
+                )
+            }
     }
 
     /**
-     * ScorePredictor wiring pass (Blueprint §2.3): a subject-by-subject expected
-     * score needs the FULL set of subjects an exam is scored on — including ones
-     * a given [com.checkmate.learning.model.StudentModel] has zero tracked
-     * concepts for — not just whatever subjects happen to show up in one
-     * student's [PerformanceAnalyzer.TopicImpact] list. [EXAM_SUBJECT_SHARE_PERCENT]
-     * already has this; it just had no public accessor before now. One function,
-     * no behavior change to any existing caller.
+     * Six-way split over a concept's own already-derived signals — no new
+     * heuristic invented, every branch reuses a decision another engine already
+     * made:
+     * - [RetentionDecisionSnapshot.REVIEW] at high mastery (something once known,
+     *   now at risk — [com.checkmate.learning.engine.RetentionEngine]'s own
+     *   truth table) -> [LearningInterventionIntent.SCHEDULE_RETENTION_TEST], not
+     *   a full repair — it doesn't need re-teaching, it needs a recall check.
+     * - High mastery with a dominant CARELESS/TIME_PRESSURE error (the two error
+     *   types [com.checkmate.learning.engine.ErrorEngine]'s current heuristic can
+     *   actually distinguish) -> [LearningInterventionIntent.INCREASE_DIFFICULTY]:
+     *   the knowledge is there, the failure mode is pace/attention under the
+     *   current difficulty tier, not the concept itself.
+     * - Heavy, high-rate errors (see [REDUCE_DIFFICULTY_ERROR_RATE]) at low
+     *   mastery -> [LearningInterventionIntent.REDUCE_DIFFICULTY]: nearly every
+     *   attempt is failing, which reads as "this tier is currently miscalibrated
+     *   for this student," not just "needs more repair time at the same level."
+     * - Everything else weak -> [LearningInterventionIntent.REPAIR_CONCEPT], the
+     *   default and by far the most common outcome.
      */
-    fun subjectsForExam(exam: String): Set<String> = EXAM_SUBJECT_SHARE_PERCENT[exam]?.keys.orEmpty()
+    private fun classifyIntent(
+        snapshot: ConceptSnapshot,
+        dominantError: String?
+    ): LearningInterventionIntent {
+        val errorRate = if (snapshot.attemptCount > 0) {
+            snapshot.errorCount.toDouble() / snapshot.attemptCount
+        } else {
+            0.0
+        }
+        return when {
+            snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW &&
+                snapshot.mastery >= HIGH_MASTERY_THRESHOLD ->
+                LearningInterventionIntent.SCHEDULE_RETENTION_TEST
 
-    /**
-     * Full marks-at-stake for a topic if the exam paper matched [PYQWeightage]'s
-     * historical proportions exactly: `totalMarks(exam) * subjectShare% * topic
-     * weightage%`. Returns 0.0 whenever either share or weightage is unresolved —
-     * "unknown" should never silently become "zero risk" further downstream, but
-     * this class only reports the number; callers (PerformanceAnalyzer) are
-     * responsible for not treating a 0.0 marksAtStake as a confirmed non-issue when
-     * `resolution.weightagePercent == 0f` also holds.
-     */
-    fun marksAtStake(exam: String, resolution: WeightageResolution): Double {
-        val share = subjectSharePercent(exam, resolution.subjectResolved)
-        if (share <= 0f || resolution.weightagePercent <= 0f) return 0.0
-        val subjectMarks = totalMarks(exam) * (share / 100.0)
-        return subjectMarks * (resolution.weightagePercent / 100.0)
+            snapshot.mastery >= HIGH_MASTERY_THRESHOLD &&
+                (dominantError == "CARELESS" || dominantError == "TIME_PRESSURE") ->
+                LearningInterventionIntent.INCREASE_DIFFICULTY
+
+            snapshot.errorCount >= ERROR_HEAVY_THRESHOLD &&
+                errorRate >= REDUCE_DIFFICULTY_ERROR_RATE &&
+                snapshot.mastery < HIGH_MASTERY_THRESHOLD ->
+                LearningInterventionIntent.REDUCE_DIFFICULTY
+
+            else -> LearningInterventionIntent.REPAIR_CONCEPT
+        }
     }
 
-    /** Convenience: resolve + marksAtStake in one call. */
-    fun marksAtStake(exam: String, subject: String?, chapter: String, topic: String): Double =
-        marksAtStake(exam, resolveWeightage(exam, subject, chapter, topic))
+    private fun durationFor(
+        intent: LearningInterventionIntent,
+        estimate: ScoreGainEstimator.ScoreGainEstimate
+    ): Int = when (intent) {
+        LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> RETENTION_TEST_MINUTES
+        else -> estimate.timeCostMinutes.toInt()
+    }
+
+    private fun rationaleFor(
+        intent: LearningInterventionIntent,
+        estimate: ScoreGainEstimator.ScoreGainEstimate,
+        snapshot: ConceptSnapshot,
+        dominantError: String?
+    ): String {
+        val label = estimate.topic ?: estimate.chapter ?: "this concept"
+        return when (intent) {
+            LearningInterventionIntent.SCHEDULE_RETENTION_TEST ->
+                "$label is well-mastered (%.0f%%) but at forgetting risk — a short recall check, not a re-teach."
+                    .format(snapshot.mastery * 100)
+            LearningInterventionIntent.INCREASE_DIFFICULTY ->
+                "$label is well-mastered (%.0f%%) but errors skew $dominantError — push harder practice to convert accuracy under pressure."
+                    .format(snapshot.mastery * 100)
+            LearningInterventionIntent.REDUCE_DIFFICULTY ->
+                "$label: ${snapshot.errorCount} errors across ${snapshot.attemptCount} attempts at %.0f%% mastery — current difficulty tier looks miscalibrated; step down before more repair time."
+                    .format(snapshot.mastery * 100)
+            else ->
+                "$label at %.0f%% mastery, ~%.1f marks still at stake.".format(snapshot.mastery * 100, estimate.marksAtStake)
+        }
+    }
 
     /**
-     * Real per-question scoring pattern — SubjectScoreCalculator's "actual marks a
-     * student would recognize" tally needs the literal +/- pattern, not the
-     * proportional-marks abstraction above. Same honest-gap discipline as
-     * [EXAM_TOTAL_MARKS]: only NEET/JEE Main are filled in with their real,
-     * currently-stable +4/-1 pattern. An unmapped exam returns 0 for both, which is
-     * deliberately indistinguishable from "no negative marking" — callers can't tell
-     * the difference either, same caveat as [marksAtStake] for an unmapped exam.
+     * Collapses [LearningInterventionIntent.REPAIR_CONCEPT] candidates sharing a
+     * (subject, chapter) into one [LearningInterventionIntent.ASSIGN_TARGETED_SET]
+     * once there are at least [MIN_TOPICS_FOR_TARGETED_SET] of them — every other
+     * intent passes through untouched, since collapsing a
+     * [LearningInterventionIntent.SCHEDULE_RETENTION_TEST] or
+     * [LearningInterventionIntent.REDUCE_DIFFICULTY] into a generic practice set
+     * would lose exactly the distinction [classifyIntent] just made. The
+     * collapsed candidate's `expectedGain`/`priorityScore` sum the group's own
+     * (already-real) numbers — not re-estimated — and `durationMinutes` sums the
+     * group's own time costs, capped at [MAX_TARGETED_SET_MINUTES] so one chapter
+     * with many weak topics doesn't imply an unrealistically long single session.
      */
-    private val EXAM_MARKS_PER_QUESTION: Map<String, Int> = mapOf(
-        "NEET" to 4,
-        "JEE" to 4
-    )
+    private fun collapseIntoTargetedSets(candidates: List<CandidateIntervention>): List<CandidateIntervention> {
+        val repairable = candidates.filter { it.intent == LearningInterventionIntent.REPAIR_CONCEPT }
+        val rest = candidates.filter { it.intent != LearningInterventionIntent.REPAIR_CONCEPT }
+        val groups = repairable.groupBy { it.subject to it.chapter }
 
-    private val EXAM_NEGATIVE_MARKS_PER_WRONG: Map<String, Int> = mapOf(
-        "NEET" to 1,
-        "JEE" to 1
-    )
+        val kept = mutableListOf<CandidateIntervention>()
+        val collapsed = mutableListOf<CandidateIntervention>()
 
-    fun marksPerQuestion(exam: String): Int = EXAM_MARKS_PER_QUESTION[exam] ?: 0
+        for ((key, group) in groups) {
+            if (group.size >= MIN_TOPICS_FOR_TARGETED_SET) {
+                val totalGain = group.sumOf { it.expectedGain }
+                val totalMinutes = group.sumOf { it.durationMinutes }.coerceAtMost(MAX_TARGETED_SET_MINUTES)
+                val label = key.second ?: key.first ?: "this chapter"
+                collapsed += CandidateIntervention(
+                    intent = LearningInterventionIntent.ASSIGN_TARGETED_SET,
+                    conceptId = null,
+                    subject = key.first,
+                    chapter = key.second,
+                    topic = null,
+                    durationMinutes = totalMinutes,
+                    expectedGain = totalGain,
+                    priorityScore = totalGain,
+                    rationale = "${group.size} weak topics in $label — one mixed practice set covers them " +
+                        "together instead of ${group.size} separate repair sessions."
+                )
+            } else {
+                kept += group
+            }
+        }
 
-    fun negativeMarksPerWrong(exam: String): Int = EXAM_NEGATIVE_MARKS_PER_WRONG[exam] ?: 0
+        return kept + collapsed + rest
+    }
+
+    /**
+     * Whole-student candidates that aren't about any single concept —
+     * [LearningInterventionIntent.START_MOCK] when the entire report is running on
+     * too few attempts to trust ([THIN_DATA_ATTEMPT_THRESHOLD]), and
+     * [LearningInterventionIntent.REPLAN_DAY] when recent accuracy is genuinely
+     * declining ([PerformanceAnalyzer.PerformanceTrend.DECLINING] — not merely
+     * stable-but-imperfect). Both conditions can fire in the same report. Neither
+     * has a natural per-session mark rate the way concept-level candidates do
+     * (see class doc's HONEST GAP note), so `priorityScore` is scaled relative to
+     * `conceptCeiling` — the strongest concept-level candidate's own priority in
+     * this same report — floored at [MIN_MACRO_PRIORITY_SHARE] of it so a macro
+     * candidate can never be silently sorted to the bottom by being on the wrong
+     * numeric scale, but also never guaranteed to outrank a genuinely strong
+     * concept-level opportunity just for existing.
+     */
+    private fun macroCandidates(
+        studentModel: StudentModel,
+        report: PerformanceAnalyzer.PerformanceReport,
+        conceptCeiling: Double
+    ): List<CandidateIntervention> {
+        val floor = (conceptCeiling * MIN_MACRO_PRIORITY_SHARE).coerceAtLeast(1.0)
+        val out = mutableListOf<CandidateIntervention>()
+
+        if (studentModel.overall.totalAttempts < THIN_DATA_ATTEMPT_THRESHOLD) {
+            out += CandidateIntervention(
+                intent = LearningInterventionIntent.START_MOCK,
+                conceptId = null,
+                subject = null,
+                chapter = null,
+                topic = null,
+                durationMinutes = MOCK_MINUTES,
+                expectedGain = 0.0,
+                priorityScore = floor,
+                rationale = "Only ${studentModel.overall.totalAttempts} attempts tracked so far — every " +
+                    "estimate above is running on thin evidence. A fresh mock generates more real signal " +
+                    "than another guess at what to repair."
+            )
+        }
+
+        if (report.overallTrend == PerformanceAnalyzer.PerformanceTrend.DECLINING) {
+            val severity = (-report.overallTrendDelta).coerceIn(0.0, 1.0)
+            out += CandidateIntervention(
+                intent = LearningInterventionIntent.REPLAN_DAY,
+                conceptId = null,
+                subject = null,
+                chapter = null,
+                topic = null,
+                durationMinutes = 0,
+                expectedGain = 0.0,
+                priorityScore = (conceptCeiling * severity).coerceAtLeast(floor),
+                rationale = "Recent accuracy is trending down (%.0f%% below your overall average) — the " +
+                    "current plan itself may need restructuring, not just more of the same sessions."
+                    .format(severity * 100)
+            )
+        }
+
+        return out
+    }
 }
 
 
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ConceptWeightageTest.kt =====
-package com.checkmate.learning.analytics
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LearningDecisionEngineTest.kt =====
+package com.checkmate.learning.engine
 
-import com.checkmate.core.PYQWeightage
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.ErrorPatternSnapshot
+import com.checkmate.learning.model.OverallLearningState
+import com.checkmate.learning.model.PrerequisiteIssue
+import com.checkmate.learning.model.PrerequisiteRef
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class ConceptWeightageTest {
+class LearningDecisionEngineTest {
 
-    @Test
-    fun `exact subject+topic match resolves without falling back`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = "Physics", chapter = "Electrostatics", topic = "Electrostatics"
-        )
-        assertEquals("Physics", r.subjectResolved)
-        // Real 2026-paper-grounded value post canonical rebuild (see PYQWeightage doc).
-        assertEquals(8.9f, r.weightagePercent, 0.001f)
-        assertEquals(PYQWeightage.Confidence.HIGH, r.confidence)
-    }
+    // Same fixture shape as ScorePredictorTest/ScoreGainEstimatorTest, reused
+    // deliberately so this test can only fail on LearningDecisionEngine's own
+    // classification/ranking logic, not a fresh weightage-resolution question.
+    private fun concept(
+        id: String,
+        subject: String?,
+        chapter: String,
+        topic: String,
+        mastery: Double,
+        attemptCount: Int,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
+        errorCount: Int = 0,
+        prerequisiteIssues: List<com.checkmate.learning.model.PrerequisiteRef> = emptyList()
+    ) = ConceptSnapshot(
+        conceptId = id,
+        exam = "NEET",
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = 0.0,
+        attemptCount = attemptCount,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = prerequisiteIssues
+    )
 
-    @Test
-    fun `null subject falls back to fuzzy match and infers the subject`() {
-        // Mirrors a real TestResultNormalizer import: subject is never set.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Current Electricity", topic = "Ohm's Law"
-        )
-        assertEquals("Physics", r.subjectResolved)
-        assertTrue(r.weightagePercent > 0f)
-    }
+    private fun studentModel(
+        concepts: List<ConceptSnapshot>,
+        unresolvedErrors: List<ErrorPatternSnapshot> = emptyList(),
+        weakPrerequisites: List<PrerequisiteIssue> = emptyList()
+    ) = StudentModel(
+        studentId = "s1",
+        generatedAt = 1_000L,
+        overall = OverallLearningState(
+            conceptsTracked = concepts.size,
+            conceptsMastered = concepts.count { it.mastery >= 0.75 },
+            conceptsWeak = concepts.count { it.mastery < 0.75 },
+            averageMastery = if (concepts.isEmpty()) 0.0 else concepts.map { it.mastery }.average(),
+            totalAttempts = concepts.sumOf { it.attemptCount },
+            unresolvedErrorCount = unresolvedErrors.sumOf { it.occurrences }
+        ),
+        concepts = concepts.associateBy { it.conceptId },
+        unresolvedErrors = unresolvedErrors,
+        weakPrerequisites = weakPrerequisites
+    )
 
-    @Test
-    fun `unresolvable topic returns zero weightage, not a crash`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Not A Real Chapter", topic = "Not A Real Topic"
-        )
-        assertEquals(0f, r.weightagePercent, 0.001f)
-        assertEquals(PYQWeightage.Confidence.ESTIMATED, r.confidence)
-    }
-
-    @Test
-    fun `marksAtStake scales total exam marks by subject share and topic weightage`() {
-        // NEET Biology is 50% of 720 = 360; Human Physiology is 12% of that subject.
-        val marks = ConceptWeightage.marksAtStake(
-            exam = "NEET", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology"
-        )
-        assertEquals(360.0 * 0.12, marks, 0.5)
-    }
-
-    @Test
-    fun `unresolved subject share yields zero marksAtStake instead of a wrong guess`() {
-        val marks = ConceptWeightage.marksAtStake(
-            exam = "SSC CGL", subject = "Quantitative Aptitude", chapter = "Algebra", topic = "Algebra"
-        )
-        assertEquals(0.0, marks, 0.001)
-    }
-
-    // ---- Real FT-02B / FT-01B report.md fixtures (see ai-output history) ----
-    // Testmate's own report never carries a topic, so every real call site passes
-    // the same string as both `chapter` and `topic` (see TestResultNormalizer /
-    // PerformanceAnalyzer.resolveAgainstWeightage) — mirrored here rather than
-    // testing chapter/topic independently.
-
-    @Test
-    fun `Laws of Motion now resolves via canonical normalization, alias no longer needed`() {
-        // PYQWeightage's NEET key is now the exact ExamSyllabus chapter string
-        // "Laws Of Motion" (see PYQWeightage's canonical-chapter-rebuild doc), so
-        // a case-only difference clears tier 3 directly — no ALIAS tier required
-        // the way "Mechanics — Newton's Laws" used to require one.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Laws of Motion", topic = "Laws of Motion"
-        )
-        assertEquals("Physics", r.subjectResolved)
-        assertEquals("Laws Of Motion", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.EXACT_CANONICAL, r.method)
-        assertEquals(7.0f, r.weightagePercent, 0.001f)
-    }
-
-    @Test
-    fun `Structure of Atom resolves via alias, not fuzzy overlap`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Structure of Atom", topic = "Structure of Atom"
-        )
-        assertEquals("Chemistry", r.subjectResolved)
-        assertEquals("Atomic Structure", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-    }
-
-    @Test
-    fun `The Living World resolves via alias to the canonical ExamSyllabus chapter name`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "The Living World", topic = "The Living World"
-        )
-        assertEquals("Biology", r.subjectResolved)
-        assertEquals("Diversity In Living World", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-    }
-
-    @Test
-    fun `Cell Cycle and Cell Division resolves via alias into the merged canonical chapter`() {
-        // "Cell Division" no longer exists as its own PYQWeightage chapter — its
-        // weight was folded into "Cell Structure And Function" during the
-        // canonical rebuild (see PYQWeightage doc), so the alias target moved too.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Cell Cycle & Cell Division", topic = "Cell Cycle & Cell Division"
-        )
-        assertEquals("Biology", r.subjectResolved)
-        assertEquals("Cell Structure And Function", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-    }
-
-    @Test
-    fun `bare Biomolecules-I fragment now deterministically resolves to Chemistry`() {
-        // BEHAVIOR CHANGE from before the canonical rebuild: the old table had an
-        // identical "Biomolecules" key duplicated under BOTH NEET Chemistry and
-        // NEET Biology, so which subject a bare "Biomolecules" fragment landed on
-        // depended on Map iteration order — undefined, not a real resolution.
-        // Biology's biomolecules content now lives under "Cell Structure And
-        // Function" (a uniquely-keyed chapter), so the only remaining literal
-        // "Biomolecules" key is Chemistry's — a short fragment with no
-        // distinguishing content (no "Lipids"/"Enzymes"/etc., see the -II test
-        // below) is genuinely ambiguous and now resolves deterministically to
-        // Chemistry instead of accidentally to Biology.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null,
-            chapter = "Biomolecules-I (Upto polysaccharides)", topic = "Biomolecules-I (Upto polysaccharides)"
-        )
-        assertEquals("Chemistry", r.subjectResolved)
-        assertEquals("Biomolecules", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.EXACT_CANONICAL, r.method)
-    }
-
-    @Test
-    fun `Biomolecules-II long chapter still needs its explicit alias into Biology`() {
-        // Real FT-02B chapter string — has trailing content beyond the
-        // parenthetical/suffix ("Lipids, Nucleic acids, Enzymes, Cofactors"), so
-        // normalize() alone does NOT reduce it to bare "Biomolecules"; only the
-        // explicit alias (which routes it to Biology's "Cell Structure And
-        // Function") catches it.
-        //
-        // COARSE-BUCKET FIX (this pass): "Cell Structure And Function" has 10
-        // distinct topics in ExamSyllabus; Biomolecules-II's content maps to only
-        // 2 of them. This alias is now in COARSE_BUCKET_ALIASES, so it must NOT
-        // inherit "Cell Structure And Function"'s own MEDIUM confidence — same
-        // treatment as the Breathing coarse-bucket alias below.
-        val chapter = "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"
-        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
-        assertEquals("Biology", r.subjectResolved)
-        assertEquals("Cell Structure And Function", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-        assertEquals(
-            "coarse-bucket alias must be forced to ESTIMATED, not inherit the chapter's own MEDIUM confidence",
-            PYQWeightage.Confidence.ESTIMATED, r.confidence
+    // Padded with well-mastered filler concepts so overall.totalAttempts clears
+    // THIN_DATA_ATTEMPT_THRESHOLD when a test isn't specifically exercising the
+    // thin-data / START_MOCK path — keeps that path's own test the only one
+    // where it's expected to fire.
+    private fun filler(count: Int = 3) = (1..count).map {
+        concept(
+            id = "filler-$it", subject = "Physics", chapter = "Filler $it", topic = "Filler $it",
+            mastery = 0.95, attemptCount = 10
         )
     }
 
     @Test
-    fun `Motion in a Plane now resolves — Kinematics legitimately covers 2D motion`() {
-        // Previously left UNRESOLVED (session-report gap #1): the old PYQWeightage
-        // "Kinematics" entry was effectively 1D-only. The canonical-chapter rebuild
-        // keys Kinematics at the real NTA-unit level, which genuinely includes
-        // Motion in a Plane / Projectile Motion / Relative Velocity as topics
-        // (see ExamSyllabus) — aliasing to it is no longer overstating confidence.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Motion in a Plane", topic = "Motion in a Plane"
+    fun `ranks a clear weak concept as REPAIR_CONCEPT with the estimator's own expectedGain`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-weak", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                mastery = 0.1, attemptCount = 10
+            )
         )
-        assertEquals("Physics", r.subjectResolved)
-        assertEquals("Kinematics", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-        assertTrue(r.weightagePercent > 0f)
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val top = report.candidates.first()
+
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, top.intent)
+        assertEquals("c-weak", top.conceptId)
+        assertTrue(top.expectedGain > 0.0)
+        assertEquals(top.expectedGain, top.priorityScore, 0.0001)
     }
 
     @Test
-    fun `Classification of Elements and Periodicity now resolves — the missing entry was added`() {
-        // Previously left UNRESOLVED (session-report gap #2): the chapter was
-        // never missing from ExamSyllabus, only from PYQWeightage. Now has its
-        // own canonical entry, so this clears tier 3 directly.
-        val chapter = "Classification of Elements and Periodicity in Properties"
-        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
-        assertEquals("Chemistry", r.subjectResolved)
-        assertEquals("Classification Of Elements And Periodicity In Properties", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.EXACT_CANONICAL, r.method)
-        assertTrue(r.weightagePercent > 0f)
+    fun `high mastery plus REVIEW retention becomes a retention test, not a full repair`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-review", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                mastery = 0.85, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.first { it.conceptId == "c-review" }
+
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, candidate.intent)
+        assertEquals(10, candidate.durationMinutes)
     }
 
     @Test
-    fun `Breathing and Exchange of Gases now resolves via a deliberate coarse-bucket alias`() {
-        // Previously left UNRESOLVED (session-report gap #3). Still a genuine
-        // coarse-bucket attribution (Human Physiology also covers circulation,
-        // excretion, neural, endocrine content).
-        //
-        // TIGHTENED (this pass): confidence used to just happen to be ESTIMATED
-        // because "Human Physiology"'s own default confidence was ESTIMATED — an
-        // accident of that entry's current definition, not a guarantee. Now
-        // explicitly forced via COARSE_BUCKET_ALIASES regardless of what the
-        // matched chapter's own confidence is, so this stays true even if Human
-        // Physiology is later upgraded with real per-chapter PYQ data.
-        val chapter = "Breathing & Exchange of Gases-I (Upto mechanism of breathing)"
-        val r = ConceptWeightage.resolveWeightage(exam = "NEET", subject = null, chapter = chapter, topic = chapter)
-        assertEquals("Biology", r.subjectResolved)
-        assertEquals("Human Physiology", r.matchedKey)
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-        assertTrue(r.weightagePercent > 0f)
-        assertEquals(
-            "coarse-bucket alias must be forced to ESTIMATED, not just happen to inherit it",
-            PYQWeightage.Confidence.ESTIMATED, r.confidence
+    fun `high mastery with careless errors suggests increasing difficulty, not repair`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-careless", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.85, attemptCount = 10, errorCount = 2
+            ),
+            unresolvedErrors = listOf(
+                ErrorPatternSnapshot(
+                    conceptId = "c-careless", errorType = "CARELESS", occurrences = 2,
+                    firstSeen = 100L, lastSeen = 900L
+                )
+            )
         )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.firstOrNull { it.conceptId == "c-careless" }
+
+        assertTrue(candidate != null)
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY, candidate!!.intent)
     }
 
     @Test
-    fun `Motion in a Plane is not treated as a coarse-bucket alias — Kinematics genuinely covers it`() {
-        // Guards against COARSE_BUCKET_ALIASES over-applying: unlike Breathing and
-        // Biomolecules-II, "Motion in a Plane" resolving to "Kinematics" is NOT a
-        // narrow-fragment-standing-in-for-a-broad-chapter situation — Kinematics'
-        // own topic list in ExamSyllabus is essentially just straight-line and
-        // planar motion, so the chapter-level figure genuinely describes it. This
-        // alias should keep whatever confidence "Kinematics" itself carries, not
-        // get forced down to ESTIMATED.
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Motion in a Plane", topic = "Motion in a Plane"
+    fun `heavy high-rate errors at low mastery suggest reducing difficulty`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-mismatch", subject = "Chemistry", chapter = "Chemical Bonding", topic = "Chemical Bonding",
+                mastery = 0.15, attemptCount = 10, errorCount = 7
+            )
         )
-        assertEquals(ConceptWeightage.ResolutionMethod.ALIAS, r.method)
-        assertEquals(PYQWeightage.Confidence.MEDIUM, r.confidence)
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.first { it.conceptId == "c-mismatch" }
+
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY, candidate.intent)
     }
 
     @Test
-    fun `conservative fuzzy match never lets an unrelated Electric topic bleed into Current Electricity`() {
-        // Guards the exact false-positive risk the fuzzy tier was designed against:
-        // whole-word overlap only, no stemming, so "Electricity" never matches
-        // "Electric" and this stays UNRESOLVED rather than guessing "Current Electricity".
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = null, chapter = "Electric Potential Only", topic = "Electric Potential Only"
+    fun `an untested prerequisite becomes a diagnostic, an already-attempted one does not`() {
+        val untested = PrerequisiteRef(
+            conceptId = "prereq-untested", subject = "Physics", chapter = "Kinematics", topic = "Kinematics"
         )
-        assertEquals(0f, r.weightagePercent, 0.001f)
-        assertEquals(ConceptWeightage.ResolutionMethod.UNRESOLVED, r.method)
+        val attempted = PrerequisiteRef(
+            conceptId = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors"
+        )
+        val model = studentModel(
+            filler() + concept(
+                id = "c-downstream", subject = "Physics", chapter = "Rolling Motion", topic = "Rolling Motion",
+                mastery = 0.2, attemptCount = 8
+            ) + concept(
+                id = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors",
+                mastery = 0.3, attemptCount = 5
+            ),
+            weakPrerequisites = listOf(
+                PrerequisiteIssue(conceptId = "c-downstream", weakPrerequisites = listOf(untested, attempted))
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(report.candidates.any {
+            it.conceptId == "prereq-untested" &&
+                it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC
+        })
+        assertTrue(report.candidates.none { it.conceptId == "prereq-attempted" && it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC })
     }
 
     @Test
-    fun `a real single-year observed count carries HIGH confidence through resolution`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = "Physics", chapter = "Rotational Motion", topic = "Rotational Motion"
+    fun `thin overall attempt data surfaces START_MOCK among the candidates`() {
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-thin", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                    mastery = 0.2, attemptCount = 3
+                )
+            )
         )
-        assertEquals(PYQWeightage.Confidence.HIGH, r.confidence)
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(model.overall.totalAttempts < 20)
+        assertTrue(report.candidates.any { it.intent == LearningDecisionEngine.LearningInterventionIntent.START_MOCK })
     }
 
     @Test
-    fun `an estimated legacy figure carries ESTIMATED confidence through resolution, not a false HIGH`() {
-        val r = ConceptWeightage.resolveWeightage(
-            exam = "NEET", subject = "Physics", chapter = "Gravitation", topic = "Gravitation"
+    fun `three or more weak topics in one chapter collapse into one targeted set`() {
+        // "Human Physiology" resolves via ConceptWeightage's exact (exam, subject,
+        // chapter) tier since subject is provided directly — same fixture chapter
+        // ScorePredictorTest already relies on for a real, non-zero weightage.
+        val model = studentModel(
+            filler() + listOf(
+                concept(id = "c1", subject = "Biology", chapter = "Human Physiology", topic = "Excretion", mastery = 0.2, attemptCount = 6),
+                concept(id = "c2", subject = "Biology", chapter = "Human Physiology", topic = "Circulation", mastery = 0.25, attemptCount = 6),
+                concept(id = "c3", subject = "Biology", chapter = "Human Physiology", topic = "Neural Control", mastery = 0.15, attemptCount = 6)
+            )
         )
-        assertEquals(PYQWeightage.Confidence.ESTIMATED, r.confidence)
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        val targetedSets = report.candidates.filter {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET && it.chapter == "Human Physiology"
+        }
+        assertEquals(1, targetedSets.size)
+        assertTrue(report.candidates.none { it.chapter == "Human Physiology" && it.intent == LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT })
+    }
+
+    @Test
+    fun `every candidate list is capped and sorted by priority descending`() {
+        // Eight distinct, real, resolvable chapters (none repeated, so nothing
+        // collapses into a targeted set) — enough weak concepts to force the
+        // MAX_CANDIDATES cap to actually bind.
+        val chapters = listOf(
+            "Biology" to "Human Physiology",
+            "Physics" to "Laws of Motion",
+            "Physics" to "Kinematics",
+            "Chemistry" to "Chemical Bonding",
+            "Biology" to "Ecology And Environment",
+            "Physics" to "Vectors and 3D",
+            "Chemistry" to "Coordination Compounds",
+            "Biology" to "Biodiversity"
+        )
+        val model = studentModel(
+            chapters.mapIndexed { i, (subject, chapter) ->
+                concept(
+                    id = "c-many-$i", subject = subject, chapter = chapter, topic = chapter,
+                    mastery = 0.1 + i * 0.02, attemptCount = 8
+                )
+            }
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(report.candidates.isNotEmpty())
+        assertTrue(report.candidates.size <= 5)
+        val scores = report.candidates.map { it.priorityScore }
+        assertEquals(scores.sortedDescending(), scores)
     }
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsViewModel.kt =====
+package com.checkmate.ui.testresults
+
+import android.content.Context
+import android.net.Uri
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private const val TAG = "TestResultsViewModel"
+
+data class TestResultsState(
+    val sessionId: String = "",
+    val loading: Boolean = false,
+    val result: TestmateResult? = null,
+    val error: String? = null,
+    // ── Upgrade Blueprint wiring gap fix ──
+    // Phase 1 (MasteryEngine/ErrorEngine/RetentionEngine/KnowledgeGraph/
+    // TestResultNormalizer) was fully built but nothing ever called
+    // TestResultNormalizer — TestmateApi's /results endpoint only returns
+    // chapter/topic aggregates, never per-question detail, so there was no
+    // data shape TestResultNormalizer could consume. Rather than add a new
+    // testmate2.com endpoint, this reuses the report.md TestResultNormalizer
+    // already parses (TestReportParser) via a manual file picker (see
+    // TestResultsScreen's "Import report.md" section) — the student downloads
+    // the report from TestmateWebScreen's WebView (already wired to
+    // DownloadManager) and picks it here. No backend change, no
+    // DownloadManager-watching/polling, no push/pull sync layer to maintain
+    // across app updates — just a Storage Access Framework file read.
+    val importing: Boolean = false,
+    val importResult: TestResultNormalizer.NormalizeResult? = null,
+    val importError: String? = null,
+    // ── Test-report wiring pass ──
+    // Closes normalizeAndPersist() -> StudentModelBuilder.build() ->
+    // PerformanceAnalyzer.analyze() -> PerformanceReport, the second half of the
+    // loop the import above only started. Deliberately separate loading/error
+    // state from importing/importError above: a successful import that commits
+    // to Room is real and final the moment importResult is set, regardless of
+    // whether analysis afterward succeeds — see importReport's own doc on why
+    // analysis failure never rolls back or hides importResult.
+    val analyzing: Boolean = false,
+    val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
+    val analysisError: String? = null,
+    // ── ScoreGainEstimator wiring pass ──
+    // Blueprint §2.2. Built from the SAME PerformanceReport + StudentModel this
+    // buildPerformanceReport call already produced — never recomputed
+    // separately, so this can never drift out of sync with performanceReport
+    // (same "one source of truth per Room read" discipline StudentModel's own
+    // doc requires). Ranked highest-expectedGain first; empty until analysis
+    // has run at least once. Kept as its own field (not folded into
+    // performanceReport) because it's a downstream DECISION-shaped view over
+    // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
+    // own class doc on that boundary.
+    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList(),
+    // ── ScorePredictor wiring pass ──
+    // Blueprint §2.3. Built from the SAME PerformanceReport + StudentModel as
+    // scoreGainEstimates above — never a separate StudentModelBuilder.build/
+    // PerformanceAnalyzer.analyze call, same "one Room read, three derived views"
+    // discipline. targetScore comes from ConsultationProfile (the Student Profile
+    // screen's own "Target Score" field), not invented here. Null until analysis
+    // has run at least once.
+    val expectedScore: ScorePredictor.ExpectedScore? = null,
+    // ── LearningDecisionEngine wiring pass (Blueprint §2.4) ──
+    // The frontier piece: everything above this line is EVIDENCE (PerformanceReport)
+    // or a DECISION-shaped ranking over one dimension at a time (scoreGainEstimates
+    // ranks by marks, expectedScore explains a gap) — this is the first field that's
+    // an actual ranked, typed ACTION ("what should this student do next"), built
+    // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
+    // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
+    // read, N derived views" doc). Null until analysis has run at least once.
+    val decisionReport: LearningDecisionEngine.DecisionReport? = null
+)
+
+class TestResultsViewModel : ViewModel() {
+    private val _state = MutableStateFlow(TestResultsState())
+    val state: StateFlow<TestResultsState> = _state.asStateFlow()
+
+    fun onSessionIdChange(value: String) {
+        _state.update { it.copy(sessionId = value, error = null) }
+    }
+
+    fun fetch() {
+        val id = _state.value.sessionId
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            when (val outcome = TestmateApi.fetchResult(id)) {
+                is com.checkmate.testmate.TestmateResultOutcome.Success ->
+                    _state.update { it.copy(loading = false, result = outcome.result, error = null) }
+                is com.checkmate.testmate.TestmateResultOutcome.Error ->
+                    _state.update { it.copy(loading = false, error = outcome.message) }
+            }
+        }
+    }
+
+    /**
+     * Reads the picked report.md (or .txt — Testmate's export mime type varies by
+     * provider) via SAF, hands the raw text straight to
+     * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
+     * (or the "already imported" idempotency result) in [TestResultsState]. File
+     * I/O + normalization both happen off the main thread.
+     *
+     * Test-report wiring pass: once (and only once) normalizeAndPersist has
+     * actually committed — success or already-imported, both mean Room state is
+     * current — this chains into [buildPerformanceReport], closing
+     * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
+     * -> PerformanceReport -> ScoreGainEstimator.rankFromReport. The stages update
+     * state independently: `importResult` is set and `importing` flips false as
+     * soon as persistence succeeds, full stop; analysis (and the ranking built on
+     * top of it) runs after that as a separate concern, and if it fails, only
+     * `analysisError` is set — the already-committed import is never rolled back
+     * or hidden because a derived-view step afterward broke.
+     */
+    fun importReport(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    importing = true, importError = null, importResult = null,
+                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                    expectedScore = null, decisionReport = null
+                )
+            }
+            try {
+                val text = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                } ?: throw IllegalStateException("Couldn't open the selected file.")
+
+                if (text.isBlank()) {
+                    _state.update {
+                        it.copy(importing = false, importError = "Selected file is empty.")
+                    }
+                    return@launch
+                }
+
+                val result = withContext(Dispatchers.IO) {
+                    TestResultNormalizer.normalizeAndPersist(context, text)
+                }
+                // Persistence has committed — this is final regardless of what
+                // buildPerformanceReport below does with it.
+                _state.update { it.copy(importing = false, importResult = result, importError = null) }
+                buildPerformanceReport(context, result.examType)
+            } catch (e: Exception) {
+                Log.e(TAG, "Report import failed: ${e.message}", e)
+                _state.update {
+                    it.copy(importing = false, importError = "Import failed: ${e.message ?: "unknown error"}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs after a committed import (fresh or already-imported — both mean Room
+     * reflects this test). Reads current Room state fresh via
+     * [StudentModelBuilder.build] rather than anything cached from the import
+     * step, per [com.checkmate.learning.model.StudentModel]'s own "never hold a
+     * built StudentModel across a Room write" rule. `examType` comes straight from
+     * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
+     * guesses an exam identifier itself.
+     *
+     * ScoreGainEstimator wiring pass: [ScoreGainEstimator.rankFromReport] runs
+     * against the SAME `studentModel`/`report` this function just built — not a
+     * second `StudentModelBuilder.build`/`PerformanceAnalyzer.analyze` call — so
+     * `scoreGainEstimates` can never reflect a different Room snapshot than
+     * `performanceReport` does. Both are set together in one state update.
+     *
+     * ScorePredictor wiring pass (Blueprint §2.3): [ScorePredictor.predictFromReport]
+     * runs against that same `studentModel`/`report` too — third derived view over
+     * one Room read, same discipline as the ScoreGainEstimator call right above it.
+     * `targetScore` comes from [ConsultationProfile.load] (the Student Profile
+     * screen's own field, defaults to 650 if never set) — read fresh here, not
+     * cached, so a target the student just edited is reflected on the very next
+     * analysis run.
+     *
+     * LearningDecisionEngine wiring pass (Blueprint §2.4): [LearningDecisionEngine.decideFromReport]
+     * runs against the SAME `report`/`studentModel`/`estimates`/`expectedScore` this
+     * call already built — fourth derived view over one Room read, same "never
+     * recompute what's already in hand" discipline as the two calls above it.
+     *
+     * Launched as its own coroutine (not inline in importReport's try block) so an
+     * analysis failure can only ever set [TestResultsState.analysisError] — it has
+     * no path back to importReport's own try/catch and can't turn a successful
+     * import into a failed one.
+     */
+    private fun buildPerformanceReport(context: Context, examType: String?) {
+        if (examType == null) {
+            _state.update {
+                it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(analyzing = true, analysisError = null) }
+            try {
+                val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+                val report = PerformanceAnalyzer.analyze(studentModel, examType)
+                val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+                val targetScore = ConsultationProfile.load().targetScore
+                val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
+                val decisionReport = LearningDecisionEngine.decideFromReport(
+                    report, studentModel, estimates, expectedScore
+                )
+                _state.update {
+                    it.copy(
+                        analyzing = false, performanceReport = report,
+                        scoreGainEstimates = estimates, expectedScore = expectedScore,
+                        decisionReport = decisionReport
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Performance analysis failed: ${e.message}", e)
+                _state.update {
+                    it.copy(
+                        analyzing = false,
+                        analysisError = "Couldn't build performance report: ${e.message ?: "unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissImportResult() {
+        _state.update {
+            it.copy(
+                importResult = null, importError = null,
+                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                expectedScore = null, decisionReport = null
+            )
+        }
+    }
+}
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsScreen.kt =====
+package com.checkmate.ui.testresults
+
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.analytics.SubjectScore
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.testmate.TestmateWeakArea
+import com.checkmate.ui.theme.*
+
+/**
+ * Phase 6 (test-platform-blueprint.md) surface: pulls a single Testmate
+ * session result by ID and renders it natively, per spec §4's
+ * score/weak-chapters/weak-topics shape. Base URL + token are configured in
+ * Settings → Test Platform.
+ *
+ * "Import report.md" section below is separate from the fetch-by-session-ID
+ * flow above — the aggregate fetch shows score/weak-chapters/weak-topics for
+ * display only (TestmateApi's /results endpoint carries no per-question
+ * detail); the file import is what actually feeds the learning module
+ * (MasteryEngine/ErrorEngine/RetentionEngine via TestResultNormalizer). The
+ * two are independent: fetch a result to look at it, and/or import its
+ * report.md (downloaded from TestmateWebScreen's WebView) to let Checkmate
+ * learn from it.
+ *
+ * Test-report wiring pass: a successful (or already-imported) report import now
+ * also renders a [PerformanceReportCard] — the first screen showing the
+ * StudentModel -> PerformanceAnalyzer pipeline's actual output, not just raw
+ * import counts. Deliberately faithful to what the analyzer produced: no
+ * cross-test history section here (PerformanceReport is a derived view over
+ * current Room state only — see TestResultsViewModel's own doc — not a stored
+ * snapshot), so "Trend" below reflects this student's overall recent-vs-lifetime
+ * accuracy shift across every concept, not a literal previous-test-vs-this-test
+ * comparison. That comparison needs a persisted report history, which is
+ * explicitly out of scope for this pass.
+ *
+ * ScoreGainEstimator wiring pass (Blueprint §2.2): "Biggest opportunities" used
+ * to render [PerformanceAnalyzer.TopicImpact] directly — three concepts at
+ * identical "13% mastery" with no way to tell why one outranks another beyond
+ * list order. [OpportunityRow] now renders [ScoreGainEstimator.ScoreGainEstimate]
+ * instead: mastery is still shown (nothing here hides the underlying number),
+ * alongside marks-at-stake, the ranked expectedGain itself, and a confidence
+ * label — the blueprint's own "Repair rolling motion — +4.2 marks" framing,
+ * not a re-sorted mastery list.
+ *
+ * ScorePredictor wiring pass (Blueprint §2.3): [PerformanceReportCard] now also
+ * renders an [ExpectedScoreCard] — Expected/Range/Target/Gap plus a bottleneck
+ * breakdown, per the blueprint's own worked example. Explicitly labeled
+ * "Estimated performance" in the UI itself (not just in code comments), per
+ * [ScorePredictor.ExpectedScore]'s own "no false precision" caution — this is a
+ * first-pass heuristic model, not a validated predictor, and the screen should
+ * never imply otherwise.
+ *
+ * LearningDecisionEngine wiring pass (Blueprint §2.4): [PerformanceReportCard]
+ * now also renders [RecommendedNextSection] — the ranked, typed action list
+ * [LearningDecisionEngine] produces on top of everything above it. This is
+ * still a read-only display: tapping a row does nothing yet (there's no
+ * `StudyTask`-mutating wiring behind it — that's Blueprint §2.5, deliberately
+ * not started, see [LearningDecisionEngine]'s own class doc on that boundary).
+ * The point of surfacing it here now is the same "don't let evidence sit
+ * un-acted-on" reasoning every prior wiring pass in this file already follows.
+ */
+@Composable
+fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
+    val state by vm.state.collectAsState()
+    val context = LocalContext.current
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let { vm.importReport(context, it) } }
+
+    Column(
+        modifier = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState())
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { navController.popBackStack() }) {
+                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+            }
+            Text("Test Results", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = White90)
+        }
+
+        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+            Text("Session ID", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
+            OutlinedTextField(
+                value         = state.sessionId,
+                onValueChange = vm::onSessionIdChange,
+                modifier      = Modifier.fillMaxWidth(),
+                singleLine    = true,
+                placeholder   = { Text("Paste the Testmate session ID", color = White30, fontSize = 13.sp) },
+                leadingIcon   = { Icon(Icons.Default.Quiz, null, tint = White60) },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor   = AccentGreen,
+                    unfocusedBorderColor = White30,
+                    cursorColor          = AccentGreen,
+                    focusedTextColor     = White90,
+                    unfocusedTextColor   = White90
+                )
+            )
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick  = { vm.fetch() },
+                enabled  = state.sessionId.isNotBlank() && !state.loading,
+                modifier = Modifier.fillMaxWidth(),
+                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                if (state.loading) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = androidx.compose.ui.graphics.Color.Black, strokeWidth = 2.dp)
+                } else {
+                    Text("Fetch Result", color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp)
+                }
+            }
+        }
+
+        state.error?.let { err ->
+            Text(
+                err, fontSize = 12.sp, color = AccentRed,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+            )
+        }
+
+        state.result?.let { result ->
+            Spacer(Modifier.height(16.dp))
+            ResultSummaryCard(result)
+            if (result.weakChapters.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                WeakAreasCard("Weak Chapters", result.weakChapters)
+            }
+            if (result.weakTopics.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                WeakAreasCard("Weak Topics", result.weakTopics)
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider(color = White10, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 16.dp))
+        Spacer(Modifier.height(20.dp))
+
+        ImportReportSection(
+            state    = state,
+            onPick   = { importLauncher.launch("*/*") },
+            onDismiss = { vm.dismissImportResult() }
+        )
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ImportReportSection(
+    state: TestResultsState,
+    onPick: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+        Text("Import report.md", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = White90)
+        Text(
+            "Feeds this test's per-question data into Checkmate's learning engine " +
+                "(mastery, error patterns, retention) — download the report from the " +
+                "Test Platform tab first, then pick it here.",
+            fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+        )
+        Button(
+            onClick  = onPick,
+            enabled  = !state.importing,
+            modifier = Modifier.fillMaxWidth(),
+            colors   = ButtonDefaults.buttonColors(containerColor = BgCard),
+            border   = BorderStroke(0.5.dp, White30)
+        ) {
+            if (state.importing) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = AccentGreen, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Importing…", color = White90, fontSize = 13.sp)
+            } else {
+                Icon(Icons.Default.UploadFile, null, tint = AccentGreen, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Pick report.md", color = White90, fontSize = 13.sp)
+            }
+        }
+
+        state.importError?.let { err ->
+            Text(
+                err, fontSize = 12.sp, color = AccentRed,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
+
+        state.importResult?.let { result ->
+            Spacer(Modifier.height(12.dp))
+            ImportResultCard(result, onDismiss)
+        }
+
+        // Test-report wiring: the analyzer output, rendered right under the raw
+        // import counts above it — same test, next level of detail down.
+        if (state.analyzing) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Building performance report…", fontSize = 12.sp, color = White60)
+            }
+        }
+        state.analysisError?.let { err ->
+            Text(
+                err, fontSize = 12.sp, color = AccentAmber,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+        }
+        val report = state.performanceReport
+        val importResult = state.importResult
+        if (report != null && importResult != null) {
+            Spacer(Modifier.height(12.dp))
+            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore, state.decisionReport)
+        }
+    }
+}
+
+@Composable
+private fun ImportResultCard(
+    result: TestResultNormalizer.NormalizeResult,
+    onDismiss: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, if (result.alreadyImported) AccentAmber else AccentGreen)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (result.alreadyImported) "Already imported" else "Imported",
+                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    color = if (result.alreadyImported) AccentAmber else AccentGreen
+                )
+                IconButton(onClick = onDismiss, modifier = Modifier.size(20.dp)) {
+                    Icon(Icons.Default.Close, null, tint = White60, modifier = Modifier.size(16.dp))
+                }
+            }
+            if (result.alreadyImported) {
+                Text(
+                    "This test was already imported — no duplicate attempts written.",
+                    fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 6.dp)
+                )
+            } else {
+                Spacer(Modifier.height(10.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    MiniStat("Questions", "${result.questionsWritten}", AccentGreen)
+                    MiniStat("Attempts", "${result.attemptsWritten}", AccentGreen)
+                    MiniStat("Errors", "${result.errorsClassified}", AccentRed)
+                    MiniStat("Concepts", "${result.conceptsRecomputed}", AccentAmber)
+                }
+            }
+            if (result.warnings.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                result.warnings.forEach { w ->
+                    Text("⚠ $w", fontSize = 11.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Test-report wiring pass, updated by the ScoreGainEstimator wiring pass. Four
+ * layers, per the reviewed mockup: overall score (from
+ * [TestResultNormalizer.NormalizeResult], the report's own literal numbers),
+ * subject performance (real +4/-1 scoring via [SubjectScore]), biggest
+ * opportunities (top [ScoreGainEstimator.ScoreGainEstimate]s, already sorted by
+ * expectedGain descending — first 5 shown), and overall trend. `report` is still
+ * passed through for the Trend section (overallTrend/overallTrendDelta live only
+ * on [PerformanceAnalyzer.PerformanceReport]) even though topicImpacts itself is
+ * no longer rendered directly here — [estimates] is the ranked view built on top
+ * of it. Deliberately plain: no charts, no color-coded deltas beyond what
+ * MiniStat/scoreColor/confidence coloring already give the rest of this screen —
+ * render what the analyzer/estimator produced, not a reinterpretation of it.
+ *
+ * LearningDecisionEngine wiring pass: `decisionReport` renders as
+ * [RecommendedNextSection] between "Biggest opportunities" and the Expected
+ * score block — reads naturally in that order ("here's what's weak, here's
+ * what's worth doing about it, here's the score math behind the target").
+ */
+@Composable
+private fun PerformanceReportCard(
+    importResult: TestResultNormalizer.NormalizeResult,
+    report: PerformanceAnalyzer.PerformanceReport,
+    estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
+    expectedScore: ScorePredictor.ExpectedScore?,
+    decisionReport: LearningDecisionEngine.DecisionReport?
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, AccentGreen)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                importResult.title ?: "Test Result",
+                fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90
+            )
+            Spacer(Modifier.height(4.dp))
+
+            val obtained = importResult.scoreObtained
+            val total = importResult.scoreTotal
+            val percent = importResult.scorePercent
+            if (obtained != null && total != null) {
+                Text(
+                    "%.0f/%.0f".format(obtained, total),
+                    fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                    color = percent?.let { scoreColor(it) } ?: White90
+                )
+                percent?.let {
+                    Text(
+                        "%.1f%%".format(it), fontSize = 13.sp, color = White60,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+
+            if (importResult.subjectScores.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                Text("Subject performance", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(8.dp))
+                importResult.subjectScores.forEach { s -> SubjectScoreRow(s) }
+            }
+
+            val opportunities = estimates.filter { it.expectedGain > 0.0 }.take(5)
+            if (opportunities.isNotEmpty()) {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                Text("Biggest opportunities", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                Spacer(Modifier.height(8.dp))
+                opportunities.forEachIndexed { index, estimate -> OpportunityRow(index + 1, estimate) }
+            }
+
+            decisionReport?.candidates?.takeIf { it.isNotEmpty() }?.let { candidates ->
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                RecommendedNextSection(candidates)
+            }
+
+            expectedScore?.let { es ->
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                ExpectedScoreSection(es)
+            }
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = White10, thickness = 0.5.dp)
+            Spacer(Modifier.height(12.dp))
+            Text("Trend", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(6.dp))
+            Text(trendLabel(report.overallTrend, report.overallTrendDelta), fontSize = 12.sp, color = White60)
+        }
+    }
+}
+
+/**
+ * LearningDecisionEngine wiring pass (Blueprint §2.4): the ranked,
+ * typed-action list — deliberately distinct from [OpportunityRow] above it,
+ * which ranks by marks alone. Each row shows WHICH kind of action
+ * ([LearningDecisionEngine.LearningInterventionIntent]) the engine picked, not
+ * just another weak-topic name — the same "don't let the LLM choose the
+ * intervention" discipline the blueprint itself insists on: this list is
+ * produced entirely deterministically, before any LLM sees it. Read-only for
+ * now — see [PerformanceReportCard]'s own doc on why tapping a row doesn't do
+ * anything yet.
+ */
+@Composable
+private fun RecommendedNextSection(candidates: List<LearningDecisionEngine.CandidateIntervention>) {
+    Text("Recommended next", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+    Text(
+        "Ranked by the decision engine — not just by mastery",
+        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+    )
+    candidates.forEachIndexed { index, candidate -> CandidateRow(index + 1, candidate) }
+}
+
+@Composable
+private fun CandidateRow(rank: Int, candidate: LearningDecisionEngine.CandidateIntervention) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    intentLabel(candidate.intent),
+                    fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = AccentAmber
+                )
+                Text(
+                    "$rank. ${candidate.topic ?: candidate.chapter ?: candidate.subject ?: "Overall plan"}",
+                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90
+                )
+            }
+            if (candidate.durationMinutes > 0) {
+                Text(
+                    "${candidate.durationMinutes}m",
+                    fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = White60
+                )
+            }
+        }
+        Spacer(Modifier.height(2.dp))
+        Text(candidate.rationale, fontSize = 11.sp, color = White60)
+    }
+}
+
+private fun intentLabel(intent: LearningDecisionEngine.LearningInterventionIntent): String = when (intent) {
+    LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT -> "REPAIR"
+    LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC -> "DIAGNOSE"
+    LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET -> "PRACTICE SET"
+    LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> "RETENTION CHECK"
+    LearningDecisionEngine.LearningInterventionIntent.START_MOCK -> "TAKE A MOCK"
+    LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> "REPLAN TODAY"
+    LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY -> "STEP DOWN DIFFICULTY"
+    LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> "STEP UP DIFFICULTY"
+}
+
+/**
+ * ScorePredictor wiring pass (Blueprint §2.3): "Expected: 638, Range: 617–659,
+ * Target: 680, Gap: 42" plus the bottleneck breakdown, per the blueprint's own
+ * worked example. "Estimated performance" is shown as its own label (not buried
+ * in a tooltip or code comment) — [ScorePredictor.ExpectedScore]'s own class doc
+ * is explicit that this is a first-pass heuristic, not a validated predictor,
+ * and the UI shouldn't imply more certainty than the model actually has.
+ */
+@Composable
+private fun ExpectedScoreSection(es: ScorePredictor.ExpectedScore) {
+    Text("Expected score", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+    Text(
+        "Estimated performance — not a guarantee",
+        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+    )
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        MiniStat("Expected", "%.0f".format(es.expected), White90)
+        MiniStat("Range", "%.0f–%.0f".format(es.rangeLow, es.rangeHigh), White60)
+        MiniStat("Target", "${es.target}", AccentGreen)
+        MiniStat("Gap", "%.0f".format(es.gap), if (es.gap > 0.0) AccentAmber else AccentGreen)
+    }
+    if (es.bottlenecks.isNotEmpty()) {
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Where the gap comes from", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = White60
+        )
+        Spacer(Modifier.height(6.dp))
+        es.bottlenecks.forEach { b -> BottleneckRow(b) }
+    }
+}
+
+@Composable
+private fun BottleneckRow(b: ScorePredictor.BottleneckContribution) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            b.label.replaceFirstChar { it.uppercase() },
+            fontSize = 12.sp, color = White90, modifier = Modifier.weight(1f)
+        )
+        Text(
+            "+%.0f marks".format(b.marks),
+            fontSize = 12.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
+            color = AccentAmber
+        )
+    }
+}
+
+@Composable
+private fun SubjectScoreRow(score: SubjectScore) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(score.subject, fontSize = 13.sp, color = White90)
+        Text(
+            "${score.marksObtained}/${score.marksTotal}",
+            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+/**
+ * ScoreGainEstimator wiring pass. Replaces the old single-line "13% mastery"
+ * row — top line is the ranked headline (topic + expectedGain, the number this
+ * list is actually sorted by); second line keeps mastery visible (nothing here
+ * hides it) alongside marks-at-stake and a confidence label, so a student can
+ * see both "how ranked" and "how sure" in one glance, per
+ * ScoreGainEstimator.EstimateConfidence's own "well-evidenced vs single
+ * hand-typed guess" framing.
+ */
+@Composable
+private fun OpportunityRow(rank: Int, estimate: ScoreGainEstimator.ScoreGainEstimate) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "$rank. ${estimate.topic ?: estimate.chapter ?: "Unknown topic"}",
+                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                "+%.1f marks".format(estimate.expectedGain),
+                fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                color = AccentGreen
+            )
+        }
+        Spacer(Modifier.height(2.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "%.0f%% mastery · ~%.0f marks at stake".format(estimate.mastery * 100, estimate.marksAtStake),
+                fontSize = 11.sp, color = White60, fontFamily = FontFamily.Monospace
+            )
+            Text(
+                confidenceLabel(estimate.confidence),
+                fontSize = 11.sp, color = confidenceColor(estimate.confidence)
+            )
+        }
+    }
+}
+
+private fun confidenceLabel(confidence: ScoreGainEstimator.EstimateConfidence): String = when (confidence) {
+    ScoreGainEstimator.EstimateConfidence.LOW -> "Low confidence"
+    ScoreGainEstimator.EstimateConfidence.MEDIUM -> "Medium confidence"
+    ScoreGainEstimator.EstimateConfidence.HIGH -> "High confidence"
+}
+
+private fun confidenceColor(confidence: ScoreGainEstimator.EstimateConfidence): androidx.compose.ui.graphics.Color = when (confidence) {
+    ScoreGainEstimator.EstimateConfidence.LOW -> White60
+    ScoreGainEstimator.EstimateConfidence.MEDIUM -> AccentAmber
+    ScoreGainEstimator.EstimateConfidence.HIGH -> AccentGreen
+}
+
+private fun trendLabel(trend: PerformanceAnalyzer.PerformanceTrend, delta: Double): String = when (trend) {
+    PerformanceAnalyzer.PerformanceTrend.IMPROVING -> "Improving — recent accuracy is %.0f%% above your overall average.".format(delta * 100)
+    PerformanceAnalyzer.PerformanceTrend.DECLINING -> "Declining — recent accuracy is %.0f%% below your overall average.".format(-delta * 100)
+    PerformanceAnalyzer.PerformanceTrend.STABLE -> "Stable — recent accuracy is in line with your overall average."
+    PerformanceAnalyzer.PerformanceTrend.INSUFFICIENT_DATA -> "Not enough attempts yet to call a trend."
+}
+
+@Composable
+private fun ResultSummaryCard(result: com.checkmate.testmate.TestmateResult) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, White10)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(result.testTitle, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "%.0f/%.0f (%.0f%%)".format(result.score, result.totalMarks, result.accuracyPct),
+                fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                color = scoreColor(result.accuracyPct)
+            )
+            result.rankInSession?.let {
+                Text("Rank #$it", fontSize = 12.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                MiniStat("Correct", "${result.correctCount}", AccentGreen)
+                MiniStat("Wrong", "${result.incorrectCount}", AccentRed)
+                MiniStat("Skipped", "${result.skippedCount}", White60)
+                MiniStat("Avg time", "${result.avgTimePerQuestion.toInt()}s", White60)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WeakAreasCard(title: String, areas: List<TestmateWeakArea>) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        shape    = RoundedCornerShape(14.dp),
+        color    = BgCard,
+        border   = BorderStroke(0.5.dp, White10)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+            Spacer(Modifier.height(10.dp))
+            areas.forEach { area ->
+                Column(modifier = Modifier.padding(bottom = 8.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(area.name, fontSize = 13.sp, color = White90)
+                        Text(
+                            "%.0f%% (%d)".format(area.accuracyPct, area.attempted),
+                            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    LinearProgressIndicator(
+                        progress   = { (area.accuracyPct / 100f).toFloat().coerceIn(0f, 1f) },
+                        modifier   = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
+                        color      = AccentRed,
+                        trackColor = White10
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MiniStat(label: String, value: String, color: androidx.compose.ui.graphics.Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = color)
+        Text(label, fontSize = 10.sp, color = White60)
+    }
+}
+
+private fun scoreColor(accuracyPct: Double): androidx.compose.ui.graphics.Color = when {
+    accuracyPct >= 70 -> AccentGreen
+    accuracyPct >= 40 -> AccentAmber
+    else              -> AccentRed
+}
