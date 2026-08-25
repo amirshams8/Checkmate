@@ -257,7 +257,7 @@ fun TestmateWebScreen(navController: NavController) {
             }
             urlError?.let {
                 Text(it, fontSize = 10.sp, color = AccentRed,
-                    modifier = Modifier.padding(horizontal = 16.dp, bottom = 4.dp))
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp))
             }
 
             // key(activeTab.id) forces a fresh AndroidView per active tab instead of
