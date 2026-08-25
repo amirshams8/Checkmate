@@ -2,8 +2,10 @@ package com.checkmate.planner.intervention
 
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -39,6 +41,13 @@ class ActionExecutorTest {
 
         suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
             (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = now)
+                    as EscrowAcquireResult.Acquired).transaction
+
+        /** P0a — CREATE_TASK escrows on a caller-generated id that doesn't identify an
+         *  existing task yet (see [PermittedAction.CreateTask]'s doc), so tests that
+         *  exercise it acquire on a fresh id instead of [taskId]. */
+        suspend fun acquireFor(id: String, now: Long = 1_000L): InterventionTransaction =
+            (escrow.acquire(id, InterventionTriggerType.LATE_START, now = now)
                     as EscrowAcquireResult.Acquired).transaction
     }
 
@@ -241,5 +250,85 @@ class ActionExecutorTest {
 
         assertTrue(outcome is ExecutionOutcome.Failed)
         assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── CREATE_TASK (Upgrade Blueprint Phase 2.4/2.5, P0a) ───────────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        conceptId: String? = "phy_rotational_inertia"
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        rationale = "Weak prerequisite for an upcoming target concept",
+        learningIntent = learningIntent,
+        conceptId = conceptId
+    )
+
+    @Test
+    fun `create task on a fresh id applies, creates the StudyTask, and completes the transaction`() = runTest {
+        val f = Fixture(task()) // seed task is irrelevant here — CreateTask uses a fresh id
+        val newTaskId = "learning-engine-task-1"
+        val tx = f.acquireFor(newTaskId)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = f.mutator.currentState(newTaskId)
+        assertEquals("Physics", created?.subject)
+        assertEquals("Rotational Motion", created?.topic)
+        assertEquals(25, created?.durationMinutes)
+        assertEquals(TaskType.LECTURE, created?.taskType)
+        assertEquals("REPAIR_CONCEPT", created?.learningIntent)
+        assertEquals("phy_rotational_inertia", created?.conceptId)
+        assertEquals(TaskState.PENDING, created?.state) // StudyTask's own default
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `duplicate delivery of a CreateTask transaction does not create a second StudyTask`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-2"
+        val tx = f.acquireFor(newTaskId)
+        val request = createTaskRequest()
+
+        val first = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertTrue(first is ExecutionOutcome.Applied)
+
+        // Same transactionId delivered again — e.g. a retried WorkManager job. The primary
+        // guard (transaction already terminal) catches this before applyCreateTask runs.
+        val second = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+    }
+
+    @Test
+    fun `create task where the id already exists (idempotency guard) is a no-op, not a second task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-3"
+        // Simulate the id having already been created by a prior, separately-resolved
+        // execution (not the primary already-terminal guard above) — applyCreateTask's own
+        // defensive re-check (mirrors every other applyX in this class) is what catches this.
+        f.mutator.createTask(newTaskId, createTaskRequest())
+        val tx = f.acquireFor("distinct-fresh-id-for-escrow")
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    @Test
+    fun `create task with no scheduledStartTime lands unscheduled, same as any other task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-4"
+        val tx = f.acquireFor(newTaskId)
+
+        f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertNull(f.mutator.currentState(newTaskId)?.scheduledStartTime)
     }
 }

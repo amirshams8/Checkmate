@@ -39,4 +39,30 @@ class PlanStoreTaskMutator : TaskMutator {
     override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
         PlanStore.updateTaskSchedule(taskId, newScheduledStartTime)
     }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Builds the actual [StudyTask] from a
+     * validated [CreateTaskRequest] — this is the one place a [CreateTaskRequest] becomes
+     * a real StudyTask; everything upstream (LearningInterventionMapper, PolicyValidator,
+     * TaskEscrow) only ever passes the request/id pair around. `isCustom` is deliberately
+     * left at its default `false` — see StudyTask.isCustom and PlanStore.createTask's own
+     * docs on why that flag stays reserved for HomeViewModel's student-typed tasks.
+     */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        PlanStore.createTask(task)
+        return task
+    }
 }

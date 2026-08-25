@@ -2,6 +2,7 @@ package com.checkmate.planner.intervention
 
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -261,6 +262,101 @@ class PolicyValidatorTest {
             val result = PolicyValidator.validate(intent, PolicyState(task = null))
             assertTrue("$type should be permitted", result is PolicyResult.Permitted)
         }
+    }
+
+    // ── validateCreateTask (Upgrade Blueprint Phase 2.4/2.5, P0a) ──────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        scheduledStartTime: String? = null
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        scheduledStartTime = scheduledStartTime,
+        learningIntent = learningIntent,
+        conceptId = "phy_rotational_inertia"
+    )
+
+    @Test
+    fun `REPAIR_CONCEPT create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-1", createTaskRequest(learningIntent = "REPAIR_CONCEPT"))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.CreateTask
+        assertEquals("new-task-1", action.taskId)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-2", createTaskRequest(learningIntent = "START_DIAGNOSTIC"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-3", createTaskRequest(learningIntent = "ASSIGN_TARGETED_SET"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with no learningIntent (non-learning-engine caller) is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-4", createTaskRequest(learningIntent = null))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request naming an out-of-scope learning intent is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-5",
+            createTaskRequest(learningIntent = "REPLAN_DAY")
+        )
+        assertRejectedWith(result, RejectionReason.UNSUPPORTED_LEARNING_INTENT)
+    }
+
+    @Test
+    fun `create request with blank subject is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-6", createTaskRequest(subject = ""))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with blank topic is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-7", createTaskRequest(topic = "  "))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with zero duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-8", createTaskRequest(durationMinutes = 0))
+        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
+    }
+
+    @Test
+    fun `create request below minimum duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-9", createTaskRequest(durationMinutes = 3))
+        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
+    }
+
+    @Test
+    fun `create request with a valid scheduledStartTime is permitted`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-10",
+            createTaskRequest(scheduledStartTime = "20:00")
+        )
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with a malformed scheduledStartTime is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-11",
+            createTaskRequest(scheduledStartTime = "8pm")
+        )
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
     }
 
     private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {

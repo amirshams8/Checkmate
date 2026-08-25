@@ -42,4 +42,24 @@ class FakeTaskMutator(seed: List<StudyTask> = emptyList()) : TaskMutator {
     override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
         tasks[taskId] = tasks.getValue(taskId).copy(scheduledStartTime = newScheduledStartTime)
     }
+
+    /** P0a — mirrors [PlanStoreTaskMutator.createTask]'s field mapping so
+     *  ActionExecutorTest exercises the same shape production actually builds. */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        tasks[taskId] = task
+        return task
+    }
 }

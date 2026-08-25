@@ -25,6 +25,13 @@ import com.checkmate.planner.model.TaskState
  *     PENDING: PolicyValidator permits START_TASK for either, but only ActionExecutor,
  *     looking at the live task right before mutating, knows whether that means
  *     [TaskMutator.startTask] or [TaskMutator.resumeTask].
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [PermittedAction.CreateTask] follows the same
+ * defensive-guard shape as everything else — [applyCreateTask] re-reads [TaskMutator]
+ * for the pre-generated [PermittedAction.CreateTask.taskId] right before creating, so a
+ * duplicate transaction delivery (the exact scenario the class doc above is about) finds
+ * the task already there and returns [ExecutionOutcome.NoOpAlreadyApplied] instead of a
+ * second StudyTask.
  */
 class ActionExecutor(
     private val transactionDao: InterventionTransactionDao,
@@ -73,6 +80,7 @@ class ActionExecutor(
         is PermittedAction.ReduceDuration -> applyReduceDuration(action)
         is PermittedAction.RescheduleTask -> applyRescheduleTask(action)
         is PermittedAction.ShortBreak -> applyShortBreak(action, now)
+        is PermittedAction.CreateTask -> applyCreateTask(action)
         PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification ->
             ExecutionOutcome.NotApplicable(action)
         PermittedAction.RequestGuardian -> ExecutionOutcome.RequiresGuardianEscalation
@@ -136,6 +144,23 @@ class ActionExecutor(
         // student back up after `minutes` (an alarm, a notification) is scheduling
         // behavior that belongs to the Trigger Engine (a later step), not the Executor.
         taskMutator.pauseTask(action.taskId, now)
+        return ExecutionOutcome.Applied(action)
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every other applyX above, there is no
+     * pre-existing task to re-validate state on — [PermittedAction.CreateTask.taskId] is a
+     * caller-generated id that only becomes a real StudyTask once this succeeds. The live
+     * re-check here is purely the idempotency guard described in the class doc: if a task
+     * with this id already exists (a duplicate transaction delivery replaying the same
+     * CreateTask action), nothing is created a second time.
+     */
+    private fun applyCreateTask(action: PermittedAction.CreateTask): ExecutionOutcome {
+        val existing = taskMutator.findTask(action.taskId)
+        if (existing != null) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        taskMutator.createTask(action.taskId, action.request)
         return ExecutionOutcome.Applied(action)
     }
 

@@ -48,12 +48,26 @@ data class StudyTask(
     // priority ranking.
     val rationale:       String     = "",
     // ── Blueprint 4.2: Smart Scheduling ──
-    val scheduledStartTime: String? = null    // "HH:mm" 24h clock time this task is slotted into today's
+    val scheduledStartTime: String? = null,   // "HH:mm" 24h clock time this task is slotted into today's
                                                // free time (computed by AdaptivePlanner from
                                                // ConsultationProfile.blockedSlots — see FreeSlotCalculator).
                                                // Null means the planner couldn't fit it into a free slot
                                                // (e.g. total plan exceeds available time) — HomeScreen's
                                                // timeline view falls back to an "Unscheduled" section for these.
+    // ── Upgrade Blueprint Phase 2.4/2.5 (P0a): learning provenance + concept linkage ──
+    // Populated only for tasks created via TaskMutator.createTask() from a
+    // LearningDecisionEngine.CandidateIntervention (see LearningInterventionMapper). Null/empty
+    // for every existing task path (AdaptivePlanner-generated, HomeViewModel custom tasks) —
+    // this is additive, nothing upstream of this pass needs to set these fields.
+    //
+    // learningIntent stores LearningDecisionEngine.LearningInterventionIntent.name rather than
+    // the enum type itself, so :modules:planner's model layer doesn't take a compile-time
+    // dependency on :modules:learning's engine package for a single field — the intent is
+    // already a closed, versioned string vocabulary (Blueprint §2.4's 8-item taxonomy) that
+    // LearningInterventionMapper/PolicyValidator are the only things that need to interpret.
+    val learningIntent:  String?     = null,  // e.g. "REPAIR_CONCEPT" — null for non-learning-engine tasks
+    val conceptId:       String?     = null,  // single concept this task targets (REPAIR_CONCEPT/START_DIAGNOSTIC)
+    val targetedConceptIds: List<String> = emptyList() // multiple concepts folded into one session (ASSIGN_TARGETED_SET)
 )
 
 @Serializable

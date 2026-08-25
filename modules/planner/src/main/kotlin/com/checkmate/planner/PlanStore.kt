@@ -52,6 +52,22 @@ object PlanStore {
      */
     fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
 
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — appends a single LearningDecisionEngine-
+     * originated task to today's plan. Same additive semantics as [addCustomTask]
+     * (existing tasks, generated or custom, are untouched); kept as its own entry point
+     * rather than reusing addCustomTask() so a StudyTask's provenance is never ambiguous:
+     * addCustomTask() is what HomeViewModel calls for a student-typed task (isCustom=true),
+     * this is what [com.checkmate.planner.intervention.TaskMutator.createTask] calls for a
+     * task whose shape and content came from a validated [com.checkmate.planner.intervention.CreateTaskRequest]
+     * (isCustom stays false — learningIntent/conceptId/targetedConceptIds carry the
+     * provenance instead, see StudyTask's doc on those fields).
+     *
+     * Caller is expected to have already run this through TaskEscrow + PolicyValidator —
+     * PlanStore itself has no opinion on validity, same as addCustomTask/saveTodayTasks.
+     */
+    fun createTask(task: StudyTask) = persist(_todayTasks.value + task)
+
     /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
     fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
 
@@ -167,11 +183,7 @@ object PlanStore {
         for (i in 0..30) {
             val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
             val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
-            // Fix: previously "tasks.count{DONE}==0 && tasks.isNotEmpty()" meant a day where a
-            // plan was saved with ZERO tasks (empty list) did NOT break the streak — an empty
-            // plan silently counted as a study day. No tasks in the plan means no study, same
-            // as a day with tasks that were never done, so this now breaks on either case.
-            if (tasks.count { it.state == TaskState.DONE } == 0) break
+            if (tasks.isEmpty() || tasks.none { it.state == TaskState.DONE }) break
             streak++
             cal.add(Calendar.DAY_OF_YEAR, -1)
         }

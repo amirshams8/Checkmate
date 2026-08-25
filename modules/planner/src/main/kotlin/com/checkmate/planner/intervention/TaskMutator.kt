@@ -27,4 +27,14 @@ interface TaskMutator {
     fun reduceDuration(taskId: String, newDurationMinutes: Int)
 
     fun rescheduleTask(taskId: String, newScheduledStartTime: String)
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every function above, [taskId] does
+     * not yet identify an existing task — it's the caller-generated id [request] should be
+     * created under (see [PermittedAction.CreateTask]'s doc for why the id has to be
+     * generated before this is called, not by this function). Returns the created
+     * [StudyTask] so callers (currently just [ActionExecutor]) don't need a second
+     * [findTask] round-trip to get back what they just created.
+     */
+    fun createTask(taskId: String, request: CreateTaskRequest): StudyTask
 }

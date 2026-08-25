@@ -22,6 +22,12 @@ import java.time.format.DateTimeParseException
  * with a reason. There is no path from here to a protected action (device unlock,
  * disabling the guardian, removing WorkMode) because no such action is representable in
  * [InterventionIntentType] to begin with.
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [validateCreateTask] is a second, deliberately
+ * separate entry point alongside [validate] — a [CreateTaskRequest] comes from
+ * LearningInterventionMapper (deterministic, not an LLM), never from an [LlmIntent], so it
+ * doesn't belong inside the `when (type)` dispatch above. Same "code decides" principle,
+ * same [PolicyResult] shape, different input — see [CreateTaskRequest]'s own doc.
  */
 object PolicyValidator {
 
@@ -33,6 +39,12 @@ object PolicyValidator {
      *  Picked to comfortably permit that example while still capping well short of
      *  a session-length break. */
     const val MAX_BREAK_MINUTES = 30
+
+    /** P0a scope, per LearningDecisionEngine's own scoping note: SCHEDULE_RETENTION_TEST,
+     *  START_MOCK, REPLAN_DAY, and difficulty mutation are explicitly not wired to task
+     *  creation yet. A CreateTaskRequest naming any of those (or an unrecognized string)
+     *  is rejected rather than silently coerced into one of these three. */
+    val SUPPORTED_LEARNING_INTENTS = setOf("REPAIR_CONCEPT", "START_DIAGNOSTIC", "ASSIGN_TARGETED_SET")
 
     private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
 
@@ -148,6 +160,46 @@ object PolicyValidator {
             return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
         }
         return PolicyResult.Permitted(PermittedAction.ShortBreak(task.id, minutes))
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — validates a [CreateTaskRequest] (already
+     * paired with a caller-generated [taskId], same as every PermittedAction.CreateTask
+     * needs) into a [PermittedAction.CreateTask] or a rejection. There is no [PolicyState]
+     * parameter here: unlike every `validate*` above, there is no existing task whose live
+     * state could matter — the only state to validate against is the request's own fields.
+     */
+    fun validateCreateTask(taskId: String, request: CreateTaskRequest): PolicyResult {
+        if (request.subject.isBlank() || request.topic.isBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "CreateTaskRequest subject/topic must not be blank")
+        }
+
+        if (request.durationMinutes <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "durationMinutes=${request.durationMinutes}")
+        }
+        if (request.durationMinutes < MIN_DURATION_MINUTES) {
+            return reject(
+                RejectionReason.DURATION_TOO_SHORT,
+                "durationMinutes=${request.durationMinutes} below minimum $MIN_DURATION_MINUTES"
+            )
+        }
+
+        val intent = request.learningIntent
+        if (intent != null && intent !in SUPPORTED_LEARNING_INTENTS) {
+            return reject(
+                RejectionReason.UNSUPPORTED_LEARNING_INTENT,
+                "learningIntent=$intent not yet wired for task creation " +
+                    "(P0a scope: REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET only)"
+            )
+        }
+
+        request.scheduledStartTime?.let { raw ->
+            if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
+                return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
+            }
+        }
+
+        return PolicyResult.Permitted(PermittedAction.CreateTask(taskId, request))
     }
 
     private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)
