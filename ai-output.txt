@@ -1,219 +1,83 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LearningInterventionOrchestrator.kt =====
-package com.checkmate.planner.intervention
+//===== FILE: app/src/androidTest/java/com/checkmate/LearningInterventionOrchestratorIntegrationTest.kt =====
+package com.checkmate
 
-import android.content.Context
+import androidx.room.Room
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
-import java.util.UUID
-
-/**
- * Upgrade Blueprint Phase 2.4/2.5 (P0a) — the single production call site that was still
- * missing: [LearningInterventionMapper]'s own doc names this exact orchestration as "not
- * yet existing as a single call site," and [LearningInterventionCreateTaskIntegrationTest]
- * only exercises the chain a test-local `runPipeline` helper wires by hand. This is that
- * helper, promoted to a real production class:
- * ```
- * LearningDecisionEngine.DecisionReport -> LearningInterventionOrchestrator
- *     -> (per candidate, highest priorityScore first) LearningInterventionMapper
- *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow -> ActionExecutor
- *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
- * ```
- *
- * Deliberately does NOT create one task per candidate. [DecisionReport.candidates] is
- * already ranked by [LearningDecisionEngine.CandidateIntervention.priorityScore] — turning
- * every candidate into a task would just as capacity-blind as never having ranked them at
- * all, defeating the entire point of [com.checkmate.learning.analytics.ScoreGainEstimator]
- * and today's finite study time. [executeTopCandidate] instead walks the ranking in order
- * and stops at the first candidate that clears every stage — mapping, policy, and
- * execution. An earlier, higher-ranked candidate that fails any stage is recorded (never
- * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
- * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
- *
- * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
- * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
- * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
- * rather than widening that enum for this pass; this class keeps that same choice (see
- * [LEARNING_ENGINE_TRIGGER]) so both the test-only pipeline and this production one agree
- * on what gets persisted.
- *
- * This class does not itself decide *when* to run — it consumes an already-built
- * [LearningDecisionEngine.DecisionReport]. Wiring a real trigger (a schedule, a button, a
- * WorkManager job) to call [executeTopCandidate] is a separate, later step, same as every
- * other "plumbing exists, nothing calls it on a schedule yet" seam in this package.
- */
-class LearningInterventionOrchestrator(
-    private val taskEscrow: TaskEscrow,
-    private val actionExecutor: ActionExecutor,
-    private val idGenerator: () -> String = { UUID.randomUUID().toString() }
-) {
-
-    /** Why a candidate never became a task — kept as a distinct type from
-     *  [RejectionReason] because a candidate can fail before policy is ever consulted
-     *  (see [NotMappable]), and collapsing that into a fake [RejectionReason] would
-     *  misattribute a mapper decision to PolicyValidator. */
-    sealed class RejectionSource {
-        /** [LearningInterventionMapper.toCreateTaskRequest] returned null — the intent is
-         *  outside P0a's mapped scope, or the candidate is missing subject/topic. */
-        object NotMappable : RejectionSource()
-        /** [PolicyValidator.validateCreateTask] rejected the mapped request. */
-        data class PolicyRejected(val reason: RejectionReason) : RejectionSource()
-        /** The freshly generated [taskId][UUID] collided with a task already under
-         *  escrow — expected to be effectively unreachable given UUID generation, kept
-         *  as a named case rather than a thrown exception so a candidate this happens to
-         *  is recorded like any other rejection instead of aborting the whole walk. */
-        object TaskIdCollision : RejectionSource()
-    }
-
-    /** One candidate that was ranked but did not end up as a task — see class doc's
-     *  "failures are first-class" requirement. `rank` is 1-based position in
-     *  [LearningDecisionEngine.DecisionReport.candidates], preserved here because the
-     *  candidate itself carries no id of its own. */
-    data class CandidateRejection(
-        val candidate: LearningDecisionEngine.CandidateIntervention,
-        val rank: Int,
-        val source: RejectionSource,
-        val detail: String,
-        val timestamp: Long
-    )
-
-    sealed class OrchestrationOutcome {
-        /** The candidate that made it all the way through, plus what
-         *  [ActionExecutor.execute] returned for it — callers that care whether the
-         *  StudyTask really landed (vs. e.g. [ExecutionOutcome.NoOpAlreadyApplied]) read
-         *  that from here rather than assuming success. */
-        data class Created(
-            val candidate: LearningDecisionEngine.CandidateIntervention,
-            val rank: Int,
-            val taskId: String,
-            val executionOutcome: ExecutionOutcome
-        ) : OrchestrationOutcome()
-        /** Every candidate in the report was rejected (or the report had none to begin
-         *  with) — [OrchestrationResult.rejections] carries the full detail. */
-        object NoExecutableCandidate : OrchestrationOutcome()
-    }
-
-    data class OrchestrationResult(
-        val outcome: OrchestrationOutcome,
-        val rejections: List<CandidateRejection>
-    )
-
-    /**
-     * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
-     * ranked order and executes the first one that clears mapping, policy validation, and
-     * execution — see class doc for why this stops at one instead of creating a task per
-     * candidate.
-     */
-    suspend fun executeTopCandidate(
-        report: LearningDecisionEngine.DecisionReport,
-        now: Long = System.currentTimeMillis()
-    ): OrchestrationResult {
-        val rejections = mutableListOf<CandidateRejection>()
-
-        report.candidates.forEachIndexed { index, candidate ->
-            val rank = index + 1
-            val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
-            if (request == null) {
-                rejections += CandidateRejection(
-                    candidate = candidate,
-                    rank = rank,
-                    source = RejectionSource.NotMappable,
-                    detail = "intent ${candidate.intent} is not mappable to a CreateTaskRequest " +
-                        "(outside P0a scope, or missing subject/topic)",
-                    timestamp = now
-                )
-                return@forEachIndexed
-            }
-
-            val taskId = idGenerator()
-
-            when (val policyResult = PolicyValidator.validateCreateTask(taskId, request)) {
-                is PolicyResult.Rejected -> {
-                    rejections += CandidateRejection(
-                        candidate = candidate,
-                        rank = rank,
-                        source = RejectionSource.PolicyRejected(policyResult.reason),
-                        detail = policyResult.detail,
-                        timestamp = now
-                    )
-                }
-
-                is PolicyResult.Permitted -> {
-                    when (val acquireResult = taskEscrow.acquire(taskId, LEARNING_ENGINE_TRIGGER, now)) {
-                        is EscrowAcquireResult.AlreadyHeld -> {
-                            rejections += CandidateRejection(
-                                candidate = candidate,
-                                rank = rank,
-                                source = RejectionSource.TaskIdCollision,
-                                detail = "generated taskId $taskId already under escrow",
-                                timestamp = now
-                            )
-                        }
-
-                        is EscrowAcquireResult.Acquired -> {
-                            val action = policyResult.action as PermittedAction.CreateTask
-                            val executionOutcome = actionExecutor.execute(
-                                acquireResult.transaction.transactionId,
-                                action,
-                                now
-                            )
-                            return OrchestrationResult(
-                                outcome = OrchestrationOutcome.Created(candidate, rank, taskId, executionOutcome),
-                                rejections = rejections
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
-    }
-
-    companion object {
-        /** See class doc's "Trigger type" note. */
-        val LEARNING_ENGINE_TRIGGER = InterventionTriggerType.BACKLOG_RISK
-
-        /**
-         * Production wiring — same [InterventionDatabase]/[OutcomeLedgerWriter]/
-         * [PlanStoreTaskMutator] construction [InterventionReconciliation.runAtStartup]
-         * already uses, so this and the reconciliation sweep never disagree about which
-         * database or ledger a transaction was written through.
-         */
-        fun from(context: Context): LearningInterventionOrchestrator {
-            val db = InterventionDatabase.getInstance(context)
-            val dao = db.interventionTransactionDao()
-            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-            val escrow = TaskEscrow(dao, ledgerWriter)
-            val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
-            return LearningInterventionOrchestrator(escrow, executor)
-        }
-    }
-}
-
-
-//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LearningInterventionOrchestratorTest.kt =====
-package com.checkmate.planner.intervention
-
-import com.checkmate.learning.engine.LearningDecisionEngine
-import com.checkmate.planner.model.TaskType
-import kotlinx.coroutines.test.runTest
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionState
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.intervention.PlanStoreTaskMutator
+import com.checkmate.planner.intervention.TaskEscrow
+import kotlinx.coroutines.runBlocking
+import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
+import org.junit.runner.RunWith
 
 /**
- * Upgrade Blueprint Phase 2.4/2.5 (P0a follow-up) — covers [LearningInterventionOrchestrator],
- * the production call site [LearningInterventionCreateTaskIntegrationTest]'s own `runPipeline`
- * doc names as not yet existing. Same fixture shape (fakes, not PlanStore) as that test.
+ * The milestone this repo's own audit asked for: not "the components are wired correctly"
+ * (that's [com.checkmate.planner.intervention.LearningInterventionOrchestratorTest], JVM-only
+ * with fakes) but "the system actually autonomously produces a study action" — a real
+ * [DecisionReport][LearningDecisionEngine.DecisionReport] driven through the real
+ * [LearningInterventionOrchestrator], onto a real [InterventionState] FSM, ending in a
+ * [com.checkmate.planner.model.StudyTask] genuinely readable back out of [PlanStore] —
+ * i.e. the same object graph [MainActivity]/[HomeViewModel] would use, not test doubles.
+ *
+ * Only [InterventionDatabase] is swapped for an in-memory instance (standard Room testing
+ * practice — nothing about escrow/execution correctness depends on the DB being on disk).
+ * [PlanStore] and [CheckmatePrefs] are deliberately NOT swapped: they're the real
+ * SharedPreferences-backed singletons the installed app uses, because requirement #6
+ * ("the task is actually visible through PlanStore.todayTasks") only means something if
+ * it's the real PlanStore. That does mean this test writes into today's real plan on
+ * whatever device/emulator runs it — [tearDown] removes every task this test created, but
+ * if the process dies mid-test that cleanup won't run; rerunning [tearDown]'s removeTask
+ * calls by hand (or just checking today's plan) is the recovery path.
  */
-class LearningInterventionOrchestratorTest {
+@RunWith(AndroidJUnit4::class)
+class LearningInterventionOrchestratorIntegrationTest {
+
+    private lateinit var db: InterventionDatabase
+    private lateinit var orchestrator: LearningInterventionOrchestrator
+    private val createdTaskIds = mutableListOf<String>()
+
+    @Before
+    fun setUp() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        CheckmatePrefs.init(context)
+
+        db = Room.inMemoryDatabaseBuilder(context, InterventionDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+
+        val escrow = TaskEscrow(db.interventionTransactionDao())
+        val executor = ActionExecutor(db.interventionTransactionDao(), escrow, PlanStoreTaskMutator())
+        orchestrator = LearningInterventionOrchestrator(escrow, executor)
+    }
+
+    @After
+    fun tearDown() {
+        createdTaskIds.forEach { PlanStore.removeTask(it) }
+        createdTaskIds.clear()
+        db.close()
+    }
 
     private fun candidate(
         intent: LearningDecisionEngine.LearningInterventionIntent,
         priorityScore: Double,
-        conceptId: String? = "phy_rotational_inertia",
-        subject: String? = "Physics",
-        chapter: String? = "Rotational Motion",
-        durationMinutes: Int = 25
+        conceptId: String? = null,
+        subject: String? = null,
+        chapter: String? = null,
+        durationMinutes: Int = 25,
+        rationale: String = "test rationale"
     ) = LearningDecisionEngine.CandidateIntervention(
         intent = intent,
         conceptId = conceptId,
@@ -223,129 +87,83 @@ class LearningInterventionOrchestratorTest {
         durationMinutes = durationMinutes,
         expectedGain = priorityScore,
         priorityScore = priorityScore,
-        rationale = "test candidate"
+        rationale = rationale
     )
 
-    private fun report(vararg candidates: LearningDecisionEngine.CandidateIntervention) =
-        LearningDecisionEngine.DecisionReport(
-            studentId = "student-1",
+    @Test
+    fun decisionReportProducesARealPersistedStudyTask() = runBlocking {
+        // Deliberately out of rank order vs. mappability: #1 is the highest-priority
+        // candidate but unmappable, #2 is the highest-priority *executable* one (and the
+        // one that must win), #3 is executable too but lower-ranked and must be left alone.
+        val unmappableTop = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY,
+            priorityScore = 99.0
+        )
+        val winner = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 50.0,
+            conceptId = "phy_kinematics_projectile",
+            subject = "Physics",
+            chapter = "Kinematics",
+            durationMinutes = 25,
+            rationale = "Kinematics at 40% mastery, ~9 marks still at stake."
+        )
+        val untouchedLowerRank = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 10.0,
+            conceptId = "chem_mole_concept",
+            subject = "Chemistry",
+            chapter = "Mole Concept",
+            durationMinutes = 20
+        )
+
+        val report = LearningDecisionEngine.DecisionReport(
+            studentId = "integration-test-student",
             examType = "NEET",
-            generatedAt = 1_000L,
-            candidates = candidates.toList()
+            generatedAt = System.currentTimeMillis(),
+            candidates = listOf(unmappableTop, winner, untouchedLowerRank)
         )
 
-    private class Fixture {
-        val dao = FakeInterventionTransactionDao()
-        val escrow = TaskEscrow(dao)
-        val mutator = FakeTaskMutator()
-        val executor = ActionExecutor(dao, escrow, mutator)
-        var nextId = 0
-        val orchestrator = LearningInterventionOrchestrator(
-            taskEscrow = escrow,
-            actionExecutor = executor,
-            idGenerator = { "generated-task-${nextId++}" }
-        )
-    }
+        val tasksBefore = PlanStore.todayTasks.value
 
-    @Test
-    fun `single executable candidate produces a real StudyTask`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(
-            report(candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 1.6))
-        )
+        val result = orchestrator.executeTopCandidate(report)
 
-        assertTrue(result.outcome is LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+        // 1) highest-ranked EXECUTABLE candidate wins, not the highest-ranked candidate overall
         val created = result.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
-        assertEquals(1, created.rank)
-        assertTrue(created.executionOutcome is ExecutionOutcome.Applied)
-        assertEquals(TaskType.LECTURE, f.mutator.currentState(created.taskId)?.taskType)
-        assertTrue(result.rejections.isEmpty())
-    }
+        assertEquals(2, created.rank)
+        assertEquals("phy_kinematics_projectile", created.candidate.conceptId)
+        createdTaskIds += created.taskId
 
-    @Test
-    fun `stops at the first executable candidate instead of creating one task per candidate`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(
-            report(
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 1.6, conceptId = "c1"),
-                candidate(LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC, priorityScore = 0.2, conceptId = "c2"),
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 0.2, conceptId = "c3")
-            )
-        )
-
-        val created = result.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
-        assertEquals("c1", created.candidate.conceptId)
-        // Only the winning candidate's taskId/idGenerator call/transaction ever exists —
-        // candidates #2 and #3 are never mapped, validated, or given a taskId at all.
-        assertEquals(1, f.dao.transactionsById.size)
-        assertEquals(1, f.nextId)
-        assertTrue(result.rejections.isEmpty())
-    }
-
-    @Test
-    fun `an out-of-scope top candidate is rejected and recorded, then the next candidate executes`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(
-            report(
-                // REPLAN_DAY is outside LearningInterventionMapper's SUPPORTED_INTENTS.
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY, priorityScore = 1.6, conceptId = "c1"),
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 0.2, conceptId = "c2")
-            )
-        )
-
-        val created = result.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
-        assertEquals("c2", created.candidate.conceptId)
-
+        // 2) the rejected (unmappable) top candidate produced no task, and is recorded, not dropped
         assertEquals(1, result.rejections.size)
         val rejection = result.rejections.single()
         assertEquals(1, rejection.rank)
-        assertEquals("c1", rejection.candidate.conceptId)
         assertTrue(rejection.source is LearningInterventionOrchestrator.RejectionSource.NotMappable)
-    }
 
-    @Test
-    fun `a policy-rejected top candidate is recorded, then the next candidate executes`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(
-            report(
-                // durationMinutes below PolicyValidator.MIN_DURATION_MINUTES.
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 1.6, conceptId = "c1", durationMinutes = 1),
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, priorityScore = 0.2, conceptId = "c2")
-            )
-        )
+        // 3) exactly one task was created this run
+        val tasksAfter = PlanStore.todayTasks.value
+        assertEquals(tasksBefore.size + 1, tasksAfter.size)
 
-        val created = result.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
-        assertEquals("c2", created.candidate.conceptId)
+        // 6) the task is genuinely visible through PlanStore.todayTasks (real singleton, real prefs)
+        val persistedTask = tasksAfter.find { it.id == created.taskId }
+        assertNotNull("created task must be readable back from PlanStore.todayTasks", persistedTask)
 
-        assertEquals(1, result.rejections.size)
-        val rejection = result.rejections.single()
-        assertEquals("c1", rejection.candidate.conceptId)
-        val source = rejection.source as LearningInterventionOrchestrator.RejectionSource.PolicyRejected
-        assertEquals(RejectionReason.DURATION_TOO_SHORT, source.reason)
-    }
+        // 4) the task carries the winning candidate's concept/intent/rationale — not the
+        // rejected top candidate's, and not the untouched lower-ranked one's
+        assertEquals("Physics", persistedTask!!.subject)
+        assertEquals("Kinematics", persistedTask.topic)
+        assertEquals(25, persistedTask.durationMinutes)
+        assertEquals("REPAIR_CONCEPT", persistedTask.learningIntent)
+        assertEquals("phy_kinematics_projectile", persistedTask.conceptId)
+        assertEquals("Kinematics at 40% mastery, ~9 marks still at stake.", persistedTask.rationale)
 
-    @Test
-    fun `every candidate rejected yields NoExecutableCandidate with all rejections recorded`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(
-            report(
-                candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY, priorityScore = 1.6, conceptId = "c1"),
-                candidate(LearningDecisionEngine.LearningInterventionIntent.START_MOCK, priorityScore = 0.2, conceptId = "c2")
-            )
-        )
+        // the untouched, lower-ranked-but-also-executable candidate must not have become a task
+        assertNull(tasksAfter.find { it.conceptId == "chem_mole_concept" })
 
-        assertEquals(LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate, result.outcome)
-        assertEquals(2, result.rejections.size)
-        assertEquals(1, result.rejections[0].rank)
-        assertEquals(2, result.rejections[1].rank)
-    }
-
-    @Test
-    fun `an empty decision report yields NoExecutableCandidate with no rejections`() = runTest {
-        val f = Fixture()
-        val result = f.orchestrator.executeTopCandidate(report())
-
-        assertEquals(LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate, result.outcome)
-        assertTrue(result.rejections.isEmpty())
+        // 5) the intervention transaction backing the winning task reached its terminal state
+        val transaction = db.interventionTransactionDao().getLatestForTask(created.taskId)
+        assertNotNull("winning task must have an intervention transaction", transaction)
+        assertEquals(InterventionState.COMPLETED, transaction!!.currentState)
+        assertTrue(InterventionState.COMPLETED in InterventionState.TERMINAL_STATES)
     }
 }
