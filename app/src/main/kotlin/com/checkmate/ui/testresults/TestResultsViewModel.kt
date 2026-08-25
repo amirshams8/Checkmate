@@ -12,6 +12,7 @@ import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateResult
 import kotlinx.coroutines.Dispatchers
@@ -83,7 +84,17 @@ data class TestResultsState(
     // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
     // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
     // read, N derived views" doc). Null until analysis has run at least once.
-    val decisionReport: LearningDecisionEngine.DecisionReport? = null
+    val decisionReport: LearningDecisionEngine.DecisionReport? = null,
+    // ── LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam) ──
+    // The orchestrator's own class doc named this exact gap: it consumes an
+    // already-built DecisionReport but "does not itself decide when to run." A
+    // fresh test import IS that trigger — see buildPerformanceReport's doc on why
+    // this only fires when `!alreadyImported`. Built from the SAME decisionReport
+    // this call already produced — sixth derived view over one Room read, same
+    // discipline as every field above it. Null until an orchestration run has
+    // actually happened (i.e. never set on the `alreadyImported` replay path).
+    val orchestrationResult: LearningInterventionOrchestrator.OrchestrationResult? = null,
+    val orchestrationError: String? = null
 )
 
 class TestResultsViewModel : ViewModel() {
@@ -131,7 +142,8 @@ class TestResultsViewModel : ViewModel() {
                 it.copy(
                     importing = true, importError = null, importResult = null,
                     performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                    expectedScore = null, decisionReport = null
+                    expectedScore = null, decisionReport = null,
+                    orchestrationResult = null, orchestrationError = null
                 )
             }
             try {
@@ -152,7 +164,7 @@ class TestResultsViewModel : ViewModel() {
                 // Persistence has committed — this is final regardless of what
                 // buildPerformanceReport below does with it.
                 _state.update { it.copy(importing = false, importResult = result, importError = null) }
-                buildPerformanceReport(context, result.examType)
+                buildPerformanceReport(context, result.examType, result.alreadyImported)
             } catch (e: Exception) {
                 Log.e(TAG, "Report import failed: ${e.message}", e)
                 _state.update {
@@ -190,12 +202,22 @@ class TestResultsViewModel : ViewModel() {
      * call already built — fourth derived view over one Room read, same "never
      * recompute what's already in hand" discipline as the two calls above it.
      *
+     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam):
+     * once `decisionReport` above is built, [executeTopIntervention] runs it through
+     * the orchestrator — the "post-test event" trigger the orchestrator's own class
+     * doc said was still missing. `alreadyImported` is threaded all the way down
+     * from [importReport] because this function also runs on the idempotent replay
+     * path (re-picking an already-imported report re-triggers analysis so the
+     * screen has something to show), and PolicyValidator has no duplicate-task
+     * guard of its own — see [executeTopIntervention]'s doc for why that path must
+     * not also autonomously create a task.
+     *
      * Launched as its own coroutine (not inline in importReport's try block) so an
      * analysis failure can only ever set [TestResultsState.analysisError] — it has
      * no path back to importReport's own try/catch and can't turn a successful
      * import into a failed one.
      */
-    private fun buildPerformanceReport(context: Context, examType: String?) {
+    private fun buildPerformanceReport(context: Context, examType: String?, alreadyImported: Boolean) {
         if (examType == null) {
             _state.update {
                 it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
@@ -220,6 +242,7 @@ class TestResultsViewModel : ViewModel() {
                         decisionReport = decisionReport
                     )
                 }
+                executeTopIntervention(context, decisionReport, alreadyImported)
             } catch (e: Exception) {
                 Log.e(TAG, "Performance analysis failed: ${e.message}", e)
                 _state.update {
@@ -232,12 +255,53 @@ class TestResultsViewModel : ViewModel() {
         }
     }
 
+    /**
+     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5) — the trigger
+     * [LearningInterventionOrchestrator]'s own class doc said was still missing:
+     * "a schedule, a button, a WorkManager job." This is the schedule: every fresh
+     * test import is itself the natural "post-test event" trigger, so this fires
+     * right after `decisionReport` is built in [buildPerformanceReport], using
+     * that SAME DecisionReport.
+     *
+     * Gated on `!alreadyImported`: [buildPerformanceReport] also runs on the
+     * idempotent "already imported" replay path, and [PolicyValidator] has no
+     * duplicate-task guard of its own — without this gate, re-opening this screen
+     * and re-picking a report already in Room would rank the same top candidate
+     * again and autonomously create a fresh duplicate StudyTask every time. A
+     * fresh import is the only case that should actually cause a new autonomous
+     * action.
+     *
+     * Isolated in its own try/catch for the same reason analysis is isolated from
+     * import: a failure here can only ever set [TestResultsState.orchestrationError]
+     * — it has no path back to [buildPerformanceReport]'s try block and can't turn
+     * an already-successful decisionReport into a failed one.
+     */
+    private suspend fun executeTopIntervention(
+        context: Context,
+        decisionReport: LearningDecisionEngine.DecisionReport,
+        alreadyImported: Boolean
+    ) {
+        if (alreadyImported) return
+        try {
+            val result = withContext(Dispatchers.IO) {
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            }
+            _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
+            _state.update {
+                it.copy(orchestrationError = "Couldn't create a study task from this analysis: ${e.message ?: "unknown error"}")
+            }
+        }
+    }
+
     fun dismissImportResult() {
         _state.update {
             it.copy(
                 importResult = null, importError = null,
                 performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                expectedScore = null, decisionReport = null
+                expectedScore = null, decisionReport = null,
+                orchestrationResult = null, orchestrationError = null
             )
         }
     }

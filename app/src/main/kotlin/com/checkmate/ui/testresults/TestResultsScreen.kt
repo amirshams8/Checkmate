@@ -25,6 +25,8 @@ import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.analytics.SubjectScore
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.testmate.TestmateWeakArea
 import com.checkmate.ui.theme.*
 
@@ -73,12 +75,18 @@ import com.checkmate.ui.theme.*
  *
  * LearningDecisionEngine wiring pass (Blueprint §2.4): [PerformanceReportCard]
  * now also renders [RecommendedNextSection] — the ranked, typed action list
- * [LearningDecisionEngine] produces on top of everything above it. This is
- * still a read-only display: tapping a row does nothing yet (there's no
- * `StudyTask`-mutating wiring behind it — that's Blueprint §2.5, deliberately
- * not started, see [LearningDecisionEngine]'s own class doc on that boundary).
- * The point of surfacing it here now is the same "don't let evidence sit
- * un-acted-on" reasoning every prior wiring pass in this file already follows.
+ * [LearningDecisionEngine] produces on top of everything above it.
+ *
+ * LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam):
+ * [RecommendedNextSection]'s rows are still read-only (tapping one does nothing) —
+ * but the list is no longer purely informational, because [TestResultsViewModel]
+ * now autonomously runs the top-ranked executable candidate through
+ * [LearningInterventionOrchestrator] right after every fresh import, and
+ * [AutonomousActionSection] below the list shows what that run actually did:
+ * which candidate got turned into a real StudyTask, or why none did. The point of
+ * surfacing it here is the same "don't let evidence sit un-acted-on" reasoning
+ * every prior wiring pass in this file already follows — except this time
+ * something was actually acted on, not just displayed.
  */
 @Composable
 fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
@@ -231,7 +239,10 @@ private fun ImportReportSection(
         val importResult = state.importResult
         if (report != null && importResult != null) {
             Spacer(Modifier.height(12.dp))
-            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore, state.decisionReport)
+            PerformanceReportCard(
+                importResult, report, state.scoreGainEstimates, state.expectedScore,
+                state.decisionReport, state.orchestrationResult, state.orchestrationError
+            )
         }
     }
 }
@@ -304,6 +315,12 @@ private fun ImportResultCard(
  * [RecommendedNextSection] between "Biggest opportunities" and the Expected
  * score block — reads naturally in that order ("here's what's weak, here's
  * what's worth doing about it, here's the score math behind the target").
+ *
+ * LearningInterventionOrchestrator wiring pass (Blueprint §2.5): `orchestrationResult`/
+ * `orchestrationError` render as [AutonomousActionSection] right after
+ * [RecommendedNextSection] — same "one Room read, N derived views" ordering as
+ * everything else on this card, and the natural next line after the ranked plan:
+ * "here's what's worth doing, here's what Checkmate actually did about it."
  */
 @Composable
 private fun PerformanceReportCard(
@@ -311,7 +328,9 @@ private fun PerformanceReportCard(
     report: PerformanceAnalyzer.PerformanceReport,
     estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
     expectedScore: ScorePredictor.ExpectedScore?,
-    decisionReport: LearningDecisionEngine.DecisionReport?
+    decisionReport: LearningDecisionEngine.DecisionReport?,
+    orchestrationResult: LearningInterventionOrchestrator.OrchestrationResult?,
+    orchestrationError: String?
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -369,6 +388,13 @@ private fun PerformanceReportCard(
                 RecommendedNextSection(candidates)
             }
 
+            if (orchestrationResult != null || orchestrationError != null) {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = White10, thickness = 0.5.dp)
+                Spacer(Modifier.height(12.dp))
+                AutonomousActionSection(orchestrationResult, orchestrationError)
+            }
+
             expectedScore?.let { es ->
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider(color = White10, thickness = 0.5.dp)
@@ -393,9 +419,11 @@ private fun PerformanceReportCard(
  * ([LearningDecisionEngine.LearningInterventionIntent]) the engine picked, not
  * just another weak-topic name — the same "don't let the LLM choose the
  * intervention" discipline the blueprint itself insists on: this list is
- * produced entirely deterministically, before any LLM sees it. Read-only for
- * now — see [PerformanceReportCard]'s own doc on why tapping a row doesn't do
- * anything yet.
+ * produced entirely deterministically, before any LLM sees it. The rows
+ * themselves stay read-only (tapping one does nothing) — but see
+ * [AutonomousActionSection] right below this list for what
+ * [com.checkmate.planner.intervention.LearningInterventionOrchestrator]
+ * actually did with the top executable candidate, without any tap required.
  */
 @Composable
 private fun RecommendedNextSection(candidates: List<LearningDecisionEngine.CandidateIntervention>) {
@@ -446,6 +474,57 @@ private fun intentLabel(intent: LearningDecisionEngine.LearningInterventionInten
     LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> "REPLAN TODAY"
     LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY -> "STEP DOWN DIFFICULTY"
     LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> "STEP UP DIFFICULTY"
+}
+
+/**
+ * LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam):
+ * the actual, closed-loop counterpart to [RecommendedNextSection] above it — that
+ * list is a ranked plan; this is what [TestResultsViewModel] autonomously did
+ * with it. Three shapes:
+ * - [LearningInterventionOrchestrator.OrchestrationOutcome.Created]: a real
+ *   StudyTask now exists in today's plan — named here by subject/topic so the
+ *   student doesn't have to go find it to know what happened.
+ * - [LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate]:
+ *   every ranked candidate was rejected (see [LearningInterventionOrchestrator.CandidateRejection])
+ *   — shown plainly rather than silently showing nothing, same "don't let a
+ *   failure disappear" discipline [TestResultsState.analysisError] already follows.
+ * - `orchestrationError` non-null: the orchestrator run itself threw — isolated
+ *   from `orchestrationResult`, which stays null in that case (see
+ *   [TestResultsViewModel.executeTopIntervention]'s doc).
+ */
+@Composable
+private fun AutonomousActionSection(
+    orchestrationResult: LearningInterventionOrchestrator.OrchestrationResult?,
+    orchestrationError: String?
+) {
+    Text("Autonomous action", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
+    Spacer(Modifier.height(6.dp))
+    when {
+        orchestrationError != null -> {
+            Text(orchestrationError, fontSize = 12.sp, color = AccentAmber)
+        }
+        orchestrationResult != null -> when (val outcome = orchestrationResult.outcome) {
+            is LearningInterventionOrchestrator.OrchestrationOutcome.Created -> {
+                val candidate = outcome.candidate
+                val applied = outcome.executionOutcome is ExecutionOutcome.Applied
+                Text(
+                    if (applied) {
+                        "Checkmate created today's task: ${candidate.topic ?: candidate.chapter ?: candidate.subject ?: "Study session"} " +
+                            "(${intentLabel(candidate.intent)}, ${candidate.durationMinutes}m)"
+                    } else {
+                        "Selected ${candidate.topic ?: candidate.chapter ?: candidate.subject ?: "a candidate"} but couldn't apply it."
+                    },
+                    fontSize = 12.sp, color = if (applied) AccentGreen else AccentAmber
+                )
+            }
+            LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate -> {
+                Text(
+                    "No candidate cleared policy validation — nothing created this time.",
+                    fontSize = 12.sp, color = White60
+                )
+            }
+        }
+    }
 }
 
 /**
