@@ -230,6 +230,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── PlannerState.kt
 │   │   │   │   │   │   │   │   ├── intervention
 │   │   │   │   │   │   │   │   │   ├── ActionExecutor.kt
+│   │   │   │   │   │   │   │   │   ├── CreateTaskRequest.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionDatabase.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionFallback.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionGuardianGateway.kt
@@ -240,6 +241,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── InterventionTransaction.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionTriggerScheduler.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionTriggerWorker.kt
+│   │   │   │   │   │   │   │   │   ├── LearningInterventionMapper.kt
 │   │   │   │   │   │   │   │   │   ├── LlmIntentParser.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedger.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerStats.kt
@@ -262,6 +264,8 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── FakeOutcomeLedgerDao.kt
 │   │   │   │   │   │   │   │   │   ├── FakeTaskMutator.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionFallbackTest.kt
+│   │   │   │   │   │   │   │   │   ├── LearningInterventionCreateTaskIntegrationTest.kt
+│   │   │   │   │   │   │   │   │   ├── LearningInterventionMapperTest.kt
 │   │   │   │   │   │   │   │   │   ├── LlmIntentParserTest.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerStatsTest.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerTest.kt
@@ -22567,6 +22571,22 @@ object PlanStore {
      */
     fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
 
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — appends a single LearningDecisionEngine-
+     * originated task to today's plan. Same additive semantics as [addCustomTask]
+     * (existing tasks, generated or custom, are untouched); kept as its own entry point
+     * rather than reusing addCustomTask() so a StudyTask's provenance is never ambiguous:
+     * addCustomTask() is what HomeViewModel calls for a student-typed task (isCustom=true),
+     * this is what [com.checkmate.planner.intervention.TaskMutator.createTask] calls for a
+     * task whose shape and content came from a validated [com.checkmate.planner.intervention.CreateTaskRequest]
+     * (isCustom stays false — learningIntent/conceptId/targetedConceptIds carry the
+     * provenance instead, see StudyTask's doc on those fields).
+     *
+     * Caller is expected to have already run this through TaskEscrow + PolicyValidator —
+     * PlanStore itself has no opinion on validity, same as addCustomTask/saveTodayTasks.
+     */
+    fun createTask(task: StudyTask) = persist(_todayTasks.value + task)
+
     /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
     fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
 
@@ -22682,11 +22702,7 @@ object PlanStore {
         for (i in 0..30) {
             val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
             val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
-            // Fix: previously "tasks.count{DONE}==0 && tasks.isNotEmpty()" meant a day where a
-            // plan was saved with ZERO tasks (empty list) did NOT break the streak — an empty
-            // plan silently counted as a study day. No tasks in the plan means no study, same
-            // as a day with tasks that were never done, so this now breaks on either case.
-            if (tasks.count { it.state == TaskState.DONE } == 0) break
+            if (tasks.isEmpty() || tasks.none { it.state == TaskState.DONE }) break
             streak++
             cal.add(Calendar.DAY_OF_YEAR, -1)
         }
@@ -22884,6 +22900,13 @@ import com.checkmate.planner.model.TaskState
  *     PENDING: PolicyValidator permits START_TASK for either, but only ActionExecutor,
  *     looking at the live task right before mutating, knows whether that means
  *     [TaskMutator.startTask] or [TaskMutator.resumeTask].
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [PermittedAction.CreateTask] follows the same
+ * defensive-guard shape as everything else — [applyCreateTask] re-reads [TaskMutator]
+ * for the pre-generated [PermittedAction.CreateTask.taskId] right before creating, so a
+ * duplicate transaction delivery (the exact scenario the class doc above is about) finds
+ * the task already there and returns [ExecutionOutcome.NoOpAlreadyApplied] instead of a
+ * second StudyTask.
  */
 class ActionExecutor(
     private val transactionDao: InterventionTransactionDao,
@@ -22932,6 +22955,7 @@ class ActionExecutor(
         is PermittedAction.ReduceDuration -> applyReduceDuration(action)
         is PermittedAction.RescheduleTask -> applyRescheduleTask(action)
         is PermittedAction.ShortBreak -> applyShortBreak(action, now)
+        is PermittedAction.CreateTask -> applyCreateTask(action)
         PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification ->
             ExecutionOutcome.NotApplicable(action)
         PermittedAction.RequestGuardian -> ExecutionOutcome.RequiresGuardianEscalation
@@ -22998,6 +23022,23 @@ class ActionExecutor(
         return ExecutionOutcome.Applied(action)
     }
 
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every other applyX above, there is no
+     * pre-existing task to re-validate state on — [PermittedAction.CreateTask.taskId] is a
+     * caller-generated id that only becomes a real StudyTask once this succeeds. The live
+     * re-check here is purely the idempotency guard described in the class doc: if a task
+     * with this id already exists (a duplicate transaction delivery replaying the same
+     * CreateTask action), nothing is created a second time.
+     */
+    private fun applyCreateTask(action: PermittedAction.CreateTask): ExecutionOutcome {
+        val existing = taskMutator.findTask(action.taskId)
+        if (existing != null) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        taskMutator.createTask(action.taskId, action.request)
+        return ExecutionOutcome.Applied(action)
+    }
+
     private fun describe(outcome: ExecutionOutcome): String = when (outcome) {
         is ExecutionOutcome.Applied -> "Applied ${outcome.action::class.simpleName}"
         is ExecutionOutcome.NoOpAlreadyApplied -> "No-op — ${outcome.action::class.simpleName} already in effect"
@@ -23021,6 +23062,50 @@ sealed class ExecutionOutcome {
     object TransactionAlreadyResolved : ExecutionOutcome()
     object TransactionNotFound : ExecutionOutcome()
 }
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/CreateTaskRequest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.TaskType
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — the missing request shape in:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ *
+ * Untrusted the same way [LlmIntent] is treated as untrusted — [LearningInterventionMapper]
+ * is deterministic, not an LLM, but [PolicyValidator.validateCreateTask] still gates every
+ * field before anything reaches [TaskMutator.createTask]. "AI recommends, code decides"
+ * still applies here: LearningDecisionEngine recommends, PolicyValidator decides.
+ *
+ * Deliberately a plain data class, not a [PermittedAction] case directly — the same
+ * request needs to survive both a validation failure (rejected, nothing created) and a
+ * successful validation (wrapped in [PermittedAction.CreateTask]), so it exists as its own
+ * type rather than being constructed only after validation passes.
+ */
+data class CreateTaskRequest(
+    val subject:            String,
+    val topic:               String,
+    val durationMinutes:     Int,
+    val taskType:            TaskType = TaskType.OTHER,
+    val priority:            Int      = 1,
+    val scheduledStartTime:  String?  = null,   // optional "HH:mm" 24h — most learning-engine
+                                                 // tasks are unscheduled and land in HomeScreen's
+                                                 // "Unscheduled" section, same as any other task
+                                                 // AdaptivePlanner couldn't fit into a free slot.
+    val rationale:           String   = "",
+    // P0a scope (per LearningDecisionEngine's own scoping note): only REPAIR_CONCEPT,
+    // START_DIAGNOSTIC, ASSIGN_TARGETED_SET are wired end-to-end. Stored as the enum's
+    // `.name` — see StudyTask.learningIntent's doc for why this stays a String here rather
+    // than importing LearningInterventionIntent's type into this request shape.
+    val learningIntent:      String?  = null,
+    val conceptId:           String?  = null,
+    val targetedConceptIds:  List<String> = emptyList()
+)
 
 
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
@@ -23435,6 +23520,18 @@ import com.checkmate.planner.model.StudyTask
  * representable. If raw LLM output claims one of those (or anything else outside this
  * enum), [LlmIntent.parseIntentType] returns null and PolicyValidator treats it as
  * unrecognized.
+ *
+ * Note (Upgrade Blueprint Phase 2.4/2.5, P0a): [PermittedAction.CreateTask] is
+ * deliberately NOT mirrored by a CREATE_TASK case here. This enum/[LlmIntent] pair is
+ * specifically the LLM-facing schema — CreateTask's source is
+ * [com.checkmate.planner.intervention.CreateTaskRequest], produced deterministically by
+ * LearningInterventionMapper from a LearningDecisionEngine.CandidateIntervention, and
+ * validated by a separate [PolicyValidator.validateCreateTask] entry point that never
+ * goes through [LlmIntent] at all. Adding CREATE_TASK here would let raw LLM output claim
+ * it too, which is exactly the "AI recommends, code decides" boundary this enum exists to
+ * keep closed — see LearningDecisionEngine's own doc on why task creation is scoped as
+ * "its own design pass with its own PolicyValidator rules, not an incidental addition to
+ * this one."
  */
 enum class InterventionIntentType {
     START_TASK,
@@ -23491,6 +23588,16 @@ sealed class PermittedAction {
     /** Amended in step 5: needs taskId — pausing "something" isn't executable, pausing
      *  a specific task is (PlanStore.pauseTask requires one). */
     data class ShortBreak(val taskId: String, val minutes: Int) : PermittedAction()
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). [taskId] is generated by the caller (the
+     * intervention orchestrator, see LearningInterventionMapper's usage note) BEFORE
+     * validation — TaskEscrow.acquire() needs a key to lock on and ActionExecutor's
+     * idempotency check (§13) needs a stable id to re-check against, neither of which a
+     * not-yet-created task can supply on its own. [request] has already passed
+     * [PolicyValidator.validateCreateTask] by the time this exists — same invariant as
+     * every other PermittedAction case.
+     */
+    data class CreateTask(val taskId: String, val request: CreateTaskRequest) : PermittedAction()
     object KeepPlan : PermittedAction()
     object RequestClarification : PermittedAction()
     object RequestGuardian : PermittedAction()
@@ -23506,7 +23613,13 @@ enum class RejectionReason {
     DURATION_NOT_A_REDUCTION,
     BREAK_TOO_LONG,
     INVALID_RESCHEDULE_TIME,
-    MALFORMED_INTENT
+    MALFORMED_INTENT,
+    /** Upgrade Blueprint Phase 2.4/2.5 (P0a): a CreateTaskRequest named a
+     *  learningIntent outside this pass's scope (REPAIR_CONCEPT / START_DIAGNOSTIC /
+     *  ASSIGN_TARGETED_SET) — e.g. SCHEDULE_RETENTION_TEST, START_MOCK, REPLAN_DAY, or a
+     *  difficulty mutation. Rejected explicitly rather than silently creating a task
+     *  nobody has scoped a shape for yet — see LearningInterventionMapper's own doc. */
+    UNSUPPORTED_LEARNING_INTENT
 }
 
 sealed class PolicyResult {
@@ -23936,6 +24049,102 @@ class InterventionTriggerWorker(
 }
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LearningInterventionMapper.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.model.TaskType
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — implements the previously-missing arrow in the
+ * pipeline diagram:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ *
+ * Deliberately scoped to the three intents already fully specified end-to-end for this
+ * pass — REPAIR_CONCEPT, START_DIAGNOSTIC, ASSIGN_TARGETED_SET (matching
+ * [PolicyValidator.SUPPORTED_LEARNING_INTENTS]). The other five
+ * (SCHEDULE_RETENTION_TEST, START_MOCK, REPLAN_DAY, REDUCE_DIFFICULTY,
+ * INCREASE_DIFFICULTY) make [toCreateTaskRequest] return null — deliberately, not
+ * silently coerced into one of the three supported task shapes — so a caller iterating a
+ * DecisionReport's candidates can filter them out explicitly (e.g. surface them
+ * elsewhere, log them, or just skip) instead of this mapper inventing a plausible-looking
+ * CreateTaskRequest for an intent nobody has scoped a StudyTask shape for yet.
+ *
+ * This mapper does not itself talk to TaskEscrow or PolicyValidator — same separation of
+ * concerns as everything else in this package (PolicyValidator doesn't call ActionExecutor,
+ * ActionExecutor doesn't call PolicyValidator). The caller orchestrating P0a's full flow is
+ * expected to: generate a taskId, call [TaskEscrow.acquire] with it, call
+ * [PolicyValidator.validateCreateTask] with the request this mapper produced, then
+ * [ActionExecutor.execute] the resulting [PermittedAction.CreateTask] — none of that
+ * orchestration exists yet as a single call site; wiring it is a later step (see the
+ * blueprint's own note that a real end-to-end run through actual FT/test evidence comes
+ * after P0a's plumbing, not as part of it).
+ */
+object LearningInterventionMapper {
+
+    private val SUPPORTED_INTENTS = setOf(
+        LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+        LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
+        LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
+    )
+
+    /**
+     * Returns null for any candidate outside [SUPPORTED_INTENTS], or one whose subject is
+     * unknown (both [LearningDecisionEngine.CandidateIntervention.subject] and
+     * `.chapter`/`.topic`/`.conceptId` are nullable — see that class's doc — and a task
+     * with a blank subject/topic would just fail [PolicyValidator.validateCreateTask]
+     * anyway, so declining to guess here is equivalent but skips a doomed round trip).
+     */
+    fun toCreateTaskRequest(candidate: LearningDecisionEngine.CandidateIntervention): CreateTaskRequest? {
+        val intent = candidate.intent
+        if (intent !in SUPPORTED_INTENTS) return null
+
+        val subject = candidate.subject ?: return null
+        val topic = candidate.chapter ?: candidate.topic ?: candidate.conceptId ?: return null
+
+        val targetedConceptIds = when (intent) {
+            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET ->
+                // ASSIGN_TARGETED_SET candidates are collapsed chapter-level groups (see
+                // LearningDecisionEngine.collapseIntoTargetedSets) — conceptId is null for
+                // these by construction, so there is no per-concept id list to carry yet.
+                // Left empty rather than guessed; wiring the underlying concept ids through
+                // the collapse step is a separate change, not something this mapper should
+                // invent from a single collapsed candidate.
+                emptyList()
+            else -> candidate.conceptId?.let { listOf(it) } ?: emptyList()
+        }
+
+        return CreateTaskRequest(
+            subject = subject,
+            topic = topic,
+            durationMinutes = candidate.durationMinutes,
+            taskType = taskTypeFor(intent),
+            rationale = candidate.rationale,
+            learningIntent = intent.name,
+            conceptId = candidate.conceptId,
+            targetedConceptIds = targetedConceptIds
+        )
+    }
+
+    private fun taskTypeFor(intent: LearningDecisionEngine.LearningInterventionIntent): TaskType =
+        when (intent) {
+            // A repair session teaches/re-teaches the weak prerequisite — closest existing
+            // TaskType is LECTURE (see StudyTask.taskType's doc: AdaptivePlanner maps its
+            // own LEARN sessionType the same way).
+            LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT -> TaskType.LECTURE
+            // Both diagnostic and targeted-set sessions are the student answering
+            // questions, not being taught new material — PRACTICE fits both.
+            LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC -> TaskType.PRACTICE
+            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET -> TaskType.PRACTICE
+            else -> TaskType.OTHER // unreachable for the three SUPPORTED_INTENTS this is ever called with
+        }
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LlmIntentParser.kt =====
 package com.checkmate.planner.intervention
 
@@ -24323,6 +24532,32 @@ class PlanStoreTaskMutator : TaskMutator {
     override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
         PlanStore.updateTaskSchedule(taskId, newScheduledStartTime)
     }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Builds the actual [StudyTask] from a
+     * validated [CreateTaskRequest] — this is the one place a [CreateTaskRequest] becomes
+     * a real StudyTask; everything upstream (LearningInterventionMapper, PolicyValidator,
+     * TaskEscrow) only ever passes the request/id pair around. `isCustom` is deliberately
+     * left at its default `false` — see StudyTask.isCustom and PlanStore.createTask's own
+     * docs on why that flag stays reserved for HomeViewModel's student-typed tasks.
+     */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        PlanStore.createTask(task)
+        return task
+    }
 }
 
 
@@ -24351,6 +24586,12 @@ import java.time.format.DateTimeParseException
  * with a reason. There is no path from here to a protected action (device unlock,
  * disabling the guardian, removing WorkMode) because no such action is representable in
  * [InterventionIntentType] to begin with.
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [validateCreateTask] is a second, deliberately
+ * separate entry point alongside [validate] — a [CreateTaskRequest] comes from
+ * LearningInterventionMapper (deterministic, not an LLM), never from an [LlmIntent], so it
+ * doesn't belong inside the `when (type)` dispatch above. Same "code decides" principle,
+ * same [PolicyResult] shape, different input — see [CreateTaskRequest]'s own doc.
  */
 object PolicyValidator {
 
@@ -24362,6 +24603,12 @@ object PolicyValidator {
      *  Picked to comfortably permit that example while still capping well short of
      *  a session-length break. */
     const val MAX_BREAK_MINUTES = 30
+
+    /** P0a scope, per LearningDecisionEngine's own scoping note: SCHEDULE_RETENTION_TEST,
+     *  START_MOCK, REPLAN_DAY, and difficulty mutation are explicitly not wired to task
+     *  creation yet. A CreateTaskRequest naming any of those (or an unrecognized string)
+     *  is rejected rather than silently coerced into one of these three. */
+    val SUPPORTED_LEARNING_INTENTS = setOf("REPAIR_CONCEPT", "START_DIAGNOSTIC", "ASSIGN_TARGETED_SET")
 
     private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
 
@@ -24477,6 +24724,46 @@ object PolicyValidator {
             return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
         }
         return PolicyResult.Permitted(PermittedAction.ShortBreak(task.id, minutes))
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — validates a [CreateTaskRequest] (already
+     * paired with a caller-generated [taskId], same as every PermittedAction.CreateTask
+     * needs) into a [PermittedAction.CreateTask] or a rejection. There is no [PolicyState]
+     * parameter here: unlike every `validate*` above, there is no existing task whose live
+     * state could matter — the only state to validate against is the request's own fields.
+     */
+    fun validateCreateTask(taskId: String, request: CreateTaskRequest): PolicyResult {
+        if (request.subject.isBlank() || request.topic.isBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "CreateTaskRequest subject/topic must not be blank")
+        }
+
+        if (request.durationMinutes <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "durationMinutes=${request.durationMinutes}")
+        }
+        if (request.durationMinutes < MIN_DURATION_MINUTES) {
+            return reject(
+                RejectionReason.DURATION_TOO_SHORT,
+                "durationMinutes=${request.durationMinutes} below minimum $MIN_DURATION_MINUTES"
+            )
+        }
+
+        val intent = request.learningIntent
+        if (intent != null && intent !in SUPPORTED_LEARNING_INTENTS) {
+            return reject(
+                RejectionReason.UNSUPPORTED_LEARNING_INTENT,
+                "learningIntent=$intent not yet wired for task creation " +
+                    "(P0a scope: REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET only)"
+            )
+        }
+
+        request.scheduledStartTime?.let { raw ->
+            if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
+                return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
+            }
+        }
+
+        return PolicyResult.Permitted(PermittedAction.CreateTask(taskId, request))
     }
 
     private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)
@@ -24799,6 +25086,16 @@ interface TaskMutator {
     fun reduceDuration(taskId: String, newDurationMinutes: Int)
 
     fun rescheduleTask(taskId: String, newScheduledStartTime: String)
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every function above, [taskId] does
+     * not yet identify an existing task — it's the caller-generated id [request] should be
+     * created under (see [PermittedAction.CreateTask]'s doc for why the id has to be
+     * generated before this is called, not by this function). Returns the created
+     * [StudyTask] so callers (currently just [ActionExecutor]) don't need a second
+     * [findTask] round-trip to get back what they just created.
+     */
+    fun createTask(taskId: String, request: CreateTaskRequest): StudyTask
 }
 
 
@@ -24916,12 +25213,26 @@ data class StudyTask(
     // priority ranking.
     val rationale:       String     = "",
     // ── Blueprint 4.2: Smart Scheduling ──
-    val scheduledStartTime: String? = null    // "HH:mm" 24h clock time this task is slotted into today's
+    val scheduledStartTime: String? = null,   // "HH:mm" 24h clock time this task is slotted into today's
                                                // free time (computed by AdaptivePlanner from
                                                // ConsultationProfile.blockedSlots — see FreeSlotCalculator).
                                                // Null means the planner couldn't fit it into a free slot
                                                // (e.g. total plan exceeds available time) — HomeScreen's
                                                // timeline view falls back to an "Unscheduled" section for these.
+    // ── Upgrade Blueprint Phase 2.4/2.5 (P0a): learning provenance + concept linkage ──
+    // Populated only for tasks created via TaskMutator.createTask() from a
+    // LearningDecisionEngine.CandidateIntervention (see LearningInterventionMapper). Null/empty
+    // for every existing task path (AdaptivePlanner-generated, HomeViewModel custom tasks) —
+    // this is additive, nothing upstream of this pass needs to set these fields.
+    //
+    // learningIntent stores LearningDecisionEngine.LearningInterventionIntent.name rather than
+    // the enum type itself, so :modules:planner's model layer doesn't take a compile-time
+    // dependency on :modules:learning's engine package for a single field — the intent is
+    // already a closed, versioned string vocabulary (Blueprint §2.4's 8-item taxonomy) that
+    // LearningInterventionMapper/PolicyValidator are the only things that need to interpret.
+    val learningIntent:  String?     = null,  // e.g. "REPAIR_CONCEPT" — null for non-learning-engine tasks
+    val conceptId:       String?     = null,  // single concept this task targets (REPAIR_CONCEPT/START_DIAGNOSTIC)
+    val targetedConceptIds: List<String> = emptyList() // multiple concepts folded into one session (ASSIGN_TARGETED_SET)
 )
 
 @Serializable
@@ -24940,8 +25251,10 @@ package com.checkmate.planner.intervention
 
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -24977,6 +25290,13 @@ class ActionExecutorTest {
 
         suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
             (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = now)
+                    as EscrowAcquireResult.Acquired).transaction
+
+        /** P0a — CREATE_TASK escrows on a caller-generated id that doesn't identify an
+         *  existing task yet (see [PermittedAction.CreateTask]'s doc), so tests that
+         *  exercise it acquire on a fresh id instead of [taskId]. */
+        suspend fun acquireFor(id: String, now: Long = 1_000L): InterventionTransaction =
+            (escrow.acquire(id, InterventionTriggerType.LATE_START, now = now)
                     as EscrowAcquireResult.Acquired).transaction
     }
 
@@ -25180,6 +25500,86 @@ class ActionExecutorTest {
         assertTrue(outcome is ExecutionOutcome.Failed)
         assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
     }
+
+    // ── CREATE_TASK (Upgrade Blueprint Phase 2.4/2.5, P0a) ───────────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        conceptId: String? = "phy_rotational_inertia"
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        rationale = "Weak prerequisite for an upcoming target concept",
+        learningIntent = learningIntent,
+        conceptId = conceptId
+    )
+
+    @Test
+    fun `create task on a fresh id applies, creates the StudyTask, and completes the transaction`() = runTest {
+        val f = Fixture(task()) // seed task is irrelevant here — CreateTask uses a fresh id
+        val newTaskId = "learning-engine-task-1"
+        val tx = f.acquireFor(newTaskId)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = f.mutator.currentState(newTaskId)
+        assertEquals("Physics", created?.subject)
+        assertEquals("Rotational Motion", created?.topic)
+        assertEquals(25, created?.durationMinutes)
+        assertEquals(TaskType.LECTURE, created?.taskType)
+        assertEquals("REPAIR_CONCEPT", created?.learningIntent)
+        assertEquals("phy_rotational_inertia", created?.conceptId)
+        assertEquals(TaskState.PENDING, created?.state) // StudyTask's own default
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `duplicate delivery of a CreateTask transaction does not create a second StudyTask`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-2"
+        val tx = f.acquireFor(newTaskId)
+        val request = createTaskRequest()
+
+        val first = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertTrue(first is ExecutionOutcome.Applied)
+
+        // Same transactionId delivered again — e.g. a retried WorkManager job. The primary
+        // guard (transaction already terminal) catches this before applyCreateTask runs.
+        val second = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+    }
+
+    @Test
+    fun `create task where the id already exists (idempotency guard) is a no-op, not a second task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-3"
+        // Simulate the id having already been created by a prior, separately-resolved
+        // execution (not the primary already-terminal guard above) — applyCreateTask's own
+        // defensive re-check (mirrors every other applyX in this class) is what catches this.
+        f.mutator.createTask(newTaskId, createTaskRequest())
+        val tx = f.acquireFor("distinct-fresh-id-for-escrow")
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    @Test
+    fun `create task with no scheduledStartTime lands unscheduled, same as any other task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-4"
+        val tx = f.acquireFor(newTaskId)
+
+        f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertNull(f.mutator.currentState(newTaskId)?.scheduledStartTime)
+    }
 }
 
 
@@ -25301,6 +25701,26 @@ class FakeTaskMutator(seed: List<StudyTask> = emptyList()) : TaskMutator {
 
     override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
         tasks[taskId] = tasks.getValue(taskId).copy(scheduledStartTime = newScheduledStartTime)
+    }
+
+    /** P0a — mirrors [PlanStoreTaskMutator.createTask]'s field mapping so
+     *  ActionExecutorTest exercises the same shape production actually builds. */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        tasks[taskId] = task
+        return task
     }
 }
 
@@ -25622,6 +26042,302 @@ class InterventionFallbackTest {
         assertTrue(outcome is DecisionOutcome.PolicyRejected)
         assertEquals(RejectionReason.TASK_NOT_ACTIVE_STATE, (outcome as DecisionOutcome.PolicyRejected).reason)
         assertEquals(InterventionState.POLICY_REJECTED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LearningInterventionCreateTaskIntegrationTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.UUID
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — integration test for the full pipeline this
+ * pass wires up:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ * Uses [FakeTaskMutator] in place of [PlanStoreTaskMutator]/PlanStore (same reasoning as
+ * every other plain-JVM test in this package: no Android SharedPreferences dependency).
+ * Not a real end-to-end run against actual FT/test evidence and StudentModel/DecisionEngine
+ * output — that's the separate step the blueprint calls out as coming after this plumbing
+ * is in place, not part of it.
+ */
+class LearningInterventionCreateTaskIntegrationTest {
+
+    private fun candidate(
+        intent: LearningDecisionEngine.LearningInterventionIntent,
+        conceptId: String? = "phy_rotational_inertia",
+        subject: String? = "Physics",
+        chapter: String? = "Rotational Motion",
+        durationMinutes: Int = 25
+    ) = LearningDecisionEngine.CandidateIntervention(
+        intent = intent,
+        conceptId = conceptId,
+        subject = subject,
+        chapter = chapter,
+        topic = null,
+        durationMinutes = durationMinutes,
+        expectedGain = 1.5,
+        priorityScore = 1.5,
+        rationale = "Weak prerequisite for an upcoming target concept"
+    )
+
+    private class Fixture {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val mutator = FakeTaskMutator()
+        val executor = ActionExecutor(dao, escrow, mutator)
+    }
+
+    /**
+     * Runs a [LearningDecisionEngine.CandidateIntervention] through every P0a stage and
+     * returns the [ExecutionOutcome] — mirrors the orchestration
+     * [LearningInterventionMapper]'s own doc describes as not yet existing as a single
+     * production call site.
+     */
+    private suspend fun runPipeline(
+        f: Fixture,
+        candidateIntervention: LearningDecisionEngine.CandidateIntervention
+    ): ExecutionOutcome {
+        val request = LearningInterventionMapper.toCreateTaskRequest(candidateIntervention)
+            ?: error("candidate was not mappable — test setup bug")
+
+        val newTaskId = UUID.randomUUID().toString()
+        // No existing InterventionTriggerType is a semantic match for "learning-engine
+        // decided a task should exist" — none of the eleven values name that. BACKLOG_RISK
+        // is the closest available fit; picking the right value (or adding one) is a
+        // question for whoever wires this into a real trigger path, not this test.
+        val acquireResult = f.escrow.acquire(newTaskId, InterventionTriggerType.BACKLOG_RISK)
+        val transaction = (acquireResult as EscrowAcquireResult.Acquired).transaction
+
+        val policyResult = PolicyValidator.validateCreateTask(newTaskId, request)
+        val permitted = policyResult as PolicyResult.Permitted
+
+        return f.executor.execute(transaction.transactionId, permitted.action)
+    }
+
+    @Test
+    fun `REPAIR_CONCEPT candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        val task = f.mutator.currentState(created.taskId)
+
+        assertEquals("Physics", task?.subject)
+        assertEquals("Rotational Motion", task?.topic)
+        assertEquals(25, task?.durationMinutes)
+        assertEquals(TaskType.LECTURE, task?.taskType)
+        assertEquals(TaskState.PENDING, task?.state)
+        assertEquals("REPAIR_CONCEPT", task?.learningIntent)
+        assertEquals("phy_rotational_inertia", task?.conceptId)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(transactionIdOf(f, created.taskId))?.currentState)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        assertEquals(TaskType.PRACTICE, f.mutator.currentState(created.taskId)?.taskType)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET, conceptId = null)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        val task = f.mutator.currentState(created.taskId)
+        assertEquals(TaskType.PRACTICE, task?.taskType)
+        assertEquals("ASSIGN_TARGETED_SET", task?.learningIntent)
+    }
+
+    @Test
+    fun `an out-of-scope candidate never reaches PolicyValidator or the executor`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY)
+        )
+        assertEquals(null, request) // mapper declines; nothing downstream is exercised
+    }
+
+    /** Small helper — the transaction id isn't returned by [runPipeline] directly, so this
+     *  re-derives it via [TaskEscrow]'s own "latest transaction for a task" lookup. */
+    private suspend fun transactionIdOf(f: Fixture, taskId: String): String =
+        f.dao.getLatestForTask(taskId)?.transactionId ?: error("no transaction found for $taskId")
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LearningInterventionMapperTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.model.TaskType
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a). Pure JVM unit tests — [LearningInterventionMapper]
+ * has no Android dependency, same testability posture as PolicyValidator/ActionExecutor.
+ */
+class LearningInterventionMapperTest {
+
+    private fun candidate(
+        intent: LearningDecisionEngine.LearningInterventionIntent,
+        conceptId: String? = "phy_rotational_inertia",
+        subject: String? = "Physics",
+        chapter: String? = "Rotational Motion",
+        topic: String? = null,
+        durationMinutes: Int = 25,
+        rationale: String = "Weak prerequisite for an upcoming target concept"
+    ) = LearningDecisionEngine.CandidateIntervention(
+        intent = intent,
+        conceptId = conceptId,
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        expectedGain = 1.5,
+        priorityScore = 1.5,
+        rationale = rationale
+    )
+
+    // ── Supported intents (P0a scope) ───────────────────────────────────
+
+    @Test
+    fun `REPAIR_CONCEPT maps to a LECTURE CreateTaskRequest carrying the concept id`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT)
+        )
+        assertTrue(request != null)
+        request!!
+        assertEquals("Physics", request.subject)
+        assertEquals("Rotational Motion", request.topic)
+        assertEquals(25, request.durationMinutes)
+        assertEquals(TaskType.LECTURE, request.taskType)
+        assertEquals("REPAIR_CONCEPT", request.learningIntent)
+        assertEquals("phy_rotational_inertia", request.conceptId)
+        assertEquals(listOf("phy_rotational_inertia"), request.targetedConceptIds)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC maps to a PRACTICE CreateTaskRequest`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC)
+        )
+        assertTrue(request != null)
+        assertEquals(TaskType.PRACTICE, request!!.taskType)
+        assertEquals("START_DIAGNOSTIC", request.learningIntent)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET maps to a PRACTICE CreateTaskRequest with no targeted concept ids`() {
+        // ASSIGN_TARGETED_SET candidates are collapsed chapter-level groups — conceptId is
+        // null by construction (see LearningInterventionMapper's own doc).
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET, conceptId = null)
+        )
+        assertTrue(request != null)
+        assertEquals(TaskType.PRACTICE, request!!.taskType)
+        assertEquals("ASSIGN_TARGETED_SET", request.learningIntent)
+        assertNull(request.conceptId)
+        assertEquals(emptyList<String>(), request.targetedConceptIds)
+    }
+
+    @Test
+    fun `topic falls back to topic field then conceptId when chapter is null`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+                chapter = null,
+                topic = "Angular Momentum"
+            )
+        )
+        assertEquals("Angular Momentum", request!!.topic)
+    }
+
+    // ── Out-of-scope intents (deliberately not wired in P0a) ────────────
+
+    @Test
+    fun `SCHEDULE_RETENTION_TEST is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `START_MOCK is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_MOCK)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `REPLAN_DAY is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `REDUCE_DIFFICULTY and INCREASE_DIFFICULTY are not mapped`() {
+        listOf(
+            LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY,
+            LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY
+        ).forEach { intent ->
+            assertNull(LearningInterventionMapper.toCreateTaskRequest(candidate(intent)))
+        }
+    }
+
+    // ── Missing data (declines rather than guesses) ──────────────────────
+
+    @Test
+    fun `a REPAIR_CONCEPT candidate with no subject is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, subject = null)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `a candidate with no chapter, topic, or conceptId is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
+                chapter = null,
+                topic = null,
+                conceptId = null
+            )
+        )
+        assertNull(request)
     }
 }
 
@@ -26015,6 +26731,7 @@ package com.checkmate.planner.intervention
 
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26274,6 +26991,101 @@ class PolicyValidatorTest {
             val result = PolicyValidator.validate(intent, PolicyState(task = null))
             assertTrue("$type should be permitted", result is PolicyResult.Permitted)
         }
+    }
+
+    // ── validateCreateTask (Upgrade Blueprint Phase 2.4/2.5, P0a) ──────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        scheduledStartTime: String? = null
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        scheduledStartTime = scheduledStartTime,
+        learningIntent = learningIntent,
+        conceptId = "phy_rotational_inertia"
+    )
+
+    @Test
+    fun `REPAIR_CONCEPT create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-1", createTaskRequest(learningIntent = "REPAIR_CONCEPT"))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.CreateTask
+        assertEquals("new-task-1", action.taskId)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-2", createTaskRequest(learningIntent = "START_DIAGNOSTIC"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-3", createTaskRequest(learningIntent = "ASSIGN_TARGETED_SET"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with no learningIntent (non-learning-engine caller) is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-4", createTaskRequest(learningIntent = null))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request naming an out-of-scope learning intent is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-5",
+            createTaskRequest(learningIntent = "REPLAN_DAY")
+        )
+        assertRejectedWith(result, RejectionReason.UNSUPPORTED_LEARNING_INTENT)
+    }
+
+    @Test
+    fun `create request with blank subject is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-6", createTaskRequest(subject = ""))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with blank topic is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-7", createTaskRequest(topic = "  "))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with zero duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-8", createTaskRequest(durationMinutes = 0))
+        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
+    }
+
+    @Test
+    fun `create request below minimum duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-9", createTaskRequest(durationMinutes = 3))
+        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
+    }
+
+    @Test
+    fun `create request with a valid scheduledStartTime is permitted`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-10",
+            createTaskRequest(scheduledStartTime = "20:00")
+        )
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with a malformed scheduledStartTime is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-11",
+            createTaskRequest(scheduledStartTime = "8pm")
+        )
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
     }
 
     private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
