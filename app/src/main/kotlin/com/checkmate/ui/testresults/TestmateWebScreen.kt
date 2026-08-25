@@ -16,6 +16,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -94,6 +95,55 @@ fun TestmateWebScreen(navController: NavController) {
                 )
             }
         } else {
+            var urlInput by remember { mutableStateOf(baseUrl) }
+            var urlError by remember { mutableStateOf<String?>(null) }
+
+            // Address bar — lets a pasted link (e.g. a group test session URL like
+            // https://testmate2.vercel.app/test/<session-id>) be loaded directly,
+            // instead of being stuck on whatever baseUrl was saved in Settings.
+            // Still gated by the same allow-list as the Settings field
+            // (TestmateApi.isAllowedBaseUrl) — this only ever navigates within
+            // Testmate's own hosts, never an arbitrary URL.
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value         = urlInput,
+                    onValueChange = { urlInput = it; urlError = null },
+                    modifier      = Modifier.weight(1f),
+                    singleLine    = true,
+                    textStyle    = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                    placeholder  = { Text("Paste a Testmate link (e.g. group test session)", color = White30, fontSize = 12.sp) },
+                    isError      = urlError != null,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor   = AccentGreen,
+                        unfocusedBorderColor = White30,
+                        cursorColor          = AccentGreen,
+                        focusedTextColor     = White90,
+                        unfocusedTextColor   = White90,
+                        errorBorderColor     = AccentRed
+                    )
+                )
+                Spacer(Modifier.width(8.dp))
+                IconButton(onClick = {
+                    val candidate = urlInput.trim()
+                    if (TestmateApi.isAllowedBaseUrl(candidate)) {
+                        urlError = null
+                        loading = true
+                        webViewHolder[0]?.loadUrl(candidate)
+                    } else {
+                        urlError = "Only testmate2.com, testmate2.vercel.app, or the Testmate Supabase auth link are accepted"
+                    }
+                }) {
+                    Icon(Icons.Default.ArrowForward, null, tint = AccentGreen)
+                }
+            }
+            urlError?.let {
+                Text(it, fontSize = 10.sp, color = AccentRed,
+                    modifier = Modifier.padding(horizontal = 16.dp, bottom = 4.dp))
+            }
+
             AndroidView(
                 modifier = Modifier.fillMaxWidth().weight(1f),
                 factory = { ctx ->
@@ -107,6 +157,9 @@ fun TestmateWebScreen(navController: NavController) {
                                 loading = false
                                 title = view.title?.takeIf { it.isNotBlank() } ?: "Test Platform"
                                 canGoBack = view.canGoBack()
+                                // Keep the address bar in sync with wherever navigation
+                                // (including in-page links, not just the Go button) ends up.
+                                url?.takeIf { it.isNotBlank() }?.let { urlInput = it }
                             }
 
                             override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
