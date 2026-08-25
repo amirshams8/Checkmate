@@ -16,6 +16,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -79,6 +80,9 @@ fun TestmateWebScreen(navController: NavController) {
             Text(title, fontSize = 18.sp, color = White90, modifier = Modifier.weight(1f))
             if (loading) {
                 CircularProgressIndicator(modifier = Modifier.size(18.dp), color = AccentGreen, strokeWidth = 2.dp)
+            }
+            IconButton(onClick = { webViewHolder[0]?.reload() }) {
+                Icon(Icons.Default.Refresh, null, tint = AccentGreen)
             }
         }
 

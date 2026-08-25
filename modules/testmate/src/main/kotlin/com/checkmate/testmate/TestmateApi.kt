@@ -34,18 +34,23 @@ object TestmateApi {
     // value written some other way (e.g. directly to SharedPrefs, or a stale
     // value saved before this allow-list existed) can't quietly redirect
     // Testmate API calls, which carry the access token, to an
-    // attacker-controlled host. Exactly two hosts are allowed:
+    // attacker-controlled host. Exactly three hosts are allowed:
     //  1. testmate2.com, or any subdomain of it (e.g. api.testmate2.com).
-    //  2. This specific Testmate Supabase project's auth-verify endpoint —
+    //  2. testmate2.vercel.app — exact match only, not any *.vercel.app, since
+    //     that would allow-list every other Vercel-hosted app too. This is the
+    //     current production deployment host (testmate2.com isn't live yet).
+    //  3. This specific Testmate Supabase project's auth-verify endpoint —
     //     used for the magic-link flow, not general API calls, but it's a
     //     legitimate Testmate-owned endpoint so it's allow-listed too.
+    private const val VERCEL_HOST = "testmate2.vercel.app"
     private const val SUPABASE_AUTH_HOST = "donhabgdgdkygcklqxdj.supabase.co"
     private const val SUPABASE_AUTH_PATH_PREFIX = "/auth/v1/verify"
 
     /**
-     * True if [raw] is an https URL whose host is testmate2.com (or a subdomain), or this
-     * project's Supabase auth-verify host+path. Anything else — a different domain, a bare
-     * IP, http (not https), a lookalike domain, etc. — is rejected.
+     * True if [raw] is an https URL whose host is testmate2.com (or a subdomain),
+     * exactly testmate2.vercel.app, or this project's Supabase auth-verify host+path.
+     * Anything else — a different domain, a bare IP, http (not https), a lookalike
+     * domain, etc. — is rejected.
      */
     fun isAllowedBaseUrl(raw: String): Boolean {
         val trimmed = raw.trim().trimEnd('/')
@@ -56,6 +61,7 @@ object TestmateApi {
         val host = uri.host?.lowercase() ?: return false
 
         if (host == "testmate2.com" || host.endsWith(".testmate2.com")) return true
+        if (host == VERCEL_HOST) return true
         if (host == SUPABASE_AUTH_HOST && (uri.path ?: "").startsWith(SUPABASE_AUTH_PATH_PREFIX)) return true
 
         return false
