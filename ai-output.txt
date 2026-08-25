@@ -1,1647 +1,2253 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/LearningDecisionEngine.kt =====
-package com.checkmate.learning.engine
-
-import com.checkmate.learning.analytics.PerformanceAnalyzer
-import com.checkmate.learning.analytics.ScoreGainEstimator
-import com.checkmate.learning.analytics.ScorePredictor
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-
-/**
- * Upgrade Blueprint Phase 2.4 ("Extend the existing intervention pipeline, don't
- * replace it") — the actual decision layer everything upstream of this file has
- * been building evidence for.
- *
- * The question this file answers is deliberately narrow, per the blueprint's own
- * framing: "What should this student do NEXT?" — not "what's weak" (already
- * answered by [PerformanceAnalyzer]) and not "what's worth marks" (already
- * answered by [ScoreGainEstimator]/[ScorePredictor]). Those stay upstream,
- * EVIDENCE-shaped; this is the first (and, deliberately, only) file allowed to
- * turn that evidence into a ranked, typed action — same "don't let this layer
- * decide what the next layer should decide" boundary [PerformanceAnalyzer]'s own
- * class doc already draws for itself.
- *
- * DETERMINISTIC BY DESIGN — no LLM call anywhere in this file, and none should
- * ever be added. Per the blueprint's own architecture:
- * ```
- * deterministic engines -> CandidateInterventions -> LearningDecisionEngine
- *     -> ranked action -> LLM -> explanation / tutoring / wording
- * ```
- * The LLM becomes the teacher, not the decision-maker — it explains and delivers
- * whatever [CandidateIntervention] this engine already ranked first; it never
- * proposes or reorders candidates itself. If a future pass wants an LLM-proposed
- * adjustment to any ranking term below, that goes through the same "LLM proposes,
- * deterministic layer validates" discipline the blueprint applies everywhere else
- * (Phase 0 item 2), not a blind hand-off of the ranking itself.
- *
- * SCOPE OF THIS PASS: produces the ranked [CandidateIntervention] list only — the
- * "ranked action" box in the diagram above. Wiring these into the existing
- * behavior-intervention pipeline (`InterventionIntent -> ActionExecutor ->
- * PolicyValidator -> TaskEscrow -> TaskMutator -> TriggerEvaluator ->
- * InterventionTransaction -> Reconciliation`) as first-class, executable
- * `StudyTask`-mutating actions is Blueprint §2.5 ("make plan changes
- * transactional") — a separate, larger integration into `:modules:planner`'s
- * escrow/commit/rollback machinery, deliberately not started here. That pipeline
- * today only knows how to execute five narrow, already-audited behavior actions
- * (see [com.checkmate.planner.intervention.PermittedAction]); teaching it to
- * safely mutate a `StudyTask` into a `REPAIR_CONCEPT` session (create a task?
- * retarget an existing one? at what priority relative to what's already
- * scheduled?) is its own design pass with its own PolicyValidator rules, not an
- * incidental addition to this one. What's built here is the missing input that
- * pass will eventually consume — surfaced to the student directly in the
- * meantime (see `TestResultsViewModel`/`TestResultsScreen` wiring).
- *
- * INTENT TAXONOMY: exactly the eight intents Blueprint §2.4 names —
- * [LearningInterventionIntent.REPAIR_CONCEPT], [LearningInterventionIntent.START_DIAGNOSTIC],
- * [LearningInterventionIntent.ASSIGN_TARGETED_SET], [LearningInterventionIntent.SCHEDULE_RETENTION_TEST],
- * [LearningInterventionIntent.START_MOCK], [LearningInterventionIntent.REPLAN_DAY],
- * [LearningInterventionIntent.REDUCE_DIFFICULTY], [LearningInterventionIntent.INCREASE_DIFFICULTY].
- * No new intent invented here, none dropped.
- *
- * HONEST GAP: every classification rule below (which intent fits which signal
- * shape) is a first-pass heuristic, same as every other engine in this codebase —
- * flagged the same way [ScoreGainEstimator]/[ScorePredictor] flag their own
- * weights. Priority scores mix two genuinely different units on one axis: concept-
- * level candidates rank by [ScoreGainEstimator.ScoreGainEstimate.expectedGain]
- * (marks per [SESSION_MINUTES]-minute block — a real, if uncalibrated, rate), while
- * whole-student candidates ([LearningInterventionIntent.START_MOCK],
- * [LearningInterventionIntent.REPLAN_DAY]) have no natural per-session mark rate at
- * all and are scaled onto the same axis relative to the strongest concept-level
- * candidate in the same report (see [macroCandidates]) purely so ranking has
- * something to sort against — not because the two numbers mean the same thing.
- * Not validated against real outcomes; that validation, not intuition, is the bar
- * for retuning any constant here.
- */
-object LearningDecisionEngine {
-
-    /** How many ranked candidates a caller sees — enough for a "here's what's next
-     *  and what's after that" view without dumping every weak topic as a
-     *  duplicate-shaped action. */
-    private const val MAX_CANDIDATES = 5
-
-    /** How many of [ScoreGainEstimator]'s top-ranked estimates get turned into
-     *  candidates at all, before targeted-set collapsing and final ranking trim
-     *  this down further — wider than [MAX_CANDIDATES] so a chapter with several
-     *  weak topics still has enough raw material to collapse into one
-     *  [LearningInterventionIntent.ASSIGN_TARGETED_SET] instead of losing topics
-     *  to the pool cutoff before grouping even runs. */
-    private const val CONCEPT_CANDIDATE_POOL = 10
-
-    /** Kept numerically in sync with [RetentionEngine.HIGH_MASTERY_THRESHOLD] /
-     *  [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] by hand, not
-     *  imported — same "not worth a cross-file dependency for one constant"
-     *  convention [ScorePredictor.WEAK_MASTERY_THRESHOLD] already establishes. */
-    private const val HIGH_MASTERY_THRESHOLD = 0.75
-
-    /** Kept in sync with [ScorePredictor.ERROR_HEAVY_THRESHOLD] by hand, same
-     *  "repeated errors become a distinct signal, not just low mastery" framing. */
-    private const val ERROR_HEAVY_THRESHOLD = 3
-
-    /** Fraction of attempts on a concept that must have produced an error before
-     *  the failure mode looks like "the difficulty tier itself is miscalibrated"
-     *  rather than ordinary not-yet-mastered weakness — the extra bar
-     *  [LearningInterventionIntent.REDUCE_DIFFICULTY] needs beyond plain
-     *  [ERROR_HEAVY_THRESHOLD], since most weak concepts should stay
-     *  [LearningInterventionIntent.REPAIR_CONCEPT] rather than being read as a
-     *  difficulty problem. */
-    private const val REDUCE_DIFFICULTY_ERROR_RATE = 0.6
-
-    /** Below this many total attempts across the whole student model, every
-     *  ranked estimate above is running on evidence too thin to trust — a fresh
-     *  mock generates more real signal per hour than another repair guess.
-     *  First-pass threshold, not calibrated against real outcomes. */
-    private const val THIN_DATA_ATTEMPT_THRESHOLD = 20
-
-    /** Minimum weak topics sharing a (subject, chapter) before they're collapsed
-     *  into one [LearningInterventionIntent.ASSIGN_TARGETED_SET] candidate instead
-     *  of appearing as that many separate [LearningInterventionIntent.REPAIR_CONCEPT]
-     *  candidates — three near-duplicate "repair X" rows for the same chapter is
-     *  noise, not three distinct decisions. */
-    private const val MIN_TOPICS_FOR_TARGETED_SET = 3
-
-    private const val DIAGNOSTIC_MINUTES = 15
-    private const val RETENTION_TEST_MINUTES = 10
-    private const val MOCK_MINUTES = 60
-    private const val MAX_TARGETED_SET_MINUTES = 90
-
-    /** What share of the strongest concept-level candidate's priority a macro
-     *  (whole-student) candidate is scaled to when its own trigger condition is
-     *  only barely met — see [macroCandidates] and this class's own HONEST GAP
-     *  note on mixing units. */
-    private const val MIN_MACRO_PRIORITY_SHARE = 0.3
-
-    enum class LearningInterventionIntent {
-        REPAIR_CONCEPT,
-        START_DIAGNOSTIC,
-        ASSIGN_TARGETED_SET,
-        SCHEDULE_RETENTION_TEST,
-        START_MOCK,
-        REPLAN_DAY,
-        REDUCE_DIFFICULTY,
-        INCREASE_DIFFICULTY
-    }
-
-    /**
-     * One ranked, typed thing the student could do next. `conceptId` is null for
-     * candidates that aren't about one specific concept ([ASSIGN_TARGETED_SET]
-     * names a chapter instead; [START_MOCK]/[REPLAN_DAY] are whole-student).
-     * `expectedGain` is the real marks-per-session number for concept-level
-     * candidates and `0.0` for ones that don't have a comparable per-session mark
-     * rate (see class doc) — `priorityScore` is what [decideFromReport] actually
-     * sorts on, kept separate from `expectedGain` so a caller can always show the
-     * real evidence-backed number alongside the rank, never a synthetic one
-     * dressed up as marks.
-     */
-    data class CandidateIntervention(
-        val intent: LearningInterventionIntent,
-        val conceptId: String?,
-        val subject: String?,
-        val chapter: String?,
-        val topic: String?,
-        val durationMinutes: Int,
-        val expectedGain: Double,
-        val priorityScore: Double,
-        val rationale: String
-    )
-
-    data class DecisionReport(
-        val studentId: String,
-        val examType: String,
-        val generatedAt: Long,
-        /** Ranked highest-[CandidateIntervention.priorityScore] first, capped at
-         *  [MAX_CANDIDATES]. */
-        val candidates: List<CandidateIntervention>
-    )
-
-    /** Runs [PerformanceAnalyzer.analyze]/[ScoreGainEstimator.rank]/[ScorePredictor.predict]
-     *  itself — see [ScoreGainEstimator.rank]'s own doc for why this convenience
-     *  overload exists alongside [decideFromReport]. */
-    fun decide(studentModel: StudentModel, examType: String, targetScore: Int): DecisionReport {
-        val report = PerformanceAnalyzer.analyze(studentModel, examType)
-        val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
-        val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
-        return decideFromReport(report, studentModel, estimates, expectedScore)
-    }
-
-    /**
-     * Same as [decide] but against an already-built [PerformanceAnalyzer.PerformanceReport]/
-     * [ScoreGainEstimator.ScoreGainEstimate] list/[ScorePredictor.ExpectedScore] —
-     * for a caller (e.g. `TestResultsViewModel`) that already built all three off
-     * one Room read, so this can never silently diverge from what's already on
-     * screen. Same "one Room read, N derived views" discipline
-     * [ScorePredictor.predictFromReport] itself follows.
-     */
-    fun decideFromReport(
-        report: PerformanceAnalyzer.PerformanceReport,
-        studentModel: StudentModel,
-        estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
-        expectedScore: ScorePredictor.ExpectedScore
-    ): DecisionReport {
-        val diagnostics = diagnosticCandidates(studentModel, report)
-        val concepts = collapseIntoTargetedSets(conceptCandidates(studentModel, estimates))
-        val conceptLevel = diagnostics + concepts
-        val ceiling = conceptLevel.maxOfOrNull { it.priorityScore } ?: 0.0
-        val macro = macroCandidates(studentModel, report, ceiling)
-
-        val ranked = (conceptLevel + macro)
-            .sortedByDescending { it.priorityScore }
-            .take(MAX_CANDIDATES)
-
-        return DecisionReport(
-            studentId = studentModel.studentId,
-            examType = report.examType,
-            generatedAt = System.currentTimeMillis(),
-            candidates = ranked
-        )
-    }
-
-    /**
-     * [LearningInterventionIntent.START_DIAGNOSTIC] candidates — one per weak
-     * prerequisite the student has never independently attempted (no entry in
-     * [StudentModel.concepts] at all). A prerequisite the student HAS attempted
-     * already has its own [ScoreGainEstimator] ranking and belongs to
-     * [conceptCandidates] as an ordinary [LearningInterventionIntent.REPAIR_CONCEPT]
-     * — diagnosing something already directly evidenced would just repeat work
-     * [ScoreGainEstimator] already did. `priorityScore` sums the
-     * [PerformanceAnalyzer.TopicImpact.marksAtStakeGap] of every downstream weak
-     * concept that traces back to this prerequisite (Blueprint §1.4's own
-     * "Rolling Motion failure traced back to a weak Laws of Motion prerequisite"
-     * example) — same unit as concept-level `expectedGain` in spirit (marks at
-     * stake), but NOT the same calculation (no time-cost division, no
-     * probability-of-improvement term — there's no attempt data yet to derive
-     * either from). Flagged per class doc as a first-pass approximation, not a
-     * true apples-to-apples comparison.
-     */
-    private fun diagnosticCandidates(
-        studentModel: StudentModel,
-        report: PerformanceAnalyzer.PerformanceReport
-    ): List<CandidateIntervention> {
-        val gapByConceptId = report.topicImpacts.associate { it.conceptId to it.marksAtStakeGap }
-        val downstreamGaps = mutableMapOf<String, MutableList<Double>>()
-        val refByPrereqId = mutableMapOf<String, com.checkmate.learning.model.PrerequisiteRef>()
-
-        for (issue in studentModel.weakPrerequisites) {
-            val downstreamGap = gapByConceptId[issue.conceptId] ?: 0.0
-            for (ref in issue.weakPrerequisites) {
-                if (studentModel.concepts.containsKey(ref.conceptId)) continue
-                downstreamGaps.getOrPut(ref.conceptId) { mutableListOf() }.add(downstreamGap)
-                refByPrereqId.putIfAbsent(ref.conceptId, ref)
-            }
-        }
-
-        return downstreamGaps.map { (prereqConceptId, gaps) ->
-            val ref = refByPrereqId.getValue(prereqConceptId)
-            val totalDownstreamValue = gaps.sum()
-            val label = ref.topic ?: ref.chapter ?: "this prerequisite"
-            CandidateIntervention(
-                intent = LearningInterventionIntent.START_DIAGNOSTIC,
-                conceptId = prereqConceptId,
-                subject = ref.subject,
-                chapter = ref.chapter,
-                topic = ref.topic,
-                durationMinutes = DIAGNOSTIC_MINUTES,
-                expectedGain = 0.0,
-                priorityScore = totalDownstreamValue,
-                rationale = "Untested prerequisite ($label) behind ${gaps.size} weak concept(s) worth " +
-                    "~%.1f marks — diagnose it before repairing those directly.".format(totalDownstreamValue)
-            )
-        }
-    }
-
-    /**
-     * One candidate per top-[CONCEPT_CANDIDATE_POOL] [ScoreGainEstimator] estimate
-     * with positive `expectedGain` — [classifyIntent] picks which of the six
-     * concept-scoped intents fits each concept's own mastery/retention/error
-     * signal shape (see that function's own doc), everything else about the
-     * candidate (`expectedGain`, `priorityScore`) is the estimate's own number,
-     * unmodified — this function decides WHICH action, [ScoreGainEstimator]
-     * already decided HOW MUCH it's worth.
-     */
-    private fun conceptCandidates(
-        studentModel: StudentModel,
-        estimates: List<ScoreGainEstimator.ScoreGainEstimate>
-    ): List<CandidateIntervention> {
-        val dominantErrorByConceptId = studentModel.unresolvedErrors
-            .groupBy { it.conceptId }
-            .mapValues { (_, patterns) -> patterns.maxByOrNull { it.occurrences }?.errorType }
-
-        return estimates
-            .filter { it.expectedGain > 0.0 }
-            .take(CONCEPT_CANDIDATE_POOL)
-            .mapNotNull { estimate ->
-                val snapshot = studentModel.concepts[estimate.conceptId] ?: return@mapNotNull null
-                val dominantError = dominantErrorByConceptId[estimate.conceptId]
-                val intent = classifyIntent(snapshot, dominantError)
-                CandidateIntervention(
-                    intent = intent,
-                    conceptId = estimate.conceptId,
-                    subject = estimate.subject,
-                    chapter = estimate.chapter,
-                    topic = estimate.topic,
-                    durationMinutes = durationFor(intent, estimate),
-                    expectedGain = estimate.expectedGain,
-                    priorityScore = estimate.expectedGain,
-                    rationale = rationaleFor(intent, estimate, snapshot, dominantError)
-                )
-            }
-    }
-
-    /**
-     * Six-way split over a concept's own already-derived signals — no new
-     * heuristic invented, every branch reuses a decision another engine already
-     * made:
-     * - [RetentionDecisionSnapshot.REVIEW] at high mastery (something once known,
-     *   now at risk — [com.checkmate.learning.engine.RetentionEngine]'s own
-     *   truth table) -> [LearningInterventionIntent.SCHEDULE_RETENTION_TEST], not
-     *   a full repair — it doesn't need re-teaching, it needs a recall check.
-     * - High mastery with a dominant CARELESS/TIME_PRESSURE error (the two error
-     *   types [com.checkmate.learning.engine.ErrorEngine]'s current heuristic can
-     *   actually distinguish) -> [LearningInterventionIntent.INCREASE_DIFFICULTY]:
-     *   the knowledge is there, the failure mode is pace/attention under the
-     *   current difficulty tier, not the concept itself.
-     * - Heavy, high-rate errors (see [REDUCE_DIFFICULTY_ERROR_RATE]) at low
-     *   mastery -> [LearningInterventionIntent.REDUCE_DIFFICULTY]: nearly every
-     *   attempt is failing, which reads as "this tier is currently miscalibrated
-     *   for this student," not just "needs more repair time at the same level."
-     * - Everything else weak -> [LearningInterventionIntent.REPAIR_CONCEPT], the
-     *   default and by far the most common outcome.
-     */
-    private fun classifyIntent(
-        snapshot: ConceptSnapshot,
-        dominantError: String?
-    ): LearningInterventionIntent {
-        val errorRate = if (snapshot.attemptCount > 0) {
-            snapshot.errorCount.toDouble() / snapshot.attemptCount
-        } else {
-            0.0
-        }
-        return when {
-            snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW &&
-                snapshot.mastery >= HIGH_MASTERY_THRESHOLD ->
-                LearningInterventionIntent.SCHEDULE_RETENTION_TEST
-
-            snapshot.mastery >= HIGH_MASTERY_THRESHOLD &&
-                (dominantError == "CARELESS" || dominantError == "TIME_PRESSURE") ->
-                LearningInterventionIntent.INCREASE_DIFFICULTY
-
-            snapshot.errorCount >= ERROR_HEAVY_THRESHOLD &&
-                errorRate >= REDUCE_DIFFICULTY_ERROR_RATE &&
-                snapshot.mastery < HIGH_MASTERY_THRESHOLD ->
-                LearningInterventionIntent.REDUCE_DIFFICULTY
-
-            else -> LearningInterventionIntent.REPAIR_CONCEPT
-        }
-    }
-
-    private fun durationFor(
-        intent: LearningInterventionIntent,
-        estimate: ScoreGainEstimator.ScoreGainEstimate
-    ): Int = when (intent) {
-        LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> RETENTION_TEST_MINUTES
-        else -> estimate.timeCostMinutes.toInt()
-    }
-
-    private fun rationaleFor(
-        intent: LearningInterventionIntent,
-        estimate: ScoreGainEstimator.ScoreGainEstimate,
-        snapshot: ConceptSnapshot,
-        dominantError: String?
-    ): String {
-        val label = estimate.topic ?: estimate.chapter ?: "this concept"
-        return when (intent) {
-            LearningInterventionIntent.SCHEDULE_RETENTION_TEST ->
-                "$label is well-mastered (%.0f%%) but at forgetting risk — a short recall check, not a re-teach."
-                    .format(snapshot.mastery * 100)
-            LearningInterventionIntent.INCREASE_DIFFICULTY ->
-                "$label is well-mastered (%.0f%%) but errors skew $dominantError — push harder practice to convert accuracy under pressure."
-                    .format(snapshot.mastery * 100)
-            LearningInterventionIntent.REDUCE_DIFFICULTY ->
-                "$label: ${snapshot.errorCount} errors across ${snapshot.attemptCount} attempts at %.0f%% mastery — current difficulty tier looks miscalibrated; step down before more repair time."
-                    .format(snapshot.mastery * 100)
-            else ->
-                "$label at %.0f%% mastery, ~%.1f marks still at stake.".format(snapshot.mastery * 100, estimate.marksAtStake)
-        }
-    }
-
-    /**
-     * Collapses [LearningInterventionIntent.REPAIR_CONCEPT] candidates sharing a
-     * (subject, chapter) into one [LearningInterventionIntent.ASSIGN_TARGETED_SET]
-     * once there are at least [MIN_TOPICS_FOR_TARGETED_SET] of them — every other
-     * intent passes through untouched, since collapsing a
-     * [LearningInterventionIntent.SCHEDULE_RETENTION_TEST] or
-     * [LearningInterventionIntent.REDUCE_DIFFICULTY] into a generic practice set
-     * would lose exactly the distinction [classifyIntent] just made. The
-     * collapsed candidate's `expectedGain`/`priorityScore` sum the group's own
-     * (already-real) numbers — not re-estimated — and `durationMinutes` sums the
-     * group's own time costs, capped at [MAX_TARGETED_SET_MINUTES] so one chapter
-     * with many weak topics doesn't imply an unrealistically long single session.
-     */
-    private fun collapseIntoTargetedSets(candidates: List<CandidateIntervention>): List<CandidateIntervention> {
-        val repairable = candidates.filter { it.intent == LearningInterventionIntent.REPAIR_CONCEPT }
-        val rest = candidates.filter { it.intent != LearningInterventionIntent.REPAIR_CONCEPT }
-        val groups = repairable.groupBy { it.subject to it.chapter }
-
-        val kept = mutableListOf<CandidateIntervention>()
-        val collapsed = mutableListOf<CandidateIntervention>()
-
-        for ((key, group) in groups) {
-            if (group.size >= MIN_TOPICS_FOR_TARGETED_SET) {
-                val totalGain = group.sumOf { it.expectedGain }
-                val totalMinutes = group.sumOf { it.durationMinutes }.coerceAtMost(MAX_TARGETED_SET_MINUTES)
-                val label = key.second ?: key.first ?: "this chapter"
-                collapsed += CandidateIntervention(
-                    intent = LearningInterventionIntent.ASSIGN_TARGETED_SET,
-                    conceptId = null,
-                    subject = key.first,
-                    chapter = key.second,
-                    topic = null,
-                    durationMinutes = totalMinutes,
-                    expectedGain = totalGain,
-                    priorityScore = totalGain,
-                    rationale = "${group.size} weak topics in $label — one mixed practice set covers them " +
-                        "together instead of ${group.size} separate repair sessions."
-                )
-            } else {
-                kept += group
-            }
-        }
-
-        return kept + collapsed + rest
-    }
-
-    /**
-     * Whole-student candidates that aren't about any single concept —
-     * [LearningInterventionIntent.START_MOCK] when the entire report is running on
-     * too few attempts to trust ([THIN_DATA_ATTEMPT_THRESHOLD]), and
-     * [LearningInterventionIntent.REPLAN_DAY] when recent accuracy is genuinely
-     * declining ([PerformanceAnalyzer.PerformanceTrend.DECLINING] — not merely
-     * stable-but-imperfect). Both conditions can fire in the same report. Neither
-     * has a natural per-session mark rate the way concept-level candidates do
-     * (see class doc's HONEST GAP note), so `priorityScore` is scaled relative to
-     * `conceptCeiling` — the strongest concept-level candidate's own priority in
-     * this same report — floored at [MIN_MACRO_PRIORITY_SHARE] of it so a macro
-     * candidate can never be silently sorted to the bottom by being on the wrong
-     * numeric scale, but also never guaranteed to outrank a genuinely strong
-     * concept-level opportunity just for existing.
-     */
-    private fun macroCandidates(
-        studentModel: StudentModel,
-        report: PerformanceAnalyzer.PerformanceReport,
-        conceptCeiling: Double
-    ): List<CandidateIntervention> {
-        val floor = (conceptCeiling * MIN_MACRO_PRIORITY_SHARE).coerceAtLeast(1.0)
-        val out = mutableListOf<CandidateIntervention>()
-
-        if (studentModel.overall.totalAttempts < THIN_DATA_ATTEMPT_THRESHOLD) {
-            out += CandidateIntervention(
-                intent = LearningInterventionIntent.START_MOCK,
-                conceptId = null,
-                subject = null,
-                chapter = null,
-                topic = null,
-                durationMinutes = MOCK_MINUTES,
-                expectedGain = 0.0,
-                priorityScore = floor,
-                rationale = "Only ${studentModel.overall.totalAttempts} attempts tracked so far — every " +
-                    "estimate above is running on thin evidence. A fresh mock generates more real signal " +
-                    "than another guess at what to repair."
-            )
-        }
-
-        if (report.overallTrend == PerformanceAnalyzer.PerformanceTrend.DECLINING) {
-            val severity = (-report.overallTrendDelta).coerceIn(0.0, 1.0)
-            out += CandidateIntervention(
-                intent = LearningInterventionIntent.REPLAN_DAY,
-                conceptId = null,
-                subject = null,
-                chapter = null,
-                topic = null,
-                durationMinutes = 0,
-                expectedGain = 0.0,
-                priorityScore = (conceptCeiling * severity).coerceAtLeast(floor),
-                rationale = "Recent accuracy is trending down (%.0f%% below your overall average) — the " +
-                    "current plan itself may need restructuring, not just more of the same sessions."
-                    .format(severity * 100)
-            )
-        }
-
-        return out
-    }
-}
-
-
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LearningDecisionEngineTest.kt =====
-package com.checkmate.learning.engine
-
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.ErrorPatternSnapshot
-import com.checkmate.learning.model.OverallLearningState
-import com.checkmate.learning.model.PrerequisiteIssue
-import com.checkmate.learning.model.PrerequisiteRef
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class LearningDecisionEngineTest {
-
-    // Same fixture shape as ScorePredictorTest/ScoreGainEstimatorTest, reused
-    // deliberately so this test can only fail on LearningDecisionEngine's own
-    // classification/ranking logic, not a fresh weightage-resolution question.
-    private fun concept(
-        id: String,
-        subject: String?,
-        chapter: String,
-        topic: String,
-        mastery: Double,
-        attemptCount: Int,
-        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
-        errorCount: Int = 0,
-        prerequisiteIssues: List<com.checkmate.learning.model.PrerequisiteRef> = emptyList()
-    ) = ConceptSnapshot(
-        conceptId = id,
-        exam = "NEET",
-        subject = subject,
-        chapter = chapter,
-        topic = topic,
-        mastery = mastery,
-        masteryConfidence = 0.0,
-        retentionDecision = retentionDecision,
-        forgettingRisk = 0.0,
-        attemptCount = attemptCount,
-        recentAccuracy = mastery,
-        lifetimeAccuracy = mastery,
-        errorCount = errorCount,
-        lastSeen = 1_000L,
-        prerequisiteIssues = prerequisiteIssues
-    )
-
-    private fun studentModel(
-        concepts: List<ConceptSnapshot>,
-        unresolvedErrors: List<ErrorPatternSnapshot> = emptyList(),
-        weakPrerequisites: List<PrerequisiteIssue> = emptyList()
-    ) = StudentModel(
-        studentId = "s1",
-        generatedAt = 1_000L,
-        overall = OverallLearningState(
-            conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= 0.75 },
-            conceptsWeak = concepts.count { it.mastery < 0.75 },
-            averageMastery = if (concepts.isEmpty()) 0.0 else concepts.map { it.mastery }.average(),
-            totalAttempts = concepts.sumOf { it.attemptCount },
-            unresolvedErrorCount = unresolvedErrors.sumOf { it.occurrences }
-        ),
-        concepts = concepts.associateBy { it.conceptId },
-        unresolvedErrors = unresolvedErrors,
-        weakPrerequisites = weakPrerequisites
-    )
-
-    // Padded with well-mastered filler concepts so overall.totalAttempts clears
-    // THIN_DATA_ATTEMPT_THRESHOLD when a test isn't specifically exercising the
-    // thin-data / START_MOCK path — keeps that path's own test the only one
-    // where it's expected to fire.
-    private fun filler(count: Int = 3) = (1..count).map {
-        concept(
-            id = "filler-$it", subject = "Physics", chapter = "Filler $it", topic = "Filler $it",
-            mastery = 0.95, attemptCount = 10
-        )
-    }
-
-    @Test
-    fun `ranks a clear weak concept as REPAIR_CONCEPT with the estimator's own expectedGain`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-weak", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                mastery = 0.1, attemptCount = 10
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val top = report.candidates.first()
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, top.intent)
-        assertEquals("c-weak", top.conceptId)
-        assertTrue(top.expectedGain > 0.0)
-        assertEquals(top.expectedGain, top.priorityScore, 0.0001)
-    }
-
-    @Test
-    fun `high mastery plus REVIEW retention becomes a retention test, not a full repair`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-review", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                mastery = 0.85, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.first { it.conceptId == "c-review" }
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, candidate.intent)
-        assertEquals(10, candidate.durationMinutes)
-    }
-
-    @Test
-    fun `high mastery with careless errors suggests increasing difficulty, not repair`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-careless", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                mastery = 0.85, attemptCount = 10, errorCount = 2
-            ),
-            unresolvedErrors = listOf(
-                ErrorPatternSnapshot(
-                    conceptId = "c-careless", errorType = "CARELESS", occurrences = 2,
-                    firstSeen = 100L, lastSeen = 900L
-                )
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.firstOrNull { it.conceptId == "c-careless" }
-
-        assertTrue(candidate != null)
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY, candidate!!.intent)
-    }
-
-    @Test
-    fun `heavy high-rate errors at low mastery suggest reducing difficulty`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-mismatch", subject = "Chemistry", chapter = "Chemical Bonding", topic = "Chemical Bonding",
-                mastery = 0.15, attemptCount = 10, errorCount = 7
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.first { it.conceptId == "c-mismatch" }
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY, candidate.intent)
-    }
-
-    @Test
-    fun `an untested prerequisite becomes a diagnostic, an already-attempted one does not`() {
-        val untested = PrerequisiteRef(
-            conceptId = "prereq-untested", subject = "Physics", chapter = "Kinematics", topic = "Kinematics"
-        )
-        val attempted = PrerequisiteRef(
-            conceptId = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors"
-        )
-        val model = studentModel(
-            filler() + concept(
-                id = "c-downstream", subject = "Physics", chapter = "Rolling Motion", topic = "Rolling Motion",
-                mastery = 0.2, attemptCount = 8
-            ) + concept(
-                id = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors",
-                mastery = 0.3, attemptCount = 5
-            ),
-            weakPrerequisites = listOf(
-                PrerequisiteIssue(conceptId = "c-downstream", weakPrerequisites = listOf(untested, attempted))
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(report.candidates.any {
-            it.conceptId == "prereq-untested" &&
-                it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC
-        })
-        assertTrue(report.candidates.none { it.conceptId == "prereq-attempted" && it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC })
-    }
-
-    @Test
-    fun `thin overall attempt data surfaces START_MOCK among the candidates`() {
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-thin", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                    mastery = 0.2, attemptCount = 3
-                )
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(model.overall.totalAttempts < 20)
-        assertTrue(report.candidates.any { it.intent == LearningDecisionEngine.LearningInterventionIntent.START_MOCK })
-    }
-
-    @Test
-    fun `three or more weak topics in one chapter collapse into one targeted set`() {
-        // "Human Physiology" resolves via ConceptWeightage's exact (exam, subject,
-        // chapter) tier since subject is provided directly — same fixture chapter
-        // ScorePredictorTest already relies on for a real, non-zero weightage.
-        val model = studentModel(
-            filler() + listOf(
-                concept(id = "c1", subject = "Biology", chapter = "Human Physiology", topic = "Excretion", mastery = 0.2, attemptCount = 6),
-                concept(id = "c2", subject = "Biology", chapter = "Human Physiology", topic = "Circulation", mastery = 0.25, attemptCount = 6),
-                concept(id = "c3", subject = "Biology", chapter = "Human Physiology", topic = "Neural Control", mastery = 0.15, attemptCount = 6)
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        val targetedSets = report.candidates.filter {
-            it.intent == LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET && it.chapter == "Human Physiology"
-        }
-        assertEquals(1, targetedSets.size)
-        assertTrue(report.candidates.none { it.chapter == "Human Physiology" && it.intent == LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT })
-    }
-
-    @Test
-    fun `every candidate list is capped and sorted by priority descending`() {
-        // Eight distinct, real, resolvable chapters (none repeated, so nothing
-        // collapses into a targeted set) — enough weak concepts to force the
-        // MAX_CANDIDATES cap to actually bind.
-        val chapters = listOf(
-            "Biology" to "Human Physiology",
-            "Physics" to "Laws of Motion",
-            "Physics" to "Kinematics",
-            "Chemistry" to "Chemical Bonding",
-            "Biology" to "Ecology And Environment",
-            "Physics" to "Vectors and 3D",
-            "Chemistry" to "Coordination Compounds",
-            "Biology" to "Biodiversity"
-        )
-        val model = studentModel(
-            chapters.mapIndexed { i, (subject, chapter) ->
-                concept(
-                    id = "c-many-$i", subject = subject, chapter = chapter, topic = chapter,
-                    mastery = 0.1 + i * 0.02, attemptCount = 8
-                )
-            }
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(report.candidates.isNotEmpty())
-        assertTrue(report.candidates.size <= 5)
-        val scores = report.candidates.map { it.priorityScore }
-        assertEquals(scores.sortedDescending(), scores)
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsViewModel.kt =====
-package com.checkmate.ui.testresults
-
-import android.content.Context
-import android.net.Uri
-import android.util.Log
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.learning.analytics.PerformanceAnalyzer
-import com.checkmate.learning.analytics.ScoreGainEstimator
-import com.checkmate.learning.analytics.ScorePredictor
-import com.checkmate.learning.engine.LearningDecisionEngine
-import com.checkmate.learning.student.StudentModelBuilder
-import com.checkmate.learning.testmate.TestResultNormalizer
-import com.checkmate.testmate.TestmateApi
-import com.checkmate.testmate.TestmateResult
-import kotlinx.coroutines.Dispatchers
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/model/StudyTask.kt =====
+package com.checkmate.planner.model
+
+import kotlinx.serialization.Serializable
+
+enum class TaskState { PENDING, ACTIVE, PAUSED, DONE, SKIPPED }
+
+// Mentor v2 (spec 2.1): task-type dimension, separate from free-text topic.
+// Lets BehaviorLedger detect patterns like "skips PRACTICE specifically in
+// Physics" instead of only an aggregate skip rate across all task types.
+enum class TaskType { LECTURE, PRACTICE, REVISION, READING, OTHER }
+
+@Serializable
+data class StudyTask(
+    val id:              String     = java.util.UUID.randomUUID().toString(),
+    val subject:         String,
+    val topic:           String,
+    val durationMinutes: Int,
+    val priority:        Int        = 1,
+    val scheduledAt:     Long       = System.currentTimeMillis(),
+    val state:           TaskState  = TaskState.PENDING,
+    val completedAt:     Long?      = null,
+    val focusMinutes:    Int        = 0,
+    val checksPassed:    Int        = 0,
+    val checksMissed:    Int        = 0,
+    // ── Pause/Resume fields (Blueprint 2.1) ──
+    val pausedAt:        Long?      = null,   // epoch ms when task was paused
+    val totalPausedMs:   Long       = 0L,     // accumulated pause time across all pauses
+    val actualMinutes:   Int        = 0,      // real focus time excluding paused periods
+    // ── Blueprint 2.6: pause count per session, feeds Stats "pause rate" ──
+    val pauseCount:       Int       = 0,      // incremented once per pause -> resume cycle (PlanStore.pauseTask)
+    // ── Manual task tracking ──
+    val isCustom:        Boolean    = false,  // true only for tasks added via HomeViewModel.addCustomTask;
+                                               // gates the duration-edit affordance in HomeScreen
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+    val intentionText:   String     = "",     // free-text answer to "What will you study?" (pre-session)
+    val completedStatus: String?    = null,   // "YES" | "PARTIAL" | "NO" — self-report from "Did you finish it?" (post-session)
+    // ── Mentor v2: skip-pattern granularity (spec 2.1) ──
+    val taskType:        TaskType   = TaskType.OTHER, // LECTURE / PRACTICE / REVISION / READING — defaults to OTHER
+                                                        // for existing/rule-based tasks that don't set it explicitly.
+                                                        // AdaptivePlanner.tryLlmPlan() maps sessionType (LEARN/REVISE/
+                                                        // PRACTICE/TEST_PREP) onto this — see its toStudyTask() mapper
+                                                        // (Upgrade Blueprint Phase 0 item #1, "fix planner information
+                                                        // loss" — this mapping used to be silently dropped entirely).
+    // Upgrade Blueprint Phase 0 item #1: the LLM's plan JSON already includes a "reason"
+    // per task (see tryLlmPlan's systemPrompt — "reason must be specific: mention PYQ %,
+    // coaching test dates, weak topic flags"), but nothing ever kept it past parsing. Blank
+    // for rule-based tasks, which have no free-text reasoning to preserve — only a numeric
+    // priority ranking.
+    val rationale:       String     = "",
+    // ── Blueprint 4.2: Smart Scheduling ──
+    val scheduledStartTime: String? = null,   // "HH:mm" 24h clock time this task is slotted into today's
+                                               // free time (computed by AdaptivePlanner from
+                                               // ConsultationProfile.blockedSlots — see FreeSlotCalculator).
+                                               // Null means the planner couldn't fit it into a free slot
+                                               // (e.g. total plan exceeds available time) — HomeScreen's
+                                               // timeline view falls back to an "Unscheduled" section for these.
+    // ── Upgrade Blueprint Phase 2.4/2.5 (P0a): learning provenance + concept linkage ──
+    // Populated only for tasks created via TaskMutator.createTask() from a
+    // LearningDecisionEngine.CandidateIntervention (see LearningInterventionMapper). Null/empty
+    // for every existing task path (AdaptivePlanner-generated, HomeViewModel custom tasks) —
+    // this is additive, nothing upstream of this pass needs to set these fields.
+    //
+    // learningIntent stores LearningDecisionEngine.LearningInterventionIntent.name rather than
+    // the enum type itself, so :modules:planner's model layer doesn't take a compile-time
+    // dependency on :modules:learning's engine package for a single field — the intent is
+    // already a closed, versioned string vocabulary (Blueprint §2.4's 8-item taxonomy) that
+    // LearningInterventionMapper/PolicyValidator are the only things that need to interpret.
+    val learningIntent:  String?     = null,  // e.g. "REPAIR_CONCEPT" — null for non-learning-engine tasks
+    val conceptId:       String?     = null,  // single concept this task targets (REPAIR_CONCEPT/START_DIAGNOSTIC)
+    val targetedConceptIds: List<String> = emptyList() // multiple concepts folded into one session (ASSIGN_TARGETED_SET)
+)
+
+@Serializable
+data class SubjectConfig(
+    val name:      String,
+    val weightage: Int = 1
+)
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
+package com.checkmate.planner
+
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
 
-private const val TAG = "TestResultsViewModel"
-
-data class TestResultsState(
-    val sessionId: String = "",
-    val loading: Boolean = false,
-    val result: TestmateResult? = null,
-    val error: String? = null,
-    // ── Upgrade Blueprint wiring gap fix ──
-    // Phase 1 (MasteryEngine/ErrorEngine/RetentionEngine/KnowledgeGraph/
-    // TestResultNormalizer) was fully built but nothing ever called
-    // TestResultNormalizer — TestmateApi's /results endpoint only returns
-    // chapter/topic aggregates, never per-question detail, so there was no
-    // data shape TestResultNormalizer could consume. Rather than add a new
-    // testmate2.com endpoint, this reuses the report.md TestResultNormalizer
-    // already parses (TestReportParser) via a manual file picker (see
-    // TestResultsScreen's "Import report.md" section) — the student downloads
-    // the report from TestmateWebScreen's WebView (already wired to
-    // DownloadManager) and picks it here. No backend change, no
-    // DownloadManager-watching/polling, no push/pull sync layer to maintain
-    // across app updates — just a Storage Access Framework file read.
-    val importing: Boolean = false,
-    val importResult: TestResultNormalizer.NormalizeResult? = null,
-    val importError: String? = null,
-    // ── Test-report wiring pass ──
-    // Closes normalizeAndPersist() -> StudentModelBuilder.build() ->
-    // PerformanceAnalyzer.analyze() -> PerformanceReport, the second half of the
-    // loop the import above only started. Deliberately separate loading/error
-    // state from importing/importError above: a successful import that commits
-    // to Room is real and final the moment importResult is set, regardless of
-    // whether analysis afterward succeeds — see importReport's own doc on why
-    // analysis failure never rolls back or hides importResult.
-    val analyzing: Boolean = false,
-    val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
-    val analysisError: String? = null,
-    // ── ScoreGainEstimator wiring pass ──
-    // Blueprint §2.2. Built from the SAME PerformanceReport + StudentModel this
-    // buildPerformanceReport call already produced — never recomputed
-    // separately, so this can never drift out of sync with performanceReport
-    // (same "one source of truth per Room read" discipline StudentModel's own
-    // doc requires). Ranked highest-expectedGain first; empty until analysis
-    // has run at least once. Kept as its own field (not folded into
-    // performanceReport) because it's a downstream DECISION-shaped view over
-    // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
-    // own class doc on that boundary.
-    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList(),
-    // ── ScorePredictor wiring pass ──
-    // Blueprint §2.3. Built from the SAME PerformanceReport + StudentModel as
-    // scoreGainEstimates above — never a separate StudentModelBuilder.build/
-    // PerformanceAnalyzer.analyze call, same "one Room read, three derived views"
-    // discipline. targetScore comes from ConsultationProfile (the Student Profile
-    // screen's own "Target Score" field), not invented here. Null until analysis
-    // has run at least once.
-    val expectedScore: ScorePredictor.ExpectedScore? = null,
-    // ── LearningDecisionEngine wiring pass (Blueprint §2.4) ──
-    // The frontier piece: everything above this line is EVIDENCE (PerformanceReport)
-    // or a DECISION-shaped ranking over one dimension at a time (scoreGainEstimates
-    // ranks by marks, expectedScore explains a gap) — this is the first field that's
-    // an actual ranked, typed ACTION ("what should this student do next"), built
-    // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
-    // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
-    // read, N derived views" doc). Null until analysis has run at least once.
-    val decisionReport: LearningDecisionEngine.DecisionReport? = null
+// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
+// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
+// excluded — see StudyTask.actualMinutes) across today's completed sessions.
+// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
+// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
+// no pause behavior to measure), so a fatigue/distraction trend is visible
+// even on a day with zero completions.
+data class PauseStats(
+    val actualFocusMinutesToday: Int   = 0,
+    val avgPausesPerSession:     Float = 0f,
+    val pauseRatePercent:        Int   = 0
 )
 
-class TestResultsViewModel : ViewModel() {
-    private val _state = MutableStateFlow(TestResultsState())
-    val state: StateFlow<TestResultsState> = _state.asStateFlow()
+object PlanStore {
 
-    fun onSessionIdChange(value: String) {
-        _state.update { it.copy(sessionId = value, error = null) }
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
+    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
+
+    init { reload() }
+
+    private fun reload() {
+        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
+        _todayTasks.value = saved?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
     }
 
-    fun fetch() {
-        val id = _state.value.sessionId
-        viewModelScope.launch {
-            _state.update { it.copy(loading = true, error = null) }
-            when (val outcome = TestmateApi.fetchResult(id)) {
-                is com.checkmate.testmate.TestmateResultOutcome.Success ->
-                    _state.update { it.copy(loading = false, result = outcome.result, error = null) }
-                is com.checkmate.testmate.TestmateResultOutcome.Error ->
-                    _state.update { it.copy(loading = false, error = outcome.message) }
-            }
+    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
+
+    /**
+     * Appends a single manually-created task to today's plan WITHOUT touching any
+     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
+     * the whole list, this is additive — safe to call any time, any number of times.
+     * The new task goes through the exact same StudyTask model as AdaptivePlanner
+     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
+     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
+     * code path needed anywhere downstream.
+     */
+    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — appends a single LearningDecisionEngine-
+     * originated task to today's plan. Same additive semantics as [addCustomTask]
+     * (existing tasks, generated or custom, are untouched); kept as its own entry point
+     * rather than reusing addCustomTask() so a StudyTask's provenance is never ambiguous:
+     * addCustomTask() is what HomeViewModel calls for a student-typed task (isCustom=true),
+     * this is what [com.checkmate.planner.intervention.TaskMutator.createTask] calls for a
+     * task whose shape and content came from a validated [com.checkmate.planner.intervention.CreateTaskRequest]
+     * (isCustom stays false — learningIntent/conceptId/targetedConceptIds carry the
+     * provenance instead, see StudyTask's doc on those fields).
+     *
+     * Caller is expected to have already run this through TaskEscrow + PolicyValidator —
+     * PlanStore itself has no opinion on validity, same as addCustomTask/saveTodayTasks.
+     */
+    fun createTask(task: StudyTask) = persist(_todayTasks.value + task)
+
+    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
+    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
+
+    /** Edits the planned duration of a single task — used for custom-task duration editing. */
+    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(durationMinutes = durationMinutes)
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
+     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
+     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
+     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
+     * fit it into today's free time, and this is how the student fixes that from HomeScreen
+     * without deleting and re-adding it.
+     */
+    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime)
+    }
+
+    /**
+     * Manually sets both scheduledStartTime AND durationMinutes for a task in a single
+     * write — backs the Timeline/List clock-icon's start+end time editor (see
+     * HomeViewModel.rescheduleTask / HomeScreen's ScheduleTaskDialog). Unlike calling
+     * updateTaskSchedule() and updateTaskDuration() separately, this goes through one
+     * persist() call so the two fields can never observably desync mid-update (e.g. a
+     * StateFlow collector seeing the new start time paired with the old duration for one
+     * frame).
+     */
+    fun updateTaskScheduleAndDuration(taskId: String, scheduledStartTime: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime, durationMinutes = durationMinutes)
+    }
+
+    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
+
+    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
+        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+    }
+
+    /**
+     * Blueprint 2.6: records the session's real focus time — as measured by
+     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
+     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
+     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
+     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
+     * clock)"). Previously neither field was ever written, so both stats silently
+     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
+     */
+    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
+        it.copy(focusMinutes = minutes, actualMinutes = minutes)
+    }
+
+    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
+    }
+
+    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
+        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
+    }
+
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+
+    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
+    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
+        it.copy(intentionText = intentionText)
+    }
+
+    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
+    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
+        it.copy(completedStatus = status)
+    }
+
+    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
+        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
+    }
+
+    /**
+     * Single write path for today's task list — every mutating function above funnels
+     * through this instead of duplicating the "encode + persist + update StateFlow"
+     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
+     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
+     * copy is newer, without PlanStore itself knowing anything about sync/network —
+     * this module stays local-storage-only, same as before.
+     */
+    private fun persist(tasks: List<StudyTask>) {
+        val key = todayKey()
+        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
+        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
+        _todayTasks.value = tasks
+    }
+
+    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
+    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
+
+    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
+     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
+    fun currentDayKey(): String = todayKey()
+
+    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
+
+    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
+    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
+
+    fun getTodayCompletionPercent(): Int {
+        val t = _todayTasks.value
+        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
+    }
+
+    fun getStreakDays(): Int {
+        var streak = 0
+        val cal = Calendar.getInstance()
+        for (i in 0..30) {
+            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
+            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
+            if (tasks.isEmpty() || tasks.none { it.state == TaskState.DONE }) break
+            streak++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return streak
+    }
+
+    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
+
+    /**
+     * Per-day study status used by the Stats consistency calendar and by
+     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
+     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
+     * neutral/unknown state, which is what silently reading everything as 0% used to do.
+     */
+    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
+
+    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
+    fun getDayStatus(cal: Calendar): DayStudyStatus {
+        val today = Calendar.getInstance()
+        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
+            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
+        if (isFuture) return DayStudyStatus.FUTURE
+
+        val tasks = loadDay(keyForDay(cal))
+        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
+        val done = tasks.count { it.state == TaskState.DONE }
+        return when {
+            done == tasks.size -> DayStudyStatus.COMPLETE
+            done > 0            -> DayStudyStatus.PARTIAL
+            else                 -> DayStudyStatus.MISSED
         }
     }
 
     /**
-     * Reads the picked report.md (or .txt — Testmate's export mime type varies by
-     * provider) via SAF, hands the raw text straight to
-     * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
-     * (or the "already imported" idempotency result) in [TestResultsState]. File
-     * I/O + normalization both happen off the main thread.
-     *
-     * Test-report wiring pass: once (and only once) normalizeAndPersist has
-     * actually committed — success or already-imported, both mean Room state is
-     * current — this chains into [buildPerformanceReport], closing
-     * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
-     * -> PerformanceReport -> ScoreGainEstimator.rankFromReport. The stages update
-     * state independently: `importResult` is set and `importing` flips false as
-     * soon as persistence succeeds, full stop; analysis (and the ranking built on
-     * top of it) runs after that as a separate concern, and if it fails, only
-     * `analysisError` is set — the already-committed import is never rolled back
-     * or hidden because a derived-view step afterward broke.
+     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
+     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
+     * dots per day, like a GitHub-style contribution grid).
      */
-    fun importReport(context: Context, uri: Uri) {
-        viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    importing = true, importError = null, importResult = null,
-                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                    expectedScore = null, decisionReport = null
-                )
-            }
-            try {
-                val text = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                } ?: throw IllegalStateException("Couldn't open the selected file.")
-
-                if (text.isBlank()) {
-                    _state.update {
-                        it.copy(importing = false, importError = "Selected file is empty.")
-                    }
-                    return@launch
-                }
-
-                val result = withContext(Dispatchers.IO) {
-                    TestResultNormalizer.normalizeAndPersist(context, text)
-                }
-                // Persistence has committed — this is final regardless of what
-                // buildPerformanceReport below does with it.
-                _state.update { it.copy(importing = false, importResult = result, importError = null) }
-                buildPerformanceReport(context, result.examType)
-            } catch (e: Exception) {
-                Log.e(TAG, "Report import failed: ${e.message}", e)
-                _state.update {
-                    it.copy(importing = false, importError = "Import failed: ${e.message ?: "unknown error"}")
-                }
-            }
+    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.YEAR, year)
+        cal.set(Calendar.MONTH, month)
+        cal.set(Calendar.DAY_OF_MONTH, 1)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val result = LinkedHashMap<Int, DayStudyStatus>()
+        for (d in 1..daysInMonth) {
+            cal.set(Calendar.DAY_OF_MONTH, d)
+            result[d] = getDayStatus(cal)
         }
+        return result
     }
 
     /**
-     * Runs after a committed import (fresh or already-imported — both mean Room
-     * reflects this test). Reads current Room state fresh via
-     * [StudentModelBuilder.build] rather than anything cached from the import
-     * step, per [com.checkmate.learning.model.StudentModel]'s own "never hold a
-     * built StudentModel across a Room write" rule. `examType` comes straight from
-     * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
-     * guesses an exam identifier itself.
-     *
-     * ScoreGainEstimator wiring pass: [ScoreGainEstimator.rankFromReport] runs
-     * against the SAME `studentModel`/`report` this function just built — not a
-     * second `StudentModelBuilder.build`/`PerformanceAnalyzer.analyze` call — so
-     * `scoreGainEstimates` can never reflect a different Room snapshot than
-     * `performanceReport` does. Both are set together in one state update.
-     *
-     * ScorePredictor wiring pass (Blueprint §2.3): [ScorePredictor.predictFromReport]
-     * runs against that same `studentModel`/`report` too — third derived view over
-     * one Room read, same discipline as the ScoreGainEstimator call right above it.
-     * `targetScore` comes from [ConsultationProfile.load] (the Student Profile
-     * screen's own field, defaults to 650 if never set) — read fresh here, not
-     * cached, so a target the student just edited is reflected on the very next
-     * analysis run.
-     *
-     * LearningDecisionEngine wiring pass (Blueprint §2.4): [LearningDecisionEngine.decideFromReport]
-     * runs against the SAME `report`/`studentModel`/`estimates`/`expectedScore` this
-     * call already built — fourth derived view over one Room read, same "never
-     * recompute what's already in hand" discipline as the two calls above it.
-     *
-     * Launched as its own coroutine (not inline in importReport's try block) so an
-     * analysis failure can only ever set [TestResultsState.analysisError] — it has
-     * no path back to importReport's own try/catch and can't turn a successful
-     * import into a failed one.
+     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
+     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
+     * lets the app actually notice "the student hasn't studied in N days" instead of that
+     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
+     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
+     * guardian once this crosses a threshold.
      */
-    private fun buildPerformanceReport(context: Context, examType: String?) {
-        if (examType == null) {
-            _state.update {
-                it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
-            }
-            return
+    fun getConsecutiveMissedDays(): Int {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -1)
+        var missed = 0
+        for (i in 0 until 60) {
+            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
+            missed++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
         }
-        viewModelScope.launch {
-            _state.update { it.copy(analyzing = true, analysisError = null) }
-            try {
-                val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
-                val report = PerformanceAnalyzer.analyze(studentModel, examType)
-                val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
-                val targetScore = ConsultationProfile.load().targetScore
-                val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
-                val decisionReport = LearningDecisionEngine.decideFromReport(
-                    report, studentModel, estimates, expectedScore
-                )
-                _state.update {
-                    it.copy(
-                        analyzing = false, performanceReport = report,
-                        scoreGainEstimates = estimates, expectedScore = expectedScore,
-                        decisionReport = decisionReport
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Performance analysis failed: ${e.message}", e)
-                _state.update {
-                    it.copy(
-                        analyzing = false,
-                        analysisError = "Couldn't build performance report: ${e.message ?: "unknown error"}"
-                    )
-                }
-            }
-        }
+        return missed
     }
 
-    fun dismissImportResult() {
-        _state.update {
-            it.copy(
-                importResult = null, importError = null,
-                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                expectedScore = null, decisionReport = null
-            )
+    fun getWeekCompletionPercent(): Int {
+        val cal = Calendar.getInstance(); var total = 0; var done = 0
+        repeat(7) {
+            val tasks = loadDay(keyForDay(cal))
+            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
         }
+        return if (total == 0) 0 else done * 100 / total
+    }
+
+    fun getWeeklyData(): List<Pair<String, Int>> {
+        val cal = Calendar.getInstance()
+        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
+        val result = mutableListOf<Pair<String, Int>>()
+        repeat(7) { i ->
+            val tasks = loadDay(keyForDay(cal))
+            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
+            result.add(0, Pair(days[6 - i], pct))
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return result
+    }
+
+    fun getSubjectStats(): List<Pair<String, Int>> =
+        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
+            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
+        }
+
+    /** Blueprint 2.6 — see PauseStats doc above. */
+    fun getPauseStats(): PauseStats {
+        val actualFocusToday = _todayTasks.value
+            .filter { it.state == TaskState.DONE }
+            .sumOf { it.actualMinutes }
+
+        val cal = Calendar.getInstance()
+        val weekSessions = mutableListOf<StudyTask>()
+        repeat(7) {
+            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+
+        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
+
+        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
+        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
+
+        return PauseStats(
+            actualFocusMinutesToday = actualFocusToday,
+            avgPausesPerSession     = avgPauses,
+            pauseRatePercent        = pauseRate
+        )
+    }
+
+    private fun loadDay(key: String): List<StudyTask> {
+        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
+        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
+    }
+
+    private fun todayKey() = keyForDay(Calendar.getInstance())
+    private fun keyForDay(cal: Calendar) =
+        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/CreateTaskRequest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.TaskType
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — the missing request shape in:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ *
+ * Untrusted the same way [LlmIntent] is treated as untrusted — [LearningInterventionMapper]
+ * is deterministic, not an LLM, but [PolicyValidator.validateCreateTask] still gates every
+ * field before anything reaches [TaskMutator.createTask]. "AI recommends, code decides"
+ * still applies here: LearningDecisionEngine recommends, PolicyValidator decides.
+ *
+ * Deliberately a plain data class, not a [PermittedAction] case directly — the same
+ * request needs to survive both a validation failure (rejected, nothing created) and a
+ * successful validation (wrapped in [PermittedAction.CreateTask]), so it exists as its own
+ * type rather than being constructed only after validation passes.
+ */
+data class CreateTaskRequest(
+    val subject:            String,
+    val topic:               String,
+    val durationMinutes:     Int,
+    val taskType:            TaskType = TaskType.OTHER,
+    val priority:            Int      = 1,
+    val scheduledStartTime:  String?  = null,   // optional "HH:mm" 24h — most learning-engine
+                                                 // tasks are unscheduled and land in HomeScreen's
+                                                 // "Unscheduled" section, same as any other task
+                                                 // AdaptivePlanner couldn't fit into a free slot.
+    val rationale:           String   = "",
+    // P0a scope (per LearningDecisionEngine's own scoping note): only REPAIR_CONCEPT,
+    // START_DIAGNOSTIC, ASSIGN_TARGETED_SET are wired end-to-end. Stored as the enum's
+    // `.name` — see StudyTask.learningIntent's doc for why this stays a String here rather
+    // than importing LearningInterventionIntent's type into this request shape.
+    val learningIntent:      String?  = null,
+    val conceptId:           String?  = null,
+    val targetedConceptIds:  List<String> = emptyList()
+)
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionIntent.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Proactive Execution Engine — Step 1 (Blueprint Part One, §9-11).
+ *
+ * Structured LLM intents. The AI Mentor never mutates app state directly — it produces
+ * one of these, which [PolicyValidator] then validates into a [PermittedAction] (or
+ * rejects). This file intentionally keeps the intent schema narrow: there is no
+ * UNLOCK_DEVICE / DISABLE_GUARDIAN / REMOVE_WORKMODE case anywhere in
+ * [InterventionIntentType] — those aren't rejected by a rule, they're simply not
+ * representable. If raw LLM output claims one of those (or anything else outside this
+ * enum), [LlmIntent.parseIntentType] returns null and PolicyValidator treats it as
+ * unrecognized.
+ *
+ * Note (Upgrade Blueprint Phase 2.4/2.5, P0a): [PermittedAction.CreateTask] is
+ * deliberately NOT mirrored by a CREATE_TASK case here. This enum/[LlmIntent] pair is
+ * specifically the LLM-facing schema — CreateTask's source is
+ * [com.checkmate.planner.intervention.CreateTaskRequest], produced deterministically by
+ * LearningInterventionMapper from a LearningDecisionEngine.CandidateIntervention, and
+ * validated by a separate [PolicyValidator.validateCreateTask] entry point that never
+ * goes through [LlmIntent] at all. Adding CREATE_TASK here would let raw LLM output claim
+ * it too, which is exactly the "AI recommends, code decides" boundary this enum exists to
+ * keep closed — see LearningDecisionEngine's own doc on why task creation is scoped as
+ * "its own design pass with its own PolicyValidator rules, not an incidental addition to
+ * this one."
+ */
+enum class InterventionIntentType {
+    START_TASK,
+    REDUCE_DURATION,
+    RESCHEDULE_TASK,
+    KEEP_PLAN,
+    TAKE_SHORT_BREAK,
+    REQUEST_CLARIFICATION,
+    NO_ACTION,
+    REQUEST_GUARDIAN
+}
+
+/**
+ * Untrusted, LLM-produced. [parameters] holds the per-intent fields the LLM was asked to
+ * fill in — PolicyValidator looks up known keys per intent type and rejects anything it
+ * can't parse. Expected keys:
+ *   REDUCE_DURATION  -> "newDurationMinutes" (Int as String)
+ *   RESCHEDULE_TASK  -> "newScheduledStartTime" ("HH:mm", 24h)
+ *   TAKE_SHORT_BREAK -> "minutes" (Int as String) — also requires targetTaskId/state.task,
+ *                       same as every other task-scoped intent (see step 5 amendment: a
+ *                       break has to pause a specific task, so it can't be task-less).
+ *   all others       -> unused
+ */
+data class LlmIntent(
+    val speech: String,
+    val intentType: InterventionIntentType?,
+    val targetTaskId: String? = null,
+    val parameters: Map<String, String> = emptyMap()
+) {
+    companion object {
+        /** Maps a raw string from LLM JSON output onto the closed schema above, or null
+         *  if it doesn't match — including anything naming a protected action. */
+        fun parseIntentType(raw: String?): InterventionIntentType? =
+            raw?.let { r -> InterventionIntentType.entries.find { it.name == r.trim() } }
+    }
+}
+
+/** Snapshot of the state PolicyValidator needs. Assembled by the caller (Context
+ *  Builder, later) — PolicyValidator itself never touches Context/DB/network/clock APIs
+ *  beyond what's passed in here, so it stays a pure function for unit testing. */
+data class PolicyState(
+    val task: StudyTask?,
+    val nowMillis: Long = System.currentTimeMillis()
+)
+
+/** What the [PolicyValidator] permits the ActionExecutor to actually perform. Every case
+ *  here corresponds 1:1 to a deterministic, idempotent operation the Executor knows how
+ *  to run (Blueprint §13) — PermittedAction never carries anything the Executor can't
+ *  safely apply twice. */
+sealed class PermittedAction {
+    data class ReduceDuration(val taskId: String, val newDurationMinutes: Int) : PermittedAction()
+    data class RescheduleTask(val taskId: String, val newScheduledStartTime: String) : PermittedAction()
+    data class StartTask(val taskId: String) : PermittedAction()
+    /** Amended in step 5: needs taskId — pausing "something" isn't executable, pausing
+     *  a specific task is (PlanStore.pauseTask requires one). */
+    data class ShortBreak(val taskId: String, val minutes: Int) : PermittedAction()
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). [taskId] is generated by the caller (the
+     * intervention orchestrator, see LearningInterventionMapper's usage note) BEFORE
+     * validation — TaskEscrow.acquire() needs a key to lock on and ActionExecutor's
+     * idempotency check (§13) needs a stable id to re-check against, neither of which a
+     * not-yet-created task can supply on its own. [request] has already passed
+     * [PolicyValidator.validateCreateTask] by the time this exists — same invariant as
+     * every other PermittedAction case.
+     */
+    data class CreateTask(val taskId: String, val request: CreateTaskRequest) : PermittedAction()
+    object KeepPlan : PermittedAction()
+    object RequestClarification : PermittedAction()
+    object RequestGuardian : PermittedAction()
+    object NoAction : PermittedAction()
+}
+
+enum class RejectionReason {
+    UNRECOGNIZED_INTENT,
+    UNKNOWN_TASK_ID,
+    TASK_NOT_ACTIVE_STATE,
+    NEGATIVE_OR_ZERO_DURATION,
+    DURATION_TOO_SHORT,
+    DURATION_NOT_A_REDUCTION,
+    BREAK_TOO_LONG,
+    INVALID_RESCHEDULE_TIME,
+    MALFORMED_INTENT,
+    /** Upgrade Blueprint Phase 2.4/2.5 (P0a): a CreateTaskRequest named a
+     *  learningIntent outside this pass's scope (REPAIR_CONCEPT / START_DIAGNOSTIC /
+     *  ASSIGN_TARGETED_SET) — e.g. SCHEDULE_RETENTION_TEST, START_MOCK, REPLAN_DAY, or a
+     *  difficulty mutation. Rejected explicitly rather than silently creating a task
+     *  nobody has scoped a shape for yet — see LearningInterventionMapper's own doc. */
+    UNSUPPORTED_LEARNING_INTENT
+}
+
+sealed class PolicyResult {
+    data class Permitted(val action: PermittedAction) : PolicyResult()
+    data class Rejected(val reason: RejectionReason, val detail: String) : PolicyResult()
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/TaskMutator.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Proactive Execution Engine — Step 5 (Blueprint Part One, §13).
+ *
+ * Seam between [ActionExecutor] and PlanStore's real mutation surface. Exists purely so
+ * ActionExecutorTest can run as a plain JVM unit test against a fake, instead of needing
+ * PlanStore's actual CheckmatePrefs-backed (Android SharedPreferences) storage — same
+ * reasoning as InterventionTransactionDao/FakeInterventionTransactionDao in step 3.
+ * [PlanStoreTaskMutator] is the real production implementation, wired to the exact
+ * functions PlanStore already exposes — this interface deliberately adds no new
+ * capability PlanStore doesn't already have.
+ */
+interface TaskMutator {
+    fun findTask(taskId: String): StudyTask?
+
+    /** For a PENDING task. See [ActionExecutor] for why PAUSED uses [resumeTask] instead. */
+    fun startTask(taskId: String)
+
+    /** For a PAUSED task — preserves totalPausedMs accounting, unlike [startTask]. */
+    fun resumeTask(taskId: String, resumedAt: Long)
+
+    fun pauseTask(taskId: String, pausedAt: Long)
+
+    fun reduceDuration(taskId: String, newDurationMinutes: Int)
+
+    fun rescheduleTask(taskId: String, newScheduledStartTime: String)
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every function above, [taskId] does
+     * not yet identify an existing task — it's the caller-generated id [request] should be
+     * created under (see [PermittedAction.CreateTask]'s doc for why the id has to be
+     * generated before this is called, not by this function). Returns the created
+     * [StudyTask] so callers (currently just [ActionExecutor]) don't need a second
+     * [findTask] round-trip to get back what they just created.
+     */
+    fun createTask(taskId: String, request: CreateTaskRequest): StudyTask
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PlanStoreTaskMutator.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * Proactive Execution Engine — Step 5. Production [TaskMutator] — thin adapter over
+ * PlanStore's existing mutation functions. Adds no new PlanStore functions: START_TASK on
+ * a PENDING task maps to [PlanStore.setTaskActive], START_TASK on a PAUSED task maps to
+ * [PlanStore.resumeTask] instead, so totalPausedMs accounting stays correct — see
+ * [ActionExecutor] for why that distinction has to be made at execution time using live
+ * task state, not baked into the action at validation time.
+ *
+ * Not wired into app startup / DI anywhere yet — nothing constructs [ActionExecutor] with
+ * this in production code yet either. That wiring (and the Trigger Engine that would
+ * actually call ActionExecutor) is a later step.
+ */
+class PlanStoreTaskMutator : TaskMutator {
+
+    override fun findTask(taskId: String): StudyTask? =
+        PlanStore.todayTasks.value.find { it.id == taskId }
+
+    override fun startTask(taskId: String) {
+        PlanStore.setTaskActive(taskId)
+    }
+
+    override fun resumeTask(taskId: String, resumedAt: Long) {
+        PlanStore.resumeTask(taskId, resumedAt)
+    }
+
+    override fun pauseTask(taskId: String, pausedAt: Long) {
+        PlanStore.pauseTask(taskId, pausedAt)
+    }
+
+    override fun reduceDuration(taskId: String, newDurationMinutes: Int) {
+        PlanStore.updateTaskDuration(taskId, newDurationMinutes)
+    }
+
+    override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
+        PlanStore.updateTaskSchedule(taskId, newScheduledStartTime)
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Builds the actual [StudyTask] from a
+     * validated [CreateTaskRequest] — this is the one place a [CreateTaskRequest] becomes
+     * a real StudyTask; everything upstream (LearningInterventionMapper, PolicyValidator,
+     * TaskEscrow) only ever passes the request/id pair around. `isCustom` is deliberately
+     * left at its default `false` — see StudyTask.isCustom and PlanStore.createTask's own
+     * docs on why that flag stays reserved for HomeViewModel's student-typed tasks.
+     */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        PlanStore.createTask(task)
+        return task
     }
 }
 
 
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsScreen.kt =====
-package com.checkmate.ui.testresults
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PolicyValidator.kt =====
+package com.checkmate.planner.intervention
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavController
-import com.checkmate.learning.analytics.PerformanceAnalyzer
-import com.checkmate.learning.analytics.ScoreGainEstimator
-import com.checkmate.learning.analytics.ScorePredictor
-import com.checkmate.learning.analytics.SubjectScore
+import com.checkmate.planner.model.TaskState
+import java.time.Instant
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeParseException
+
+/**
+ * Proactive Execution Engine — Step 1 (Blueprint Part One, §10-11).
+ *
+ * "AI recommends. Code decides." PolicyValidator is the only thing standing between an
+ * LLM-produced [LlmIntent] and an actually-permitted mutation. It receives no Android
+ * Context, no network access, no LLM, no UI, no SharedPreferences — everything it needs
+ * comes in through [PolicyState]. That's deliberate: it makes this module trivially and
+ * aggressively unit-testable (see PolicyValidatorTest's policy test matrix), and it means
+ * the boundary that actually protects the app can be reasoned about and tested in
+ * isolation from everything else in the pipeline.
+ *
+ * PolicyValidator never talks the LLM out of anything — it either maps an intent onto a
+ * [PermittedAction] the deterministic ActionExecutor knows how to run, or it rejects it
+ * with a reason. There is no path from here to a protected action (device unlock,
+ * disabling the guardian, removing WorkMode) because no such action is representable in
+ * [InterventionIntentType] to begin with.
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [validateCreateTask] is a second, deliberately
+ * separate entry point alongside [validate] — a [CreateTaskRequest] comes from
+ * LearningInterventionMapper (deterministic, not an LLM), never from an [LlmIntent], so it
+ * doesn't belong inside the `when (type)` dispatch above. Same "code decides" principle,
+ * same [PolicyResult] shape, different input — see [CreateTaskRequest]'s own doc.
+ */
+object PolicyValidator {
+
+    /** Below this, a "reduced session" isn't meaningfully different from abandoning the
+     *  task — matches the blueprint's "no negative/degenerate durations" invariant. */
+    const val MIN_DURATION_MINUTES = 5
+
+    /** Blueprint §11 example: "15-minute break -> permitted, 4-hour break -> rejected."
+     *  Picked to comfortably permit that example while still capping well short of
+     *  a session-length break. */
+    const val MAX_BREAK_MINUTES = 30
+
+    /** P0a scope, per LearningDecisionEngine's own scoping note: SCHEDULE_RETENTION_TEST,
+     *  START_MOCK, REPLAN_DAY, and difficulty mutation are explicitly not wired to task
+     *  creation yet. A CreateTaskRequest naming any of those (or an unrecognized string)
+     *  is rejected rather than silently coerced into one of these three. */
+    val SUPPORTED_LEARNING_INTENTS = setOf("REPAIR_CONCEPT", "START_DIAGNOSTIC", "ASSIGN_TARGETED_SET")
+
+    private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
+
+    fun validate(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val type = intent.intentType
+            ?: return reject(RejectionReason.UNRECOGNIZED_INTENT, "intentType did not match the closed schema")
+
+        return when (type) {
+            InterventionIntentType.START_TASK          -> validateStartTask(state)
+            InterventionIntentType.REDUCE_DURATION      -> validateReduceDuration(intent, state)
+            InterventionIntentType.RESCHEDULE_TASK       -> validateRescheduleTask(intent, state)
+            // Amended in step 5: a break has to pause a specific task, so it now goes
+            // through the same task-presence/state checks as every other task-scoped
+            // intent instead of being validated in isolation.
+            InterventionIntentType.TAKE_SHORT_BREAK      -> validateShortBreak(intent, state)
+            InterventionIntentType.KEEP_PLAN             -> PolicyResult.Permitted(PermittedAction.KeepPlan)
+            InterventionIntentType.REQUEST_CLARIFICATION -> PolicyResult.Permitted(PermittedAction.RequestClarification)
+            InterventionIntentType.NO_ACTION             -> PolicyResult.Permitted(PermittedAction.NoAction)
+            // Escalation to a human guardian is never blocked by policy — see Blueprint §12:
+            // genuine emergencies route through the guardian override protocol, not AI judgment.
+            InterventionIntentType.REQUEST_GUARDIAN      -> PolicyResult.Permitted(PermittedAction.RequestGuardian)
+        }
+    }
+
+    private fun validateStartTask(state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.PAUSED) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, expected PENDING or PAUSED"
+            )
+        }
+        return PolicyResult.Permitted(PermittedAction.StartTask(task.id))
+    }
+
+    private fun validateReduceDuration(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, cannot reduce a task that isn't pending/active"
+            )
+        }
+
+        val raw = intent.parameters["newDurationMinutes"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newDurationMinutes")
+        val newDuration = raw.toIntOrNull()
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "newDurationMinutes '$raw' is not an integer")
+
+        if (newDuration <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "newDurationMinutes=$newDuration")
+        }
+        if (newDuration < MIN_DURATION_MINUTES) {
+            return reject(
+                RejectionReason.DURATION_TOO_SHORT,
+                "newDurationMinutes=$newDuration below minimum $MIN_DURATION_MINUTES"
+            )
+        }
+        if (newDuration >= task.durationMinutes) {
+            return reject(
+                RejectionReason.DURATION_NOT_A_REDUCTION,
+                "newDurationMinutes=$newDuration is not less than current ${task.durationMinutes}"
+            )
+        }
+        return PolicyResult.Permitted(PermittedAction.ReduceDuration(task.id, newDuration))
+    }
+
+    private fun validateRescheduleTask(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+
+        val raw = intent.parameters["newScheduledStartTime"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing newScheduledStartTime")
+        if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
+        }
+
+        val newTime = try {
+            LocalTime.parse(raw)
+        } catch (e: DateTimeParseException) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' failed to parse: ${e.message}")
+        }
+
+        val nowTime = Instant.ofEpochMilli(state.nowMillis).atZone(ZoneId.systemDefault()).toLocalTime()
+        if (!newTime.isAfter(nowTime)) {
+            return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not later than current time $nowTime")
+        }
+
+        return PolicyResult.Permitted(PermittedAction.RescheduleTask(task.id, raw))
+    }
+
+    private fun validateShortBreak(intent: LlmIntent, state: PolicyState): PolicyResult {
+        val task = state.task
+            ?: return reject(RejectionReason.UNKNOWN_TASK_ID, "no task in PolicyState")
+        if (task.state != TaskState.PENDING && task.state != TaskState.ACTIVE) {
+            return reject(
+                RejectionReason.TASK_NOT_ACTIVE_STATE,
+                "task ${task.id} is ${task.state}, cannot take a break on a task that isn't pending/active"
+            )
+        }
+
+        val raw = intent.parameters["minutes"]
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "missing minutes")
+        val minutes = raw.toIntOrNull()
+            ?: return reject(RejectionReason.MALFORMED_INTENT, "minutes '$raw' is not an integer")
+
+        if (minutes <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "minutes=$minutes")
+        }
+        if (minutes > MAX_BREAK_MINUTES) {
+            return reject(RejectionReason.BREAK_TOO_LONG, "minutes=$minutes exceeds max $MAX_BREAK_MINUTES")
+        }
+        return PolicyResult.Permitted(PermittedAction.ShortBreak(task.id, minutes))
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — validates a [CreateTaskRequest] (already
+     * paired with a caller-generated [taskId], same as every PermittedAction.CreateTask
+     * needs) into a [PermittedAction.CreateTask] or a rejection. There is no [PolicyState]
+     * parameter here: unlike every `validate*` above, there is no existing task whose live
+     * state could matter — the only state to validate against is the request's own fields.
+     */
+    fun validateCreateTask(taskId: String, request: CreateTaskRequest): PolicyResult {
+        if (request.subject.isBlank() || request.topic.isBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "CreateTaskRequest subject/topic must not be blank")
+        }
+
+        if (request.durationMinutes <= 0) {
+            return reject(RejectionReason.NEGATIVE_OR_ZERO_DURATION, "durationMinutes=${request.durationMinutes}")
+        }
+        if (request.durationMinutes < MIN_DURATION_MINUTES) {
+            return reject(
+                RejectionReason.DURATION_TOO_SHORT,
+                "durationMinutes=${request.durationMinutes} below minimum $MIN_DURATION_MINUTES"
+            )
+        }
+
+        val intent = request.learningIntent
+        if (intent != null && intent !in SUPPORTED_LEARNING_INTENTS) {
+            return reject(
+                RejectionReason.UNSUPPORTED_LEARNING_INTENT,
+                "learningIntent=$intent not yet wired for task creation " +
+                    "(P0a scope: REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET only)"
+            )
+        }
+
+        request.scheduledStartTime?.let { raw ->
+            if (!RESCHEDULE_TIME_REGEX.matches(raw)) {
+                return reject(RejectionReason.INVALID_RESCHEDULE_TIME, "'$raw' is not a valid HH:mm 24h time")
+            }
+        }
+
+        return PolicyResult.Permitted(PermittedAction.CreateTask(taskId, request))
+    }
+
+    private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/ActionExecutor.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.TaskState
+
+/**
+ * Proactive Execution Engine — Step 5 (Blueprint Part One, §13).
+ *
+ * "The Executor is the only component allowed to actually mutate application state."
+ * ActionExecutor takes a [PermittedAction] — something PolicyValidator already approved —
+ * and applies it through [TaskMutator], then resolves the owning [InterventionTransaction]
+ * via [TaskEscrow] so escrow is always released exactly once execution is done, success or
+ * failure. LLM, voice, and the Trigger Engine are not wired to this yet — nothing calls
+ * ActionExecutor from production code in this step.
+ *
+ * Idempotency (§13: "the application should not create two sessions or mutate the plan
+ * twice") has two layers here:
+ *  1. Primary guard — [execute] first checks whether [transactionId]'s transaction is
+ *     already terminal. A duplicate delivery of an already-resolved transaction is a
+ *     cheap no-op ([ExecutionOutcome.TransactionAlreadyResolved]) before any mutation is
+ *     attempted at all.
+ *  2. Defensive guard — each `applyX` function re-reads the *live* task via [TaskMutator]
+ *     and compares against what the action would produce, rather than trusting that the
+ *     [PolicyState] snapshot PolicyValidator validated against is still current. This is
+ *     also what makes START_TASK correct for a task that's since become PAUSED vs. still
+ *     PENDING: PolicyValidator permits START_TASK for either, but only ActionExecutor,
+ *     looking at the live task right before mutating, knows whether that means
+ *     [TaskMutator.startTask] or [TaskMutator.resumeTask].
+ *
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a): [PermittedAction.CreateTask] follows the same
+ * defensive-guard shape as everything else — [applyCreateTask] re-reads [TaskMutator]
+ * for the pre-generated [PermittedAction.CreateTask.taskId] right before creating, so a
+ * duplicate transaction delivery (the exact scenario the class doc above is about) finds
+ * the task already there and returns [ExecutionOutcome.NoOpAlreadyApplied] instead of a
+ * second StudyTask.
+ */
+class ActionExecutor(
+    private val transactionDao: InterventionTransactionDao,
+    private val taskEscrow: TaskEscrow,
+    private val taskMutator: TaskMutator
+) {
+
+    suspend fun execute(
+        transactionId: String,
+        action: PermittedAction,
+        now: Long = System.currentTimeMillis()
+    ): ExecutionOutcome {
+        val transaction = transactionDao.getById(transactionId)
+            ?: return ExecutionOutcome.TransactionNotFound
+
+        if (transaction.currentState.isTerminal) {
+            return ExecutionOutcome.TransactionAlreadyResolved
+        }
+
+        val outcome = applyAction(action, now)
+
+        when (outcome) {
+            is ExecutionOutcome.Applied,
+            is ExecutionOutcome.NoOpAlreadyApplied,
+            is ExecutionOutcome.NotApplicable ->
+                taskEscrow.commit(transactionId, outcome = describe(outcome))
+
+            is ExecutionOutcome.RequiresGuardianEscalation ->
+                // Recognized outcome, but this step does not call GuardianNotifier —
+                // that integration wasn't inspected/requested for this increment. The
+                // transaction still resolves so it doesn't sit open indefinitely.
+                taskEscrow.commit(transactionId, outcome = "Escalated to guardian (notifier not yet wired)")
+
+            is ExecutionOutcome.Failed ->
+                taskEscrow.resolveAs(transactionId, InterventionState.EXECUTION_FAILED, failureReason = outcome.reason)
+
+            ExecutionOutcome.TransactionAlreadyResolved, ExecutionOutcome.TransactionNotFound ->
+                Unit // unreachable here — both are returned above, before applyAction runs.
+        }
+
+        return outcome
+    }
+
+    private fun applyAction(action: PermittedAction, now: Long): ExecutionOutcome = when (action) {
+        is PermittedAction.StartTask -> applyStartTask(action, now)
+        is PermittedAction.ReduceDuration -> applyReduceDuration(action)
+        is PermittedAction.RescheduleTask -> applyRescheduleTask(action)
+        is PermittedAction.ShortBreak -> applyShortBreak(action, now)
+        is PermittedAction.CreateTask -> applyCreateTask(action)
+        PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification ->
+            ExecutionOutcome.NotApplicable(action)
+        PermittedAction.RequestGuardian -> ExecutionOutcome.RequiresGuardianEscalation
+    }
+
+    private fun applyStartTask(action: PermittedAction.StartTask, now: Long): ExecutionOutcome {
+        val task = taskMutator.findTask(action.taskId)
+            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
+        return when (task.state) {
+            TaskState.ACTIVE -> ExecutionOutcome.NoOpAlreadyApplied(action)
+            TaskState.PAUSED -> {
+                taskMutator.resumeTask(action.taskId, now)
+                ExecutionOutcome.Applied(action)
+            }
+            TaskState.PENDING -> {
+                taskMutator.startTask(action.taskId)
+                ExecutionOutcome.Applied(action)
+            }
+            TaskState.DONE, TaskState.SKIPPED ->
+                ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
+        }
+    }
+
+    private fun applyReduceDuration(action: PermittedAction.ReduceDuration): ExecutionOutcome {
+        val task = taskMutator.findTask(action.taskId)
+            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
+        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
+            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
+        }
+        if (task.durationMinutes == action.newDurationMinutes) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        taskMutator.reduceDuration(action.taskId, action.newDurationMinutes)
+        return ExecutionOutcome.Applied(action)
+    }
+
+    private fun applyRescheduleTask(action: PermittedAction.RescheduleTask): ExecutionOutcome {
+        val task = taskMutator.findTask(action.taskId)
+            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
+        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
+            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
+        }
+        if (task.scheduledStartTime == action.newScheduledStartTime) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        taskMutator.rescheduleTask(action.taskId, action.newScheduledStartTime)
+        return ExecutionOutcome.Applied(action)
+    }
+
+    private fun applyShortBreak(action: PermittedAction.ShortBreak, now: Long): ExecutionOutcome {
+        val task = taskMutator.findTask(action.taskId)
+            ?: return ExecutionOutcome.Failed(action, "task ${action.taskId} no longer exists")
+        if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
+            return ExecutionOutcome.Failed(action, "task ${action.taskId} is ${task.state}, state changed since validation")
+        }
+        if (task.state == TaskState.PAUSED) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        // Note: [action.minutes] is not persisted anywhere — PlanStore.pauseTask only
+        // records pausedAt/pauseCount, not an intended break length. Actually waking the
+        // student back up after `minutes` (an alarm, a notification) is scheduling
+        // behavior that belongs to the Trigger Engine (a later step), not the Executor.
+        taskMutator.pauseTask(action.taskId, now)
+        return ExecutionOutcome.Applied(action)
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a). Unlike every other applyX above, there is no
+     * pre-existing task to re-validate state on — [PermittedAction.CreateTask.taskId] is a
+     * caller-generated id that only becomes a real StudyTask once this succeeds. The live
+     * re-check here is purely the idempotency guard described in the class doc: if a task
+     * with this id already exists (a duplicate transaction delivery replaying the same
+     * CreateTask action), nothing is created a second time.
+     */
+    private fun applyCreateTask(action: PermittedAction.CreateTask): ExecutionOutcome {
+        val existing = taskMutator.findTask(action.taskId)
+        if (existing != null) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        taskMutator.createTask(action.taskId, action.request)
+        return ExecutionOutcome.Applied(action)
+    }
+
+    private fun describe(outcome: ExecutionOutcome): String = when (outcome) {
+        is ExecutionOutcome.Applied -> "Applied ${outcome.action::class.simpleName}"
+        is ExecutionOutcome.NoOpAlreadyApplied -> "No-op — ${outcome.action::class.simpleName} already in effect"
+        is ExecutionOutcome.NotApplicable -> "${outcome.action::class.simpleName} — no task mutation required"
+        else -> outcome.toString()
+    }
+}
+
+sealed class ExecutionOutcome {
+    data class Applied(val action: PermittedAction) : ExecutionOutcome()
+    data class NoOpAlreadyApplied(val action: PermittedAction) : ExecutionOutcome()
+    /** KeepPlan / NoAction / RequestClarification — by design, nothing to mutate. */
+    data class NotApplicable(val action: PermittedAction) : ExecutionOutcome()
+    /** RequestGuardian — recognized, but not wired to GuardianNotifier in this step. */
+    object RequiresGuardianEscalation : ExecutionOutcome()
+    /** The live task no longer supports this action — state changed (or the task was
+     *  deleted) between PolicyValidator's snapshot and execution. Resolves the
+     *  transaction as EXECUTION_FAILED, not USER_ABORTED. */
+    data class Failed(val action: PermittedAction, val reason: String) : ExecutionOutcome()
+    /** Duplicate delivery of a transaction that already resolved — see class doc. */
+    object TransactionAlreadyResolved : ExecutionOutcome()
+    object TransactionNotFound : ExecutionOutcome()
+}
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LearningInterventionMapper.kt =====
+package com.checkmate.planner.intervention
+
 import com.checkmate.learning.engine.LearningDecisionEngine
-import com.checkmate.learning.testmate.TestResultNormalizer
-import com.checkmate.testmate.TestmateWeakArea
-import com.checkmate.ui.theme.*
+import com.checkmate.planner.model.TaskType
 
 /**
- * Phase 6 (test-platform-blueprint.md) surface: pulls a single Testmate
- * session result by ID and renders it natively, per spec §4's
- * score/weak-chapters/weak-topics shape. Base URL + token are configured in
- * Settings → Test Platform.
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — implements the previously-missing arrow in the
+ * pipeline diagram:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
  *
- * "Import report.md" section below is separate from the fetch-by-session-ID
- * flow above — the aggregate fetch shows score/weak-chapters/weak-topics for
- * display only (TestmateApi's /results endpoint carries no per-question
- * detail); the file import is what actually feeds the learning module
- * (MasteryEngine/ErrorEngine/RetentionEngine via TestResultNormalizer). The
- * two are independent: fetch a result to look at it, and/or import its
- * report.md (downloaded from TestmateWebScreen's WebView) to let Checkmate
- * learn from it.
+ * Deliberately scoped to the three intents already fully specified end-to-end for this
+ * pass — REPAIR_CONCEPT, START_DIAGNOSTIC, ASSIGN_TARGETED_SET (matching
+ * [PolicyValidator.SUPPORTED_LEARNING_INTENTS]). The other five
+ * (SCHEDULE_RETENTION_TEST, START_MOCK, REPLAN_DAY, REDUCE_DIFFICULTY,
+ * INCREASE_DIFFICULTY) make [toCreateTaskRequest] return null — deliberately, not
+ * silently coerced into one of the three supported task shapes — so a caller iterating a
+ * DecisionReport's candidates can filter them out explicitly (e.g. surface them
+ * elsewhere, log them, or just skip) instead of this mapper inventing a plausible-looking
+ * CreateTaskRequest for an intent nobody has scoped a StudyTask shape for yet.
  *
- * Test-report wiring pass: a successful (or already-imported) report import now
- * also renders a [PerformanceReportCard] — the first screen showing the
- * StudentModel -> PerformanceAnalyzer pipeline's actual output, not just raw
- * import counts. Deliberately faithful to what the analyzer produced: no
- * cross-test history section here (PerformanceReport is a derived view over
- * current Room state only — see TestResultsViewModel's own doc — not a stored
- * snapshot), so "Trend" below reflects this student's overall recent-vs-lifetime
- * accuracy shift across every concept, not a literal previous-test-vs-this-test
- * comparison. That comparison needs a persisted report history, which is
- * explicitly out of scope for this pass.
- *
- * ScoreGainEstimator wiring pass (Blueprint §2.2): "Biggest opportunities" used
- * to render [PerformanceAnalyzer.TopicImpact] directly — three concepts at
- * identical "13% mastery" with no way to tell why one outranks another beyond
- * list order. [OpportunityRow] now renders [ScoreGainEstimator.ScoreGainEstimate]
- * instead: mastery is still shown (nothing here hides the underlying number),
- * alongside marks-at-stake, the ranked expectedGain itself, and a confidence
- * label — the blueprint's own "Repair rolling motion — +4.2 marks" framing,
- * not a re-sorted mastery list.
- *
- * ScorePredictor wiring pass (Blueprint §2.3): [PerformanceReportCard] now also
- * renders an [ExpectedScoreCard] — Expected/Range/Target/Gap plus a bottleneck
- * breakdown, per the blueprint's own worked example. Explicitly labeled
- * "Estimated performance" in the UI itself (not just in code comments), per
- * [ScorePredictor.ExpectedScore]'s own "no false precision" caution — this is a
- * first-pass heuristic model, not a validated predictor, and the screen should
- * never imply otherwise.
- *
- * LearningDecisionEngine wiring pass (Blueprint §2.4): [PerformanceReportCard]
- * now also renders [RecommendedNextSection] — the ranked, typed action list
- * [LearningDecisionEngine] produces on top of everything above it. This is
- * still a read-only display: tapping a row does nothing yet (there's no
- * `StudyTask`-mutating wiring behind it — that's Blueprint §2.5, deliberately
- * not started, see [LearningDecisionEngine]'s own class doc on that boundary).
- * The point of surfacing it here now is the same "don't let evidence sit
- * un-acted-on" reasoning every prior wiring pass in this file already follows.
+ * This mapper does not itself talk to TaskEscrow or PolicyValidator — same separation of
+ * concerns as everything else in this package (PolicyValidator doesn't call ActionExecutor,
+ * ActionExecutor doesn't call PolicyValidator). The caller orchestrating P0a's full flow is
+ * expected to: generate a taskId, call [TaskEscrow.acquire] with it, call
+ * [PolicyValidator.validateCreateTask] with the request this mapper produced, then
+ * [ActionExecutor.execute] the resulting [PermittedAction.CreateTask] — none of that
+ * orchestration exists yet as a single call site; wiring it is a later step (see the
+ * blueprint's own note that a real end-to-end run through actual FT/test evidence comes
+ * after P0a's plumbing, not as part of it).
  */
-@Composable
-fun TestResultsScreen(navController: NavController, vm: TestResultsViewModel = viewModel()) {
-    val state by vm.state.collectAsState()
-    val context = LocalContext.current
+object LearningInterventionMapper {
 
-    val importLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri -> uri?.let { vm.importReport(context, it) } }
-
-    Column(
-        modifier = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState())
-    ) {
-        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { navController.popBackStack() }) {
-                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
-            }
-            Text("Test Results", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = White90)
-        }
-
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Text("Session ID", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 6.dp))
-            OutlinedTextField(
-                value         = state.sessionId,
-                onValueChange = vm::onSessionIdChange,
-                modifier      = Modifier.fillMaxWidth(),
-                singleLine    = true,
-                placeholder   = { Text("Paste the Testmate session ID", color = White30, fontSize = 13.sp) },
-                leadingIcon   = { Icon(Icons.Default.Quiz, null, tint = White60) },
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor   = AccentGreen,
-                    unfocusedBorderColor = White30,
-                    cursorColor          = AccentGreen,
-                    focusedTextColor     = White90,
-                    unfocusedTextColor   = White90
-                )
-            )
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick  = { vm.fetch() },
-                enabled  = state.sessionId.isNotBlank() && !state.loading,
-                modifier = Modifier.fillMaxWidth(),
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                if (state.loading) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = androidx.compose.ui.graphics.Color.Black, strokeWidth = 2.dp)
-                } else {
-                    Text("Fetch Result", color = androidx.compose.ui.graphics.Color.Black, fontSize = 13.sp)
-                }
-            }
-        }
-
-        state.error?.let { err ->
-            Text(
-                err, fontSize = 12.sp, color = AccentRed,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
-            )
-        }
-
-        state.result?.let { result ->
-            Spacer(Modifier.height(16.dp))
-            ResultSummaryCard(result)
-            if (result.weakChapters.isNotEmpty()) {
-                Spacer(Modifier.height(12.dp))
-                WeakAreasCard("Weak Chapters", result.weakChapters)
-            }
-            if (result.weakTopics.isNotEmpty()) {
-                Spacer(Modifier.height(12.dp))
-                WeakAreasCard("Weak Topics", result.weakTopics)
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-        HorizontalDivider(color = White10, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 16.dp))
-        Spacer(Modifier.height(20.dp))
-
-        ImportReportSection(
-            state    = state,
-            onPick   = { importLauncher.launch("*/*") },
-            onDismiss = { vm.dismissImportResult() }
-        )
-
-        Spacer(Modifier.height(24.dp))
-    }
-}
-
-@Composable
-private fun ImportReportSection(
-    state: TestResultsState,
-    onPick: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-        Text("Import report.md", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = White90)
-        Text(
-            "Feeds this test's per-question data into Checkmate's learning engine " +
-                "(mastery, error patterns, retention) — download the report from the " +
-                "Test Platform tab first, then pick it here.",
-            fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
-        )
-        Button(
-            onClick  = onPick,
-            enabled  = !state.importing,
-            modifier = Modifier.fillMaxWidth(),
-            colors   = ButtonDefaults.buttonColors(containerColor = BgCard),
-            border   = BorderStroke(0.5.dp, White30)
-        ) {
-            if (state.importing) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = AccentGreen, strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-                Text("Importing…", color = White90, fontSize = 13.sp)
-            } else {
-                Icon(Icons.Default.UploadFile, null, tint = AccentGreen, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Pick report.md", color = White90, fontSize = 13.sp)
-            }
-        }
-
-        state.importError?.let { err ->
-            Text(
-                err, fontSize = 12.sp, color = AccentRed,
-                modifier = Modifier.padding(top = 10.dp)
-            )
-        }
-
-        state.importResult?.let { result ->
-            Spacer(Modifier.height(12.dp))
-            ImportResultCard(result, onDismiss)
-        }
-
-        // Test-report wiring: the analyzer output, rendered right under the raw
-        // import counts above it — same test, next level of detail down.
-        if (state.analyzing) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = AccentGreen, strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-                Text("Building performance report…", fontSize = 12.sp, color = White60)
-            }
-        }
-        state.analysisError?.let { err ->
-            Text(
-                err, fontSize = 12.sp, color = AccentAmber,
-                modifier = Modifier.padding(top = 10.dp)
-            )
-        }
-        val report = state.performanceReport
-        val importResult = state.importResult
-        if (report != null && importResult != null) {
-            Spacer(Modifier.height(12.dp))
-            PerformanceReportCard(importResult, report, state.scoreGainEstimates, state.expectedScore, state.decisionReport)
-        }
-    }
-}
-
-@Composable
-private fun ImportResultCard(
-    result: TestResultNormalizer.NormalizeResult,
-    onDismiss: () -> Unit
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, if (result.alreadyImported) AccentAmber else AccentGreen)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    if (result.alreadyImported) "Already imported" else "Imported",
-                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                    color = if (result.alreadyImported) AccentAmber else AccentGreen
-                )
-                IconButton(onClick = onDismiss, modifier = Modifier.size(20.dp)) {
-                    Icon(Icons.Default.Close, null, tint = White60, modifier = Modifier.size(16.dp))
-                }
-            }
-            if (result.alreadyImported) {
-                Text(
-                    "This test was already imported — no duplicate attempts written.",
-                    fontSize = 12.sp, color = White60, modifier = Modifier.padding(top = 6.dp)
-                )
-            } else {
-                Spacer(Modifier.height(10.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    MiniStat("Questions", "${result.questionsWritten}", AccentGreen)
-                    MiniStat("Attempts", "${result.attemptsWritten}", AccentGreen)
-                    MiniStat("Errors", "${result.errorsClassified}", AccentRed)
-                    MiniStat("Concepts", "${result.conceptsRecomputed}", AccentAmber)
-                }
-            }
-            if (result.warnings.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                result.warnings.forEach { w ->
-                    Text("⚠ $w", fontSize = 11.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
-                }
-            }
-        }
-    }
-}
-
-/**
- * Test-report wiring pass, updated by the ScoreGainEstimator wiring pass. Four
- * layers, per the reviewed mockup: overall score (from
- * [TestResultNormalizer.NormalizeResult], the report's own literal numbers),
- * subject performance (real +4/-1 scoring via [SubjectScore]), biggest
- * opportunities (top [ScoreGainEstimator.ScoreGainEstimate]s, already sorted by
- * expectedGain descending — first 5 shown), and overall trend. `report` is still
- * passed through for the Trend section (overallTrend/overallTrendDelta live only
- * on [PerformanceAnalyzer.PerformanceReport]) even though topicImpacts itself is
- * no longer rendered directly here — [estimates] is the ranked view built on top
- * of it. Deliberately plain: no charts, no color-coded deltas beyond what
- * MiniStat/scoreColor/confidence coloring already give the rest of this screen —
- * render what the analyzer/estimator produced, not a reinterpretation of it.
- *
- * LearningDecisionEngine wiring pass: `decisionReport` renders as
- * [RecommendedNextSection] between "Biggest opportunities" and the Expected
- * score block — reads naturally in that order ("here's what's weak, here's
- * what's worth doing about it, here's the score math behind the target").
- */
-@Composable
-private fun PerformanceReportCard(
-    importResult: TestResultNormalizer.NormalizeResult,
-    report: PerformanceAnalyzer.PerformanceReport,
-    estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
-    expectedScore: ScorePredictor.ExpectedScore?,
-    decisionReport: LearningDecisionEngine.DecisionReport?
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, AccentGreen)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                importResult.title ?: "Test Result",
-                fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90
-            )
-            Spacer(Modifier.height(4.dp))
-
-            val obtained = importResult.scoreObtained
-            val total = importResult.scoreTotal
-            val percent = importResult.scorePercent
-            if (obtained != null && total != null) {
-                Text(
-                    "%.0f/%.0f".format(obtained, total),
-                    fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                    color = percent?.let { scoreColor(it) } ?: White90
-                )
-                percent?.let {
-                    Text(
-                        "%.1f%%".format(it), fontSize = 13.sp, color = White60,
-                        modifier = Modifier.padding(top = 2.dp)
-                    )
-                }
-            }
-
-            if (importResult.subjectScores.isNotEmpty()) {
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = White10, thickness = 0.5.dp)
-                Spacer(Modifier.height(12.dp))
-                Text("Subject performance", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
-                Spacer(Modifier.height(8.dp))
-                importResult.subjectScores.forEach { s -> SubjectScoreRow(s) }
-            }
-
-            val opportunities = estimates.filter { it.expectedGain > 0.0 }.take(5)
-            if (opportunities.isNotEmpty()) {
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = White10, thickness = 0.5.dp)
-                Spacer(Modifier.height(12.dp))
-                Text("Biggest opportunities", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
-                Spacer(Modifier.height(8.dp))
-                opportunities.forEachIndexed { index, estimate -> OpportunityRow(index + 1, estimate) }
-            }
-
-            decisionReport?.candidates?.takeIf { it.isNotEmpty() }?.let { candidates ->
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = White10, thickness = 0.5.dp)
-                Spacer(Modifier.height(12.dp))
-                RecommendedNextSection(candidates)
-            }
-
-            expectedScore?.let { es ->
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = White10, thickness = 0.5.dp)
-                Spacer(Modifier.height(12.dp))
-                ExpectedScoreSection(es)
-            }
-
-            Spacer(Modifier.height(16.dp))
-            HorizontalDivider(color = White10, thickness = 0.5.dp)
-            Spacer(Modifier.height(12.dp))
-            Text("Trend", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(6.dp))
-            Text(trendLabel(report.overallTrend, report.overallTrendDelta), fontSize = 12.sp, color = White60)
-        }
-    }
-}
-
-/**
- * LearningDecisionEngine wiring pass (Blueprint §2.4): the ranked,
- * typed-action list — deliberately distinct from [OpportunityRow] above it,
- * which ranks by marks alone. Each row shows WHICH kind of action
- * ([LearningDecisionEngine.LearningInterventionIntent]) the engine picked, not
- * just another weak-topic name — the same "don't let the LLM choose the
- * intervention" discipline the blueprint itself insists on: this list is
- * produced entirely deterministically, before any LLM sees it. Read-only for
- * now — see [PerformanceReportCard]'s own doc on why tapping a row doesn't do
- * anything yet.
- */
-@Composable
-private fun RecommendedNextSection(candidates: List<LearningDecisionEngine.CandidateIntervention>) {
-    Text("Recommended next", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
-    Text(
-        "Ranked by the decision engine — not just by mastery",
-        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+    private val SUPPORTED_INTENTS = setOf(
+        LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+        LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
+        LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
     )
-    candidates.forEachIndexed { index, candidate -> CandidateRow(index + 1, candidate) }
+
+    /**
+     * Returns null for any candidate outside [SUPPORTED_INTENTS], or one whose subject is
+     * unknown (both [LearningDecisionEngine.CandidateIntervention.subject] and
+     * `.chapter`/`.topic`/`.conceptId` are nullable — see that class's doc — and a task
+     * with a blank subject/topic would just fail [PolicyValidator.validateCreateTask]
+     * anyway, so declining to guess here is equivalent but skips a doomed round trip).
+     */
+    fun toCreateTaskRequest(candidate: LearningDecisionEngine.CandidateIntervention): CreateTaskRequest? {
+        val intent = candidate.intent
+        if (intent !in SUPPORTED_INTENTS) return null
+
+        val subject = candidate.subject ?: return null
+        val topic = candidate.chapter ?: candidate.topic ?: candidate.conceptId ?: return null
+
+        val targetedConceptIds = when (intent) {
+            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET ->
+                // ASSIGN_TARGETED_SET candidates are collapsed chapter-level groups (see
+                // LearningDecisionEngine.collapseIntoTargetedSets) — conceptId is null for
+                // these by construction, so there is no per-concept id list to carry yet.
+                // Left empty rather than guessed; wiring the underlying concept ids through
+                // the collapse step is a separate change, not something this mapper should
+                // invent from a single collapsed candidate.
+                emptyList()
+            else -> candidate.conceptId?.let { listOf(it) } ?: emptyList()
+        }
+
+        return CreateTaskRequest(
+            subject = subject,
+            topic = topic,
+            durationMinutes = candidate.durationMinutes,
+            taskType = taskTypeFor(intent),
+            rationale = candidate.rationale,
+            learningIntent = intent.name,
+            conceptId = candidate.conceptId,
+            targetedConceptIds = targetedConceptIds
+        )
+    }
+
+    private fun taskTypeFor(intent: LearningDecisionEngine.LearningInterventionIntent): TaskType =
+        when (intent) {
+            // A repair session teaches/re-teaches the weak prerequisite — closest existing
+            // TaskType is LECTURE (see StudyTask.taskType's doc: AdaptivePlanner maps its
+            // own LEARN sessionType the same way).
+            LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT -> TaskType.LECTURE
+            // Both diagnostic and targeted-set sessions are the student answering
+            // questions, not being taught new material — PRACTICE fits both.
+            LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC -> TaskType.PRACTICE
+            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET -> TaskType.PRACTICE
+            else -> TaskType.OTHER // unreachable for the three SUPPORTED_INTENTS this is ever called with
+        }
 }
 
-@Composable
-private fun CandidateRow(rank: Int, candidate: LearningDecisionEngine.CandidateIntervention) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    intentLabel(candidate.intent),
-                    fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = AccentAmber
-                )
-                Text(
-                    "$rank. ${candidate.topic ?: candidate.chapter ?: candidate.subject ?: "Overall plan"}",
-                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90
-                )
-            }
-            if (candidate.durationMinutes > 0) {
-                Text(
-                    "${candidate.durationMinutes}m",
-                    fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = White60
-                )
-            }
-        }
-        Spacer(Modifier.height(2.dp))
-        Text(candidate.rationale, fontSize = 11.sp, color = White60)
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/FakeTaskMutator.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+
+/**
+ * In-memory [TaskMutator] for [ActionExecutorTest] — mirrors PlanStore's real mutation
+ * semantics (including the totalPausedMs accounting [resumeTask] does) closely enough to
+ * exercise ActionExecutor's branching without touching Android SharedPreferences.
+ */
+class FakeTaskMutator(seed: List<StudyTask> = emptyList()) : TaskMutator {
+
+    private val tasks: MutableMap<String, StudyTask> = seed.associateBy { it.id }.toMutableMap()
+
+    fun currentState(taskId: String): StudyTask? = tasks[taskId]
+
+    override fun findTask(taskId: String): StudyTask? = tasks[taskId]
+
+    override fun startTask(taskId: String) {
+        tasks[taskId] = tasks.getValue(taskId).copy(state = TaskState.ACTIVE)
+    }
+
+    override fun resumeTask(taskId: String, resumedAt: Long) {
+        val task = tasks.getValue(taskId)
+        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        tasks[taskId] = task.copy(
+            state = TaskState.ACTIVE,
+            pausedAt = null,
+            totalPausedMs = task.totalPausedMs + elapsed
+        )
+    }
+
+    override fun pauseTask(taskId: String, pausedAt: Long) {
+        val task = tasks.getValue(taskId)
+        tasks[taskId] = task.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = task.pauseCount + 1)
+    }
+
+    override fun reduceDuration(taskId: String, newDurationMinutes: Int) {
+        tasks[taskId] = tasks.getValue(taskId).copy(durationMinutes = newDurationMinutes)
+    }
+
+    override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
+        tasks[taskId] = tasks.getValue(taskId).copy(scheduledStartTime = newScheduledStartTime)
+    }
+
+    /** P0a — mirrors [PlanStoreTaskMutator.createTask]'s field mapping so
+     *  ActionExecutorTest exercises the same shape production actually builds. */
+    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
+        val task = StudyTask(
+            id = taskId,
+            subject = request.subject,
+            topic = request.topic,
+            durationMinutes = request.durationMinutes,
+            priority = request.priority,
+            taskType = request.taskType,
+            scheduledStartTime = request.scheduledStartTime,
+            rationale = request.rationale,
+            learningIntent = request.learningIntent,
+            conceptId = request.conceptId,
+            targetedConceptIds = request.targetedConceptIds
+        )
+        tasks[taskId] = task
+        return task
     }
 }
 
-private fun intentLabel(intent: LearningDecisionEngine.LearningInterventionIntent): String = when (intent) {
-    LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT -> "REPAIR"
-    LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC -> "DIAGNOSE"
-    LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET -> "PRACTICE SET"
-    LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> "RETENTION CHECK"
-    LearningDecisionEngine.LearningInterventionIntent.START_MOCK -> "TAKE A MOCK"
-    LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> "REPLAN TODAY"
-    LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY -> "STEP DOWN DIFFICULTY"
-    LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> "STEP UP DIFFICULTY"
-}
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/ActionExecutorTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
 /**
- * ScorePredictor wiring pass (Blueprint §2.3): "Expected: 638, Range: 617–659,
- * Target: 680, Gap: 42" plus the bottleneck breakdown, per the blueprint's own
- * worked example. "Estimated performance" is shown as its own label (not buried
- * in a tooltip or code comment) — [ScorePredictor.ExpectedScore]'s own class doc
- * is explicit that this is a first-pass heuristic, not a validated predictor,
- * and the UI shouldn't imply more certainty than the model actually has.
+ * Proactive Execution Engine — Step 5 (Blueprint Part One, §13). LLM/voice/the Trigger
+ * Engine are not involved anywhere here — ActionExecutor is exercised directly against
+ * PermittedActions, as scoped.
  */
-@Composable
-private fun ExpectedScoreSection(es: ScorePredictor.ExpectedScore) {
-    Text("Expected score", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90)
-    Text(
-        "Estimated performance — not a guarantee",
-        fontSize = 10.sp, color = White60, modifier = Modifier.padding(top = 1.dp, bottom = 8.dp)
+class ActionExecutorTest {
+
+    private fun task(
+        state: TaskState = TaskState.PENDING,
+        durationMinutes: Int = 90,
+        scheduledStartTime: String? = null,
+        pausedAt: Long? = null,
+        totalPausedMs: Long = 0L
+    ) = StudyTask(
+        subject = "Physics",
+        topic = "Electrostatics",
+        durationMinutes = durationMinutes,
+        state = state,
+        scheduledStartTime = scheduledStartTime,
+        pausedAt = pausedAt,
+        totalPausedMs = totalPausedMs
     )
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        MiniStat("Expected", "%.0f".format(es.expected), White90)
-        MiniStat("Range", "%.0f–%.0f".format(es.rangeLow, es.rangeHigh), White60)
-        MiniStat("Target", "${es.target}", AccentGreen)
-        MiniStat("Gap", "%.0f".format(es.gap), if (es.gap > 0.0) AccentAmber else AccentGreen)
+
+    private class Fixture(task: StudyTask) {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val mutator = FakeTaskMutator(listOf(task))
+        val executor = ActionExecutor(dao, escrow, mutator)
+        val taskId = task.id
+
+        suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
+            (escrow.acquire(taskId, InterventionTriggerType.LATE_START, now = now)
+                    as EscrowAcquireResult.Acquired).transaction
+
+        /** P0a — CREATE_TASK escrows on a caller-generated id that doesn't identify an
+         *  existing task yet (see [PermittedAction.CreateTask]'s doc), so tests that
+         *  exercise it acquire on a fresh id instead of [taskId]. */
+        suspend fun acquireFor(id: String, now: Long = 1_000L): InterventionTransaction =
+            (escrow.acquire(id, InterventionTriggerType.LATE_START, now = now)
+                    as EscrowAcquireResult.Acquired).transaction
     }
-    if (es.bottlenecks.isNotEmpty()) {
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "Where the gap comes from", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = White60
-        )
-        Spacer(Modifier.height(6.dp))
-        es.bottlenecks.forEach { b -> BottleneckRow(b) }
+
+    // ── START_TASK ───────────────────────────────────────────────────────
+
+    @Test
+    fun `start task on PENDING applies and completes the transaction`() = runTest {
+        val f = Fixture(task(state = TaskState.PENDING))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals(TaskState.ACTIVE, f.mutator.currentState(f.taskId)?.state)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `start task on PAUSED resumes instead of restarting, preserving pause accounting`() = runTest {
+        val f = Fixture(task(state = TaskState.PAUSED, pausedAt = 1_000L, totalPausedMs = 2_000L))
+        val tx = f.acquire(now = 5_000L)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId), now = 5_000L)
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val result = f.mutator.currentState(f.taskId)
+        assertEquals(TaskState.ACTIVE, result?.state)
+        assertEquals(null, result?.pausedAt)
+        // 2_000 (already accumulated) + 4_000 (5_000 - 1_000 elapsed since pausedAt)
+        assertEquals(6_000L, result?.totalPausedMs)
+    }
+
+    @Test
+    fun `start task on already ACTIVE is a no-op but still completes the transaction`() = runTest {
+        val f = Fixture(task(state = TaskState.ACTIVE))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `start task on a DONE task fails and resolves EXECUTION_FAILED`() = runTest {
+        val f = Fixture(task(state = TaskState.DONE))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask(f.taskId))
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── REDUCE_DURATION ──────────────────────────────────────────────────
+
+    @Test
+    fun `reduce duration applies and completes the transaction`() = runTest {
+        val f = Fixture(task(durationMinutes = 90))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `reduce duration to the same value already in effect is a no-op`() = runTest {
+        val f = Fixture(task(durationMinutes = 35))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    // ── RESCHEDULE_TASK ──────────────────────────────────────────────────
+
+    @Test
+    fun `reschedule applies and completes the transaction`() = runTest {
+        val f = Fixture(task(scheduledStartTime = "19:00"))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RescheduleTask(f.taskId, "20:00"))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals("20:00", f.mutator.currentState(f.taskId)?.scheduledStartTime)
+    }
+
+    @Test
+    fun `reschedule to the same time already in effect is a no-op`() = runTest {
+        val f = Fixture(task(scheduledStartTime = "20:00"))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RescheduleTask(f.taskId, "20:00"))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    // ── TAKE_SHORT_BREAK ─────────────────────────────────────────────────
+
+    @Test
+    fun `short break on PENDING pauses the task and completes the transaction`() = runTest {
+        val f = Fixture(task(state = TaskState.PENDING))
+        val tx = f.acquire(now = 3_000L)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15), now = 3_000L)
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val result = f.mutator.currentState(f.taskId)
+        assertEquals(TaskState.PAUSED, result?.state)
+        assertEquals(3_000L, result?.pausedAt)
+    }
+
+    @Test
+    fun `short break on an already PAUSED task is a no-op`() = runTest {
+        val f = Fixture(task(state = TaskState.PAUSED, pausedAt = 1_000L))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    @Test
+    fun `short break on a DONE task fails and resolves EXECUTION_FAILED`() = runTest {
+        val f = Fixture(task(state = TaskState.DONE))
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ShortBreak(f.taskId, 15))
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── Non-mutating actions ─────────────────────────────────────────────
+
+    @Test
+    fun `KEEP_PLAN NO_ACTION and REQUEST_CLARIFICATION do not touch the task but do complete`() = runTest {
+        listOf(PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification)
+            .forEach { action ->
+                val f = Fixture(task(durationMinutes = 90, scheduledStartTime = "19:00"))
+                val tx = f.acquire()
+                val before = f.mutator.currentState(f.taskId)
+
+                val outcome = f.executor.execute(tx.transactionId, action)
+
+                assertTrue("$action should be NotApplicable", outcome is ExecutionOutcome.NotApplicable)
+                assertEquals(before, f.mutator.currentState(f.taskId))
+                assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+            }
+    }
+
+    @Test
+    fun `REQUEST_GUARDIAN is recognized and completes without mutating the task`() = runTest {
+        val f = Fixture(task())
+        val tx = f.acquire()
+        val before = f.mutator.currentState(f.taskId)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.RequestGuardian)
+
+        assertTrue(outcome is ExecutionOutcome.RequiresGuardianEscalation)
+        assertEquals(before, f.mutator.currentState(f.taskId))
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── Duplicate delivery / transaction lookup (Blueprint §13) ─────────
+
+    @Test
+    fun `duplicate delivery of an already-resolved transaction does not mutate the task twice`() = runTest {
+        val f = Fixture(task(durationMinutes = 90))
+        val tx = f.acquire()
+
+        val first = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
+        assertTrue(first is ExecutionOutcome.Applied)
+        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
+
+        // Same transactionId delivered again — e.g. a retried WorkManager job.
+        val second = f.executor.execute(tx.transactionId, PermittedAction.ReduceDuration(f.taskId, 35))
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+        // Still 35 — not reduced again, and no error either.
+        assertEquals(35, f.mutator.currentState(f.taskId)?.durationMinutes)
+    }
+
+    @Test
+    fun `executing an unknown transaction id returns TransactionNotFound`() = runTest {
+        val f = Fixture(task())
+        val outcome = f.executor.execute("does-not-exist", PermittedAction.StartTask(f.taskId))
+        assertEquals(ExecutionOutcome.TransactionNotFound, outcome)
+    }
+
+    @Test
+    fun `task deleted between validation and execution fails cleanly`() = runTest {
+        val f = Fixture(task())
+        val tx = f.acquire()
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.StartTask("some-other-task-id"))
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    // ── CREATE_TASK (Upgrade Blueprint Phase 2.4/2.5, P0a) ───────────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        conceptId: String? = "phy_rotational_inertia"
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        rationale = "Weak prerequisite for an upcoming target concept",
+        learningIntent = learningIntent,
+        conceptId = conceptId
+    )
+
+    @Test
+    fun `create task on a fresh id applies, creates the StudyTask, and completes the transaction`() = runTest {
+        val f = Fixture(task()) // seed task is irrelevant here — CreateTask uses a fresh id
+        val newTaskId = "learning-engine-task-1"
+        val tx = f.acquireFor(newTaskId)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = f.mutator.currentState(newTaskId)
+        assertEquals("Physics", created?.subject)
+        assertEquals("Rotational Motion", created?.topic)
+        assertEquals(25, created?.durationMinutes)
+        assertEquals(TaskType.LECTURE, created?.taskType)
+        assertEquals("REPAIR_CONCEPT", created?.learningIntent)
+        assertEquals("phy_rotational_inertia", created?.conceptId)
+        assertEquals(TaskState.PENDING, created?.state) // StudyTask's own default
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `duplicate delivery of a CreateTask transaction does not create a second StudyTask`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-2"
+        val tx = f.acquireFor(newTaskId)
+        val request = createTaskRequest()
+
+        val first = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertTrue(first is ExecutionOutcome.Applied)
+
+        // Same transactionId delivered again — e.g. a retried WorkManager job. The primary
+        // guard (transaction already terminal) catches this before applyCreateTask runs.
+        val second = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, request))
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+    }
+
+    @Test
+    fun `create task where the id already exists (idempotency guard) is a no-op, not a second task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-3"
+        // Simulate the id having already been created by a prior, separately-resolved
+        // execution (not the primary already-terminal guard above) — applyCreateTask's own
+        // defensive re-check (mirrors every other applyX in this class) is what catches this.
+        f.mutator.createTask(newTaskId, createTaskRequest())
+        val tx = f.acquireFor("distinct-fresh-id-for-escrow")
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+    }
+
+    @Test
+    fun `create task with no scheduledStartTime lands unscheduled, same as any other task`() = runTest {
+        val f = Fixture(task())
+        val newTaskId = "learning-engine-task-4"
+        val tx = f.acquireFor(newTaskId)
+
+        f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
+
+        assertNull(f.mutator.currentState(newTaskId)?.scheduledStartTime)
     }
 }
 
-@Composable
-private fun BottleneckRow(b: ScorePredictor.BottleneckContribution) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(
-            b.label.replaceFirstChar { it.uppercase() },
-            fontSize = 12.sp, color = White90, modifier = Modifier.weight(1f)
-        )
-        Text(
-            "+%.0f marks".format(b.marks),
-            fontSize = 12.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace,
-            color = AccentAmber
-        )
-    }
-}
 
-@Composable
-private fun SubjectScoreRow(score: SubjectScore) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(score.subject, fontSize = 13.sp, color = White90)
-        Text(
-            "${score.marksObtained}/${score.marksTotal}",
-            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
-        )
-    }
-}
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/PolicyValidatorTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.time.LocalTime
+import java.time.ZoneId
 
 /**
- * ScoreGainEstimator wiring pass. Replaces the old single-line "13% mastery"
- * row — top line is the ranked headline (topic + expectedGain, the number this
- * list is actually sorted by); second line keeps mastery visible (nothing here
- * hides it) alongside marks-at-stake and a confidence label, so a student can
- * see both "how ranked" and "how sure" in one glance, per
- * ScoreGainEstimator.EstimateConfidence's own "well-evidenced vs single
- * hand-typed guess" framing.
+ * Proactive Execution Engine — Step 2 (Blueprint Part One, §11 / §26 build sequence).
+ * The policy test matrix. Pure JVM unit tests — PolicyValidator has no Android
+ * dependency, so none of this needs Robolectric or an instrumented test.
  */
-@Composable
-private fun OpportunityRow(rank: Int, estimate: ScoreGainEstimator.ScoreGainEstimate) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "$rank. ${estimate.topic ?: estimate.chapter ?: "Unknown topic"}",
-                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = White90,
-                modifier = Modifier.weight(1f)
-            )
-            Text(
-                "+%.1f marks".format(estimate.expectedGain),
-                fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                color = AccentGreen
-            )
+class PolicyValidatorTest {
+
+    private fun pendingTask(durationMinutes: Int = 90, state: TaskState = TaskState.PENDING) = StudyTask(
+        subject = "Physics",
+        topic = "Electrostatics",
+        durationMinutes = durationMinutes,
+        state = state
+    )
+
+    private fun stateAt(hour: Int, minute: Int, task: StudyTask?): PolicyState {
+        val zone = ZoneId.systemDefault()
+        val today = java.time.LocalDate.now(zone)
+        val millis = java.time.ZonedDateTime.of(today, LocalTime.of(hour, minute), zone)
+            .toInstant().toEpochMilli()
+        return PolicyState(task = task, nowMillis = millis)
+    }
+
+    // ── Blueprint §11 worked examples ───────────────────────────────────────
+
+    @Test
+    fun `REDUCE_DURATION with valid smaller duration is permitted`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "Reducing to 35 minutes.",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.ReduceDuration
+        assertEquals(35, action.newDurationMinutes)
+    }
+
+    @Test
+    fun `negative duration is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "-10")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
+    }
+
+    @Test
+    fun `unknown task id is rejected`() {
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = "does-not-exist",
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
+    }
+
+    @Test
+    fun `UNLOCK_DEVICE is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("UNLOCK_DEVICE")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `DISABLE_GUARDIAN is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("DISABLE_GUARDIAN")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `REMOVE_WORKMODE is not representable and is rejected as unrecognized`() {
+        val intentType = LlmIntent.parseIntentType("REMOVE_WORKMODE")
+        assertEquals(null, intentType)
+        val intent = LlmIntent(speech = "x", intentType = intentType)
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNRECOGNIZED_INTENT)
+    }
+
+    @Test
+    fun `15 minute break is permitted`() {
+        // Amended in step 5: TAKE_SHORT_BREAK now requires a task (PlanStore.pauseTask
+        // needs one to actually pause), so this needs PolicyState.task set.
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "Take 15.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            targetTaskId = task.id,
+            parameters = mapOf("minutes" to "15")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.ShortBreak
+        assertEquals(task.id, action.taskId)
+    }
+
+    @Test
+    fun `4 hour break is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "Take 240.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            targetTaskId = task.id,
+            parameters = mapOf("minutes" to "240")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.BREAK_TOO_LONG)
+    }
+
+    @Test
+    fun `short break on a task with no task in PolicyState is rejected`() {
+        val intent = LlmIntent(
+            speech = "Take 15.",
+            intentType = InterventionIntentType.TAKE_SHORT_BREAK,
+            parameters = mapOf("minutes" to "15")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = null))
+        assertRejectedWith(result, RejectionReason.UNKNOWN_TASK_ID)
+    }
+
+    // ── Additional coverage beyond the blueprint's worked examples ─────────
+
+    @Test
+    fun `reduce duration below minimum is rejected`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "2")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
+    }
+
+    @Test
+    fun `reduce duration that is not actually smaller is rejected`() {
+        val task = pendingTask(durationMinutes = 90)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "120")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.DURATION_NOT_A_REDUCTION)
+    }
+
+    @Test
+    fun `reduce duration on a DONE task is rejected`() {
+        val task = pendingTask(durationMinutes = 90, state = TaskState.DONE)
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "35")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
+    }
+
+    @Test
+    fun `reduce duration with malformed number is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.REDUCE_DURATION,
+            targetTaskId = task.id,
+            parameters = mapOf("newDurationMinutes" to "soon")
+        )
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `start task on a PENDING task is permitted`() {
+        val task = pendingTask(state = TaskState.PENDING)
+        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `start task on an already ACTIVE task is rejected`() {
+        val task = pendingTask(state = TaskState.ACTIVE)
+        val intent = LlmIntent(speech = "x", intentType = InterventionIntentType.START_TASK, targetTaskId = task.id)
+        val result = PolicyValidator.validate(intent, PolicyState(task = task))
+        assertRejectedWith(result, RejectionReason.TASK_NOT_ACTIVE_STATE)
+    }
+
+    @Test
+    fun `reschedule to a valid future time is permitted`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "20:00")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `reschedule to a time in the past is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "18:00")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
+    }
+
+    @Test
+    fun `reschedule with malformed time string is rejected`() {
+        val task = pendingTask()
+        val intent = LlmIntent(
+            speech = "x",
+            intentType = InterventionIntentType.RESCHEDULE_TASK,
+            targetTaskId = task.id,
+            parameters = mapOf("newScheduledStartTime" to "8pm")
+        )
+        val result = PolicyValidator.validate(intent, stateAt(19, 0, task))
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
+    }
+
+    @Test
+    fun `KEEP_PLAN NO_ACTION REQUEST_CLARIFICATION and REQUEST_GUARDIAN are always permitted`() {
+        listOf(
+            InterventionIntentType.KEEP_PLAN,
+            InterventionIntentType.NO_ACTION,
+            InterventionIntentType.REQUEST_CLARIFICATION,
+            InterventionIntentType.REQUEST_GUARDIAN
+        ).forEach { type ->
+            val intent = LlmIntent(speech = "x", intentType = type)
+            val result = PolicyValidator.validate(intent, PolicyState(task = null))
+            assertTrue("$type should be permitted", result is PolicyResult.Permitted)
         }
-        Spacer(Modifier.height(2.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "%.0f%% mastery · ~%.0f marks at stake".format(estimate.mastery * 100, estimate.marksAtStake),
-                fontSize = 11.sp, color = White60, fontFamily = FontFamily.Monospace
-            )
-            Text(
-                confidenceLabel(estimate.confidence),
-                fontSize = 11.sp, color = confidenceColor(estimate.confidence)
-            )
-        }
+    }
+
+    // ── validateCreateTask (Upgrade Blueprint Phase 2.4/2.5, P0a) ──────────
+
+    private fun createTaskRequest(
+        subject: String = "Physics",
+        topic: String = "Rotational Motion",
+        durationMinutes: Int = 25,
+        learningIntent: String? = "REPAIR_CONCEPT",
+        scheduledStartTime: String? = null
+    ) = CreateTaskRequest(
+        subject = subject,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        taskType = TaskType.LECTURE,
+        scheduledStartTime = scheduledStartTime,
+        learningIntent = learningIntent,
+        conceptId = "phy_rotational_inertia"
+    )
+
+    @Test
+    fun `REPAIR_CONCEPT create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-1", createTaskRequest(learningIntent = "REPAIR_CONCEPT"))
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.CreateTask
+        assertEquals("new-task-1", action.taskId)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-2", createTaskRequest(learningIntent = "START_DIAGNOSTIC"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-3", createTaskRequest(learningIntent = "ASSIGN_TARGETED_SET"))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with no learningIntent (non-learning-engine caller) is permitted`() {
+        val result = PolicyValidator.validateCreateTask("new-task-4", createTaskRequest(learningIntent = null))
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request naming an out-of-scope learning intent is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-5",
+            createTaskRequest(learningIntent = "REPLAN_DAY")
+        )
+        assertRejectedWith(result, RejectionReason.UNSUPPORTED_LEARNING_INTENT)
+    }
+
+    @Test
+    fun `create request with blank subject is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-6", createTaskRequest(subject = ""))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with blank topic is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-7", createTaskRequest(topic = "  "))
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `create request with zero duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-8", createTaskRequest(durationMinutes = 0))
+        assertRejectedWith(result, RejectionReason.NEGATIVE_OR_ZERO_DURATION)
+    }
+
+    @Test
+    fun `create request below minimum duration is rejected`() {
+        val result = PolicyValidator.validateCreateTask("new-task-9", createTaskRequest(durationMinutes = 3))
+        assertRejectedWith(result, RejectionReason.DURATION_TOO_SHORT)
+    }
+
+    @Test
+    fun `create request with a valid scheduledStartTime is permitted`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-10",
+            createTaskRequest(scheduledStartTime = "20:00")
+        )
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `create request with a malformed scheduledStartTime is rejected`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-11",
+            createTaskRequest(scheduledStartTime = "8pm")
+        )
+        assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
+    }
+
+    private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
+        assertTrue("expected Rejected but was $result", result is PolicyResult.Rejected)
+        assertEquals(reason, (result as PolicyResult.Rejected).reason)
     }
 }
 
-private fun confidenceLabel(confidence: ScoreGainEstimator.EstimateConfidence): String = when (confidence) {
-    ScoreGainEstimator.EstimateConfidence.LOW -> "Low confidence"
-    ScoreGainEstimator.EstimateConfidence.MEDIUM -> "Medium confidence"
-    ScoreGainEstimator.EstimateConfidence.HIGH -> "High confidence"
-}
 
-private fun confidenceColor(confidence: ScoreGainEstimator.EstimateConfidence): androidx.compose.ui.graphics.Color = when (confidence) {
-    ScoreGainEstimator.EstimateConfidence.LOW -> White60
-    ScoreGainEstimator.EstimateConfidence.MEDIUM -> AccentAmber
-    ScoreGainEstimator.EstimateConfidence.HIGH -> AccentGreen
-}
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LearningInterventionMapperTest.kt =====
+package com.checkmate.planner.intervention
 
-private fun trendLabel(trend: PerformanceAnalyzer.PerformanceTrend, delta: Double): String = when (trend) {
-    PerformanceAnalyzer.PerformanceTrend.IMPROVING -> "Improving — recent accuracy is %.0f%% above your overall average.".format(delta * 100)
-    PerformanceAnalyzer.PerformanceTrend.DECLINING -> "Declining — recent accuracy is %.0f%% below your overall average.".format(-delta * 100)
-    PerformanceAnalyzer.PerformanceTrend.STABLE -> "Stable — recent accuracy is in line with your overall average."
-    PerformanceAnalyzer.PerformanceTrend.INSUFFICIENT_DATA -> "Not enough attempts yet to call a trend."
-}
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.model.TaskType
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
-@Composable
-private fun ResultSummaryCard(result: com.checkmate.testmate.TestmateResult) {
-    Surface(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, White10)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(result.testTitle, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "%.0f/%.0f (%.0f%%)".format(result.score, result.totalMarks, result.accuracyPct),
-                fontSize = 26.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                color = scoreColor(result.accuracyPct)
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a). Pure JVM unit tests — [LearningInterventionMapper]
+ * has no Android dependency, same testability posture as PolicyValidator/ActionExecutor.
+ */
+class LearningInterventionMapperTest {
+
+    private fun candidate(
+        intent: LearningDecisionEngine.LearningInterventionIntent,
+        conceptId: String? = "phy_rotational_inertia",
+        subject: String? = "Physics",
+        chapter: String? = "Rotational Motion",
+        topic: String? = null,
+        durationMinutes: Int = 25,
+        rationale: String = "Weak prerequisite for an upcoming target concept"
+    ) = LearningDecisionEngine.CandidateIntervention(
+        intent = intent,
+        conceptId = conceptId,
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        durationMinutes = durationMinutes,
+        expectedGain = 1.5,
+        priorityScore = 1.5,
+        rationale = rationale
+    )
+
+    // ── Supported intents (P0a scope) ───────────────────────────────────
+
+    @Test
+    fun `REPAIR_CONCEPT maps to a LECTURE CreateTaskRequest carrying the concept id`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT)
+        )
+        assertTrue(request != null)
+        request!!
+        assertEquals("Physics", request.subject)
+        assertEquals("Rotational Motion", request.topic)
+        assertEquals(25, request.durationMinutes)
+        assertEquals(TaskType.LECTURE, request.taskType)
+        assertEquals("REPAIR_CONCEPT", request.learningIntent)
+        assertEquals("phy_rotational_inertia", request.conceptId)
+        assertEquals(listOf("phy_rotational_inertia"), request.targetedConceptIds)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC maps to a PRACTICE CreateTaskRequest`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC)
+        )
+        assertTrue(request != null)
+        assertEquals(TaskType.PRACTICE, request!!.taskType)
+        assertEquals("START_DIAGNOSTIC", request.learningIntent)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET maps to a PRACTICE CreateTaskRequest with no targeted concept ids`() {
+        // ASSIGN_TARGETED_SET candidates are collapsed chapter-level groups — conceptId is
+        // null by construction (see LearningInterventionMapper's own doc).
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET, conceptId = null)
+        )
+        assertTrue(request != null)
+        assertEquals(TaskType.PRACTICE, request!!.taskType)
+        assertEquals("ASSIGN_TARGETED_SET", request.learningIntent)
+        assertNull(request.conceptId)
+        assertEquals(emptyList<String>(), request.targetedConceptIds)
+    }
+
+    @Test
+    fun `topic falls back to topic field then conceptId when chapter is null`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+                chapter = null,
+                topic = "Angular Momentum"
             )
-            result.rankInSession?.let {
-                Text("Rank #$it", fontSize = 12.sp, color = AccentAmber, modifier = Modifier.padding(top = 2.dp))
-            }
-            Spacer(Modifier.height(12.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                MiniStat("Correct", "${result.correctCount}", AccentGreen)
-                MiniStat("Wrong", "${result.incorrectCount}", AccentRed)
-                MiniStat("Skipped", "${result.skippedCount}", White60)
-                MiniStat("Avg time", "${result.avgTimePerQuestion.toInt()}s", White60)
-            }
+        )
+        assertEquals("Angular Momentum", request!!.topic)
+    }
+
+    // ── Out-of-scope intents (deliberately not wired in P0a) ────────────
+
+    @Test
+    fun `SCHEDULE_RETENTION_TEST is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `START_MOCK is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_MOCK)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `REPLAN_DAY is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `REDUCE_DIFFICULTY and INCREASE_DIFFICULTY are not mapped`() {
+        listOf(
+            LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY,
+            LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY
+        ).forEach { intent ->
+            assertNull(LearningInterventionMapper.toCreateTaskRequest(candidate(intent)))
         }
     }
-}
 
-@Composable
-private fun WeakAreasCard(title: String, areas: List<TestmateWeakArea>) {
-    Surface(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-        shape    = RoundedCornerShape(14.dp),
-        color    = BgCard,
-        border   = BorderStroke(0.5.dp, White10)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(10.dp))
-            areas.forEach { area ->
-                Column(modifier = Modifier.padding(bottom = 8.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(area.name, fontSize = 13.sp, color = White90)
-                        Text(
-                            "%.0f%% (%d)".format(area.accuracyPct, area.attempted),
-                            fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace
-                        )
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    LinearProgressIndicator(
-                        progress   = { (area.accuracyPct / 100f).toFloat().coerceIn(0f, 1f) },
-                        modifier   = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
-                        color      = AccentRed,
-                        trackColor = White10
-                    )
-                }
-            }
-        }
+    // ── Missing data (declines rather than guesses) ──────────────────────
+
+    @Test
+    fun `a REPAIR_CONCEPT candidate with no subject is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, subject = null)
+        )
+        assertNull(request)
+    }
+
+    @Test
+    fun `a candidate with no chapter, topic, or conceptId is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
+                chapter = null,
+                topic = null,
+                conceptId = null
+            )
+        )
+        assertNull(request)
     }
 }
 
-@Composable
-private fun MiniStat(label: String, value: String, color: androidx.compose.ui.graphics.Color) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = color)
-        Text(label, fontSize = 10.sp, color = White60)
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/LearningInterventionCreateTaskIntegrationTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.UUID
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — integration test for the full pipeline this
+ * pass wires up:
+ * ```
+ * LearningDecisionEngine -> CandidateIntervention -> LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow/transaction
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ * Uses [FakeTaskMutator] in place of [PlanStoreTaskMutator]/PlanStore (same reasoning as
+ * every other plain-JVM test in this package: no Android SharedPreferences dependency).
+ * Not a real end-to-end run against actual FT/test evidence and StudentModel/DecisionEngine
+ * output — that's the separate step the blueprint calls out as coming after this plumbing
+ * is in place, not part of it.
+ */
+class LearningInterventionCreateTaskIntegrationTest {
+
+    private fun candidate(
+        intent: LearningDecisionEngine.LearningInterventionIntent,
+        conceptId: String? = "phy_rotational_inertia",
+        subject: String? = "Physics",
+        chapter: String? = "Rotational Motion",
+        durationMinutes: Int = 25
+    ) = LearningDecisionEngine.CandidateIntervention(
+        intent = intent,
+        conceptId = conceptId,
+        subject = subject,
+        chapter = chapter,
+        topic = null,
+        durationMinutes = durationMinutes,
+        expectedGain = 1.5,
+        priorityScore = 1.5,
+        rationale = "Weak prerequisite for an upcoming target concept"
+    )
+
+    private class Fixture {
+        val dao = FakeInterventionTransactionDao()
+        val escrow = TaskEscrow(dao)
+        val mutator = FakeTaskMutator()
+        val executor = ActionExecutor(dao, escrow, mutator)
     }
+
+    /**
+     * Runs a [LearningDecisionEngine.CandidateIntervention] through every P0a stage and
+     * returns the [ExecutionOutcome] — mirrors the orchestration
+     * [LearningInterventionMapper]'s own doc describes as not yet existing as a single
+     * production call site.
+     */
+    private suspend fun runPipeline(
+        f: Fixture,
+        candidateIntervention: LearningDecisionEngine.CandidateIntervention
+    ): ExecutionOutcome {
+        val request = LearningInterventionMapper.toCreateTaskRequest(candidateIntervention)
+            ?: error("candidate was not mappable — test setup bug")
+
+        val newTaskId = UUID.randomUUID().toString()
+        // No existing InterventionTriggerType is a semantic match for "learning-engine
+        // decided a task should exist" — none of the eleven values name that. BACKLOG_RISK
+        // is the closest available fit; picking the right value (or adding one) is a
+        // question for whoever wires this into a real trigger path, not this test.
+        val acquireResult = f.escrow.acquire(newTaskId, InterventionTriggerType.BACKLOG_RISK)
+        val transaction = (acquireResult as EscrowAcquireResult.Acquired).transaction
+
+        val policyResult = PolicyValidator.validateCreateTask(newTaskId, request)
+        val permitted = policyResult as PolicyResult.Permitted
+
+        return f.executor.execute(transaction.transactionId, permitted.action)
+    }
+
+    @Test
+    fun `REPAIR_CONCEPT candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        val task = f.mutator.currentState(created.taskId)
+
+        assertEquals("Physics", task?.subject)
+        assertEquals("Rotational Motion", task?.topic)
+        assertEquals(25, task?.durationMinutes)
+        assertEquals(TaskType.LECTURE, task?.taskType)
+        assertEquals(TaskState.PENDING, task?.state)
+        assertEquals("REPAIR_CONCEPT", task?.learningIntent)
+        assertEquals("phy_rotational_inertia", task?.conceptId)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(transactionIdOf(f, created.taskId))?.currentState)
+    }
+
+    @Test
+    fun `START_DIAGNOSTIC candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        assertEquals(TaskType.PRACTICE, f.mutator.currentState(created.taskId)?.taskType)
+    }
+
+    @Test
+    fun `ASSIGN_TARGETED_SET candidate produces a real StudyTask via the full pipeline`() = runTest {
+        val f = Fixture()
+        val outcome = runPipeline(
+            f,
+            candidate(LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET, conceptId = null)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        val created = (outcome as ExecutionOutcome.Applied).action as PermittedAction.CreateTask
+        val task = f.mutator.currentState(created.taskId)
+        assertEquals(TaskType.PRACTICE, task?.taskType)
+        assertEquals("ASSIGN_TARGETED_SET", task?.learningIntent)
+    }
+
+    @Test
+    fun `an out-of-scope candidate never reaches PolicyValidator or the executor`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY)
+        )
+        assertEquals(null, request) // mapper declines; nothing downstream is exercised
+    }
+
+    /** Small helper — the transaction id isn't returned by [runPipeline] directly, so this
+     *  re-derives it via [TaskEscrow]'s own "latest transaction for a task" lookup. */
+    private suspend fun transactionIdOf(f: Fixture, taskId: String): String =
+        f.dao.getLatestForTask(taskId)?.transactionId ?: error("no transaction found for $taskId")
 }
 
-private fun scoreColor(accuracyPct: Double): androidx.compose.ui.graphics.Color = when {
-    accuracyPct >= 70 -> AccentGreen
-    accuracyPct >= 40 -> AccentAmber
-    else              -> AccentRed
-}
+
