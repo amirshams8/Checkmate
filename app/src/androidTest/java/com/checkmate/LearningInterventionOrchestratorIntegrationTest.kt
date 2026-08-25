@@ -1,0 +1,168 @@
+package com.checkmate
+
+import androidx.room.Room
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.intervention.InterventionState
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.intervention.PlanStoreTaskMutator
+import com.checkmate.planner.intervention.TaskEscrow
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * The milestone this repo's own audit asked for: not "the components are wired correctly"
+ * (that's [com.checkmate.planner.intervention.LearningInterventionOrchestratorTest], JVM-only
+ * with fakes) but "the system actually autonomously produces a study action" — a real
+ * [DecisionReport][LearningDecisionEngine.DecisionReport] driven through the real
+ * [LearningInterventionOrchestrator], onto a real [InterventionState] FSM, ending in a
+ * [com.checkmate.planner.model.StudyTask] genuinely readable back out of [PlanStore] —
+ * i.e. the same object graph [MainActivity]/[HomeViewModel] would use, not test doubles.
+ *
+ * Only [InterventionDatabase] is swapped for an in-memory instance (standard Room testing
+ * practice — nothing about escrow/execution correctness depends on the DB being on disk).
+ * [PlanStore] and [CheckmatePrefs] are deliberately NOT swapped: they're the real
+ * SharedPreferences-backed singletons the installed app uses, because requirement #6
+ * ("the task is actually visible through PlanStore.todayTasks") only means something if
+ * it's the real PlanStore. That does mean this test writes into today's real plan on
+ * whatever device/emulator runs it — [tearDown] removes every task this test created, but
+ * if the process dies mid-test that cleanup won't run; rerunning [tearDown]'s removeTask
+ * calls by hand (or just checking today's plan) is the recovery path.
+ */
+@RunWith(AndroidJUnit4::class)
+class LearningInterventionOrchestratorIntegrationTest {
+
+    private lateinit var db: InterventionDatabase
+    private lateinit var orchestrator: LearningInterventionOrchestrator
+    private val createdTaskIds = mutableListOf<String>()
+
+    @Before
+    fun setUp() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        CheckmatePrefs.init(context)
+
+        db = Room.inMemoryDatabaseBuilder(context, InterventionDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+
+        val escrow = TaskEscrow(db.interventionTransactionDao())
+        val executor = ActionExecutor(db.interventionTransactionDao(), escrow, PlanStoreTaskMutator())
+        orchestrator = LearningInterventionOrchestrator(escrow, executor)
+    }
+
+    @After
+    fun tearDown() {
+        createdTaskIds.forEach { PlanStore.removeTask(it) }
+        createdTaskIds.clear()
+        db.close()
+    }
+
+    private fun candidate(
+        intent: LearningDecisionEngine.LearningInterventionIntent,
+        priorityScore: Double,
+        conceptId: String? = null,
+        subject: String? = null,
+        chapter: String? = null,
+        durationMinutes: Int = 25,
+        rationale: String = "test rationale"
+    ) = LearningDecisionEngine.CandidateIntervention(
+        intent = intent,
+        conceptId = conceptId,
+        subject = subject,
+        chapter = chapter,
+        topic = null,
+        durationMinutes = durationMinutes,
+        expectedGain = priorityScore,
+        priorityScore = priorityScore,
+        rationale = rationale
+    )
+
+    @Test
+    fun decisionReportProducesARealPersistedStudyTask() = runBlocking {
+        // Deliberately out of rank order vs. mappability: #1 is the highest-priority
+        // candidate but unmappable, #2 is the highest-priority *executable* one (and the
+        // one that must win), #3 is executable too but lower-ranked and must be left alone.
+        val unmappableTop = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY,
+            priorityScore = 99.0
+        )
+        val winner = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 50.0,
+            conceptId = "phy_kinematics_projectile",
+            subject = "Physics",
+            chapter = "Kinematics",
+            durationMinutes = 25,
+            rationale = "Kinematics at 40% mastery, ~9 marks still at stake."
+        )
+        val untouchedLowerRank = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 10.0,
+            conceptId = "chem_mole_concept",
+            subject = "Chemistry",
+            chapter = "Mole Concept",
+            durationMinutes = 20
+        )
+
+        val report = LearningDecisionEngine.DecisionReport(
+            studentId = "integration-test-student",
+            examType = "NEET",
+            generatedAt = System.currentTimeMillis(),
+            candidates = listOf(unmappableTop, winner, untouchedLowerRank)
+        )
+
+        val tasksBefore = PlanStore.todayTasks.value
+
+        val result = orchestrator.executeTopCandidate(report)
+
+        // 1) highest-ranked EXECUTABLE candidate wins, not the highest-ranked candidate overall
+        val created = result.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
+        assertEquals(2, created.rank)
+        assertEquals("phy_kinematics_projectile", created.candidate.conceptId)
+        createdTaskIds += created.taskId
+
+        // 2) the rejected (unmappable) top candidate produced no task, and is recorded, not dropped
+        assertEquals(1, result.rejections.size)
+        val rejection = result.rejections.single()
+        assertEquals(1, rejection.rank)
+        assertTrue(rejection.source is LearningInterventionOrchestrator.RejectionSource.NotMappable)
+
+        // 3) exactly one task was created this run
+        val tasksAfter = PlanStore.todayTasks.value
+        assertEquals(tasksBefore.size + 1, tasksAfter.size)
+
+        // 6) the task is genuinely visible through PlanStore.todayTasks (real singleton, real prefs)
+        val persistedTask = tasksAfter.find { it.id == created.taskId }
+        assertNotNull("created task must be readable back from PlanStore.todayTasks", persistedTask)
+
+        // 4) the task carries the winning candidate's concept/intent/rationale — not the
+        // rejected top candidate's, and not the untouched lower-ranked one's
+        assertEquals("Physics", persistedTask!!.subject)
+        assertEquals("Kinematics", persistedTask.topic)
+        assertEquals(25, persistedTask.durationMinutes)
+        assertEquals("REPAIR_CONCEPT", persistedTask.learningIntent)
+        assertEquals("phy_kinematics_projectile", persistedTask.conceptId)
+        assertEquals("Kinematics at 40% mastery, ~9 marks still at stake.", persistedTask.rationale)
+
+        // the untouched, lower-ranked-but-also-executable candidate must not have become a task
+        assertNull(tasksAfter.find { it.conceptId == "chem_mole_concept" })
+
+        // 5) the intervention transaction backing the winning task reached its terminal state
+        val transaction = db.interventionTransactionDao().getLatestForTask(created.taskId)
+        assertNotNull("winning task must have an intervention transaction", transaction)
+        assertEquals(InterventionState.COMPLETED, transaction!!.currentState)
+        assertTrue(InterventionState.COMPLETED in InterventionState.TERMINAL_STATES)
+    }
+}
