@@ -1,512 +1,469 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestmateWebScreen.kt =====
-package com.checkmate.ui.testresults
+//===== FILE: app/src/main/kotlin/com/checkmate/service/MentorSyncManager.kt =====
+package com.checkmate.service
 
-import android.annotation.SuppressLint
-import android.app.DownloadManager
-import android.content.Context
-import android.net.Uri
-import android.os.Environment
-import android.view.ViewGroup
-import android.webkit.CookieManager
-import android.webkit.MimeTypeMap
-import android.webkit.URLUtil
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Toast
-import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.ArrowForward
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.navigation.NavController
+import android.util.Log
 import com.checkmate.core.CheckmatePrefs
-import com.checkmate.testmate.TestmateApi
-import com.checkmate.ui.theme.*
+import com.checkmate.ui.mentor.MentorMessage
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-
-private const val PREF_HISTORY = "testmate_webview_history"
-private const val HISTORY_LIMIT = 30
+import java.util.concurrent.TimeUnit
 
 /**
- * One open WebView "tab" — each gets its own [WebView] instance (kept alive in
- * [TestmateWebScreen]'s tabWebViews cache so switching tabs doesn't reload them),
- * so each tab's back/forward stack is naturally independent, same as a real browser.
- */
-private class TabState(val id: String, initialUrl: String) {
-    var url by mutableStateOf(initialUrl)
-    var title by mutableStateOf("Test Platform")
-    var canGoBack by mutableStateOf(false)
-    var loading by mutableStateOf(true)
-}
-
-private data class HistoryEntry(val url: String, val title: String)
-
-private fun loadHistory(): List<HistoryEntry> {
-    val raw = CheckmatePrefs.getString(PREF_HISTORY, null) ?: return emptyList()
-    return try {
-        val arr = JSONArray(raw)
-        (0 until arr.length()).map {
-            val o = arr.getJSONObject(it)
-            HistoryEntry(o.optString("url"), o.optString("title"))
-        }
-    } catch (_: Exception) {
-        emptyList()
-    }
-}
-
-private fun saveHistory(entries: List<HistoryEntry>) {
-    val arr = JSONArray()
-    entries.take(HISTORY_LIMIT).forEach {
-        arr.put(JSONObject().apply { put("url", it.url); put("title", it.title) })
-    }
-    CheckmatePrefs.putString(PREF_HISTORY, arr.toString())
-}
-
-/** Most-recent-first, de-duped by URL (a revisit moves the entry back to the top). */
-private fun recordVisit(url: String, title: String) {
-    if (url.isBlank()) return
-    val updated = listOf(HistoryEntry(url, title.ifBlank { url })) +
-        loadHistory().filterNot { it.url == url }
-    saveHistory(updated.take(HISTORY_LIMIT))
-}
-
-/**
- * Standalone WebView wrapper around the actual Testmate web app — this is
- * the "load the web and let it do the rest" path: test-taking, group-mode
- * timers, leaderboard, everything Testmate already has, none of it rebuilt
- * natively. Login is Testmate's own cookie session (typed once here, then
- * persisted by the system WebView's cookie jar across app restarts) — not
- * the Bearer device-token flow, which is a separate, headless path used
- * only by TestResultsScreen/TestmateApi for pulling a result summary.
+ * MentorSyncManager — syncs the Mentor chat log (MentorViewModel's PREFS_KEY_HISTORY)
+ * between two devices sharing the same "sync_code" set in Settings -> Task Sync, same
+ * Cloudflare Worker + KV that [TaskSyncManager]/[ProfileSyncManager]/[OutcomeLedgerSyncManager]
+ * already POST to.
  *
- * File downloads (answer-key PDFs, exported reports, etc.) don't work out
- * of the box in a plain WebView — the browser normally hands those off to
- * the OS, but a WebView just silently swallows the navigation. We wire a
- * DownloadListener to Android's DownloadManager and forward the WebView's
- * session cookie + user agent so authenticated downloads still work.
+ * REQUIRES a new `/mentor` route on the Worker (KV-backed, same shape as the existing
+ * `/tasks` and `/outcomes` routes) — that source isn't part of this Android repo, same
+ * caveat as TaskSyncManager's doc comment. Add a `/mentor` handler that stores whatever
+ * JSON body is POSTed under the `code` field, and returns it verbatim on GET `?code=`.
  *
- * Multi-tab + history: several WebViews can be open at once (e.g. a group
- * session in one tab, a previous test result in another) via the tab
- * switcher grid, and every page visited across every tab is logged to a
- * small persisted history list (CheckmatePrefs, capped at [HISTORY_LIMIT])
- * so an old test result page can be reopened without re-navigating from
- * scratch. This is a lightweight approximation of a real browser's tab
- * strip — not Chrome's tab-group/thumbnail machinery.
+ * Sync model: merge, not last-write-wins whole-list-replace like [TaskSyncManager] — a
+ * chat log is additive (each device may append messages while the other is offline), so
+ * overwriting one device's copy with the other's would silently drop real messages. Every
+ * pull unions local + remote messages, de-duped by (role, content, ts) and sorted by ts,
+ * then both sides converge: the merged result is what gets kept locally AND pushed back up,
+ * same non-destructive spirit as [OutcomeLedgerSyncManager] but for a log both devices write
+ * to, not just one that gets backed up.
  */
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-fun TestmateWebScreen(navController: NavController) {
-    val context = LocalContext.current
-    // Cache of live WebView instances keyed by tab id — never read during
-    // composition, only from click handlers / WebView callbacks. Reused
-    // across tab switches (reparented into whichever AndroidView is active)
-    // so a tab's page and its own back/forward stack survive switching away
-    // and back, instead of reloading from scratch every time.
-    val tabWebViews = remember { mutableMapOf<String, WebView>() }
+object MentorSyncManager {
 
-    val baseUrl = remember {
-        CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
-    }
+    private const val TAG = "MentorSyncManager"
+    private const val MENTOR_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/mentor"
+    private const val MAX_MESSAGES = 40 // matches MentorViewModel.MAX_PERSISTED_MESSAGES
 
-    val tabs = remember {
-        mutableStateListOf<TabState>().apply {
-            if (!baseUrl.isNullOrBlank()) add(TabState(id = "tab-0", initialUrl = baseUrl))
-        }
-    }
-    var activeTabId by remember { mutableStateOf(tabs.firstOrNull()?.id ?: "") }
-    var nextTabIndex by remember { mutableStateOf(1) }
-    val activeTab = tabs.find { it.id == activeTabId }
+    private val json = Json { ignoreUnknownKeys = true }
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
 
-    var showTabSwitcher by remember { mutableStateOf(false) }
-    var showHistory by remember { mutableStateOf(false) }
-    var history by remember { mutableStateOf(loadHistory()) }
+    private fun syncCode(): String? =
+        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
 
-    fun openNewTab(url: String) {
-        val id = "tab-${nextTabIndex++}"
-        tabs.add(TabState(id = id, initialUrl = url))
-        activeTabId = id
-        showTabSwitcher = false
-    }
+    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
+    fun isEnabled(): Boolean = syncCode() != null
 
-    fun closeTab(id: String) {
-        tabWebViews.remove(id)?.destroy()
-        tabs.removeAll { it.id == id }
-        if (activeTabId == id) {
-            activeTabId = tabs.lastOrNull()?.id ?: ""
-        }
-        if (tabs.isEmpty()) {
-            showTabSwitcher = false
-            navController.popBackStack()
-        }
-    }
-
-    // Hardware/gesture back: go back within the active tab's own history first,
-    // only leaving the screen once that tab has nowhere left to go back to.
-    BackHandler(enabled = activeTab?.canGoBack == true) {
-        tabWebViews[activeTabId]?.goBack()
-    }
-
-    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
-        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = {
-                if (activeTab?.canGoBack == true) tabWebViews[activeTabId]?.goBack()
-                else navController.popBackStack()
-            }) {
-                Icon(Icons.Default.ArrowBack, null, tint = AccentGreen)
+    /**
+     * Pushes the given (already-trimmed) message list up under the configured sync code.
+     * No-op if no sync code is set. Must be called from a background thread; failures are
+     * logged and swallowed, same posture as every other sync manager here — a flaky
+     * connection should never block sending or reading a Mentor message.
+     */
+    fun pushHistory(messages: List<MentorMessage>) {
+        val code = syncCode() ?: return
+        try {
+            val messagesJson = json.encodeToString(messages)
+            val payload = JSONObject().apply {
+                put("code", code)
+                put("updatedAt", System.currentTimeMillis())
+                put("messages", JSONArray(messagesJson))
             }
-            Text(
-                activeTab?.title ?: "Test Platform",
-                fontSize = 18.sp, color = White90, modifier = Modifier.weight(1f),
-                maxLines = 1, overflow = TextOverflow.Ellipsis
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val response = client.newCall(Request.Builder().url(MENTOR_URL).post(body).build()).execute()
+            Log.d(TAG, "pushHistory: ${response.code} (${messages.size} messages)")
+            response.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "pushHistory exception: ${e.message}")
+        }
+    }
+
+    /**
+     * Fetches the other device's synced messages and returns [local] merged with them —
+     * union de-duped by (role, content, ts), sorted by ts, capped to [MAX_MESSAGES] — or
+     * null if no sync code is set or nothing could be fetched (caller keeps [local]
+     * untouched in that case). Must be called from a background thread.
+     */
+    fun pullAndMerge(local: List<MentorMessage>): List<MentorMessage>? {
+        val code = syncCode() ?: return null
+        return try {
+            val request = Request.Builder().url("$MENTOR_URL?code=$code").get().build()
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string()
+            response.close()
+            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
+
+            val messagesArr = JSONObject(bodyStr).optJSONArray("messages") ?: return null
+            val remote = json.decodeFromString<List<MentorMessage>>(messagesArr.toString())
+            if (remote.isEmpty()) return null
+
+            (local + remote)
+                .distinctBy { "${it.role}|${it.content}|${it.ts}" }
+                .sortedBy { it.ts }
+                .takeLast(MAX_MESSAGES)
+        } catch (e: Exception) {
+            Log.w(TAG, "pullAndMerge exception: ${e.message}")
+            null
+        }
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
+package com.checkmate.ui.mentor
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.AppUsageTracker
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.MentorKnowledge
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.MentorSyncManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+
+private val historyJson = Json { ignoreUnknownKeys = true }
+private const val PREFS_KEY_HISTORY = "mentor_chat_history"
+private const val MAX_PERSISTED_MESSAGES = 40
+
+@Serializable
+data class MentorMessage(
+    val role:    String,
+    val content: String,
+    val ts:      Long = System.currentTimeMillis()
+)
+
+data class MentorUiState(
+    val messages:   List<MentorMessage> = emptyList(),
+    val inputText:  String              = "",
+    val isLoading:  Boolean             = false,
+    val ttsEnabled: Boolean             = CheckmatePrefs.getBoolean("tts_enabled", true)
+)
+
+class MentorViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(MentorUiState())
+    val state: StateFlow<MentorUiState> = _state.asStateFlow()
+
+    init {
+        loadHistory()
+        syncFromRemote()
+    }
+
+    private fun loadHistory() {
+        val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+        val messages = if (saved != null) {
+            try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+            catch (_: Exception) { emptyList() }
+        } else emptyList()
+
+        val initial = if (messages.isEmpty())
+            listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        else messages
+
+        _state.update { it.copy(messages = initial) }
+    }
+
+    /**
+     * Pulls the other device's synced Mentor history (if a sync code is set) and merges
+     * it into what's already loaded locally — this is what actually fixes "chat history
+     * not syncing along with sync code": until now MentorViewModel never called
+     * MentorSyncManager at all, so nothing here ever left or entered the device.
+     * Runs once per screen open, off the main thread; if nothing changes (no sync code,
+     * request failed, or the merge is identical to what's already showing) the local
+     * state is left untouched.
+     */
+    private fun syncFromRemote() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val merged = MentorSyncManager.pullAndMerge(_state.value.messages) ?: return@launch
+            if (merged != _state.value.messages) {
+                _state.update { it.copy(messages = merged) }
+                val trimmed = merged.takeLast(MAX_PERSISTED_MESSAGES)
+                CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(trimmed))
+                // Push the merged copy back up too, so the other device converges on the
+                // same union next time it pulls, instead of only this device gaining
+                // messages the other device sent while offline.
+                MentorSyncManager.pushHistory(trimmed)
+            }
+        }
+    }
+
+    private fun persistHistory(messages: List<MentorMessage>) {
+        val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
+        CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(trimmed))
+        viewModelScope.launch(Dispatchers.IO) { MentorSyncManager.pushHistory(trimmed) }
+    }
+
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank() || _state.value.isLoading) return
+
+        val userMsg = MentorMessage("user", text)
+        val updatedMessages = _state.value.messages + userMsg
+        _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
+        persistHistory(updatedMessages)
+
+        viewModelScope.launch {
+            val response = try {
+                val systemPrompt = buildSystemPrompt(context, text)
+                val history      = buildHistoryForLlm()
+                LlmGateway.complete(history, systemPrompt)
+            } catch (e: Exception) {
+                "I couldn't process that right now. Try again."
+            }
+
+            val assistantMsg = MentorMessage(
+                "assistant",
+                response.ifBlank { "No response. Check your API key in Settings." }
             )
-            if (activeTab?.loading == true) {
-                CircularProgressIndicator(modifier = Modifier.size(18.dp), color = AccentGreen, strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-            }
-            IconButton(onClick = { tabWebViews[activeTabId]?.reload() }) {
-                Icon(Icons.Default.Refresh, null, tint = AccentGreen)
-            }
-            IconButton(onClick = { openNewTab(baseUrl ?: activeTab?.url ?: "") }) {
-                Icon(Icons.Default.Add, null, tint = AccentGreen)
-            }
-            IconButton(onClick = { showTabSwitcher = true }) {
-                TabCountBadge(count = tabs.size)
-            }
-        }
+            val finalMessages = _state.value.messages + assistantMsg
+            _state.update { it.copy(messages = finalMessages, isLoading = false) }
+            persistHistory(finalMessages)
 
-        if (baseUrl.isNullOrBlank()) {
-            Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
-                Text(
-                    "Set the Testmate base URL in Settings → Test Platform first.",
-                    fontSize = 13.sp, color = White60
-                )
-            }
-        } else if (activeTab != null) {
-            var urlError by remember(activeTab.id) { mutableStateOf<String?>(null) }
-
-            // Address bar — lets a pasted link (e.g. a group test session URL like
-            // https://testmate2.vercel.app/test/<session-id>) be loaded directly in
-            // the active tab. Bound directly to activeTab.url (a field on the stable
-            // TabState object, not a separate recomposition-scoped variable) so it
-            // stays correct even when a cached WebView from an earlier composition
-            // updates it via onPageFinished. Still gated by the same allow-list as
-            // the Settings field (TestmateApi.isAllowedBaseUrl) — this only ever
-            // navigates within Testmate's own hosts, never an arbitrary URL.
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value         = activeTab.url,
-                    onValueChange = { activeTab.url = it; urlError = null },
-                    modifier      = Modifier.weight(1f),
-                    singleLine    = true,
-                    textStyle    = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
-                    placeholder  = { Text("Paste a Testmate link (e.g. group test session)", color = White30, fontSize = 12.sp) },
-                    isError      = urlError != null,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor   = AccentGreen,
-                        unfocusedBorderColor = White30,
-                        cursorColor          = AccentGreen,
-                        focusedTextColor     = White90,
-                        unfocusedTextColor   = White90,
-                        errorBorderColor     = AccentRed
-                    )
-                )
-                Spacer(Modifier.width(8.dp))
-                IconButton(onClick = {
-                    val candidate = activeTab.url.trim()
-                    if (TestmateApi.isAllowedBaseUrl(candidate)) {
-                        urlError = null
-                        activeTab.loading = true
-                        tabWebViews[activeTabId]?.loadUrl(candidate)
-                    } else {
-                        urlError = "Only testmate2.com, testmate2.vercel.app, or the Testmate Supabase auth link are accepted"
-                    }
-                }) {
-                    Icon(Icons.Default.ArrowForward, null, tint = AccentGreen)
-                }
-                IconButton(onClick = { history = loadHistory(); showHistory = true }) {
-                    Icon(Icons.Default.History, null, tint = White60)
-                }
-            }
-            urlError?.let {
-                Text(it, fontSize = 10.sp, color = AccentRed,
-                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp))
-            }
-
-            // key(activeTab.id) forces a fresh AndroidView per active tab instead of
-            // mutating one in place — factory then either reparents the cached WebView
-            // for that tab (switching back to a tab you already had open) or creates a
-            // brand-new one (first time this tab is shown).
-            key(activeTab.id) {
-                AndroidView(
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    factory = { ctx ->
-                        val cached = tabWebViews[activeTab.id]
-                        if (cached != null) {
-                            (cached.parent as? ViewGroup)?.removeView(cached)
-                            cached
-                        } else {
-                            CookieManager.getInstance().setAcceptCookie(true)
-                            WebView(ctx).apply {
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true
-                                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                                webViewClient = object : WebViewClient() {
-                                    override fun onPageFinished(view: WebView, url: String?) {
-                                        activeTab.loading = false
-                                        val pageTitle = view.title?.takeIf { it.isNotBlank() } ?: "Test Platform"
-                                        activeTab.title = pageTitle
-                                        activeTab.canGoBack = view.canGoBack()
-                                        url?.takeIf { it.isNotBlank() }?.let {
-                                            activeTab.url = it
-                                            recordVisit(it, pageTitle)
-                                        }
-                                    }
-
-                                    override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
-                                        activeTab.canGoBack = view.canGoBack()
-                                    }
-                                }
-                                setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                                    downloadFile(ctx, url, userAgent, contentDisposition, mimeType)
-                                }
-                                tabWebViews[activeTab.id] = this
-                                loadUrl(activeTab.url)
-                            }
-                        }
-                    }
-                )
+            if (_state.value.ttsEnabled && response.isNotBlank()) {
+                val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
+                CheckmateTTS.speak(context, firstSentence)
             }
         }
     }
 
-    if (showTabSwitcher) {
-        TabSwitcherOverlay(
-            tabs = tabs,
-            activeTabId = activeTabId,
-            onSelect = { activeTabId = it; showTabSwitcher = false },
-            onClose = { closeTab(it) },
-            onNewTab = { openNewTab(baseUrl ?: "") },
-            onDismiss = { showTabSwitcher = false }
-        )
+    fun clearHistory() {
+        val initial = listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        _state.update { it.copy(messages = initial) }
+        // FIX: putString(key, null) crashes on non-null String param — use remove() instead
+        CheckmatePrefs.remove(PREFS_KEY_HISTORY)
+        // Push the reset state too — otherwise the next sync pull on this device (or a
+        // pull on the other device) would merge the old messages right back in, since
+        // pullAndMerge unions with whatever's still sitting in the worker's KV under
+        // this sync code.
+        viewModelScope.launch(Dispatchers.IO) { MentorSyncManager.pushHistory(initial) }
     }
 
-    if (showHistory) {
-        HistoryDialog(
-            entries = history,
-            onOpen = { entry ->
-                showHistory = false
-                if (activeTab != null && TestmateApi.isAllowedBaseUrl(entry.url)) {
-                    activeTab.loading = true
-                    tabWebViews[activeTabId]?.loadUrl(entry.url)
-                } else if (TestmateApi.isAllowedBaseUrl(entry.url)) {
-                    openNewTab(entry.url)
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(20)
+        return msgs.joinToString("\n") { msg ->
+            if (msg.role == "user") "Student: ${msg.content}"
+            else "Mentor: ${msg.content}"
+        }
+    }
+
+    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
+    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
+    // other suspend call this function already awaits nothing for (buildSystemPrompt
+    // itself did no suspending work before this). Its one call site (send(), above)
+    // already invokes it from inside viewModelScope.launch, so this is a signature-only
+    // change — no call-site rewrite needed.
+    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
+        val profile         = ConsultationProfile.load()
+        val ledger          = BehaviorLedger.getSummaryForPlanner()
+        val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
+
+        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
+        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
+        // updates, and upcoming coaching tests. These four blocks close that gap.
+        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
+        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
+            todayTasks.joinToString("\n") { t ->
+                val marker = when (t.state) {
+                    TaskState.DONE    -> "[DONE]"
+                    TaskState.SKIPPED -> "[SKIPPED]"
+                    TaskState.ACTIVE  -> "[ACTIVE]"
+                    TaskState.PAUSED  -> "[PAUSED]"
+                    TaskState.PENDING -> "[PENDING]"
                 }
-            },
-            onClear = {
-                saveHistory(emptyList())
-                history = emptyList()
-            },
-            onDismiss = { showHistory = false }
-        )
-    }
-}
-
-/** Small rounded-square tab-count indicator, same idea as Chrome's tab-switcher icon. */
-@Composable
-private fun TabCountBadge(count: Int) {
-    Box(
-        modifier = Modifier
-            .size(24.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .border(1.5.dp, AccentGreen, RoundedCornerShape(6.dp)),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(count.toString(), fontSize = 12.sp, color = AccentGreen, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-private fun TabSwitcherOverlay(
-    tabs: List<TabState>,
-    activeTabId: String,
-    onSelect: (String) -> Unit,
-    onClose: (String) -> Unit,
-    onNewTab: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    Column(modifier = Modifier.fillMaxSize().background(BgDark)) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onNewTab) {
-                Icon(Icons.Default.Add, null, tint = AccentGreen)
+                val custom = if (t.isCustom) " (custom)" else ""
+                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
             }
-            Text(
-                "${tabs.size} tab${if (tabs.size == 1) "" else "s"}",
-                fontSize = 16.sp, color = White90, fontWeight = FontWeight.Medium,
-                modifier = Modifier.weight(1f).padding(start = 8.dp)
+        }
+
+        val usageSummary = try {
+            AppUsageTracker.getTodayUsage(context, limit = 5)
+                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
+        } catch (_: Exception) { "" }
+
+        val todayContext = TodayContext.getSummaryText()
+        val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
+
+        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
+        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
+        // import — see TestResultNormalizer) into one StudentModel, but nothing read
+        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
+        // ledger, blind to actual test performance. buildLearningSummary() below
+        // compacts it into the same plain-text block style as planSummary/ledger.
+        val learningSummary = try {
+            buildLearningSummary(StudentModelBuilder.build(context))
+        } catch (e: Exception) {
+            "" // same fail-open pattern as usageSummary/coachingContext above — a
+               // learning-state read failure shouldn't block the rest of the prompt.
+        }
+
+        return buildString {
+            appendLine("""
+You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
+You have full context about this student. Be specific, direct, and curriculum-aware.
+Keep responses under 5 lines unless a detailed breakdown is needed.
+Never give generic motivation. React to actual data.
+Refer to specific topics, chapters, marks gaps, and deadlines.
+You also have access to the full conversation history above — refer to it naturally when relevant.
+If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
+you may briefly flag it — but don't derail the actual question they asked.
+If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
+the student's question, reference them specifically instead of speaking generically. When a
+weak concept lists a prerequisite issue, name the specific prerequisite topic (e.g. "your
+Rolling Motion mistakes trace back to Laws of Motion, which is still at 38%") rather than
+saying only that a prerequisite gap exists.
+            """.trimIndent())
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            appendLine("BEHAVIOR DATA: $ledger")
+            appendLine()
+            appendLine("TODAY'S PLAN:")
+            appendLine(planSummary)
+            appendLine()
+            if (learningSummary.isNotBlank()) {
+                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
+                appendLine(learningSummary)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES:")
+                appendLine(todayContext)
+                appendLine()
+            }
+            if (usageSummary.isNotBlank()) {
+                appendLine("TODAY'S APP USAGE (top 5):")
+                appendLine(usageSummary)
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING TESTS/LECTURES (next 3 days):")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (knowledgeBlocks.isNotBlank()) {
+                appendLine("RELEVANT KNOWLEDGE:")
+                appendLine(knowledgeBlocks)
+                appendLine()
+            }
+            appendLine("Respond as Mentor.")
+        }.trim()
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
+     * plain-text block matching the existing planSummary/ledger style — Mentor's
+     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
+     * convention, so this deliberately doesn't reuse AdaptivePlanner's
+     * StudentModelPromptSummary/Json.encodeToString approach.
+     *
+     * Empty-guard: returns "" when no report has ever been imported
+     * (conceptsTracked == 0) — same pattern as the other optional context blocks
+     * above (usageSummary/coachingContext) — so a student who hasn't imported a
+     * mock yet doesn't get a misleading "0 concepts tracked" section.
+     */
+    private fun buildLearningSummary(model: StudentModel): String {
+        if (model.overall.conceptsTracked == 0) return ""
+
+        val overall = model.overall
+        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(5)
+        val topErrors = model.unresolvedErrors.take(5)
+
+        return buildString {
+            appendLine(
+                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
+                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
+                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
             )
-            IconButton(onClick = onDismiss) {
-                Icon(Icons.Default.Close, null, tint = White60)
-            }
-        }
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
-            contentPadding = PaddingValues(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.weight(1f)
-        ) {
-            items(tabs, key = { it.id }) { tab ->
-                val selected = tab.id == activeTabId
-                Surface(
-                    onClick = { onSelect(tab.id) },
-                    shape  = RoundedCornerShape(12.dp),
-                    color  = BgCard,
-                    border = BorderStroke(if (selected) 1.5.dp else 0.5.dp, if (selected) AccentGreen else White10)
-                ) {
-                    Column(modifier = Modifier.padding(10.dp).height(90.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                tab.title, fontSize = 13.sp, color = White90, fontWeight = FontWeight.Medium,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
-                            )
-                            IconButton(onClick = { onClose(tab.id) }, modifier = Modifier.size(20.dp)) {
-                                Icon(Icons.Default.Close, null, tint = White60, modifier = Modifier.size(16.dp))
-                            }
+            if (weakest.isNotEmpty()) {
+                appendLine("Weakest concepts:")
+                weakest.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s) and, when known, their own mastery — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) {
+                        val names = c.prerequisiteIssues.joinToString { ref ->
+                            val prereqLabel = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+                            val prereqMastery = model.concepts[ref.conceptId]?.mastery
+                            if (prereqMastery != null) "$prereqLabel (${(prereqMastery * 100).toInt()}%)"
+                            else "$prereqLabel (not yet attempted)"
                         }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            tab.url, fontSize = 10.sp, color = White30,
-                            maxLines = 2, overflow = TextOverflow.Ellipsis
-                        )
-                    }
+                        " — traces to weak prerequisite(s): $names"
+                    } else ""
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
                 }
             }
+            if (reviewDue.isNotEmpty()) {
+                appendLine("Due for review (forgetting risk rising):")
+                reviewDue.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
+                }
+            }
+            if (topErrors.isNotEmpty()) {
+                appendLine("Recurring errors:")
+                topErrors.forEach { e ->
+                    val concept = model.concepts[e.conceptId]
+                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
+                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
+                }
+            }
+        }.trim()
+    }
+
+    companion object {
+        /**
+         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
+         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
+         * directly into the same persisted chat history MentorViewModel reads on init — turning
+         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
+         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
+         * methods above so a message appended here shows up next time MentorScreen is opened.
+         */
+        fun appendProactiveMessage(text: String) {
+            val clean = text.trim()
+            if (clean.isEmpty()) return
+            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+            val existing = if (saved != null) {
+                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+                catch (_: Exception) { emptyList() }
+            } else emptyList()
+            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(updated))
+            // Same sync gap as the instance methods above — this is a static call from
+            // services with no viewModelScope to hop onto (DistractionGuard, ReminderService),
+            // so a plain background Thread is used instead, same pattern Settings already
+            // uses for its own fire-and-forget sync calls.
+            Thread { MentorSyncManager.pushHistory(updated) }.start()
         }
     }
 }
 
-@Composable
-private fun HistoryDialog(
-    entries: List<HistoryEntry>,
-    onOpen: (HistoryEntry) -> Unit,
-    onClear: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = BgCard,
-        title = { Text("History", color = White90, fontSize = 16.sp) },
-        text = {
-            if (entries.isEmpty()) {
-                Text("No pages visited yet.", fontSize = 12.sp, color = White30)
-            } else {
-                LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
-                    items(entries, key = { it.url }) { entry ->
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp)
-                        ) {
-                            Surface(onClick = { onOpen(entry) }, color = Color.Transparent) {
-                                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                                    Text(
-                                        entry.title, fontSize = 13.sp, color = White90,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        entry.url, fontSize = 10.sp, color = White30,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            HorizontalDivider(color = White10)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Close", color = AccentGreen) }
-        },
-        dismissButton = {
-            if (entries.isNotEmpty()) {
-                TextButton(onClick = onClear) { Text("Clear", color = AccentRed) }
-            }
-        }
-    )
-}
 
-/**
- * Hands a WebView download off to the system DownloadManager so it lands
- * in the device's normal Downloads folder with a notification, progress
- * bar, and retry-on-failure — same as any browser download. Cookies are
- * copied over explicitly because DownloadManager makes its own network
- * request outside the WebView, so it doesn't automatically inherit the
- * WebView's session.
- */
-private fun downloadFile(
-    context: Context,
-    url: String,
-    userAgent: String?,
-    contentDisposition: String?,
-    mimeType: String?
-) {
-    try {
-        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-        val cookie = CookieManager.getInstance().getCookie(url)
-        val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() }
-            ?: MimeTypeMap.getSingleton()
-                .getMimeTypeFromExtension(MimeTypeMap.getFileExtensionFromUrl(url))
-            ?: "application/octet-stream"
-
-        val request = DownloadManager.Request(Uri.parse(url)).apply {
-            if (!cookie.isNullOrBlank()) addRequestHeader("cookie", cookie)
-            if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
-            setMimeType(resolvedMimeType)
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-            setAllowedOverRoaming(true)
-        }
-
-        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        downloadManager.enqueue(request)
-        Toast.makeText(context, "Downloading $fileName…", Toast.LENGTH_SHORT).show()
-    } catch (e: Exception) {
-        Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
-    }
-}
