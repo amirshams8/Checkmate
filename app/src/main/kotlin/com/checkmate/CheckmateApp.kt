@@ -18,6 +18,7 @@ import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.ReminderService
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.StudyStateSyncManager
 import com.checkmate.workmode.DistractionGuard
@@ -59,6 +60,17 @@ class CheckmateApp : Application() {
         // scheduled anywhere, which is why the weekly report never sent.
         GuardianNotifier.scheduleWeeklyReport(this)
         // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
+
+        // Previously missing — nothing anywhere in the app called
+        // ReminderService.start(), so its 15-min loop (checkPendingTasks,
+        // ProactiveMentor.idleCheckIfNeeded/consistencyCheckIfNeeded/
+        // holidayPromptIfNeeded, and GapTaskManager.generateIfNeeded/
+        // escalationCheckIfNeeded) never ran on a fresh install/process start.
+        // Mirrors the other always-on schedulers above (WorkModeManager,
+        // GuardianNotifier) that get armed unconditionally from here; also
+        // re-armed from BootReceiver since a plain Service doesn't survive
+        // reboot the way InterventionTriggerScheduler's WorkManager job does.
+        ReminderService.start(this)
 
         // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
         // BEFORE scheduling the periodic trigger evaluation below, so there's no window

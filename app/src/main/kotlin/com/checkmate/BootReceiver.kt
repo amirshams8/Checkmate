@@ -9,6 +9,7 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ReminderService
 import com.checkmate.service.TelegramAlertBot
 import com.checkmate.workmode.WorkModeManager
 import com.checkmate.workmode.WorkModeScheduleReceiver
@@ -43,6 +44,15 @@ class BootReceiver : BroadcastReceiver() {
         WorkModeManager.init(context)
         WorkModeScheduleReceiver.scheduleDailyAlarms(context)
         Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
+
+        // Previously missing — ReminderService is a plain foreground Service, not
+        // WorkManager, so (like the AlarmManager schedules above, unlike
+        // InterventionTriggerScheduler's periodic work) it does not survive a reboot
+        // on its own. Nothing was restarting it here, which meant the entire 15-min
+        // loop (checkPendingTasks, ProactiveMentor's idle/consistency/holiday checks,
+        // GapTaskManager's daily generation + escalation) silently stopped firing
+        // after every reboot.
+        ReminderService.start(context)
 
         // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
         // non-terminal by the process that just died (Blueprint §4). No equivalent call
