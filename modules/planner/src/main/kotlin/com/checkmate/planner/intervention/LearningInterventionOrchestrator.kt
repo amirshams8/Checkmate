@@ -27,6 +27,18 @@ import java.util.UUID
  * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
  * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
  *
+ * Daily-cadence wiring ([com.checkmate.service.GapTaskManager] calls [executeTopCandidate]
+ * once a day, not just once at import time): without something remembering what was
+ * already served, re-running the same-shaped [LearningDecisionEngine.decideFromReport]
+ * output tomorrow would just re-pick today's exact candidate forever, since mastery hasn't
+ * moved without the P0b evidence loop. [GapTaskLedger] is that memory — a candidate whose
+ * concept is already [GapTaskLedger.isCovered] is skipped here (see [RejectionSource.AlreadyCovered])
+ * before it's even mapped, and a successful [OrchestrationOutcome.Created] records itself
+ * via [GapTaskLedger.recordServed] so the NEXT run's escalation depth and "which concept is
+ * this" both stay accurate. A concept only ever becomes covered when its task reaches
+ * `TaskState.DONE` (see [GapTaskLedger.markCovered]'s own doc) — never merely because a
+ * task once existed for it — so an ignored gap-task keeps being re-served, not abandoned.
+ *
  * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
  * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
  * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
@@ -35,14 +47,15 @@ import java.util.UUID
  * on what gets persisted.
  *
  * This class does not itself decide *when* to run — it consumes an already-built
- * [LearningDecisionEngine.DecisionReport]. Wiring a real trigger (a schedule, a button, a
- * WorkManager job) to call [executeTopCandidate] is a separate, later step, same as every
- * other "plumbing exists, nothing calls it on a schedule yet" seam in this package.
+ * [LearningDecisionEngine.DecisionReport]. [com.checkmate.ui.testresults.TestResultsViewModel]
+ * calls it once per fresh test import; [com.checkmate.service.GapTaskManager] calls it once
+ * per day thereafter — see that class's own doc for the daily trigger.
  */
 class LearningInterventionOrchestrator(
     private val taskEscrow: TaskEscrow,
     private val actionExecutor: ActionExecutor,
-    private val idGenerator: () -> String = { UUID.randomUUID().toString() }
+    private val idGenerator: () -> String = { UUID.randomUUID().toString() },
+    private val dayKeyProvider: () -> String = { GapTaskLedger.todayKey() }
 ) {
 
     /** Why a candidate never became a task — kept as a distinct type from
@@ -60,6 +73,10 @@ class LearningInterventionOrchestrator(
          *  as a named case rather than a thrown exception so a candidate this happens to
          *  is recorded like any other rejection instead of aborting the whole walk. */
         object TaskIdCollision : RejectionSource()
+        /** [GapTaskLedger.isCovered] already true for this candidate's concept — its
+         *  gap-task previously reached DONE, so the daily walk moves on to the next
+         *  ranked candidate instead of re-serving a concept the student already finished. */
+        object AlreadyCovered : RejectionSource()
     }
 
     /** One candidate that was ranked but did not end up as a task — see class doc's
@@ -97,9 +114,9 @@ class LearningInterventionOrchestrator(
 
     /**
      * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
-     * ranked order and executes the first one that clears mapping, policy validation, and
-     * execution — see class doc for why this stops at one instead of creating a task per
-     * candidate.
+     * ranked order and executes the first one that clears the covered-concept check,
+     * mapping, policy validation, and execution — see class doc for why this stops at one
+     * instead of creating a task per candidate, and for [GapTaskLedger]'s role in the walk.
      */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
@@ -109,6 +126,19 @@ class LearningInterventionOrchestrator(
 
         report.candidates.forEachIndexed { index, candidate ->
             val rank = index + 1
+
+            val conceptId = candidate.conceptId
+            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.AlreadyCovered,
+                    detail = "concept $conceptId already reached DONE on a previous gap-task run",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
+
             val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
             if (request == null) {
                 rejections += CandidateRejection(
@@ -154,6 +184,7 @@ class LearningInterventionOrchestrator(
                                 action,
                                 now
                             )
+                            GapTaskLedger.recordServed(candidate, taskId, dayKeyProvider())
                             return OrchestrationResult(
                                 outcome = OrchestrationOutcome.Created(candidate, rank, taskId, executionOutcome),
                                 rejections = rejections

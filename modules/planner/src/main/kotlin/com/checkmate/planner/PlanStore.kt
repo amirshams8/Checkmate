@@ -310,12 +310,25 @@ object PlanStore {
         )
     }
 
-    private fun loadDay(key: String): List<StudyTask> {
+    /**
+     * Gap-task escalation pass: was `private`, now exposed. [GapTaskManager] (app layer)
+     * needs to read a SPECIFIC past day's plan to check whether an autonomously-created
+     * gap-repair task ever reached DONE — [todayTasks] only ever holds the current day's
+     * list, so there was no way to answer "what happened to the task from 3 days ago"
+     * without this. Behavior is unchanged for every existing caller in this file.
+     */
+    fun loadDay(key: String): List<StudyTask> {
         val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
         return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
     }
 
     private fun todayKey() = keyForDay(Calendar.getInstance())
-    private fun keyForDay(cal: Calendar) =
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed alongside [loadDay] — same
+     * caller, same reason: [GapTaskManager] needs to compute the exact day-key for "N days
+     * ago" itself so it can pair it with [loadDay].
+     */
+    fun keyForDay(cal: Calendar) =
         "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
 }

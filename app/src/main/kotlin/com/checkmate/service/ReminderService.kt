@@ -63,6 +63,15 @@ class ReminderService : Service() {
                 // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
                 // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
                 try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
+                // own class doc always said was still missing — runs the analysis pipeline once
+                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. See
+                // GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
+                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task escalation: warns the student, with escalating persuasion, when the
+                // currently-active gap concept has gone unaddressed for more than a day — see
+                // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
+                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min
