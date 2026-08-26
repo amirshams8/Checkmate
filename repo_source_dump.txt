@@ -27,6 +27,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── BehaviorLedgerSyncManager.kt
 │   │   │   │   │   │   │   ├── DayHistorySyncManager.kt
 │   │   │   │   │   │   │   ├── FloatingAttentionService.kt
+│   │   │   │   │   │   │   ├── GapTaskManager.kt
 │   │   │   │   │   │   │   ├── GuardianNotifier.kt
 │   │   │   │   │   │   │   ├── InterventionActionReceiver.kt
 │   │   │   │   │   │   │   ├── InterventionNotifier.kt
@@ -232,6 +233,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── intervention
 │   │   │   │   │   │   │   │   │   ├── ActionExecutor.kt
 │   │   │   │   │   │   │   │   │   ├── CreateTaskRequest.kt
+│   │   │   │   │   │   │   │   │   ├── GapTaskLedger.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionDatabase.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionFallback.kt
 │   │   │   │   │   │   │   │   │   ├── InterventionGuardianGateway.kt
@@ -2282,6 +2284,217 @@ private fun DragHandle(onDrag: (Float) -> Unit) {
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.ui.mentor.MentorViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done — and warn the student, with escalating persuasion, when one is being
+ * ignored." Two entry points, both called from [ReminderService]'s existing 15-min loop
+ * (same wiring pattern as every [ProactiveMentor] check already there):
+ *
+ * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
+ *   doc always said was still missing, now filled by a genuine day-level schedule instead
+ *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
+ *   still owns that import-time trigger; this is the *ongoing* one).
+ * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
+ *   currently being served and, once it's gone unaddressed for more than a day, sends an
+ *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
+ *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ *
+ * Neither function needs its own "is there anything to analyze" gate beyond checking
+ * `studentModel.concepts.isEmpty()` — an empty StudentModel (no test ever imported) just
+ * means [LearningDecisionEngine.decideFromReport] returns no candidates and nothing happens,
+ * same as the import-time trigger's own behavior.
+ */
+object GapTaskManager {
+
+    private const val TAG = "GapTaskManager"
+
+    // ── Daily generation ─────────────────────────────────────────────────────
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasGeneratedToday]): resolves whether
+     * yesterday's gap-task actually got finished (see [resolveActiveConceptState]), then runs
+     * the exact same StudentModel -> PerformanceReport -> ScoreGainEstimator -> ExpectedScore
+     * -> DecisionReport pipeline [com.checkmate.ui.testresults.TestResultsViewModel] runs
+     * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
+     * instead of a just-parsed report since there may be no fresh import today at all.
+     * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
+     * and picking up where yesterday left off — this function's only job is to run the
+     * pipeline and mark today done, success or failure either way (a failed analysis run
+     * shouldn't retry every 15 minutes for the rest of the day).
+     */
+    suspend fun generateIfNeeded(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+
+        resolveActiveConceptState()
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+            val decisionReport = LearningDecisionEngine.decideFromReport(
+                report, studentModel, estimates, expectedScore
+            )
+            LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+        } catch (e: Exception) {
+            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+        } finally {
+            GapTaskLedger.markGeneratedToday(todayKey)
+        }
+    }
+
+    /**
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, marks it covered
+     * BEFORE re-ranking — otherwise today's run would still see it as active (streak intact)
+     * for the few seconds between "the student finished it" and "the ledger found out," and
+     * [LearningInterventionOrchestrator] would have no way to know without this being called
+     * first. Safe to call with nothing active (both lookups return null and this no-ops).
+     */
+    private fun resolveActiveConceptState() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey) ?: return
+        if (task.state == TaskState.DONE) {
+            GapTaskLedger.markCovered(conceptId)
+        }
+    }
+
+    /** Checks today's live list first (cheap, common case), falls back to [PlanStore.loadDay]
+     *  for a task created on an earlier day that hasn't rolled into today's plan. */
+    private fun findTask(taskId: String, dayKey: String): StudyTask? =
+        PlanStore.todayTasks.value.find { it.id == taskId }
+            ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── Escalating skip/stall warning ───────────────────────────────────────
+
+    private val TIER_1_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach warning a student about ONE specific unfinished
+task, not their whole day. Rules:
+- 1-3 sentences, direct and consequence-based, no generic praise or "you can do it"
+- Name the specific concept and why it matters (marks at stake), not vague encouragement
+- Tone: firm reminder, not yet an ultimatum
+""".trimIndent()
+
+    private val TIER_2_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach. This specific gap has been ignored for several
+days running — this is the escalated warning, not the first nudge. Rules:
+- 3-5 sentences, still no fluff, but now make the full case
+- State plainly how many days this has been unaddressed
+- Connect this ONE concept to the real exam-day consequence (marks lost, gap to target score)
+- Reference the student's own skip pattern if given one, as evidence this is a pattern, not a one-off
+- End with a direct, specific ask — not "you should study" but "do this today"
+""".trimIndent()
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasEscalatedToday]). Depth scales with
+     * [GapTaskLedger.activeDaysServed]: day 1 gets no escalation at all (the task just showed
+     * up today — that's the normal experience, not a warning), day 2-3 names the concrete
+     * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
+     * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
+     * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
+     * interrupting with a warning would be counterproductive) and clears/covers it instead of
+     * warning if it turns out to already be DONE (belt-and-suspenders alongside
+     * [resolveActiveConceptState], which normally catches this first).
+     */
+    suspend fun escalationCheckIfNeeded(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasEscalatedToday(todayKey)) return
+
+        val daysServed = GapTaskLedger.activeDaysServed()
+        if (daysServed < 2) return // day 1: normal experience, no warning
+
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey)
+
+        if (task == null || task.state == TaskState.DONE) {
+            if (task?.state == TaskState.DONE) GapTaskLedger.markCovered(conceptId)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+        if (task.state != TaskState.PENDING && task.state != TaskState.SKIPPED) {
+            return // ACTIVE/PAUSED right now — don't interrupt an in-progress session
+        }
+
+        val tier = if (daysServed >= 4) 2 else 1
+        val message = try {
+            buildEscalationMessage(tier, daysServed)
+        } catch (e: Exception) {
+            Log.e(TAG, "escalation message build failed: ${e.message}", e)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+
+        MentorViewModel.appendProactiveMessage(message)
+        MentorNotifier.notify(context, message)
+        GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
+        GapTaskLedger.markEscalatedToday(todayKey)
+        Log.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+    }
+
+    private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {
+        val subject = GapTaskLedger.activeSubject()?.takeIf { it.isNotBlank() } ?: "this subject"
+        val topic = GapTaskLedger.activeTopic()?.takeIf { it.isNotBlank() } ?: subject
+        val rationale = GapTaskLedger.activeRationale()?.takeIf { it.isNotBlank() }
+            ?: "$topic still needs work."
+        val marksAtStake = GapTaskLedger.activeExpectedGain()
+
+        val patternLine = BehaviorLedger.getSnapshot().subjectPatterns
+            .filter { it.subject.equals(subject, ignoreCase = true) }
+            .maxByOrNull { it.occurrences }
+            ?.let { "You've skipped $subject ${it.taskType} tasks ${it.occurrences} times recently — this fits the pattern." }
+            ?: ""
+
+        val ruleMsg = when (tier) {
+            2 -> "Day $daysServed unaddressed: $topic. $rationale $patternLine " +
+                "This gap alone is worth roughly ${"%.1f".format(marksAtStake)} marks — " +
+                "left alone, it stays a hole on exam day. Do it today."
+            else -> "$topic has gone $daysServed days without being done. $rationale Do it today."
+        }
+
+        val systemPrompt = if (tier == 2) TIER_2_SYSTEM_PROMPT else TIER_1_SYSTEM_PROMPT
+        val userPrompt = "Concept: $topic ($subject). Days unaddressed: $daysServed. " +
+            "Why it matters: $rationale Approx marks at stake: ${"%.1f".format(marksAtStake)}. " +
+            "$patternLine Write the warning message now."
+
+        return try {
+            val llmMsg = LlmGateway.complete(userPrompt, systemPrompt)
+            if (llmMsg.isBlank()) ruleMsg else llmMsg
+        } catch (_: Exception) {
+            ruleMsg
+        }
+    }
+}
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
 package com.checkmate.service
 
@@ -4087,6 +4300,15 @@ class ReminderService : Service() {
                 // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
                 // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
                 try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
+                // own class doc always said was still missing — runs the analysis pipeline once
+                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. See
+                // GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
+                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task escalation: warns the student, with escalating persuasion, when the
+                // currently-active gap concept has gone unaddressed for more than a day — see
+                // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
+                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min
@@ -23611,13 +23833,26 @@ object PlanStore {
         )
     }
 
-    private fun loadDay(key: String): List<StudyTask> {
+    /**
+     * Gap-task escalation pass: was `private`, now exposed. [GapTaskManager] (app layer)
+     * needs to read a SPECIFIC past day's plan to check whether an autonomously-created
+     * gap-repair task ever reached DONE — [todayTasks] only ever holds the current day's
+     * list, so there was no way to answer "what happened to the task from 3 days ago"
+     * without this. Behavior is unchanged for every existing caller in this file.
+     */
+    fun loadDay(key: String): List<StudyTask> {
         val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
         return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
     }
 
     private fun todayKey() = keyForDay(Calendar.getInstance())
-    private fun keyForDay(cal: Calendar) =
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed alongside [loadDay] — same
+     * caller, same reason: [GapTaskManager] needs to compute the exact day-key for "N days
+     * ago" itself so it can pair it with [loadDay].
+     */
+    fun keyForDay(cal: Calendar) =
         "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
 }
 
@@ -23888,6 +24123,207 @@ data class CreateTaskRequest(
     val conceptId:           String?  = null,
     val targetedConceptIds:  List<String> = emptyList()
 )
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done" needs state that neither [LearningInterventionOrchestrator] nor
+ * [com.checkmate.planner.PlanStore] carry on their own:
+ *
+ * - [PlanStore.todayTasks] only ever holds the CURRENT day's list — there's nowhere to ask
+ *   "did the concept I served three days ago ever get finished."
+ * - [LearningInterventionOrchestrator.executeTopCandidate] re-ranks from scratch every run.
+ *   Without something outside it remembering what's already been served, re-running the
+ *   SAME [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport] output
+ *   tomorrow (mastery hasn't moved without the P0b evidence loop) would just re-pick
+ *   today's exact candidate forever — the backlog would never advance.
+ *
+ * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
+ * covering three things:
+ * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
+ *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
+ *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
+ *    skips covered concepts when walking the ranked candidate list.
+ * 2. **The active concept's streak** — how many consecutive days the current gap concept
+ *    has been re-served without reaching DONE, which is exactly the escalation-depth input
+ *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
+ *    persuasion — see [com.checkmate.service.GapTaskManager]).
+ * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
+ *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ *
+ * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
+ * per-student keying needed.
+ */
+object GapTaskLedger {
+
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private const val KEY_COVERED_CONCEPT_IDS   = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID     = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID        = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY   = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED    = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT        = "gap_task_active_subject"
+    private const val KEY_ACTIVE_TOPIC          = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN   = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE      = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN  = "gap_task_active_expected_gain"
+    private const val KEY_LAST_GENERATED_DAY    = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY    = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG           = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES   = 50
+
+    // ── Covered concepts ────────────────────────────────────────────────────
+
+    fun isCovered(conceptId: String): Boolean =
+        coveredIds().contains(conceptId)
+
+    /**
+     * Marks [conceptId] covered — call this ONLY once the gap-task's own `TaskState`
+     * reaches DONE, never at task-creation time. Creation-time marking would mean an
+     * ignored task silently "counts" as covered and the orchestrator moves on to the next
+     * gap, permanently abandoning the one the student never actually did — the opposite of
+     * "till every gap is covered." Clears the active-concept pointer if [conceptId] was it,
+     * so the next [recordServed] call for a different concept starts a fresh streak instead
+     * of inheriting this one's day count.
+     */
+    fun markCovered(conceptId: String) {
+        val updated = coveredIds() + conceptId
+        CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
+        recordWarningOutcome(conceptId)
+        if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
+            clearActive()
+        }
+    }
+
+    private fun coveredIds(): Set<String> =
+        CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
+            ?.split(",")
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
+
+    // ── Active concept + streak ─────────────────────────────────────────────
+
+    /**
+     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
+     * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
+     * SAME concept already active (re-served because it wasn't finished); starts a fresh
+     * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     */
+    fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
+        val conceptId = candidate.conceptId ?: return
+        val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+        val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        val daysServed = if (previousConceptId == conceptId) previousDays + 1 else 1
+
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, candidate.topic ?: candidate.chapter ?: "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
+    }
+
+    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+    fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
+    fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
+    fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+    fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeTopic(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null)?.takeIf { it.isNotBlank() }
+    fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
+    fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
+    fun activeExpectedGain(): Double =
+        CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
+
+    private fun clearActive() {
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+    }
+
+    // ── Once-a-day guards ────────────────────────────────────────────────────
+
+    fun hasGeneratedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_GENERATED_DAY, null) == todayKey
+
+    fun markGeneratedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_GENERATED_DAY, todayKey)
+
+    fun hasEscalatedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_ESCALATED_DAY, null) == todayKey
+
+    fun markEscalatedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_ESCALATED_DAY, todayKey)
+
+    // ── Warning outcome log (data collection only — no style-selection logic yet) ──────
+
+    @Serializable
+    data class WarningLogEntry(
+        val conceptId: String,
+        val sentDayKey: String,
+        val daysServedAtEscalation: Int,
+        val tier: Int,
+        var completedAfterward: Boolean = false
+    )
+
+    /**
+     * Appends one record every time [com.checkmate.service.GapTaskManager] actually sends
+     * an escalation message. Deliberately just data collection for now — once there's
+     * enough history to mean anything, which [tier] (escalation depth) correlates with a
+     * concept actually reaching DONE afterward becomes a real, evidence-backed question
+     * instead of a guess. Capped at [MAX_WARNING_LOG_ENTRIES], oldest dropped first.
+     */
+    fun logWarningSent(conceptId: String, dayKey: String, daysServedAtEscalation: Int, tier: Int) {
+        val updated = (warningLog() + WarningLogEntry(conceptId, dayKey, daysServedAtEscalation, tier))
+            .takeLast(MAX_WARNING_LOG_ENTRIES)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    /** Called from [markCovered] — flips the most recent unresolved warning for
+     *  [conceptId], if any, so the log can later answer "did warning X actually work." */
+    private fun recordWarningOutcome(conceptId: String) {
+        val log = warningLog()
+        val lastUnresolvedIndex = log.indexOfLast { it.conceptId == conceptId && !it.completedAfterward }
+        if (lastUnresolvedIndex == -1) return
+        val updated = log.toMutableList()
+        updated[lastUnresolvedIndex] = updated[lastUnresolvedIndex].copy(completedAfterward = true)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    fun warningLog(): List<WarningLogEntry> =
+        CheckmatePrefs.getString(KEY_WARNING_LOG, null)?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+
+    // ── Shared day-key helper — same "YYYY_dayOfYear" format PlanStore uses ────────────
+
+    fun todayKey(): String {
+        val cal = Calendar.getInstance()
+        return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+}
 
 
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/InterventionDatabase.kt =====
@@ -24957,6 +25393,18 @@ import java.util.UUID
  * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
  * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
  *
+ * Daily-cadence wiring ([com.checkmate.service.GapTaskManager] calls [executeTopCandidate]
+ * once a day, not just once at import time): without something remembering what was
+ * already served, re-running the same-shaped [LearningDecisionEngine.decideFromReport]
+ * output tomorrow would just re-pick today's exact candidate forever, since mastery hasn't
+ * moved without the P0b evidence loop. [GapTaskLedger] is that memory — a candidate whose
+ * concept is already [GapTaskLedger.isCovered] is skipped here (see [RejectionSource.AlreadyCovered])
+ * before it's even mapped, and a successful [OrchestrationOutcome.Created] records itself
+ * via [GapTaskLedger.recordServed] so the NEXT run's escalation depth and "which concept is
+ * this" both stay accurate. A concept only ever becomes covered when its task reaches
+ * `TaskState.DONE` (see [GapTaskLedger.markCovered]'s own doc) — never merely because a
+ * task once existed for it — so an ignored gap-task keeps being re-served, not abandoned.
+ *
  * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
  * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
  * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
@@ -24965,14 +25413,15 @@ import java.util.UUID
  * on what gets persisted.
  *
  * This class does not itself decide *when* to run — it consumes an already-built
- * [LearningDecisionEngine.DecisionReport]. Wiring a real trigger (a schedule, a button, a
- * WorkManager job) to call [executeTopCandidate] is a separate, later step, same as every
- * other "plumbing exists, nothing calls it on a schedule yet" seam in this package.
+ * [LearningDecisionEngine.DecisionReport]. [com.checkmate.ui.testresults.TestResultsViewModel]
+ * calls it once per fresh test import; [com.checkmate.service.GapTaskManager] calls it once
+ * per day thereafter — see that class's own doc for the daily trigger.
  */
 class LearningInterventionOrchestrator(
     private val taskEscrow: TaskEscrow,
     private val actionExecutor: ActionExecutor,
-    private val idGenerator: () -> String = { UUID.randomUUID().toString() }
+    private val idGenerator: () -> String = { UUID.randomUUID().toString() },
+    private val dayKeyProvider: () -> String = { GapTaskLedger.todayKey() }
 ) {
 
     /** Why a candidate never became a task — kept as a distinct type from
@@ -24990,6 +25439,10 @@ class LearningInterventionOrchestrator(
          *  as a named case rather than a thrown exception so a candidate this happens to
          *  is recorded like any other rejection instead of aborting the whole walk. */
         object TaskIdCollision : RejectionSource()
+        /** [GapTaskLedger.isCovered] already true for this candidate's concept — its
+         *  gap-task previously reached DONE, so the daily walk moves on to the next
+         *  ranked candidate instead of re-serving a concept the student already finished. */
+        object AlreadyCovered : RejectionSource()
     }
 
     /** One candidate that was ranked but did not end up as a task — see class doc's
@@ -25027,9 +25480,9 @@ class LearningInterventionOrchestrator(
 
     /**
      * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
-     * ranked order and executes the first one that clears mapping, policy validation, and
-     * execution — see class doc for why this stops at one instead of creating a task per
-     * candidate.
+     * ranked order and executes the first one that clears the covered-concept check,
+     * mapping, policy validation, and execution — see class doc for why this stops at one
+     * instead of creating a task per candidate, and for [GapTaskLedger]'s role in the walk.
      */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
@@ -25039,6 +25492,19 @@ class LearningInterventionOrchestrator(
 
         report.candidates.forEachIndexed { index, candidate ->
             val rank = index + 1
+
+            val conceptId = candidate.conceptId
+            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.AlreadyCovered,
+                    detail = "concept $conceptId already reached DONE on a previous gap-task run",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
+
             val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
             if (request == null) {
                 rejections += CandidateRejection(
@@ -25084,6 +25550,7 @@ class LearningInterventionOrchestrator(
                                 action,
                                 now
                             )
+                            GapTaskLedger.recordServed(candidate, taskId, dayKeyProvider())
                             return OrchestrationResult(
                                 outcome = OrchestrationOutcome.Created(candidate, rank, taskId, executionOutcome),
                                 rejections = rejections
