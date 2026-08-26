@@ -1,571 +1,1088 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/service/StudyStateSyncManager.kt =====
-package com.checkmate.service
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
+package com.checkmate.planner
 
-import android.util.Log
 import com.checkmate.core.CheckmatePrefs
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
-
-/**
- * StudyStateSyncManager — "sync everything" pass, third and last piece alongside
- * [BehaviorLedgerSyncManager] and the pre-existing [OutcomeLedgerSyncManager]/
- * [ProfileSyncManager]/[TaskSyncManager]/[StatsSyncManager].
- *
- * Backs up the remaining small "current state" blobs that weren't covered by any
- * existing sync manager, same Cloudflare Worker + KV, same "sync_code":
- *   - mentor_chat_history   (MentorViewModel — capped at 40 messages)
- *   - checklist_template    (DailyChecklist — master item list, not the daily
- *                            done/not-done state, which is day-history — see
- *                            DayHistorySyncManager for that)
- *   - coaching_planner_entries (CoachingPlannerEntry — coaching-test countdown list)
- *
- * Two sync paths share this one worker blob:
- *  - [pushState]/[pullStateIfEmpty]: reinstall-recovery only, once-daily EOD
- *    cadence, restore-only-if-locally-unset (see GuardianNotifier.sendEndOfDaySummary
- *    and CheckmateApp startup).
- *  - [pushMentorMessage]/[pullMentorHistory]: fast per-message mentor path, called
- *    directly from MentorViewModel on every send/receive. Both are read-modify-write
- *    against the server blob (GET current state, touch only KEY_MENTOR_HISTORY, PUT
- *    the whole thing back) since the worker's /studystate route is a flat overwrite
- *    with no server-side merge — skipping the GET would silently wipe out whatever
- *    checklist_template / coaching_planner_entries the other device last synced.
- *
- * Synchronous OkHttp calls, matching [ProfileSyncManager]'s style (these are
- * plain CheckmatePrefs string reads, no suspend DAO calls involved) — callers
- * must run this off the main thread, which all wiring points already do.
- */
-object StudyStateSyncManager {
-
-    private const val TAG = "StudyStateSyncManager"
-    private const val STATE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/studystate"
-
-    private const val KEY_MENTOR_HISTORY = "mentor_chat_history"
-    private const val KEY_CHECKLIST_TEMPLATE = "checklist_template"
-    private const val KEY_COACHING_ENTRIES = "coaching_planner_entries"
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .build()
-
-    private fun syncCode(): String? =
-        CheckmatePrefs.getString("sync_code", null)?.trim()?.takeIf { it.isNotBlank() }
-
-    /** True when a sync code is configured — callers can use this to show/hide sync UI state. */
-    fun isEnabled(): Boolean = syncCode() != null
-
-    /**
-     * Pushes whichever of the three fields have local values (a device that's
-     * never opened Mentor simply omits that field rather than pushing blank
-     * over a possibly-already-synced value). No-op if no sync code is set.
-     * Must be called from a background thread.
-     */
-    fun pushState() {
-        val code = syncCode() ?: return
-        try {
-            val state = JSONObject()
-            CheckmatePrefs.getString(KEY_MENTOR_HISTORY, null)?.let { state.put("mentor_chat_history", it) }
-            CheckmatePrefs.getString(KEY_CHECKLIST_TEMPLATE, null)?.let { state.put("checklist_template", it) }
-            CheckmatePrefs.getString(KEY_COACHING_ENTRIES, null)?.let { state.put("coaching_planner_entries", it) }
-
-            if (state.length() == 0) return // nothing local to push yet
-
-            val payload = JSONObject().apply {
-                put("code", code)
-                put("updatedAt", System.currentTimeMillis())
-                put("state", state)
-            }
-            val body = payload.toString().toRequestBody("application/json".toMediaType())
-            val response = client.newCall(Request.Builder().url(STATE_URL).post(body).build()).execute()
-            Log.d(TAG, "pushState: ${response.code}")
-            response.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "pushState exception: ${e.message}")
-        }
-    }
-
-    /**
-     * Restores each of the three fields independently, but ONLY where the local
-     * value for that specific field is unset — a device that already has its own
-     * checklist template keeps it even if this restores a fresh Mentor history.
-     * Must be called from a background thread.
-     */
-    fun pullStateIfEmpty() {
-        val code = syncCode() ?: return
-        val needMentor    = CheckmatePrefs.getString(KEY_MENTOR_HISTORY, null) == null
-        val needChecklist = CheckmatePrefs.getString(KEY_CHECKLIST_TEMPLATE, null) == null
-        val needCoaching  = CheckmatePrefs.getString(KEY_COACHING_ENTRIES, null) == null
-        if (!needMentor && !needChecklist && !needCoaching) return // nothing to restore
-
-        try {
-            val request = Request.Builder().url("$STATE_URL?code=$code").get().build()
-            val response = client.newCall(request).execute()
-            val bodyStr = response.body?.string()
-            response.close()
-            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return
-
-            val state = JSONObject(bodyStr).optJSONObject("state") ?: return
-            var restoredAny = false
-
-            if (needMentor) {
-                state.optString("mentor_chat_history", "").takeIf { it.isNotBlank() }?.let {
-                    CheckmatePrefs.putString(KEY_MENTOR_HISTORY, it); restoredAny = true
-                }
-            }
-            if (needChecklist) {
-                state.optString("checklist_template", "").takeIf { it.isNotBlank() }?.let {
-                    CheckmatePrefs.putString(KEY_CHECKLIST_TEMPLATE, it); restoredAny = true
-                }
-            }
-            if (needCoaching) {
-                state.optString("coaching_planner_entries", "").takeIf { it.isNotBlank() }?.let {
-                    CheckmatePrefs.putString(KEY_COACHING_ENTRIES, it); restoredAny = true
-                }
-            }
-            if (restoredAny) Log.d(TAG, "pullStateIfEmpty: restored fields from sync code")
-        } catch (e: Exception) {
-            Log.w(TAG, "pullStateIfEmpty exception: ${e.message}")
-        }
-    }
-
-    /**
-     * Pushes a single updated mentor chat history string immediately — not
-     * gated behind [pushState]'s once-daily cadence. Read-modify-write: fetches
-     * the current server blob first and merges only [KEY_MENTOR_HISTORY] into
-     * it, so a device that only ever talks to Mentor can't clobber another
-     * device's already-synced checklist/coaching fields. No-op if no sync code
-     * is set. Must be called from a background thread.
-     */
-    fun pushMentorMessage(chatHistoryJson: String) {
-        val code = syncCode() ?: return
-        try {
-            val state = fetchServerState(code) ?: JSONObject()
-            state.put(KEY_MENTOR_HISTORY, chatHistoryJson)
-
-            val payload = JSONObject().apply {
-                put("code", code)
-                put("updatedAt", System.currentTimeMillis())
-                put("state", state)
-            }
-            val body = payload.toString().toRequestBody("application/json".toMediaType())
-            val response = client.newCall(Request.Builder().url(STATE_URL).post(body).build()).execute()
-            Log.d(TAG, "pushMentorMessage: ${response.code}")
-            response.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "pushMentorMessage exception: ${e.message}")
-        }
-    }
-
-    /**
-     * Fetches the latest mentor chat history from the server unconditionally —
-     * unlike [pullStateIfEmpty], which only restores when the local field is
-     * null, this always checks so MentorViewModel can pick up a message sent
-     * from the other device. Returns null on any failure or empty history.
-     * Must be called from a background thread.
-     */
-    fun pullMentorHistory(): String? {
-        val code = syncCode() ?: return null
-        return try {
-            fetchServerState(code)?.optString(KEY_MENTOR_HISTORY, "")?.takeIf { it.isNotBlank() }
-        } catch (e: Exception) {
-            Log.w(TAG, "pullMentorHistory exception: ${e.message}")
-            null
-        }
-    }
-
-    /** Shared GET + parse helper for [pushMentorMessage] / [pullMentorHistory]. */
-    private fun fetchServerState(code: String): JSONObject? {
-        val request = Request.Builder().url("$STATE_URL?code=$code").get().build()
-        val response = client.newCall(request).execute()
-        val bodyStr = response.body?.string()
-        response.close()
-        if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
-        return JSONObject(bodyStr).optJSONObject("state")
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
-package com.checkmate.ui.mentor
-
-import android.content.Context
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.checkmate.core.AppUsageTracker
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CoachingPlannerEntry
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
-import com.checkmate.core.MentorKnowledge
-import com.checkmate.core.TodayContext
-import com.checkmate.core.llm.LlmGateway
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import com.checkmate.learning.student.StudentModelBuilder
-import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.BehaviorLedger
-import com.checkmate.service.StudyStateSyncManager
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import java.util.Calendar
 
-private val historyJson = Json { ignoreUnknownKeys = true }
-private const val PREFS_KEY_HISTORY = "mentor_chat_history"
-private const val MAX_PERSISTED_MESSAGES = 40
-
-@Serializable
-data class MentorMessage(
-    val role:    String,
-    val content: String,
-    val ts:      Long = System.currentTimeMillis()
+// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
+// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
+// excluded — see StudyTask.actualMinutes) across today's completed sessions.
+// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
+// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
+// no pause behavior to measure), so a fatigue/distraction trend is visible
+// even on a day with zero completions.
+data class PauseStats(
+    val actualFocusMinutesToday: Int   = 0,
+    val avgPausesPerSession:     Float = 0f,
+    val pauseRatePercent:        Int   = 0
 )
 
-data class MentorUiState(
-    val messages:   List<MentorMessage> = emptyList(),
-    val inputText:  String              = "",
-    val isLoading:  Boolean             = false,
-    val ttsEnabled: Boolean             = CheckmatePrefs.getBoolean("tts_enabled", true)
-)
+object PlanStore {
 
-class MentorViewModel : ViewModel() {
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
+    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
 
-    private val _state = MutableStateFlow(MentorUiState())
-    val state: StateFlow<MentorUiState> = _state.asStateFlow()
+    init { reload() }
 
-    init {
-        loadHistory()
-        // CORRECTION: chat previously synced through a /mentor endpoint that was
-        // never added to the worker (permanent 404 — see StudyStateSyncManager's
-        // class doc). Now routed through /studystate's dedicated mentor path
-        // instead. Pull-on-open picks up whatever the OTHER device pushed since
-        // this device last had the screen open — pullStateIfEmpty() alone can't
-        // do this because it only restores when the local field is unset, which
-        // is false the moment this device has ever sent one message.
-        pullRemoteIfNewer()
+    private fun reload() {
+        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
+        _todayTasks.value = saved?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
     }
 
-    private fun loadHistory() {
-        val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
-        val messages = if (saved != null) {
-            try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
-            catch (_: Exception) { emptyList() }
-        } else emptyList()
-
-        val initial = if (messages.isEmpty())
-            listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
-        else messages
-
-        _state.update { it.copy(messages = initial) }
-    }
+    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
 
     /**
-     * Fetches the server's mentor history and adopts it only if it's strictly
-     * newer than what's already loaded locally (by last-message timestamp) —
-     * last-write-wins, matching StudyStateSyncManager's flat-overwrite model.
-     * This guards against a slow network response landing after the student
-     * has already sent a new local message and stomping it with a stale pull.
-     * On adopt, re-persists locally but does NOT push back — that would just
-     * echo the same history the server already has.
+     * Appends a single manually-created task to today's plan WITHOUT touching any
+     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
+     * the whole list, this is additive — safe to call any time, any number of times.
+     * The new task goes through the exact same StudyTask model as AdaptivePlanner
+     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
+     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
+     * code path needed anywhere downstream.
      */
-    private fun pullRemoteIfNewer() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val remoteJson = StudyStateSyncManager.pullMentorHistory() ?: return@launch
-            val remoteMessages = try {
-                historyJson.decodeFromString<List<MentorMessage>>(remoteJson)
-            } catch (_: Exception) {
-                return@launch
-            }
-            if (remoteMessages.isEmpty()) return@launch
-
-            val remoteLastTs = remoteMessages.last().ts
-            val localLastTs = _state.value.messages.lastOrNull()?.ts ?: 0L
-            if (remoteLastTs > localLastTs) {
-                _state.update { it.copy(messages = remoteMessages) }
-                persistHistory(remoteMessages)
-            }
-        }
-    }
-
-    private fun persistHistory(messages: List<MentorMessage>): String {
-        val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
-        val json = historyJson.encodeToString(trimmed)
-        CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
-        return json
-    }
-
-    /** Persists locally, then pushes to the other device off the main thread. */
-    private fun persistAndSync(messages: List<MentorMessage>) {
-        val json = persistHistory(messages)
-        viewModelScope.launch(Dispatchers.IO) { StudyStateSyncManager.pushMentorMessage(json) }
-    }
-
-    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
-
-    fun send(context: Context) {
-        val text = _state.value.inputText.trim()
-        if (text.isBlank() || _state.value.isLoading) return
-
-        val userMsg = MentorMessage("user", text)
-        val updatedMessages = _state.value.messages + userMsg
-        _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
-        persistAndSync(updatedMessages)
-
-        viewModelScope.launch {
-            val response = try {
-                val systemPrompt = buildSystemPrompt(context, text)
-                val history      = buildHistoryForLlm()
-                LlmGateway.complete(history, systemPrompt)
-            } catch (e: Exception) {
-                "I couldn't process that right now. Try again."
-            }
-
-            val assistantMsg = MentorMessage(
-                "assistant",
-                response.ifBlank { "No response. Check your API key in Settings." }
-            )
-            val finalMessages = _state.value.messages + assistantMsg
-            _state.update { it.copy(messages = finalMessages, isLoading = false) }
-            persistAndSync(finalMessages)
-
-            if (_state.value.ttsEnabled && response.isNotBlank()) {
-                val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
-                CheckmateTTS.speak(context, firstSentence)
-            }
-        }
-    }
-
-    fun clearHistory() {
-        val initial = listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
-        _state.update { it.copy(messages = initial) }
-        // FIX: putString(key, null) crashes on non-null String param — use remove() instead
-        CheckmatePrefs.remove(PREFS_KEY_HISTORY)
-        // Push the reset state too, so the other device's next pullRemoteIfNewer()
-        // picks up the clear instead of silently keeping stale history around.
-        viewModelScope.launch(Dispatchers.IO) {
-            StudyStateSyncManager.pushMentorMessage(historyJson.encodeToString(initial))
-        }
-    }
-
-    private fun buildHistoryForLlm(): String {
-        val msgs = _state.value.messages.takeLast(20)
-        return msgs.joinToString("\n") { msg ->
-            if (msg.role == "user") "Student: ${msg.content}"
-            else "Mentor: ${msg.content}"
-        }
-    }
-
-    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
-    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
-    // other suspend call this function already awaits nothing for (buildSystemPrompt
-    // itself did no suspending work before this). Its one call site (send(), above)
-    // already invokes it from inside viewModelScope.launch, so this is a signature-only
-    // change — no call-site rewrite needed.
-    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
-        val profile         = ConsultationProfile.load()
-        val ledger          = BehaviorLedger.getSummaryForPlanner()
-        val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
-
-        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
-        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
-        // updates, and upcoming coaching tests. These four blocks close that gap.
-        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
-        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
-            todayTasks.joinToString("\n") { t ->
-                val marker = when (t.state) {
-                    TaskState.DONE    -> "[DONE]"
-                    TaskState.SKIPPED -> "[SKIPPED]"
-                    TaskState.ACTIVE  -> "[ACTIVE]"
-                    TaskState.PAUSED  -> "[PAUSED]"
-                    TaskState.PENDING -> "[PENDING]"
-                }
-                val custom = if (t.isCustom) " (custom)" else ""
-                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
-            }
-        }
-
-        val usageSummary = try {
-            AppUsageTracker.getTodayUsage(context, limit = 5)
-                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
-        } catch (_: Exception) { "" }
-
-        val todayContext = TodayContext.getSummaryText()
-        val coachingContext = try { CoachingPlannerEntry.upcomingContext(3) } catch (_: Exception) { "" }
-
-        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
-        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
-        // import — see TestResultNormalizer) into one StudentModel, but nothing read
-        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
-        // ledger, blind to actual test performance. buildLearningSummary() below
-        // compacts it into the same plain-text block style as planSummary/ledger.
-        val learningSummary = try {
-            buildLearningSummary(StudentModelBuilder.build(context))
-        } catch (e: Exception) {
-            "" // same fail-open pattern as usageSummary/coachingContext above — a
-               // learning-state read failure shouldn't block the rest of the prompt.
-        }
-
-        return buildString {
-            appendLine("""
-You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
-You have full context about this student. Be specific, direct, and curriculum-aware.
-Keep responses under 5 lines unless a detailed breakdown is needed.
-Never give generic motivation. React to actual data.
-Refer to specific topics, chapters, marks gaps, and deadlines.
-You also have access to the full conversation history above — refer to it naturally when relevant.
-If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
-you may briefly flag it — but don't derail the actual question they asked.
-If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
-the student's question, reference them specifically instead of speaking generically. When a
-weak concept lists a prerequisite issue, name the specific prerequisite topic (e.g. "your
-Rolling Motion mistakes trace back to Laws of Motion, which is still at 38%") rather than
-saying only that a prerequisite gap exists.
-            """.trimIndent())
-            appendLine()
-            appendLine("STUDENT PROFILE:")
-            appendLine(profile.toPromptContext())
-            appendLine()
-            appendLine("BEHAVIOR DATA: $ledger")
-            appendLine()
-            appendLine("TODAY'S PLAN:")
-            appendLine(planSummary)
-            appendLine()
-            if (learningSummary.isNotBlank()) {
-                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
-                appendLine(learningSummary)
-                appendLine()
-            }
-            if (todayContext.isNotBlank()) {
-                appendLine("TODAY'S LOGGED UPDATES:")
-                appendLine(todayContext)
-                appendLine()
-            }
-            if (usageSummary.isNotBlank()) {
-                appendLine("TODAY'S APP USAGE (top 5):")
-                appendLine(usageSummary)
-                appendLine()
-            }
-            if (coachingContext.isNotBlank()) {
-                appendLine("UPCOMING COACHING TESTS/LECTURES (next 3 days):")
-                appendLine(coachingContext)
-                appendLine()
-            }
-            if (knowledgeBlocks.isNotBlank()) {
-                appendLine("RELEVANT KNOWLEDGE:")
-                appendLine(knowledgeBlocks)
-                appendLine()
-            }
-            appendLine("Respond as Mentor.")
-        }.trim()
-    }
+    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
 
     /**
-     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
-     * plain-text block matching the existing planSummary/ledger style — Mentor's
-     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
-     * convention, so this deliberately doesn't reuse AdaptivePlanner's
-     * StudentModelPromptSummary/Json.encodeToString approach.
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — appends a single LearningDecisionEngine-
+     * originated task to today's plan. Same additive semantics as [addCustomTask]
+     * (existing tasks, generated or custom, are untouched); kept as its own entry point
+     * rather than reusing addCustomTask() so a StudyTask's provenance is never ambiguous:
+     * addCustomTask() is what HomeViewModel calls for a student-typed task (isCustom=true),
+     * this is what [com.checkmate.planner.intervention.TaskMutator.createTask] calls for a
+     * task whose shape and content came from a validated [com.checkmate.planner.intervention.CreateTaskRequest]
+     * (isCustom stays false — learningIntent/conceptId/targetedConceptIds carry the
+     * provenance instead, see StudyTask's doc on those fields).
      *
-     * Empty-guard: returns "" when no report has ever been imported
-     * (conceptsTracked == 0) — same pattern as the other optional context blocks
-     * above (usageSummary/coachingContext) — so a student who hasn't imported a
-     * mock yet doesn't get a misleading "0 concepts tracked" section.
+     * Caller is expected to have already run this through TaskEscrow + PolicyValidator —
+     * PlanStore itself has no opinion on validity, same as addCustomTask/saveTodayTasks.
      */
-    private fun buildLearningSummary(model: StudentModel): String {
-        if (model.overall.conceptsTracked == 0) return ""
+    fun createTask(task: StudyTask) = persist(_todayTasks.value + task)
 
-        val overall = model.overall
-        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
-        val reviewDue = model.concepts.values
-            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
-            .sortedByDescending { it.forgettingRisk }
-            .take(5)
-        val topErrors = model.unresolvedErrors.take(5)
+    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
+    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
 
-        return buildString {
-            appendLine(
-                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
-                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
-                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
-            )
-            if (weakest.isNotEmpty()) {
-                appendLine("Weakest concepts:")
-                weakest.forEach { c ->
-                    val label = c.topic ?: c.chapter ?: "unknown"
-                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
-                    // prerequisite(s) and, when known, their own mastery — see
-                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
-                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) {
-                        val names = c.prerequisiteIssues.joinToString { ref ->
-                            val prereqLabel = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
-                            val prereqMastery = model.concepts[ref.conceptId]?.mastery
-                            if (prereqMastery != null) "$prereqLabel (${(prereqMastery * 100).toInt()}%)"
-                            else "$prereqLabel (not yet attempted)"
+    /** Edits the planned duration of a single task — used for custom-task duration editing. */
+    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(durationMinutes = durationMinutes)
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
+     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
+     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
+     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
+     * fit it into today's free time, and this is how the student fixes that from HomeScreen
+     * without deleting and re-adding it.
+     */
+    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime)
+    }
+
+    /**
+     * Manually sets both scheduledStartTime AND durationMinutes for a task in a single
+     * write — backs the Timeline/List clock-icon's start+end time editor (see
+     * HomeViewModel.rescheduleTask / HomeScreen's ScheduleTaskDialog). Unlike calling
+     * updateTaskSchedule() and updateTaskDuration() separately, this goes through one
+     * persist() call so the two fields can never observably desync mid-update (e.g. a
+     * StateFlow collector seeing the new start time paired with the old duration for one
+     * frame).
+     */
+    fun updateTaskScheduleAndDuration(taskId: String, scheduledStartTime: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime, durationMinutes = durationMinutes)
+    }
+
+    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
+
+    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
+        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+    }
+
+    /**
+     * Blueprint 2.6: records the session's real focus time — as measured by
+     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
+     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
+     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
+     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
+     * clock)"). Previously neither field was ever written, so both stats silently
+     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
+     */
+    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
+        it.copy(focusMinutes = minutes, actualMinutes = minutes)
+    }
+
+    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
+    }
+
+    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
+        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
+    }
+
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+
+    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
+    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
+        it.copy(intentionText = intentionText)
+    }
+
+    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
+    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
+        it.copy(completedStatus = status)
+    }
+
+    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
+        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
+    }
+
+    /**
+     * Single write path for today's task list — every mutating function above funnels
+     * through this instead of duplicating the "encode + persist + update StateFlow"
+     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
+     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
+     * copy is newer, without PlanStore itself knowing anything about sync/network —
+     * this module stays local-storage-only, same as before.
+     */
+    private fun persist(tasks: List<StudyTask>) {
+        val key = todayKey()
+        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
+        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
+        _todayTasks.value = tasks
+    }
+
+    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
+    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
+
+    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
+     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
+    fun currentDayKey(): String = todayKey()
+
+    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
+
+    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
+    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
+
+    fun getTodayCompletionPercent(): Int {
+        val t = _todayTasks.value
+        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
+    }
+
+    fun getStreakDays(): Int {
+        var streak = 0
+        val cal = Calendar.getInstance()
+        for (i in 0..30) {
+            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
+            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
+            if (tasks.isEmpty() || tasks.none { it.state == TaskState.DONE }) break
+            streak++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return streak
+    }
+
+    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
+
+    /**
+     * Per-day study status used by the Stats consistency calendar and by
+     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
+     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
+     * neutral/unknown state, which is what silently reading everything as 0% used to do.
+     */
+    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
+
+    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
+    fun getDayStatus(cal: Calendar): DayStudyStatus {
+        val today = Calendar.getInstance()
+        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
+            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
+        if (isFuture) return DayStudyStatus.FUTURE
+
+        val tasks = loadDay(keyForDay(cal))
+        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
+        val done = tasks.count { it.state == TaskState.DONE }
+        return when {
+            done == tasks.size -> DayStudyStatus.COMPLETE
+            done > 0            -> DayStudyStatus.PARTIAL
+            else                 -> DayStudyStatus.MISSED
+        }
+    }
+
+    /**
+     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
+     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
+     * dots per day, like a GitHub-style contribution grid).
+     */
+    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.YEAR, year)
+        cal.set(Calendar.MONTH, month)
+        cal.set(Calendar.DAY_OF_MONTH, 1)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val result = LinkedHashMap<Int, DayStudyStatus>()
+        for (d in 1..daysInMonth) {
+            cal.set(Calendar.DAY_OF_MONTH, d)
+            result[d] = getDayStatus(cal)
+        }
+        return result
+    }
+
+    /**
+     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
+     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
+     * lets the app actually notice "the student hasn't studied in N days" instead of that
+     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
+     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
+     * guardian once this crosses a threshold.
+     */
+    fun getConsecutiveMissedDays(): Int {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -1)
+        var missed = 0
+        for (i in 0 until 60) {
+            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
+            missed++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return missed
+    }
+
+    fun getWeekCompletionPercent(): Int {
+        val cal = Calendar.getInstance(); var total = 0; var done = 0
+        repeat(7) {
+            val tasks = loadDay(keyForDay(cal))
+            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return if (total == 0) 0 else done * 100 / total
+    }
+
+    fun getWeeklyData(): List<Pair<String, Int>> {
+        val cal = Calendar.getInstance()
+        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
+        val result = mutableListOf<Pair<String, Int>>()
+        repeat(7) { i ->
+            val tasks = loadDay(keyForDay(cal))
+            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
+            result.add(0, Pair(days[6 - i], pct))
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return result
+    }
+
+    fun getSubjectStats(): List<Pair<String, Int>> =
+        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
+            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
+        }
+
+    /** Blueprint 2.6 — see PauseStats doc above. */
+    fun getPauseStats(): PauseStats {
+        val actualFocusToday = _todayTasks.value
+            .filter { it.state == TaskState.DONE }
+            .sumOf { it.actualMinutes }
+
+        val cal = Calendar.getInstance()
+        val weekSessions = mutableListOf<StudyTask>()
+        repeat(7) {
+            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+
+        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
+
+        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
+        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
+
+        return PauseStats(
+            actualFocusMinutesToday = actualFocusToday,
+            avgPausesPerSession     = avgPauses,
+            pauseRatePercent        = pauseRate
+        )
+    }
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed. [GapTaskManager] (app layer)
+     * needs to read a SPECIFIC past day's plan to check whether an autonomously-created
+     * gap-repair task ever reached DONE — [todayTasks] only ever holds the current day's
+     * list, so there was no way to answer "what happened to the task from 3 days ago"
+     * without this. Behavior is unchanged for every existing caller in this file.
+     */
+    fun loadDay(key: String): List<StudyTask> {
+        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
+        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
+    }
+
+    private fun todayKey() = keyForDay(Calendar.getInstance())
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed alongside [loadDay] — same
+     * caller, same reason: [GapTaskManager] needs to compute the exact day-key for "N days
+     * ago" itself so it can pair it with [loadDay].
+     */
+    fun keyForDay(cal: Calendar) =
+        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+}
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done" needs state that neither [LearningInterventionOrchestrator] nor
+ * [com.checkmate.planner.PlanStore] carry on their own:
+ *
+ * - [PlanStore.todayTasks] only ever holds the CURRENT day's list — there's nowhere to ask
+ *   "did the concept I served three days ago ever get finished."
+ * - [LearningInterventionOrchestrator.executeTopCandidate] re-ranks from scratch every run.
+ *   Without something outside it remembering what's already been served, re-running the
+ *   SAME [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport] output
+ *   tomorrow (mastery hasn't moved without the P0b evidence loop) would just re-pick
+ *   today's exact candidate forever — the backlog would never advance.
+ *
+ * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
+ * covering three things:
+ * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
+ *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
+ *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
+ *    skips covered concepts when walking the ranked candidate list.
+ * 2. **The active concept's streak** — how many consecutive days the current gap concept
+ *    has been re-served without reaching DONE, which is exactly the escalation-depth input
+ *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
+ *    persuasion — see [com.checkmate.service.GapTaskManager]).
+ * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
+ *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ *
+ * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
+ * per-student keying needed.
+ */
+object GapTaskLedger {
+
+    private val json = Json { ignoreUnknownKeys = true }
+
+    private const val KEY_COVERED_CONCEPT_IDS   = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID     = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID        = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY   = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED    = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT        = "gap_task_active_subject"
+    private const val KEY_ACTIVE_TOPIC          = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN   = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE      = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN  = "gap_task_active_expected_gain"
+    private const val KEY_LAST_GENERATED_DAY    = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY    = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG           = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES   = 50
+
+    // ── Covered concepts ────────────────────────────────────────────────────
+
+    fun isCovered(conceptId: String): Boolean =
+        coveredIds().contains(conceptId)
+
+    /**
+     * Marks [conceptId] covered — call this ONLY once the gap-task's own `TaskState`
+     * reaches DONE, never at task-creation time. Creation-time marking would mean an
+     * ignored task silently "counts" as covered and the orchestrator moves on to the next
+     * gap, permanently abandoning the one the student never actually did — the opposite of
+     * "till every gap is covered." Clears the active-concept pointer if [conceptId] was it,
+     * so the next [recordServed] call for a different concept starts a fresh streak instead
+     * of inheriting this one's day count.
+     */
+    fun markCovered(conceptId: String) {
+        val updated = coveredIds() + conceptId
+        CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
+        recordWarningOutcome(conceptId)
+        if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
+            clearActive()
+        }
+    }
+
+    private fun coveredIds(): Set<String> =
+        CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
+            ?.split(",")
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
+
+    // ── Active concept + streak ─────────────────────────────────────────────
+
+    /**
+     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
+     * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
+     * SAME concept already active (re-served because it wasn't finished); starts a fresh
+     * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     */
+    fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
+        val conceptId = candidate.conceptId ?: return
+        val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+        val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        val daysServed = if (previousConceptId == conceptId) previousDays + 1 else 1
+
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, candidate.topic ?: candidate.chapter ?: "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
+    }
+
+    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+    fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
+    fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
+    fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+    fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeTopic(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null)?.takeIf { it.isNotBlank() }
+    fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
+    fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
+    fun activeExpectedGain(): Double =
+        CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
+
+    private fun clearActive() {
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+    }
+
+    // ── Once-a-day guards ────────────────────────────────────────────────────
+
+    fun hasGeneratedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_GENERATED_DAY, null) == todayKey
+
+    fun markGeneratedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_GENERATED_DAY, todayKey)
+
+    fun hasEscalatedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_ESCALATED_DAY, null) == todayKey
+
+    fun markEscalatedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_ESCALATED_DAY, todayKey)
+
+    // ── Warning outcome log (data collection only — no style-selection logic yet) ──────
+
+    @Serializable
+    data class WarningLogEntry(
+        val conceptId: String,
+        val sentDayKey: String,
+        val daysServedAtEscalation: Int,
+        val tier: Int,
+        var completedAfterward: Boolean = false
+    )
+
+    /**
+     * Appends one record every time [com.checkmate.service.GapTaskManager] actually sends
+     * an escalation message. Deliberately just data collection for now — once there's
+     * enough history to mean anything, which [tier] (escalation depth) correlates with a
+     * concept actually reaching DONE afterward becomes a real, evidence-backed question
+     * instead of a guess. Capped at [MAX_WARNING_LOG_ENTRIES], oldest dropped first.
+     */
+    fun logWarningSent(conceptId: String, dayKey: String, daysServedAtEscalation: Int, tier: Int) {
+        val updated = (warningLog() + WarningLogEntry(conceptId, dayKey, daysServedAtEscalation, tier))
+            .takeLast(MAX_WARNING_LOG_ENTRIES)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    /** Called from [markCovered] — flips the most recent unresolved warning for
+     *  [conceptId], if any, so the log can later answer "did warning X actually work." */
+    private fun recordWarningOutcome(conceptId: String) {
+        val log = warningLog()
+        val lastUnresolvedIndex = log.indexOfLast { it.conceptId == conceptId && !it.completedAfterward }
+        if (lastUnresolvedIndex == -1) return
+        val updated = log.toMutableList()
+        updated[lastUnresolvedIndex] = updated[lastUnresolvedIndex].copy(completedAfterward = true)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    fun warningLog(): List<WarningLogEntry> =
+        CheckmatePrefs.getString(KEY_WARNING_LOG, null)?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+
+    // ── Shared day-key helper — same "YYYY_dayOfYear" format PlanStore uses ────────────
+
+    fun todayKey(): String {
+        val cal = Calendar.getInstance()
+        return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+}
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LearningInterventionOrchestrator.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import com.checkmate.learning.engine.LearningDecisionEngine
+import java.util.UUID
+
+/**
+ * Upgrade Blueprint Phase 2.4/2.5 (P0a) — the single production call site that was still
+ * missing: [LearningInterventionMapper]'s own doc names this exact orchestration as "not
+ * yet existing as a single call site," and [LearningInterventionCreateTaskIntegrationTest]
+ * only exercises the chain a test-local `runPipeline` helper wires by hand. This is that
+ * helper, promoted to a real production class:
+ * ```
+ * LearningDecisionEngine.DecisionReport -> LearningInterventionOrchestrator
+ *     -> (per candidate, highest priorityScore first) LearningInterventionMapper
+ *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow -> ActionExecutor
+ *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ * ```
+ *
+ * Deliberately does NOT create one task per candidate. [DecisionReport.candidates] is
+ * already ranked by [LearningDecisionEngine.CandidateIntervention.priorityScore] — turning
+ * every candidate into a task would just as capacity-blind as never having ranked them at
+ * all, defeating the entire point of [com.checkmate.learning.analytics.ScoreGainEstimator]
+ * and today's finite study time. [executeTopCandidate] instead walks the ranking in order
+ * and stops at the first candidate that clears every stage — mapping, policy, and
+ * execution. An earlier, higher-ranked candidate that fails any stage is recorded (never
+ * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
+ * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
+ *
+ * Daily-cadence wiring ([com.checkmate.service.GapTaskManager] calls [executeTopCandidate]
+ * once a day, not just once at import time): without something remembering what was
+ * already served, re-running the same-shaped [LearningDecisionEngine.decideFromReport]
+ * output tomorrow would just re-pick today's exact candidate forever, since mastery hasn't
+ * moved without the P0b evidence loop. [GapTaskLedger] is that memory — a candidate whose
+ * concept is already [GapTaskLedger.isCovered] is skipped here (see [RejectionSource.AlreadyCovered])
+ * before it's even mapped, and a successful [OrchestrationOutcome.Created] records itself
+ * via [GapTaskLedger.recordServed] so the NEXT run's escalation depth and "which concept is
+ * this" both stay accurate. A concept only ever becomes covered when its task reaches
+ * `TaskState.DONE` (see [GapTaskLedger.markCovered]'s own doc) — never merely because a
+ * task once existed for it — so an ignored gap-task keeps being re-served, not abandoned.
+ *
+ * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
+ * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
+ * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
+ * rather than widening that enum for this pass; this class keeps that same choice (see
+ * [LEARNING_ENGINE_TRIGGER]) so both the test-only pipeline and this production one agree
+ * on what gets persisted.
+ *
+ * This class does not itself decide *when* to run — it consumes an already-built
+ * [LearningDecisionEngine.DecisionReport]. [com.checkmate.ui.testresults.TestResultsViewModel]
+ * calls it once per fresh test import; [com.checkmate.service.GapTaskManager] calls it once
+ * per day thereafter — see that class's own doc for the daily trigger.
+ */
+class LearningInterventionOrchestrator(
+    private val taskEscrow: TaskEscrow,
+    private val actionExecutor: ActionExecutor,
+    private val idGenerator: () -> String = { UUID.randomUUID().toString() },
+    private val dayKeyProvider: () -> String = { GapTaskLedger.todayKey() }
+) {
+
+    /** Why a candidate never became a task — kept as a distinct type from
+     *  [RejectionReason] because a candidate can fail before policy is ever consulted
+     *  (see [NotMappable]), and collapsing that into a fake [RejectionReason] would
+     *  misattribute a mapper decision to PolicyValidator. */
+    sealed class RejectionSource {
+        /** [LearningInterventionMapper.toCreateTaskRequest] returned null — the intent is
+         *  outside P0a's mapped scope, or the candidate is missing subject/topic. */
+        object NotMappable : RejectionSource()
+        /** [PolicyValidator.validateCreateTask] rejected the mapped request. */
+        data class PolicyRejected(val reason: RejectionReason) : RejectionSource()
+        /** The freshly generated [taskId][UUID] collided with a task already under
+         *  escrow — expected to be effectively unreachable given UUID generation, kept
+         *  as a named case rather than a thrown exception so a candidate this happens to
+         *  is recorded like any other rejection instead of aborting the whole walk. */
+        object TaskIdCollision : RejectionSource()
+        /** [GapTaskLedger.isCovered] already true for this candidate's concept — its
+         *  gap-task previously reached DONE, so the daily walk moves on to the next
+         *  ranked candidate instead of re-serving a concept the student already finished. */
+        object AlreadyCovered : RejectionSource()
+    }
+
+    /** One candidate that was ranked but did not end up as a task — see class doc's
+     *  "failures are first-class" requirement. `rank` is 1-based position in
+     *  [LearningDecisionEngine.DecisionReport.candidates], preserved here because the
+     *  candidate itself carries no id of its own. */
+    data class CandidateRejection(
+        val candidate: LearningDecisionEngine.CandidateIntervention,
+        val rank: Int,
+        val source: RejectionSource,
+        val detail: String,
+        val timestamp: Long
+    )
+
+    sealed class OrchestrationOutcome {
+        /** The candidate that made it all the way through, plus what
+         *  [ActionExecutor.execute] returned for it — callers that care whether the
+         *  StudyTask really landed (vs. e.g. [ExecutionOutcome.NoOpAlreadyApplied]) read
+         *  that from here rather than assuming success. */
+        data class Created(
+            val candidate: LearningDecisionEngine.CandidateIntervention,
+            val rank: Int,
+            val taskId: String,
+            val executionOutcome: ExecutionOutcome
+        ) : OrchestrationOutcome()
+        /** Every candidate in the report was rejected (or the report had none to begin
+         *  with) — [OrchestrationResult.rejections] carries the full detail. */
+        object NoExecutableCandidate : OrchestrationOutcome()
+    }
+
+    data class OrchestrationResult(
+        val outcome: OrchestrationOutcome,
+        val rejections: List<CandidateRejection>
+    )
+
+    /**
+     * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
+     * ranked order and executes the first one that clears the covered-concept check,
+     * mapping, policy validation, and execution — see class doc for why this stops at one
+     * instead of creating a task per candidate, and for [GapTaskLedger]'s role in the walk.
+     */
+    suspend fun executeTopCandidate(
+        report: LearningDecisionEngine.DecisionReport,
+        now: Long = System.currentTimeMillis()
+    ): OrchestrationResult {
+        val rejections = mutableListOf<CandidateRejection>()
+
+        report.candidates.forEachIndexed { index, candidate ->
+            val rank = index + 1
+
+            val conceptId = candidate.conceptId
+            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.AlreadyCovered,
+                    detail = "concept $conceptId already reached DONE on a previous gap-task run",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
+
+            val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
+            if (request == null) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.NotMappable,
+                    detail = "intent ${candidate.intent} is not mappable to a CreateTaskRequest " +
+                        "(outside P0a scope, or missing subject/topic)",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
+
+            val taskId = idGenerator()
+
+            when (val policyResult = PolicyValidator.validateCreateTask(taskId, request)) {
+                is PolicyResult.Rejected -> {
+                    rejections += CandidateRejection(
+                        candidate = candidate,
+                        rank = rank,
+                        source = RejectionSource.PolicyRejected(policyResult.reason),
+                        detail = policyResult.detail,
+                        timestamp = now
+                    )
+                }
+
+                is PolicyResult.Permitted -> {
+                    when (val acquireResult = taskEscrow.acquire(taskId, LEARNING_ENGINE_TRIGGER, now)) {
+                        is EscrowAcquireResult.AlreadyHeld -> {
+                            rejections += CandidateRejection(
+                                candidate = candidate,
+                                rank = rank,
+                                source = RejectionSource.TaskIdCollision,
+                                detail = "generated taskId $taskId already under escrow",
+                                timestamp = now
+                            )
                         }
-                        " — traces to weak prerequisite(s): $names"
-                    } else ""
-                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
+
+                        is EscrowAcquireResult.Acquired -> {
+                            val action = policyResult.action as PermittedAction.CreateTask
+                            val executionOutcome = actionExecutor.execute(
+                                acquireResult.transaction.transactionId,
+                                action,
+                                now
+                            )
+                            GapTaskLedger.recordServed(candidate, taskId, dayKeyProvider())
+                            return OrchestrationResult(
+                                outcome = OrchestrationOutcome.Created(candidate, rank, taskId, executionOutcome),
+                                rejections = rejections
+                            )
+                        }
+                    }
                 }
             }
-            if (reviewDue.isNotEmpty()) {
-                appendLine("Due for review (forgetting risk rising):")
-                reviewDue.forEach { c ->
-                    val label = c.topic ?: c.chapter ?: "unknown"
-                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
-                }
-            }
-            if (topErrors.isNotEmpty()) {
-                appendLine("Recurring errors:")
-                topErrors.forEach { e ->
-                    val concept = model.concepts[e.conceptId]
-                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
-                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
-                }
-            }
-        }.trim()
+        }
+
+        return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
     }
 
     companion object {
+        /** See class doc's "Trigger type" note. */
+        val LEARNING_ENGINE_TRIGGER = InterventionTriggerType.BACKLOG_RISK
+
         /**
-         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
-         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
-         * directly into the same persisted chat history MentorViewModel reads on init — turning
-         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
-         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
-         * methods above so a message appended here shows up next time MentorScreen is opened.
-         *
-         * Also pushes the update via StudyStateSyncManager. These callers (HomeViewModel button
-         * handlers, DistractionGuard's listener, ReminderService) aren't guaranteed to already be
-         * on a background thread the way the ViewModel's own viewModelScope.launch(Dispatchers.IO)
-         * calls are, so the push is wrapped in its own short-lived Thread here rather than assumed
-         * safe to run inline — StudyStateSyncManager's synchronous OkHttp calls must not run on
-         * the main thread.
+         * Production wiring — same [InterventionDatabase]/[OutcomeLedgerWriter]/
+         * [PlanStoreTaskMutator] construction [InterventionReconciliation.runAtStartup]
+         * already uses, so this and the reconciliation sweep never disagree about which
+         * database or ledger a transaction was written through.
          */
-        fun appendProactiveMessage(text: String) {
-            val clean = text.trim()
-            if (clean.isEmpty()) return
-            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
-            val existing = if (saved != null) {
-                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
-                catch (_: Exception) { emptyList() }
-            } else emptyList()
-            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
-            val json = historyJson.encodeToString(updated)
-            CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
-            Thread { StudyStateSyncManager.pushMentorMessage(json) }.start()
+        fun from(context: Context): LearningInterventionOrchestrator {
+            val db = InterventionDatabase.getInstance(context)
+            val dao = db.interventionTransactionDao()
+            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
+            val escrow = TaskEscrow(dao, ledgerWriter)
+            val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+            return LearningInterventionOrchestrator(escrow, executor)
         }
     }
+}
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.ui.mentor.MentorViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done — and warn the student, with escalating persuasion, when one is being
+ * ignored." Two entry points, both called from [ReminderService]'s existing 15-min loop
+ * (same wiring pattern as every [ProactiveMentor] check already there):
+ *
+ * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
+ *   doc always said was still missing, now filled by a genuine day-level schedule instead
+ *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
+ *   still owns that import-time trigger; this is the *ongoing* one).
+ * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
+ *   currently being served and, once it's gone unaddressed for more than a day, sends an
+ *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
+ *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ *
+ * Neither function needs its own "is there anything to analyze" gate beyond checking
+ * `studentModel.concepts.isEmpty()` — an empty StudentModel (no test ever imported) just
+ * means [LearningDecisionEngine.decideFromReport] returns no candidates and nothing happens,
+ * same as the import-time trigger's own behavior.
+ */
+object GapTaskManager {
+
+    private const val TAG = "GapTaskManager"
+
+    // ── Daily generation ─────────────────────────────────────────────────────
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasGeneratedToday]): resolves whether
+     * yesterday's gap-task actually got finished (see [resolveActiveConceptState]), then runs
+     * the exact same StudentModel -> PerformanceReport -> ScoreGainEstimator -> ExpectedScore
+     * -> DecisionReport pipeline [com.checkmate.ui.testresults.TestResultsViewModel] runs
+     * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
+     * instead of a just-parsed report since there may be no fresh import today at all.
+     * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
+     * and picking up where yesterday left off — this function's only job is to run the
+     * pipeline and mark today done, success or failure either way (a failed analysis run
+     * shouldn't retry every 15 minutes for the rest of the day).
+     */
+    suspend fun generateIfNeeded(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+
+        resolveActiveConceptState()
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+            val decisionReport = LearningDecisionEngine.decideFromReport(
+                report, studentModel, estimates, expectedScore
+            )
+            LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+        } catch (e: Exception) {
+            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+        } finally {
+            GapTaskLedger.markGeneratedToday(todayKey)
+        }
+    }
+
+    /**
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, marks it covered
+     * BEFORE re-ranking — otherwise today's run would still see it as active (streak intact)
+     * for the few seconds between "the student finished it" and "the ledger found out," and
+     * [LearningInterventionOrchestrator] would have no way to know without this being called
+     * first. Safe to call with nothing active (both lookups return null and this no-ops).
+     */
+    private fun resolveActiveConceptState() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey) ?: return
+        if (task.state == TaskState.DONE) {
+            GapTaskLedger.markCovered(conceptId)
+        }
+    }
+
+    /** Checks today's live list first (cheap, common case), falls back to [PlanStore.loadDay]
+     *  for a task created on an earlier day that hasn't rolled into today's plan. */
+    private fun findTask(taskId: String, dayKey: String): StudyTask? =
+        PlanStore.todayTasks.value.find { it.id == taskId }
+            ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── Escalating skip/stall warning ───────────────────────────────────────
+
+    private val TIER_1_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach warning a student about ONE specific unfinished
+task, not their whole day. Rules:
+- 1-3 sentences, direct and consequence-based, no generic praise or "you can do it"
+- Name the specific concept and why it matters (marks at stake), not vague encouragement
+- Tone: firm reminder, not yet an ultimatum
+""".trimIndent()
+
+    private val TIER_2_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach. This specific gap has been ignored for several
+days running — this is the escalated warning, not the first nudge. Rules:
+- 3-5 sentences, still no fluff, but now make the full case
+- State plainly how many days this has been unaddressed
+- Connect this ONE concept to the real exam-day consequence (marks lost, gap to target score)
+- Reference the student's own skip pattern if given one, as evidence this is a pattern, not a one-off
+- End with a direct, specific ask — not "you should study" but "do this today"
+""".trimIndent()
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasEscalatedToday]). Depth scales with
+     * [GapTaskLedger.activeDaysServed]: day 1 gets no escalation at all (the task just showed
+     * up today — that's the normal experience, not a warning), day 2-3 names the concrete
+     * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
+     * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
+     * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
+     * interrupting with a warning would be counterproductive) and clears/covers it instead of
+     * warning if it turns out to already be DONE (belt-and-suspenders alongside
+     * [resolveActiveConceptState], which normally catches this first).
+     */
+    suspend fun escalationCheckIfNeeded(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasEscalatedToday(todayKey)) return
+
+        val daysServed = GapTaskLedger.activeDaysServed()
+        if (daysServed < 2) return // day 1: normal experience, no warning
+
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey)
+
+        if (task == null || task.state == TaskState.DONE) {
+            if (task?.state == TaskState.DONE) GapTaskLedger.markCovered(conceptId)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+        if (task.state != TaskState.PENDING && task.state != TaskState.SKIPPED) {
+            return // ACTIVE/PAUSED right now — don't interrupt an in-progress session
+        }
+
+        val tier = if (daysServed >= 4) 2 else 1
+        val message = try {
+            buildEscalationMessage(tier, daysServed)
+        } catch (e: Exception) {
+            Log.e(TAG, "escalation message build failed: ${e.message}", e)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+
+        MentorViewModel.appendProactiveMessage(message)
+        MentorNotifier.notify(context, message)
+        GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
+        GapTaskLedger.markEscalatedToday(todayKey)
+        Log.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+    }
+
+    private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {
+        val subject = GapTaskLedger.activeSubject()?.takeIf { it.isNotBlank() } ?: "this subject"
+        val topic = GapTaskLedger.activeTopic()?.takeIf { it.isNotBlank() } ?: subject
+        val rationale = GapTaskLedger.activeRationale()?.takeIf { it.isNotBlank() }
+            ?: "$topic still needs work."
+        val marksAtStake = GapTaskLedger.activeExpectedGain()
+
+        val patternLine = BehaviorLedger.getSnapshot().subjectPatterns
+            .filter { it.subject.equals(subject, ignoreCase = true) }
+            .maxByOrNull { it.occurrences }
+            ?.let { "You've skipped $subject ${it.taskType} tasks ${it.occurrences} times recently — this fits the pattern." }
+            ?: ""
+
+        val ruleMsg = when (tier) {
+            2 -> "Day $daysServed unaddressed: $topic. $rationale $patternLine " +
+                "This gap alone is worth roughly ${"%.1f".format(marksAtStake)} marks — " +
+                "left alone, it stays a hole on exam day. Do it today."
+            else -> "$topic has gone $daysServed days without being done. $rationale Do it today."
+        }
+
+        val systemPrompt = if (tier == 2) TIER_2_SYSTEM_PROMPT else TIER_1_SYSTEM_PROMPT
+        val userPrompt = "Concept: $topic ($subject). Days unaddressed: $daysServed. " +
+            "Why it matters: $rationale Approx marks at stake: ${"%.1f".format(marksAtStake)}. " +
+            "$patternLine Write the warning message now."
+
+        return try {
+            val llmMsg = LlmGateway.complete(userPrompt, systemPrompt)
+            if (llmMsg.isBlank()) ruleMsg else llmMsg
+        } catch (_: Exception) {
+            ruleMsg
+        }
+    }
+}
+//===== FILE: app/src/main/kotlin/com/checkmate/service/ReminderService.kt =====
+package com.checkmate.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import com.checkmate.workmode.UninstallGuard
+import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+class ReminderService : Service() {
+    companion object {
+        private const val CHANNEL_ID = "reminder_channel"
+        private const val NOTIF_ID   = 55
+        // Mentor v2 (spec 3.5): same Cloudflare Worker StatusReporter already pushes to.
+        // NOTE: the worker-side route that lets a guardian issue an "unlock"/"override"
+        // command via Telegram and have it show up here isn't part of this Android repo —
+        // this only polls a /override-status endpoint and expects {"override": true|false}
+        // back. Add the matching route to worker.js to make this live end-to-end; until then
+        // this poll just always sees false and grantRemoteOverride() is never called, so it's
+        // a safe no-op rather than a broken dependency.
+        private const val OVERRIDE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/override-status"
+
+        fun start(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(Intent(context, ReminderService::class.java))
+            else
+                context.startService(Intent(context, ReminderService::class.java))
+        }
+    }
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .build()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
+        scope.launch {
+            while (isActive) {
+                checkPendingTasks()
+                // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
+                // nothing's been started by the configured hour. No-ops after the first fire
+                // each day (see ProactiveMentor.idleCheckIfNeeded's day-key guard).
+                try { ProactiveMentor.idleCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // "No tasks in plan == no study": once-daily check for a multi-day gap with
+                // no plan/completion, nudges the student and alerts the guardian. Same
+                // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
+                try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
+                // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
+                try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
+                // own class doc always said was still missing — runs the analysis pipeline once
+                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. See
+                // GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
+                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task escalation: warns the student, with escalating persuasion, when the
+                // currently-active gap concept has gone unaddressed for more than a day — see
+                // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
+                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
+                try { pollRemoteOverride() } catch (_: Exception) {}
+                delay(15 * 60 * 1000L) // check every 15 min
+            }
+        }
+    }
+
+    private suspend fun checkPendingTasks() {
+        val tasks = PlanStore.getTodayTasksSnapshot()
+        val pending = tasks.filter { it.state == TaskState.PENDING }
+        if (pending.isNotEmpty()) {
+            val next = pending.first()
+            CheckmateTTS.speak(this, "Reminder: ${next.subject} — ${next.topic} is pending.")
+        }
+    }
+
+    /** See OVERRIDE_URL note above — safe no-op until the worker-side route exists. */
+    private suspend fun pollRemoteOverride() = withContext(Dispatchers.IO) {
+        val chatId = TelegramAlertBot.getChatId() ?: return@withContext
+        val request = Request.Builder()
+            .url("$OVERRIDE_URL?chatId=$chatId")
+            .get()
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext
+            val body = response.body?.string() ?: return@withContext
+            val overridden = JSONObject(body).optBoolean("override", false)
+            if (overridden) UninstallGuard.grantRemoteOverride()
+        }
+    }
+
+    private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("Checkmate")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setOngoing(true)
+        .setPriority(NotificationCompat.PRIORITY_LOW)
+        .build()
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() { scope.cancel(); super.onDestroy() }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
