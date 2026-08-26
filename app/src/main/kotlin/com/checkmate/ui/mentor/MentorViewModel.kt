@@ -18,6 +18,8 @@ import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.StudyStateSyncManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -51,7 +53,17 @@ class MentorViewModel : ViewModel() {
     private val _state = MutableStateFlow(MentorUiState())
     val state: StateFlow<MentorUiState> = _state.asStateFlow()
 
-    init { loadHistory() }
+    init {
+        loadHistory()
+        // CORRECTION: chat previously synced through a /mentor endpoint that was
+        // never added to the worker (permanent 404 — see StudyStateSyncManager's
+        // class doc). Now routed through /studystate's dedicated mentor path
+        // instead. Pull-on-open picks up whatever the OTHER device pushed since
+        // this device last had the screen open — pullStateIfEmpty() alone can't
+        // do this because it only restores when the local field is unset, which
+        // is false the moment this device has ever sent one message.
+        pullRemoteIfNewer()
+    }
 
     private fun loadHistory() {
         val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
@@ -67,9 +79,45 @@ class MentorViewModel : ViewModel() {
         _state.update { it.copy(messages = initial) }
     }
 
-    private fun persistHistory(messages: List<MentorMessage>) {
+    /**
+     * Fetches the server's mentor history and adopts it only if it's strictly
+     * newer than what's already loaded locally (by last-message timestamp) —
+     * last-write-wins, matching StudyStateSyncManager's flat-overwrite model.
+     * This guards against a slow network response landing after the student
+     * has already sent a new local message and stomping it with a stale pull.
+     * On adopt, re-persists locally but does NOT push back — that would just
+     * echo the same history the server already has.
+     */
+    private fun pullRemoteIfNewer() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val remoteJson = StudyStateSyncManager.pullMentorHistory() ?: return@launch
+            val remoteMessages = try {
+                historyJson.decodeFromString<List<MentorMessage>>(remoteJson)
+            } catch (_: Exception) {
+                return@launch
+            }
+            if (remoteMessages.isEmpty()) return@launch
+
+            val remoteLastTs = remoteMessages.last().ts
+            val localLastTs = _state.value.messages.lastOrNull()?.ts ?: 0L
+            if (remoteLastTs > localLastTs) {
+                _state.update { it.copy(messages = remoteMessages) }
+                persistHistory(remoteMessages)
+            }
+        }
+    }
+
+    private fun persistHistory(messages: List<MentorMessage>): String {
         val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
-        CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(trimmed))
+        val json = historyJson.encodeToString(trimmed)
+        CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
+        return json
+    }
+
+    /** Persists locally, then pushes to the other device off the main thread. */
+    private fun persistAndSync(messages: List<MentorMessage>) {
+        val json = persistHistory(messages)
+        viewModelScope.launch(Dispatchers.IO) { StudyStateSyncManager.pushMentorMessage(json) }
     }
 
     fun setInput(text: String) = _state.update { it.copy(inputText = text) }
@@ -81,7 +129,7 @@ class MentorViewModel : ViewModel() {
         val userMsg = MentorMessage("user", text)
         val updatedMessages = _state.value.messages + userMsg
         _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
-        persistHistory(updatedMessages)
+        persistAndSync(updatedMessages)
 
         viewModelScope.launch {
             val response = try {
@@ -98,7 +146,7 @@ class MentorViewModel : ViewModel() {
             )
             val finalMessages = _state.value.messages + assistantMsg
             _state.update { it.copy(messages = finalMessages, isLoading = false) }
-            persistHistory(finalMessages)
+            persistAndSync(finalMessages)
 
             if (_state.value.ttsEnabled && response.isNotBlank()) {
                 val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
@@ -112,6 +160,11 @@ class MentorViewModel : ViewModel() {
         _state.update { it.copy(messages = initial) }
         // FIX: putString(key, null) crashes on non-null String param — use remove() instead
         CheckmatePrefs.remove(PREFS_KEY_HISTORY)
+        // Push the reset state too, so the other device's next pullRemoteIfNewer()
+        // picks up the clear instead of silently keeping stale history around.
+        viewModelScope.launch(Dispatchers.IO) {
+            StudyStateSyncManager.pushMentorMessage(historyJson.encodeToString(initial))
+        }
     }
 
     private fun buildHistoryForLlm(): String {
@@ -300,6 +353,13 @@ saying only that a prerequisite gap exists.
          * Mentor chat into a running log the mentor writes into, not only a box the user opens.
          * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
          * methods above so a message appended here shows up next time MentorScreen is opened.
+         *
+         * Also pushes the update via StudyStateSyncManager. These callers (HomeViewModel button
+         * handlers, DistractionGuard's listener, ReminderService) aren't guaranteed to already be
+         * on a background thread the way the ViewModel's own viewModelScope.launch(Dispatchers.IO)
+         * calls are, so the push is wrapped in its own short-lived Thread here rather than assumed
+         * safe to run inline — StudyStateSyncManager's synchronous OkHttp calls must not run on
+         * the main thread.
          */
         fun appendProactiveMessage(text: String) {
             val clean = text.trim()
@@ -310,7 +370,9 @@ saying only that a prerequisite gap exists.
                 catch (_: Exception) { emptyList() }
             } else emptyList()
             val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
-            CheckmatePrefs.putString(PREFS_KEY_HISTORY, historyJson.encodeToString(updated))
+            val json = historyJson.encodeToString(updated)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
+            Thread { StudyStateSyncManager.pushMentorMessage(json) }.start()
         }
     }
 }
