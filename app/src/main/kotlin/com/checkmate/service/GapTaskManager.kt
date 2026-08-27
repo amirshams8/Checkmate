@@ -15,6 +15,10 @@ import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateQuestionPool
+import com.checkmate.testmate.TestmateResultOutcome
+import com.checkmate.testmate.TestmateTargetedTestOutcome
 import com.checkmate.ui.mentor.MentorViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -22,26 +26,34 @@ import kotlinx.coroutines.withContext
 /**
  * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
  * is actually done — and warn the student, with escalating persuasion, when one is being
- * ignored." Two entry points, both called from [ReminderService]'s existing 15-min loop
- * (same wiring pattern as every [ProactiveMentor] check already there):
+ * ignored." Three entry points now, all called from [ReminderService]'s existing 15-min
+ * loop (same wiring pattern as every [ProactiveMentor] check already there):
  *
  * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
  *   doc always said was still missing, now filled by a genuine day-level schedule instead
  *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
- *   still owns that import-time trigger; this is the *ongoing* one).
+ *   still owns that import-time trigger; this is the *ongoing* one). Also now requests the
+ *   P0b Testmate targeted test for whichever concept ends up active (see
+ *   [createTargetedTestIfNeeded]).
  * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
  *   currently being served and, once it's gone unaddressed for more than a day, sends an
  *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
  *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ * - [evidencePollIfNeeded] — P0b: the actual return arrow. Every 15-min cycle (NOT
+ *   once-a-day gated, unlike the two above — the student could submit the Testmate test at
+ *   any time), checks whether the active concept's targeted-test result is in yet and, if
+ *   so, hands it to [TargetedTestEvidenceImporter] so mastery moves off REAL evidence
+ *   instead of only the task's DONE flag.
  *
- * Neither function needs its own "is there anything to analyze" gate beyond checking
- * `studentModel.concepts.isEmpty()` — an empty StudentModel (no test ever imported) just
- * means [LearningDecisionEngine.decideFromReport] returns no candidates and nothing happens,
- * same as the import-time trigger's own behavior.
+ * Neither [generateIfNeeded] nor [escalationCheckIfNeeded] needs its own "is there anything
+ * to analyze" gate beyond checking `studentModel.concepts.isEmpty()` — an empty StudentModel
+ * (no test ever imported) just means [LearningDecisionEngine.decideFromReport] returns no
+ * candidates and nothing happens, same as the import-time trigger's own behavior.
  */
 object GapTaskManager {
 
     private const val TAG = "GapTaskManager"
+    private const val TARGETED_TEST_QUESTION_COUNT = 15
 
     // ── Daily generation ─────────────────────────────────────────────────────
 
@@ -53,9 +65,10 @@ object GapTaskManager {
      * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
      * instead of a just-parsed report since there may be no fresh import today at all.
      * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
-     * and picking up where yesterday left off — this function's only job is to run the
-     * pipeline and mark today done, success or failure either way (a failed analysis run
-     * shouldn't retry every 15 minutes for the rest of the day).
+     * and picking up where yesterday left off. Once that's done, also requests (or confirms)
+     * the P0b Testmate targeted test for whichever concept is now active — see
+     * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
+     * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
     suspend fun generateIfNeeded(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
@@ -75,6 +88,7 @@ object GapTaskManager {
                 report, studentModel, estimates, expectedScore
             )
             LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            createTargetedTestIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
@@ -104,6 +118,100 @@ object GapTaskManager {
     private fun findTask(taskId: String, dayKey: String): StudyTask? =
         PlanStore.todayTasks.value.find { it.id == taskId }
             ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── P0b: Testmate targeted-test creation ────────────────────────────────
+
+    /**
+     * Requests a Testmate targeted-repair test for the currently active gap concept, but
+     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
+     * means either this call already succeeded for this concept, or the concept is being
+     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
+     * across days (see its own doc). No-ops with nothing active, or with no
+     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
+     * crashing the whole generation pass over it). A failed request is NOT retried until the
+     * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
+     * session that was actually recorded, so a create failure just means one day's targeted
+     * test is missing, not a retry storm.
+     */
+    private suspend fun createTargetedTestIfNeeded() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        if (GapTaskLedger.activeTestmateSessionId() != null) return
+        val chapter = GapTaskLedger.activeChapter() ?: run {
+            Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
+            return
+        }
+        val topic = GapTaskLedger.activeTopic()
+
+        val outcome = try {
+            TestmateApi.createTargetedTest(
+                interventionId = conceptId,
+                chapter = chapter,
+                topic = topic,
+                questionCount = TARGETED_TEST_QUESTION_COUNT,
+                pool = TestmateQuestionPool.WRONG_SKIPPED
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            return
+        }
+
+        when (outcome) {
+            is TestmateTargetedTestOutcome.Success -> {
+                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+            }
+            is TestmateTargetedTestOutcome.Error -> {
+                Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+            }
+        }
+    }
+
+    // ── P0b: evidence import ─────────────────────────────────────────────────
+
+    /**
+     * Every 15-min cycle: if the active concept has a Testmate session ([createTargetedTestIfNeeded]
+     * already ran) whose evidence hasn't been imported yet, fetches the result and, once it's
+     * actually there (the student has submitted — an [TestmateResultOutcome.Error], including
+     * Testmate's "no result yet" 404, just means try again next cycle), hands the per-question
+     * breakdown to [TargetedTestEvidenceImporter]. This is deliberately NOT gated to once/day
+     * like [generateIfNeeded]/[escalationCheckIfNeeded] — the student can submit the test at any
+     * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
+     * up to 24 hours later.
+     */
+    suspend fun evidencePollIfNeeded(context: Context) {
+        if (GapTaskLedger.isActiveEvidenceImported()) return
+        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
+
+        val outcome = try {
+            TestmateApi.fetchResult(sessionId)
+        } catch (e: Exception) {
+            Log.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
+            return
+        }
+        val result = when (outcome) {
+            is TestmateResultOutcome.Success -> outcome.result
+            is TestmateResultOutcome.Error -> return // not submitted yet (or a real failure either way) — retry next cycle
+        }
+        if (result.breakdown.isEmpty()) return // submitted but no per-question data yet — treat like not-ready
+
+        try {
+            val exam = ConsultationProfile.load().examTarget
+            val chapter = GapTaskLedger.activeChapter()
+            val topic = GapTaskLedger.activeTopic()
+            TargetedTestEvidenceImporter.import(
+                context = context,
+                sessionId = sessionId,
+                exam = exam,
+                chapter = chapter,
+                topic = topic,
+                result = result
+            )
+            GapTaskLedger.markActiveEvidenceImported()
+        } catch (e: Exception) {
+            Log.e(TAG, "evidence import failed: ${e.message}", e)
+        }
+    }
 
     // ── Escalating skip/stall warning ───────────────────────────────────────
 

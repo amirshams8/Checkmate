@@ -4,8 +4,11 @@ import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -14,8 +17,9 @@ import java.util.concurrent.TimeUnit
  * (test-platform-blueprint.md §3 — Phase 6: Checkmate integration).
  *
  * Hits the already-stabilized API surface directly:
- *   GET /api/sessions/:id/results
- *   GET /api/sessions/:id/leaderboard
+ *   GET  /api/sessions/:id/results
+ *   GET  /api/sessions/:id/leaderboard
+ *   POST /api/tests/targeted   (P0b — see [createTargetedTest])
  *
  * Base URL + token are configured in Settings → Test Platform and stored via
  * CheckmatePrefs (same pattern as the LLM provider keys in LlmGateway).
@@ -115,9 +119,85 @@ object TestmateApi {
         }
     }
 
+    /**
+     * P0b — the actual seam that closes the evidence loop. Asks Testmate to build a
+     * fresh test out of the student's own wrong/skipped history (or unseen questions,
+     * depending on [pool]) for one chapter/topic, and immediately starts a solo session
+     * against it, so Checkmate never has to also implement `POST /api/sessions` +
+     * question selection itself. See app/api/tests/targeted/route.ts on the Testmate
+     * side for exactly how [pool] resolves to a question set.
+     *
+     * Idempotent by [interventionId] — Testmate's own route returns the SAME test/session
+     * on a repeated call with the same [interventionId] rather than creating a duplicate
+     * (see that route's doc). Safe to call again if a caller isn't sure whether it already
+     * succeeded; [com.checkmate.service.GapTaskManager] still avoids the redundant network
+     * call by checking [com.checkmate.planner.intervention.GapTaskLedger.activeTestmateSessionId]
+     * first, but this being idempotent is what makes that check "an optimization," not "a
+     * correctness requirement."
+     */
+    suspend fun createTargetedTest(
+        interventionId: String,
+        chapter: String,
+        topic: String?,
+        questionCount: Int = 15,
+        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED
+    ): TestmateTargetedTestOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateTargetedTestOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateTargetedTestOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+        if (chapter.isBlank()) {
+            return@withContext TestmateTargetedTestOutcome.Error("chapter is required to target a test.")
+        }
+
+        val payload = JSONObject().apply {
+            put("intervention_id", interventionId)
+            put("chapter", chapter)
+            topic?.takeIf { it.isNotBlank() }?.let { put("topic", it) }
+            put("question_count", questionCount)
+            put("pool", pool.name)
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+
+        val req = Request.Builder()
+            .url("$base/api/tests/targeted")
+            .addHeader("Authorization", "Bearer $authToken")
+            .post(body)
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "POST /api/tests/targeted HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateTargetedTestOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            val json = JSONObject(bodyStr)
+            val test = json.optJSONObject("test")
+            val session = json.optJSONObject("session")
+            if (test == null || session == null) {
+                return@withContext TestmateTargetedTestOutcome.Error("Testmate response missing test/session.")
+            }
+            TestmateTargetedTestOutcome.Success(
+                TestmateTargetedTest(
+                    testId = test.optString("id"),
+                    sessionId = session.optString("id"),
+                    interventionId = session.optString("intervention_id", interventionId),
+                    questionCount = json.optInt("question_count", questionCount)
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest failed: ${e.message}")
+            TestmateTargetedTestOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
     private fun errorMessageFor(code: Int, bodyStr: String): String = when (code) {
         401, 403 -> "Testmate rejected the token — check Settings → Test Platform."
         404      -> "No result found for that session ID."
+        422      -> "Testmate couldn't build a test from the available questions."
         else     -> "Testmate returned HTTP $code."
     }.let { msg ->
         // Surface a server-provided `error` field when present, without letting
@@ -138,6 +218,38 @@ object TestmateApi {
                 )
             }
         }
+
+        // P0b addition: previously this route's `breakdown` array was fetched but never
+        // read — every field below it existed server-side already (see
+        // app/api/sessions/[id]/results/route.ts), this is just the client finally parsing
+        // it into something TargetedTestEvidenceImporter can write as real evidence.
+        fun optionsMap(o: JSONObject): Map<String, String>? {
+            val opts = o.optJSONObject("options") ?: return null
+            val map = mutableMapOf<String, String>()
+            opts.keys().forEach { k -> map[k] = opts.optString(k) }
+            return map.takeIf { it.isNotEmpty() }
+        }
+
+        val breakdownArr: JSONArray? = json.optJSONArray("breakdown")
+        val breakdown = breakdownArr?.let { arr ->
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateBreakdownRow(
+                    questionId       = o.optString("question_id").takeIf { it.isNotBlank() },
+                    questionNumber   = o.optInt("question_number", i + 1),
+                    questionText     = o.optString("question_text").takeIf { it.isNotBlank() },
+                    chapter          = o.optString("chapter").takeIf { it.isNotBlank() },
+                    topic            = o.optString("topic").takeIf { it.isNotBlank() },
+                    correctAnswer    = o.optString("correct_answer").takeIf { it.isNotBlank() },
+                    selectedAnswer   = if (o.isNull("selected_answer")) null else o.optString("selected_answer").takeIf { it.isNotBlank() },
+                    isCorrect        = if (o.isNull("is_correct")) null else o.optBoolean("is_correct"),
+                    timeSpentSeconds = o.optInt("time_spent_seconds", 0),
+                    options          = optionsMap(o),
+                    explanation      = o.optString("explanation").takeIf { it.isNotBlank() }
+                )
+            }
+        } ?: emptyList()
+
         return TestmateResult(
             sessionId          = sessionId,
             testTitle          = json.optString("test_title", "Test"),
@@ -151,7 +263,9 @@ object TestmateApi {
             avgTimePerQuestion = json.optDouble("avg_time_per_question", 0.0),
             weakChapters       = weakAreas("weak_chapters"),
             weakTopics         = weakAreas("weak_topics"),
-            rankInSession      = if (json.isNull("rank_in_session")) null else json.optInt("rank_in_session")
+            rankInSession      = if (json.isNull("rank_in_session")) null else json.optInt("rank_in_session"),
+            interventionId     = json.optString("intervention_id").takeIf { it.isNotBlank() },
+            breakdown          = breakdown
         )
     }
 }

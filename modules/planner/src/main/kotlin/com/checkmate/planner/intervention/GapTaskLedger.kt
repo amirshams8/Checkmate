@@ -22,7 +22,7 @@ import java.util.Calendar
  *   today's exact candidate forever — the backlog would never advance.
  *
  * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
- * covering three things:
+ * covering four things:
  * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
  *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
  *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
@@ -33,6 +33,14 @@ import java.util.Calendar
  *    persuasion — see [com.checkmate.service.GapTaskManager]).
  * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
  *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ * 4. **P0b: the active concept's linked Testmate targeted-test session** — which
+ *    `test_sessions.id`/`tests.id` Testmate created for the CURRENT active concept (see
+ *    [recordTestmateSession]), and whether that session's result has already been turned
+ *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
+ *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
+ *    creates the targeted test at most once per concept and imports its result at most once.
+ *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
+ *    map, since there is only ever one active gap concept at a time in this single-user app.
  *
  * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
  * per-student keying needed.
@@ -41,20 +49,24 @@ object GapTaskLedger {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private const val KEY_COVERED_CONCEPT_IDS   = "gap_task_covered_concept_ids"
-    private const val KEY_ACTIVE_CONCEPT_ID     = "gap_task_active_concept_id"
-    private const val KEY_ACTIVE_TASK_ID        = "gap_task_active_task_id"
-    private const val KEY_ACTIVE_TASK_DAY_KEY   = "gap_task_active_task_day_key"
-    private const val KEY_ACTIVE_DAYS_SERVED    = "gap_task_active_days_served"
-    private const val KEY_ACTIVE_SUBJECT        = "gap_task_active_subject"
-    private const val KEY_ACTIVE_TOPIC          = "gap_task_active_topic"
-    private const val KEY_ACTIVE_DURATION_MIN   = "gap_task_active_duration_min"
-    private const val KEY_ACTIVE_RATIONALE      = "gap_task_active_rationale"
-    private const val KEY_ACTIVE_EXPECTED_GAIN  = "gap_task_active_expected_gain"
-    private const val KEY_LAST_GENERATED_DAY    = "gap_task_last_generated_day"
-    private const val KEY_LAST_ESCALATED_DAY    = "gap_task_last_escalated_day"
-    private const val KEY_WARNING_LOG           = "gap_task_warning_log"
-    private const val MAX_WARNING_LOG_ENTRIES   = 50
+    private const val KEY_COVERED_CONCEPT_IDS       = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID         = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID            = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY       = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED        = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT            = "gap_task_active_subject"
+    private const val KEY_ACTIVE_CHAPTER            = "gap_task_active_chapter"
+    private const val KEY_ACTIVE_TOPIC              = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN       = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE          = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN      = "gap_task_active_expected_gain"
+    private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
+    private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
+    private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG               = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES       = 50
 
     // ── Covered concepts ────────────────────────────────────────────────────
 
@@ -94,22 +106,35 @@ object GapTaskLedger {
      * SAME concept already active (re-served because it wasn't finished); starts a fresh
      * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
      * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     *
+     * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
+     * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
+     * day must leave an already-created session alone, since the whole point of re-serving
+     * it is that the student hasn't taken that session yet.
      */
     fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
         val conceptId = candidate.conceptId ?: return
         val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
         val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
-        val daysServed = if (previousConceptId == conceptId) previousDays + 1 else 1
+        val isNewConcept = previousConceptId != conceptId
+        val daysServed = if (isNewConcept) 1 else previousDays + 1
 
         CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
         CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
         CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
         CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, candidate.topic ?: candidate.chapter ?: "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
         CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
         CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
+
+        if (isNewConcept) {
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+            CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        }
     }
 
     fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
@@ -117,11 +142,39 @@ object GapTaskLedger {
     fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
     fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
     fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
     fun activeTopic(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null)?.takeIf { it.isNotBlank() }
     fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
     fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
     fun activeExpectedGain(): Double =
         CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
+
+    // ── P0b: active concept's Testmate targeted-test link ───────────────────
+
+    fun activeTestmateTestId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_TEST_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun activeTestmateSessionId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun isActiveEvidenceImported(): Boolean =
+        CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+
+    /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
+     *  a targeted test was created (or already existed — see the endpoint's own idempotency
+     *  by intervention_id) for the currently active concept. */
+    fun recordTestmateSession(testId: String, sessionId: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
+    }
+
+    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
+     *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
+     *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
+     *  session every 15 minutes for the rest of the day. */
+    fun markActiveEvidenceImported() {
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+    }
 
     private fun clearActive() {
         CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
@@ -129,10 +182,14 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
         CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
         CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
         CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────
