@@ -117,10 +117,16 @@ private fun recordVisit(url: String, title: String) {
  * so an old test result page can be reopened without re-navigating from
  * scratch. This is a lightweight approximation of a real browser's tab
  * strip — not Chrome's tab-group/thumbnail machinery.
+ *
+ * [initialSessionId] — P0b: when set (navigated here via "test_web/{sessionId}",
+ * see MainScreen's NavHost), the first tab opens directly at
+ * "$baseUrl/test/$initialSessionId" — the student's assigned Testmate
+ * targeted-repair test — instead of the bare Testmate homepage. Null for the
+ * plain "test_web" route (bottom-nav / manual entry), which is unchanged.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun TestmateWebScreen(navController: NavController) {
+fun TestmateWebScreen(navController: NavController, initialSessionId: String? = null) {
     val context = LocalContext.current
     // Cache of live WebView instances keyed by tab id — never read during
     // composition, only from click handlers / WebView callbacks. Reused
@@ -133,9 +139,18 @@ fun TestmateWebScreen(navController: NavController) {
         CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
     }
 
+    // P0b: land directly on the assigned repair test when we were navigated here
+    // with a sessionId, rather than opening the bare base URL and making the
+    // student find their way to it themselves.
+    val initialUrl = remember {
+        if (!baseUrl.isNullOrBlank() && !initialSessionId.isNullOrBlank())
+            "$baseUrl/test/$initialSessionId"
+        else baseUrl
+    }
+
     val tabs = remember {
         mutableStateListOf<TabState>().apply {
-            if (!baseUrl.isNullOrBlank()) add(TabState(id = "tab-0", initialUrl = baseUrl))
+            if (!initialUrl.isNullOrBlank()) add(TabState(id = "tab-0", initialUrl = initialUrl))
         }
     }
     var activeTabId by remember { mutableStateOf(tabs.firstOrNull()?.id ?: "") }

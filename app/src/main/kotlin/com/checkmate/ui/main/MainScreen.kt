@@ -118,6 +118,18 @@ fun MainScreen(homeViewModel: HomeViewModel, pendingNegotiation: PendingNegotiat
             // Testmate integration (Phase 6)
             composable("test_results")  { TestResultsScreen(navController) }
             composable("test_web")      { TestmateWebScreen(navController) }
+            // P0b: "Take repair test" from a TaskCard — opens straight at the
+            // targeted-test session GapTaskManager.createTargetedTestIfNeeded()
+            // already created, instead of landing on the bare Testmate homepage
+            // and making the student find it themselves. sessionId is a Testmate
+            // uuid (no '/' characters), so plain path-segment interpolation is
+            // safe here, same reasoning as the negotiation route below.
+            composable(
+                route = "test_web/{sessionId}",
+                arguments = listOf(navArgument("sessionId") { type = NavType.StringType })
+            ) { backStackEntry ->
+                TestmateWebScreen(navController, backStackEntry.arguments?.getString("sessionId"))
+            }
 
             // Proactive Execution Engine — Step 10 (Blueprint §16): the conversational
             // negotiation screen. transactionId/taskId are UUID strings (no '/' characters),

@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.FreeSlotCalculator
+import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -40,6 +41,18 @@ private enum class HomeViewMode { LIST, TIMELINE }
 fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     val state   by vm.state.collectAsState()
     val context = LocalContext.current
+
+    // P0b: which task (if any) is the active gap concept's, and does it have a
+    // Testmate targeted-repair test waiting (see GapTaskManager.createTargetedTestIfNeeded).
+    // Read fresh each recomposition rather than remembered — GapTaskLedger is
+    // CheckmatePrefs-backed, not Flow-backed, so a session created by ReminderService's
+    // background loop only shows up here the next time this screen recomposes (e.g.
+    // switching tabs and back), not the instant it's created. Cheap enough (a couple of
+    // SharedPreferences reads) that recomputing on every recomposition is fine.
+    val activeConceptId = GapTaskLedger.activeConceptId()
+    val activeSessionId = GapTaskLedger.activeTestmateSessionId()
+    fun repairSessionFor(task: StudyTask): String? =
+        if (task.conceptId != null && task.conceptId == activeConceptId) activeSessionId else null
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
@@ -76,6 +89,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                         TaskCard(
                             task           = task,
                             isActive       = state.activeTaskId == task.id,
+                            showRepairTestButton = repairSessionFor(task) != null,
+                            onOpenRepairTest      = { repairSessionFor(task)?.let { navController.navigate("test_web/$it") } },
                             onStart        = { vm.startTask(context, task) },
                             onDone         = { vm.requestCompletion(context, task) },
                             onSkip         = { vm.markSkip(context, task) },
@@ -91,6 +106,8 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
                         TimelineView(
                             tasks          = state.tasks,
                             activeTaskId   = state.activeTaskId,
+                            repairSessionFor = ::repairSessionFor,
+                            onOpenRepairTest  = { sessionId -> navController.navigate("test_web/$sessionId") },
                             onStart        = { vm.startTask(context, it) },
                             onDone         = { vm.requestCompletion(context, it) },
                             onSkip         = { vm.markSkip(context, it) },
@@ -231,6 +248,8 @@ private fun ViewModeToggle(viewMode: HomeViewMode, onChange: (HomeViewMode) -> U
 private fun TimelineView(
     tasks:          List<StudyTask>,
     activeTaskId:   String?,
+    repairSessionFor: (StudyTask) -> String?,     // NEW (P0b) — see HomeScreen's own doc
+    onOpenRepairTest: (String) -> Unit,             // NEW (P0b) — receives the sessionId to open
     onStart:        (StudyTask) -> Unit,
     onDone:         (StudyTask) -> Unit,
     onSkip:         (StudyTask) -> Unit,
@@ -249,6 +268,8 @@ private fun TimelineView(
             TimelineRow(
                 task           = task,
                 isActive       = activeTaskId == task.id,
+                showRepairTestButton = repairSessionFor(task) != null,
+                onOpenRepairTest      = { repairSessionFor(task)?.let(onOpenRepairTest) },
                 onStart        = { onStart(task) },
                 onDone         = { onDone(task) },
                 onSkip         = { onSkip(task) },
@@ -275,6 +296,8 @@ private fun TimelineView(
                     TaskCard(
                         task           = task,
                         isActive       = activeTaskId == task.id,
+                        showRepairTestButton = repairSessionFor(task) != null,
+                        onOpenRepairTest      = { repairSessionFor(task)?.let(onOpenRepairTest) },
                         onStart        = { onStart(task) },
                         onDone         = { onDone(task) },
                         onSkip         = { onSkip(task) },
@@ -294,6 +317,8 @@ private fun TimelineView(
 private fun TimelineRow(
     task:           StudyTask,
     isActive:       Boolean,
+    showRepairTestButton: Boolean,      // NEW (P0b)
+    onOpenRepairTest: () -> Unit,        // NEW (P0b)
     onStart:        () -> Unit,
     onDone:         () -> Unit,
     onSkip:         () -> Unit,
@@ -322,6 +347,8 @@ private fun TimelineRow(
             TaskCard(
                 task           = task,
                 isActive       = isActive,
+                showRepairTestButton = showRepairTestButton,
+                onOpenRepairTest      = onOpenRepairTest,
                 onStart        = onStart,
                 onDone         = onDone,
                 onSkip         = onSkip,
@@ -886,6 +913,8 @@ private fun PsycheMessageCard(message: String) {
 private fun TaskCard(
     task:           StudyTask,
     isActive:       Boolean,
+    showRepairTestButton: Boolean = false,   // NEW (P0b)
+    onOpenRepairTest: () -> Unit = {},         // NEW (P0b)
     onStart:        () -> Unit,
     onDone:         () -> Unit,
     onSkip:         () -> Unit,
@@ -988,6 +1017,25 @@ private fun TaskCard(
                 fontWeight = FontWeight.SemiBold,
                 color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
             )
+
+            // P0b: shown regardless of task.state — the behavioral task (DONE/SKIPPED)
+            // and the linked Testmate targeted-test are two independent completions by
+            // design (see TargetedTestEvidenceImporter's doc: DONE must never stand in
+            // for real evidence), so a student who already tapped Done can still reach
+            // the test from here, and one who hasn't can take the test first if they want.
+            if (showRepairTestButton) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick  = onOpenRepairTest,
+                    border   = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.5f)),
+                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Quiz, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Take repair test", fontWeight = FontWeight.SemiBold)
+                }
+            }
 
             if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
                 Spacer(Modifier.height(6.dp))
