@@ -42,6 +42,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── ScreenCaptureManager.kt
 │   │   │   │   │   │   │   ├── StatusReporter.kt
 │   │   │   │   │   │   │   ├── StudyStateSyncManager.kt
+│   │   │   │   │   │   │   ├── TargetedTestEvidenceImporter.kt
 │   │   │   │   │   │   │   ├── TaskSyncManager.kt
 │   │   │   │   │   │   │   ├── TelegramAlertBot.kt
 │   │   │   │   │   │   ├── ui
@@ -2324,6 +2325,10 @@ import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateQuestionPool
+import com.checkmate.testmate.TestmateResultOutcome
+import com.checkmate.testmate.TestmateTargetedTestOutcome
 import com.checkmate.ui.mentor.MentorViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -2331,26 +2336,34 @@ import kotlinx.coroutines.withContext
 /**
  * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
  * is actually done — and warn the student, with escalating persuasion, when one is being
- * ignored." Two entry points, both called from [ReminderService]'s existing 15-min loop
- * (same wiring pattern as every [ProactiveMentor] check already there):
+ * ignored." Three entry points now, all called from [ReminderService]'s existing 15-min
+ * loop (same wiring pattern as every [ProactiveMentor] check already there):
  *
  * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
  *   doc always said was still missing, now filled by a genuine day-level schedule instead
  *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
- *   still owns that import-time trigger; this is the *ongoing* one).
+ *   still owns that import-time trigger; this is the *ongoing* one). Also now requests the
+ *   P0b Testmate targeted test for whichever concept ends up active (see
+ *   [createTargetedTestIfNeeded]).
  * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
  *   currently being served and, once it's gone unaddressed for more than a day, sends an
  *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
  *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ * - [evidencePollIfNeeded] — P0b: the actual return arrow. Every 15-min cycle (NOT
+ *   once-a-day gated, unlike the two above — the student could submit the Testmate test at
+ *   any time), checks whether the active concept's targeted-test result is in yet and, if
+ *   so, hands it to [TargetedTestEvidenceImporter] so mastery moves off REAL evidence
+ *   instead of only the task's DONE flag.
  *
- * Neither function needs its own "is there anything to analyze" gate beyond checking
- * `studentModel.concepts.isEmpty()` — an empty StudentModel (no test ever imported) just
- * means [LearningDecisionEngine.decideFromReport] returns no candidates and nothing happens,
- * same as the import-time trigger's own behavior.
+ * Neither [generateIfNeeded] nor [escalationCheckIfNeeded] needs its own "is there anything
+ * to analyze" gate beyond checking `studentModel.concepts.isEmpty()` — an empty StudentModel
+ * (no test ever imported) just means [LearningDecisionEngine.decideFromReport] returns no
+ * candidates and nothing happens, same as the import-time trigger's own behavior.
  */
 object GapTaskManager {
 
     private const val TAG = "GapTaskManager"
+    private const val TARGETED_TEST_QUESTION_COUNT = 15
 
     // ── Daily generation ─────────────────────────────────────────────────────
 
@@ -2362,9 +2375,10 @@ object GapTaskManager {
      * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
      * instead of a just-parsed report since there may be no fresh import today at all.
      * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
-     * and picking up where yesterday left off — this function's only job is to run the
-     * pipeline and mark today done, success or failure either way (a failed analysis run
-     * shouldn't retry every 15 minutes for the rest of the day).
+     * and picking up where yesterday left off. Once that's done, also requests (or confirms)
+     * the P0b Testmate targeted test for whichever concept is now active — see
+     * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
+     * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
     suspend fun generateIfNeeded(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
@@ -2384,6 +2398,7 @@ object GapTaskManager {
                 report, studentModel, estimates, expectedScore
             )
             LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            createTargetedTestIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
@@ -2413,6 +2428,100 @@ object GapTaskManager {
     private fun findTask(taskId: String, dayKey: String): StudyTask? =
         PlanStore.todayTasks.value.find { it.id == taskId }
             ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── P0b: Testmate targeted-test creation ────────────────────────────────
+
+    /**
+     * Requests a Testmate targeted-repair test for the currently active gap concept, but
+     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
+     * means either this call already succeeded for this concept, or the concept is being
+     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
+     * across days (see its own doc). No-ops with nothing active, or with no
+     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
+     * crashing the whole generation pass over it). A failed request is NOT retried until the
+     * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
+     * session that was actually recorded, so a create failure just means one day's targeted
+     * test is missing, not a retry storm.
+     */
+    private suspend fun createTargetedTestIfNeeded() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        if (GapTaskLedger.activeTestmateSessionId() != null) return
+        val chapter = GapTaskLedger.activeChapter() ?: run {
+            Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
+            return
+        }
+        val topic = GapTaskLedger.activeTopic()
+
+        val outcome = try {
+            TestmateApi.createTargetedTest(
+                interventionId = conceptId,
+                chapter = chapter,
+                topic = topic,
+                questionCount = TARGETED_TEST_QUESTION_COUNT,
+                pool = TestmateQuestionPool.WRONG_SKIPPED
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            return
+        }
+
+        when (outcome) {
+            is TestmateTargetedTestOutcome.Success -> {
+                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+            }
+            is TestmateTargetedTestOutcome.Error -> {
+                Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+            }
+        }
+    }
+
+    // ── P0b: evidence import ─────────────────────────────────────────────────
+
+    /**
+     * Every 15-min cycle: if the active concept has a Testmate session ([createTargetedTestIfNeeded]
+     * already ran) whose evidence hasn't been imported yet, fetches the result and, once it's
+     * actually there (the student has submitted — an [TestmateResultOutcome.Error], including
+     * Testmate's "no result yet" 404, just means try again next cycle), hands the per-question
+     * breakdown to [TargetedTestEvidenceImporter]. This is deliberately NOT gated to once/day
+     * like [generateIfNeeded]/[escalationCheckIfNeeded] — the student can submit the test at any
+     * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
+     * up to 24 hours later.
+     */
+    suspend fun evidencePollIfNeeded(context: Context) {
+        if (GapTaskLedger.isActiveEvidenceImported()) return
+        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
+
+        val outcome = try {
+            TestmateApi.fetchResult(sessionId)
+        } catch (e: Exception) {
+            Log.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
+            return
+        }
+        val result = when (outcome) {
+            is TestmateResultOutcome.Success -> outcome.result
+            is TestmateResultOutcome.Error -> return // not submitted yet (or a real failure either way) — retry next cycle
+        }
+        if (result.breakdown.isEmpty()) return // submitted but no per-question data yet — treat like not-ready
+
+        try {
+            val exam = ConsultationProfile.load().examTarget
+            val chapter = GapTaskLedger.activeChapter()
+            val topic = GapTaskLedger.activeTopic()
+            TargetedTestEvidenceImporter.import(
+                context = context,
+                sessionId = sessionId,
+                exam = exam,
+                chapter = chapter,
+                topic = topic,
+                result = result
+            )
+            GapTaskLedger.markActiveEvidenceImported()
+        } catch (e: Exception) {
+            Log.e(TAG, "evidence import failed: ${e.message}", e)
+        }
+    }
 
     // ── Escalating skip/stall warning ───────────────────────────────────────
 
@@ -4324,13 +4433,20 @@ class ReminderService : Service() {
                 try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
                 // own class doc always said was still missing — runs the analysis pipeline once
-                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. See
-                // GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
+                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. Also
+                // requests the P0b Testmate targeted test for whatever concept ends up active.
+                // See GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
                 try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Gap-task escalation: warns the student, with escalating persuasion, when the
                 // currently-active gap concept has gone unaddressed for more than a day — see
                 // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
                 try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // P0b: the actual evidence-loop return arrow — polls the active concept's
+                // Testmate targeted-test session and, once it's submitted, imports real
+                // QuestionAttempt/LearningEvent evidence instead of leaving mastery to move
+                // only off the task's DONE flag. Deliberately every cycle, not once/day — see
+                // GapTaskManager.evidencePollIfNeeded's own doc.
+                try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min
@@ -4959,6 +5075,198 @@ object StudyStateSyncManager {
         if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
         return JSONObject(bodyStr).optJSONObject("state")
     }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/TargetedTestEvidenceImporter.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.engine.ErrorEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningEvent
+import com.checkmate.learning.model.LearningEventType
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.Question
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
+import com.checkmate.testmate.TestmateResult
+
+/**
+ * P0b evidence loop — the "return arrow" the roadmap flagged as the biggest remaining
+ * gap: a [com.checkmate.planner.model.StudyTask] reaching DONE is behavior evidence only
+ * (the student pressed the button). This is what turns a Testmate targeted-repair test
+ * the student actually took into real LEARNING evidence — the same
+ * [Question]/[QuestionAttempt]/[LearningEvent] shape
+ * [com.checkmate.learning.testmate.TestResultNormalizer] already produces for a full mock
+ * import, reusing the identical downstream pipeline (ErrorEngine -> MasteryEngine) rather
+ * than inventing a second one.
+ *
+ * Deliberately a separate object from TestResultNormalizer, not a shared code path — that
+ * one parses report.md TEXT; this one consumes an already-structured [TestmateResult]
+ * fetched via [com.checkmate.testmate.TestmateApi.fetchResult]. Lives in `app` (not
+ * `modules/learning`) because it needs [TestmateResult] from `:modules:testmate` alongside
+ * the learning-module pieces — same reasoning as [com.checkmate.testmate.TestmateApi]
+ * itself living where it does.
+ *
+ * IMPORTANT (per the P0b design doc): this object NEVER moves mastery on its own — it only
+ * writes attempts/events; [MasteryEngine.recomputeAll] is what actually changes
+ * ConceptMastery, and only in proportion to what was answered correctly/incorrectly. A
+ * `StudyTask` reaching DONE with zero evidence imported must never, on its own, look like
+ * a mastery gain — that's exactly the anti-pattern the doc called out.
+ */
+object TargetedTestEvidenceImporter {
+
+    private const val TAG = "TargetedTestEvidence"
+
+    data class ImportResult(
+        val alreadyImported: Boolean,
+        val questionsWritten: Int,
+        val attemptsWritten: Int,
+        val eventsWritten: Int
+    )
+
+    /**
+     * [exam]/[chapter]/[topic] should be the SAME values
+     * [com.checkmate.planner.intervention.GapTaskLedger] recorded when the gap-task was
+     * served (`activeChapter()`/`activeTopic()`) — [MasteryEngine] regroups attempts by
+     * [com.checkmate.learning.graph.KnowledgeGraph.conceptId] computed from a Question's
+     * OWN exam/chapter/topic fields, not from anything passed to this function directly,
+     * so a mismatch here would silently recompute mastery for the wrong concept bucket.
+     * Falls back to each [TestmateBreakdownRow]'s own chapter/topic first, since that's
+     * Testmate's authoritative tag for that specific question — [chapter]/[topic] here are
+     * only the fallback for a row that came back without one.
+     */
+    suspend fun import(
+        context: Context,
+        sessionId: String,
+        exam: String?,
+        chapter: String?,
+        topic: String?,
+        result: TestmateResult,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID,
+        source: String = "testmate_targeted"
+    ): ImportResult {
+        if (result.breakdown.isEmpty()) {
+            Log.w(TAG, "import called with an empty breakdown (session=$sessionId) — nothing to write")
+            return ImportResult(alreadyImported = false, questionsWritten = 0, attemptsWritten = 0, eventsWritten = 0)
+        }
+
+        val db = LearningDatabase.getInstance(context)
+
+        // Idempotency guard, same reasoning/shape as TestResultNormalizer's: this session's
+        // question ids are deterministic from (sessionId, question number), so checking the
+        // first one tells us whether this exact session was already imported. Belt-and-
+        // suspenders alongside GapTaskLedger.isActiveEvidenceImported(), which is the guard
+        // that actually stops GapTaskManager from calling this repeatedly.
+        val firstQuestionId = deterministicQuestionId(sessionId, result.breakdown.first().questionNumber)
+        if (db.questionDao().getById(firstQuestionId) != null) {
+            Log.w(TAG, "Targeted test session $sessionId already imported — skipping to avoid duplicate attempts.")
+            return ImportResult(alreadyImported = true, questionsWritten = 0, attemptsWritten = 0, eventsWritten = 0)
+        }
+
+        val questions = mutableListOf<Question>()
+        val attempts = mutableListOf<QuestionAttempt>()
+        val events = mutableListOf<LearningEvent>()
+        val now = System.currentTimeMillis()
+
+        // One summary event for the whole targeted test, same role MOCK_COMPLETED plays for
+        // a full mock import — REVISION_COMPLETED rather than MOCK_COMPLETED since this is a
+        // small student-specific repair set, not a full paper.
+        events.add(
+            LearningEvent(
+                studentId = studentId,
+                eventType = LearningEventType.REVISION_COMPLETED,
+                timestamp = now,
+                chapterId = chapter,
+                topicId = topic,
+                source = source,
+                accuracy = if (result.attemptedCount > 0) result.correctCount.toDouble() / result.attemptedCount else null
+            )
+        )
+
+        for (row in result.breakdown) {
+            val questionId = deterministicQuestionId(sessionId, row.questionNumber)
+
+            questions.add(
+                Question(
+                    id = questionId,
+                    source = source,
+                    exam = exam,
+                    chapter = row.chapter ?: chapter,
+                    topic = row.topic ?: topic,
+                    correctOption = row.correctAnswer,
+                    questionText = row.questionText,
+                    explanation = row.explanation,
+                    options = row.options
+                )
+            )
+
+            // Same reasoning as TestResultNormalizer: a genuinely skipped question
+            // (selectedAnswer == null) gets no QuestionAttempt row — only Question +
+            // LearningEvent — so ErrorEngine's wrong-attempt query never conflates a skip
+            // with an actual wrong answer.
+            if (row.selectedAnswer != null) {
+                attempts.add(
+                    QuestionAttempt(
+                        studentId = studentId,
+                        questionId = questionId,
+                        timestamp = now,
+                        selectedOption = row.selectedAnswer,
+                        correct = row.isCorrect == true,
+                        timeTakenSeconds = row.timeSpentSeconds
+                    )
+                )
+            }
+
+            val eventType = when {
+                row.selectedAnswer == null -> LearningEventType.QUESTION_SKIPPED
+                row.isCorrect == true -> LearningEventType.QUESTION_CORRECT
+                else -> LearningEventType.QUESTION_WRONG
+            }
+            events.add(
+                LearningEvent(
+                    studentId = studentId,
+                    eventType = eventType,
+                    timestamp = now,
+                    chapterId = row.chapter ?: chapter,
+                    topicId = row.topic ?: topic,
+                    questionId = questionId,
+                    source = source,
+                    duration = row.timeSpentSeconds
+                )
+            )
+        }
+
+        db.questionDao().upsertAll(questions)
+        db.questionAttemptDao().insertAll(attempts)
+        db.learningEventDao().insertAll(events)
+
+        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
+        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
+
+        Log.d(
+            TAG,
+            "Imported targeted test session $sessionId: ${questions.size} questions, " +
+                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
+                "classified, ${recomputedMastery.size} concept(s) recomputed"
+        )
+
+        return ImportResult(
+            alreadyImported = false,
+            questionsWritten = questions.size,
+            attemptsWritten = attempts.size,
+            eventsWritten = events.size
+        )
+    }
+
+    /** `testmate_targeted-{sessionId}-q{n}` — namespaced separately from
+     *  TestResultNormalizer's `{testId}-q{n}` scheme so a targeted-test question id can
+     *  never collide with a full-mock-import question id even if both happened to touch
+     *  the same underlying Testmate question. */
+    private fun deterministicQuestionId(sessionId: String, questionNumber: Int): String =
+        "testmate_targeted-$sessionId-q$questionNumber"
 }
 
 
@@ -24172,7 +24480,7 @@ import java.util.Calendar
  *   today's exact candidate forever — the backlog would never advance.
  *
  * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
- * covering three things:
+ * covering four things:
  * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
  *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
  *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
@@ -24183,6 +24491,14 @@ import java.util.Calendar
  *    persuasion — see [com.checkmate.service.GapTaskManager]).
  * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
  *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ * 4. **P0b: the active concept's linked Testmate targeted-test session** — which
+ *    `test_sessions.id`/`tests.id` Testmate created for the CURRENT active concept (see
+ *    [recordTestmateSession]), and whether that session's result has already been turned
+ *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
+ *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
+ *    creates the targeted test at most once per concept and imports its result at most once.
+ *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
+ *    map, since there is only ever one active gap concept at a time in this single-user app.
  *
  * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
  * per-student keying needed.
@@ -24191,20 +24507,24 @@ object GapTaskLedger {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private const val KEY_COVERED_CONCEPT_IDS   = "gap_task_covered_concept_ids"
-    private const val KEY_ACTIVE_CONCEPT_ID     = "gap_task_active_concept_id"
-    private const val KEY_ACTIVE_TASK_ID        = "gap_task_active_task_id"
-    private const val KEY_ACTIVE_TASK_DAY_KEY   = "gap_task_active_task_day_key"
-    private const val KEY_ACTIVE_DAYS_SERVED    = "gap_task_active_days_served"
-    private const val KEY_ACTIVE_SUBJECT        = "gap_task_active_subject"
-    private const val KEY_ACTIVE_TOPIC          = "gap_task_active_topic"
-    private const val KEY_ACTIVE_DURATION_MIN   = "gap_task_active_duration_min"
-    private const val KEY_ACTIVE_RATIONALE      = "gap_task_active_rationale"
-    private const val KEY_ACTIVE_EXPECTED_GAIN  = "gap_task_active_expected_gain"
-    private const val KEY_LAST_GENERATED_DAY    = "gap_task_last_generated_day"
-    private const val KEY_LAST_ESCALATED_DAY    = "gap_task_last_escalated_day"
-    private const val KEY_WARNING_LOG           = "gap_task_warning_log"
-    private const val MAX_WARNING_LOG_ENTRIES   = 50
+    private const val KEY_COVERED_CONCEPT_IDS       = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID         = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID            = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY       = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED        = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT            = "gap_task_active_subject"
+    private const val KEY_ACTIVE_CHAPTER            = "gap_task_active_chapter"
+    private const val KEY_ACTIVE_TOPIC              = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN       = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE          = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN      = "gap_task_active_expected_gain"
+    private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
+    private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
+    private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG               = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES       = 50
 
     // ── Covered concepts ────────────────────────────────────────────────────
 
@@ -24244,22 +24564,35 @@ object GapTaskLedger {
      * SAME concept already active (re-served because it wasn't finished); starts a fresh
      * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
      * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     *
+     * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
+     * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
+     * day must leave an already-created session alone, since the whole point of re-serving
+     * it is that the student hasn't taken that session yet.
      */
     fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
         val conceptId = candidate.conceptId ?: return
         val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
         val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
-        val daysServed = if (previousConceptId == conceptId) previousDays + 1 else 1
+        val isNewConcept = previousConceptId != conceptId
+        val daysServed = if (isNewConcept) 1 else previousDays + 1
 
         CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
         CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
         CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
         CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, candidate.topic ?: candidate.chapter ?: "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
         CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
         CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
+
+        if (isNewConcept) {
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+            CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        }
     }
 
     fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
@@ -24267,11 +24600,39 @@ object GapTaskLedger {
     fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
     fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
     fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
     fun activeTopic(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null)?.takeIf { it.isNotBlank() }
     fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
     fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
     fun activeExpectedGain(): Double =
         CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
+
+    // ── P0b: active concept's Testmate targeted-test link ───────────────────
+
+    fun activeTestmateTestId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_TEST_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun activeTestmateSessionId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun isActiveEvidenceImported(): Boolean =
+        CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+
+    /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
+     *  a targeted test was created (or already existed — see the endpoint's own idempotency
+     *  by intervention_id) for the currently active concept. */
+    fun recordTestmateSession(testId: String, sessionId: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
+    }
+
+    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
+     *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
+     *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
+     *  session every 15 minutes for the rest of the day. */
+    fun markActiveEvidenceImported() {
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+    }
 
     private fun clearActive() {
         CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
@@ -24279,10 +24640,14 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
         CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
         CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
         CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
         CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────
@@ -30251,8 +30616,11 @@ import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -30261,8 +30629,9 @@ import java.util.concurrent.TimeUnit
  * (test-platform-blueprint.md §3 — Phase 6: Checkmate integration).
  *
  * Hits the already-stabilized API surface directly:
- *   GET /api/sessions/:id/results
- *   GET /api/sessions/:id/leaderboard
+ *   GET  /api/sessions/:id/results
+ *   GET  /api/sessions/:id/leaderboard
+ *   POST /api/tests/targeted   (P0b — see [createTargetedTest])
  *
  * Base URL + token are configured in Settings → Test Platform and stored via
  * CheckmatePrefs (same pattern as the LLM provider keys in LlmGateway).
@@ -30362,9 +30731,85 @@ object TestmateApi {
         }
     }
 
+    /**
+     * P0b — the actual seam that closes the evidence loop. Asks Testmate to build a
+     * fresh test out of the student's own wrong/skipped history (or unseen questions,
+     * depending on [pool]) for one chapter/topic, and immediately starts a solo session
+     * against it, so Checkmate never has to also implement `POST /api/sessions` +
+     * question selection itself. See app/api/tests/targeted/route.ts on the Testmate
+     * side for exactly how [pool] resolves to a question set.
+     *
+     * Idempotent by [interventionId] — Testmate's own route returns the SAME test/session
+     * on a repeated call with the same [interventionId] rather than creating a duplicate
+     * (see that route's doc). Safe to call again if a caller isn't sure whether it already
+     * succeeded; [com.checkmate.service.GapTaskManager] still avoids the redundant network
+     * call by checking [com.checkmate.planner.intervention.GapTaskLedger.activeTestmateSessionId]
+     * first, but this being idempotent is what makes that check "an optimization," not "a
+     * correctness requirement."
+     */
+    suspend fun createTargetedTest(
+        interventionId: String,
+        chapter: String,
+        topic: String?,
+        questionCount: Int = 15,
+        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED
+    ): TestmateTargetedTestOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateTargetedTestOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateTargetedTestOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+        if (chapter.isBlank()) {
+            return@withContext TestmateTargetedTestOutcome.Error("chapter is required to target a test.")
+        }
+
+        val payload = JSONObject().apply {
+            put("intervention_id", interventionId)
+            put("chapter", chapter)
+            topic?.takeIf { it.isNotBlank() }?.let { put("topic", it) }
+            put("question_count", questionCount)
+            put("pool", pool.name)
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+
+        val req = Request.Builder()
+            .url("$base/api/tests/targeted")
+            .addHeader("Authorization", "Bearer $authToken")
+            .post(body)
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "POST /api/tests/targeted HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateTargetedTestOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            val json = JSONObject(bodyStr)
+            val test = json.optJSONObject("test")
+            val session = json.optJSONObject("session")
+            if (test == null || session == null) {
+                return@withContext TestmateTargetedTestOutcome.Error("Testmate response missing test/session.")
+            }
+            TestmateTargetedTestOutcome.Success(
+                TestmateTargetedTest(
+                    testId = test.optString("id"),
+                    sessionId = session.optString("id"),
+                    interventionId = session.optString("intervention_id", interventionId),
+                    questionCount = json.optInt("question_count", questionCount)
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest failed: ${e.message}")
+            TestmateTargetedTestOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
     private fun errorMessageFor(code: Int, bodyStr: String): String = when (code) {
         401, 403 -> "Testmate rejected the token — check Settings → Test Platform."
         404      -> "No result found for that session ID."
+        422      -> "Testmate couldn't build a test from the available questions."
         else     -> "Testmate returned HTTP $code."
     }.let { msg ->
         // Surface a server-provided `error` field when present, without letting
@@ -30385,6 +30830,38 @@ object TestmateApi {
                 )
             }
         }
+
+        // P0b addition: previously this route's `breakdown` array was fetched but never
+        // read — every field below it existed server-side already (see
+        // app/api/sessions/[id]/results/route.ts), this is just the client finally parsing
+        // it into something TargetedTestEvidenceImporter can write as real evidence.
+        fun optionsMap(o: JSONObject): Map<String, String>? {
+            val opts = o.optJSONObject("options") ?: return null
+            val map = mutableMapOf<String, String>()
+            opts.keys().forEach { k -> map[k] = opts.optString(k) }
+            return map.takeIf { it.isNotEmpty() }
+        }
+
+        val breakdownArr: JSONArray? = json.optJSONArray("breakdown")
+        val breakdown = breakdownArr?.let { arr ->
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateBreakdownRow(
+                    questionId       = o.optString("question_id").takeIf { it.isNotBlank() },
+                    questionNumber   = o.optInt("question_number", i + 1),
+                    questionText     = o.optString("question_text").takeIf { it.isNotBlank() },
+                    chapter          = o.optString("chapter").takeIf { it.isNotBlank() },
+                    topic            = o.optString("topic").takeIf { it.isNotBlank() },
+                    correctAnswer    = o.optString("correct_answer").takeIf { it.isNotBlank() },
+                    selectedAnswer   = if (o.isNull("selected_answer")) null else o.optString("selected_answer").takeIf { it.isNotBlank() },
+                    isCorrect        = if (o.isNull("is_correct")) null else o.optBoolean("is_correct"),
+                    timeSpentSeconds = o.optInt("time_spent_seconds", 0),
+                    options          = optionsMap(o),
+                    explanation      = o.optString("explanation").takeIf { it.isNotBlank() }
+                )
+            }
+        } ?: emptyList()
+
         return TestmateResult(
             sessionId          = sessionId,
             testTitle          = json.optString("test_title", "Test"),
@@ -30398,7 +30875,9 @@ object TestmateApi {
             avgTimePerQuestion = json.optDouble("avg_time_per_question", 0.0),
             weakChapters       = weakAreas("weak_chapters"),
             weakTopics         = weakAreas("weak_topics"),
-            rankInSession      = if (json.isNull("rank_in_session")) null else json.optInt("rank_in_session")
+            rankInSession      = if (json.isNull("rank_in_session")) null else json.optInt("rank_in_session"),
+            interventionId     = json.optString("intervention_id").takeIf { it.isNotBlank() },
+            breakdown          = breakdown
         )
     }
 }
@@ -30412,11 +30891,36 @@ package com.checkmate.testmate
  * the parts of `tests` / `session_participants` needed to show a result natively.
  * Parsed by hand from JSON in TestmateApi — matches the org.json style already
  * used by LlmGateway rather than pulling in Retrofit/Moshi for one client.
+ *
+ * P0b addition: [TestmateResult.breakdown] + [TestmateResult.interventionId], and the
+ * new [TestmateQuestionPool]/[TestmateTargetedTest]/[TestmateTargetedTestOutcome] types
+ * for the targeted-repair-test creation call. See TestmateApi.createTargetedTest's doc.
  */
 data class TestmateWeakArea(
     val name: String,
     val accuracyPct: Double,
     val attempted: Int
+)
+
+/**
+ * One row of `GET /api/sessions/:id/results`'s `breakdown` array — added on the Testmate
+ * side specifically so an external client (Checkmate) could get real per-question evidence
+ * instead of only the aggregate fields below. [questionId] is Testmate's own `questions.id`
+ * for this row, used to build a deterministic, idempotent Checkmate `Question.id` (see
+ * TargetedTestEvidenceImporter) — NOT the same as [TestmateResult.sessionId].
+ */
+data class TestmateBreakdownRow(
+    val questionId: String?,
+    val questionNumber: Int,
+    val questionText: String?,
+    val chapter: String?,
+    val topic: String?,
+    val correctAnswer: String?,
+    val selectedAnswer: String?,
+    val isCorrect: Boolean?,
+    val timeSpentSeconds: Int,
+    val options: Map<String, String>?,
+    val explanation: String?
 )
 
 data class TestmateResult(
@@ -30432,12 +30936,52 @@ data class TestmateResult(
     val avgTimePerQuestion: Double,
     val weakChapters: List<TestmateWeakArea>,
     val weakTopics: List<TestmateWeakArea>,
-    val rankInSession: Int?
+    val rankInSession: Int?,
+    /** Null for a session created before this field existed server-side, or for any
+     *  session not created via [TestmateApi.createTargetedTest] (e.g. a manually
+     *  entered session ID on the Testmate Settings screen). */
+    val interventionId: String? = null,
+    /** Per-question detail — see [TestmateBreakdownRow]. Empty for a pre-P0b Testmate
+     *  deployment that hasn't picked up the `breakdown` field on its results route yet;
+     *  callers must treat an empty list as "no evidence available," not "zero questions." */
+    val breakdown: List<TestmateBreakdownRow> = emptyList()
 )
 
 sealed class TestmateResultOutcome {
     data class Success(val result: TestmateResult) : TestmateResultOutcome()
     data class Error(val message: String) : TestmateResultOutcome()
+}
+
+/**
+ * Which of the student's own question history to draw a targeted-repair test from —
+ * mirrors the "selection modes" from the P0b design doc, minus the ones not built yet
+ * (RECENT_ERRORS, REPAIR_MIX, difficulty-adaptive selection). Sent as-is (name.lowercase())
+ * in the `pool` field of [TestmateApi.createTargetedTest]'s request body — see
+ * app/api/tests/targeted/route.ts on the Testmate side for exactly how each is resolved.
+ */
+enum class TestmateQuestionPool {
+    /** Previously answered incorrectly. */
+    WRONG,
+    /** Previously visited but left unanswered. */
+    SKIPPED,
+    /** WRONG + SKIPPED combined — the default; matches the doc's own example. */
+    WRONG_SKIPPED,
+    /** Never attempted by this student before, same chapter/topic — used as a standalone
+     *  pool request, or automatically by the server as backfill when WRONG/SKIPPED/
+     *  WRONG_SKIPPED don't have enough candidates to fill questionCount. */
+    NEW
+}
+
+data class TestmateTargetedTest(
+    val testId: String,
+    val sessionId: String,
+    val interventionId: String,
+    val questionCount: Int
+)
+
+sealed class TestmateTargetedTestOutcome {
+    data class Success(val test: TestmateTargetedTest) : TestmateTargetedTestOutcome()
+    data class Error(val message: String) : TestmateTargetedTestOutcome()
 }
 
 
