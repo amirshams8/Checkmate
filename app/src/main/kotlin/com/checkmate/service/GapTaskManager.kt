@@ -155,38 +155,45 @@ object GapTaskManager {
         // Same verbose-chapter-name problem already diagnosed for subject resolution
         // (see ConceptWeightage's ALIASES doc): GapTaskLedger.activeChapter() is whatever
         // free-text chapter label Testmate's own report exported (e.g. "Biomolecules-II
-        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"),
-        // not a chapter Testmate's /api/tests/targeted question bank necessarily
-        // recognizes as-is. Route it through the same canonical resolver PYQWeightage
-        // lookups already use before sending it cross-system — resolveWeightage's
-        // ALIAS/TOKEN_OVERLAP tiers exist for exactly this. Falls back to the raw
-        // chapter string if nothing resolves, so this can only help, never regress
-        // a chapter that already worked unresolved.
+        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors").
+        // This resolver was originally routed into the Testmate API call on the assumption
+        // that Testmate's question bank used Checkmate's own canonical chapter names —
+        // that assumption turned out to be wrong (see BUGFIX below) — but it's kept computed
+        // here purely for the diagnostic log line, since knowing what Checkmate's own
+        // weightage system considers this chapter is still useful context when debugging.
         val exam = ConsultationProfile.load().examTarget
         val subject = GapTaskLedger.activeSubject()
         val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
         val canonicalChapter = resolution.matchedKey ?: chapter
         if (canonicalChapter != chapter) {
-            Log.d(TAG, "createTargetedTestIfNeeded: canonicalized chapter '$chapter' -> '$canonicalChapter' " +
-                "(method=${resolution.method})")
+            Log.d(TAG, "createTargetedTestIfNeeded: chapter '$chapter' resolves internally to " +
+                "'$canonicalChapter' (method=${resolution.method}) — sending raw label to Testmate, see BUGFIX")
         }
+
+        // BUGFIX: this used to send canonicalChapter (above) to Testmate instead of the raw
+        // chapter string, on the assumption that Testmate's questions.chapter column used the
+        // same canonical names Checkmate's own ConceptWeightage resolver produces. Live data
+        // disproved that: Testmate stores the exact raw, unedited chapter label from each
+        // source PDF at import time (e.g. "The Living World" — 18 questions in Testmate;
+        // Checkmate's canonicalized "Diversity In Living World" — zero. Same story for
+        // "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes,
+        // Cofactors" — 33 questions raw; canonicalized to "Cell Structure And Function" — zero).
+        // route.ts does an exact .eq('chapter', chapter) match, so sending the canonicalized
+        // name was silently routing every one of these lookups at a chapter Testmate has never
+        // heard of. Sending the raw, uncanonicalized chapter is what actually matches Testmate's
+        // own tags.
 
         // BUGFIX: GapTaskLedger.recordServed sets activeTopic() to the RAW (pre-canonicalization)
         // chapter string as its "no real topic" sentinel (candidate.topic ?: candidate.chapter —
         // see that function's own doc, matching Concept.kt's "topic then equals chapter" convention).
-        // Sending that raw copy alongside the now-canonicalized chapter above produces a
-        // chapter/topic pair that no longer agrees with itself (e.g. chapter canonicalized to
-        // "Laws Of Motion" but topic still the raw "Laws of Motion"), which Testmate's own
-        // .eq('topic', topic) filter then can't match against anything — a 422 "no questions
-        // available" that has nothing to do with actual data availability. Only forward topic
-        // when it's a genuinely distinct value from the raw chapter; otherwise the canonicalized
-        // chapter alone is the correct filter, same as if no topic had ever been recorded.
+        // Only forward topic when it's a genuinely distinct value from the raw chapter; otherwise
+        // sending chapter alone is correct, same as if no topic had ever been recorded.
         val topicForApi = topic?.takeIf { it != chapter }
 
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = conceptId,
-                chapter = canonicalChapter,
+                chapter = chapter,
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT,
                 pool = TestmateQuestionPool.WRONG_SKIPPED
