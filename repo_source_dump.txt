@@ -2312,8 +2312,10 @@ package com.checkmate.service
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.ConceptWeightage
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
@@ -2364,6 +2366,13 @@ object GapTaskManager {
 
     private const val TAG = "GapTaskManager"
     private const val TARGETED_TEST_QUESTION_COUNT = 15
+
+    // Persisted (not just logged) so a create-test failure is visible in Settings → Test
+    // Platform without needing adb logcat — Log.w/Log.e alone rotate out of the buffer
+    // within hours, which is exactly what made a 2-day-old missing token invisible on
+    // device. Cleared on the next successful attempt, or manually from Settings.
+    const val PREF_TESTMATE_LAST_ERROR = "gap_task_testmate_last_error"
+    const val PREF_TESTMATE_LAST_ERROR_AT = "gap_task_testmate_last_error_at"
 
     // ── Daily generation ─────────────────────────────────────────────────────
 
@@ -2453,16 +2462,36 @@ object GapTaskManager {
         }
         val topic = GapTaskLedger.activeTopic()
 
+        // Same verbose-chapter-name problem already diagnosed for subject resolution
+        // (see ConceptWeightage's ALIASES doc): GapTaskLedger.activeChapter() is whatever
+        // free-text chapter label Testmate's own report exported (e.g. "Biomolecules-II
+        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"),
+        // not a chapter Testmate's /api/tests/targeted question bank necessarily
+        // recognizes as-is. Route it through the same canonical resolver PYQWeightage
+        // lookups already use before sending it cross-system — resolveWeightage's
+        // ALIAS/TOKEN_OVERLAP tiers exist for exactly this. Falls back to the raw
+        // chapter string if nothing resolves, so this can only help, never regress
+        // a chapter that already worked unresolved.
+        val exam = ConsultationProfile.load().examTarget
+        val subject = GapTaskLedger.activeSubject()
+        val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
+        val canonicalChapter = resolution.matchedKey ?: chapter
+        if (canonicalChapter != chapter) {
+            Log.d(TAG, "createTargetedTestIfNeeded: canonicalized chapter '$chapter' -> '$canonicalChapter' " +
+                "(method=${resolution.method})")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = conceptId,
-                chapter = chapter,
+                chapter = canonicalChapter,
                 topic = topic,
                 questionCount = TARGETED_TEST_QUESTION_COUNT,
                 pool = TestmateQuestionPool.WRONG_SKIPPED
             )
         } catch (e: Exception) {
             Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
             return
         }
 
@@ -2470,11 +2499,24 @@ object GapTaskManager {
             is TestmateTargetedTestOutcome.Success -> {
                 GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
                 Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                clearTestmateError()
             }
             is TestmateTargetedTestOutcome.Error -> {
                 Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+                recordTestmateError(outcome.message)
             }
         }
+    }
+
+    /** Persists the failure so it survives past logcat's buffer — see [PREF_TESTMATE_LAST_ERROR]. */
+    private fun recordTestmateError(message: String) {
+        CheckmatePrefs.putString(PREF_TESTMATE_LAST_ERROR, message)
+        CheckmatePrefs.putLong(PREF_TESTMATE_LAST_ERROR_AT, System.currentTimeMillis())
+    }
+
+    private fun clearTestmateError() {
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR)
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR_AT)
     }
 
     // ── P0b: evidence import ─────────────────────────────────────────────────
@@ -10137,6 +10179,7 @@ import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GapTaskManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProfileSyncManager
@@ -11153,6 +11196,17 @@ private fun VoiceSettings(context: Context) {
 
 // ── Testmate (test platform) settings ─────────────────────────────────────────
 
+/** "3h ago" / "2d ago" style label for [GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT]. */
+private fun relativeTimeAgo(epochMillis: Long): String {
+    val deltaMin = (System.currentTimeMillis() - epochMillis) / 60_000L
+    return when {
+        deltaMin < 1L  -> "just now"
+        deltaMin < 60L -> "${deltaMin}m ago"
+        deltaMin < 1440L -> "${deltaMin / 60L}h ago"
+        else -> "${deltaMin / 1440L}d ago"
+    }
+}
+
 @Composable
 private fun TestmateSettings() {
     var baseUrl by remember {
@@ -11166,6 +11220,45 @@ private fun TestmateSettings() {
     }
     var showToken by remember { mutableStateOf(false) }
     var tokenSaved by remember { mutableStateOf(false) }
+
+    // Last create-targeted-test failure, if any — persisted by GapTaskManager so it's visible
+    // here without adb logcat (which rotates the warning out within hours). Most common cause
+    // is simply an empty token/base URL, which this same screen fixes.
+    var lastError by remember {
+        mutableStateOf(CheckmatePrefs.getString(GapTaskManager.PREF_TESTMATE_LAST_ERROR, null))
+    }
+    var lastErrorAt by remember {
+        mutableStateOf(CheckmatePrefs.getLong(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT, 0L))
+    }
+    if (lastError != null) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Icon(Icons.Default.Warning, null, tint = AccentRed,
+                    modifier = Modifier.padding(top = 2.dp, end = 8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Last targeted-test attempt failed", fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold, color = AccentRed)
+                    Text(lastError ?: "", fontSize = 12.sp, color = White90,
+                        modifier = Modifier.padding(top = 2.dp))
+                    if (lastErrorAt > 0L) {
+                        Text(relativeTimeAgo(lastErrorAt), fontSize = 11.sp, color = White30,
+                            modifier = Modifier.padding(top = 2.dp))
+                    }
+                    TextButton(
+                        onClick = {
+                            CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR)
+                            CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT)
+                            lastError = null
+                            lastErrorAt = 0L
+                        },
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.padding(top = 2.dp)
+                    ) { Text("Dismiss", fontSize = 11.sp, color = White60) }
+                }
+            }
+        }
+        HorizontalDivider(color = White10)
+    }
 
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Testmate Base URL", fontSize = 12.sp, color = White60,
@@ -11252,6 +11345,13 @@ private fun TestmateSettings() {
                     IconButton(onClick = {
                         CheckmatePrefs.putString(TestmateApi.PREF_TOKEN, token.trim())
                         tokenSaved = true
+                        // Saving a token is the fix action for the most common failure
+                        // (missing token) — clear the stale banner rather than leaving it
+                        // until the next 15-min cycle happens to succeed and clear it itself.
+                        CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR)
+                        CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT)
+                        lastError = null
+                        lastErrorAt = 0L
                     }) {
                         Icon(
                             if (tokenSaved) Icons.Default.Check else Icons.Default.Save,
