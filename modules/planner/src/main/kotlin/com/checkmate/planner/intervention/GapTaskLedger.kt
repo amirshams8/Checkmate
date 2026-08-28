@@ -137,7 +137,14 @@ object GapTaskLedger {
         }
     }
 
-    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+    // BUGFIX: this was the one accessor in this object missing the blank-filter every
+    // sibling below it has (activeSubject/activeChapter/activeTopic/etc.). clearActive()
+    // writes "" (not null) to KEY_ACTIVE_CONCEPT_ID same as every other key — without the
+    // filter, a cleared ledger reported a truthy-but-empty concept id instead of null,
+    // which made createTargetedTestIfNeeded() (see GapTaskManager) treat "nothing active"
+    // as "an active concept with a missing chapter" and log a misleading warning every
+    // cycle instead of correctly no-op'ing.
+    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)?.takeIf { it.isNotBlank() }
     fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
     fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
     fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)

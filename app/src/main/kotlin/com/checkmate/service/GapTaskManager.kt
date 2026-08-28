@@ -171,11 +171,23 @@ object GapTaskManager {
                 "(method=${resolution.method})")
         }
 
+        // BUGFIX: GapTaskLedger.recordServed sets activeTopic() to the RAW (pre-canonicalization)
+        // chapter string as its "no real topic" sentinel (candidate.topic ?: candidate.chapter —
+        // see that function's own doc, matching Concept.kt's "topic then equals chapter" convention).
+        // Sending that raw copy alongside the now-canonicalized chapter above produces a
+        // chapter/topic pair that no longer agrees with itself (e.g. chapter canonicalized to
+        // "Laws Of Motion" but topic still the raw "Laws of Motion"), which Testmate's own
+        // .eq('topic', topic) filter then can't match against anything — a 422 "no questions
+        // available" that has nothing to do with actual data availability. Only forward topic
+        // when it's a genuinely distinct value from the raw chapter; otherwise the canonicalized
+        // chapter alone is the correct filter, same as if no topic had ever been recorded.
+        val topicForApi = topic?.takeIf { it != chapter }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = conceptId,
                 chapter = canonicalChapter,
-                topic = topic,
+                topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT,
                 pool = TestmateQuestionPool.WRONG_SKIPPED
             )
