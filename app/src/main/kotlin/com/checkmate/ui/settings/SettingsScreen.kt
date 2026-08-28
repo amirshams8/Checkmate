@@ -27,6 +27,7 @@ import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.service.FloatingAttentionService
+import com.checkmate.service.GapTaskManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
 import com.checkmate.service.ProfileSyncManager
@@ -1043,6 +1044,17 @@ private fun VoiceSettings(context: Context) {
 
 // ── Testmate (test platform) settings ─────────────────────────────────────────
 
+/** "3h ago" / "2d ago" style label for [GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT]. */
+private fun relativeTimeAgo(epochMillis: Long): String {
+    val deltaMin = (System.currentTimeMillis() - epochMillis) / 60_000L
+    return when {
+        deltaMin < 1L  -> "just now"
+        deltaMin < 60L -> "${deltaMin}m ago"
+        deltaMin < 1440L -> "${deltaMin / 60L}h ago"
+        else -> "${deltaMin / 1440L}d ago"
+    }
+}
+
 @Composable
 private fun TestmateSettings() {
     var baseUrl by remember {
@@ -1056,6 +1068,45 @@ private fun TestmateSettings() {
     }
     var showToken by remember { mutableStateOf(false) }
     var tokenSaved by remember { mutableStateOf(false) }
+
+    // Last create-targeted-test failure, if any — persisted by GapTaskManager so it's visible
+    // here without adb logcat (which rotates the warning out within hours). Most common cause
+    // is simply an empty token/base URL, which this same screen fixes.
+    var lastError by remember {
+        mutableStateOf(CheckmatePrefs.getString(GapTaskManager.PREF_TESTMATE_LAST_ERROR, null))
+    }
+    var lastErrorAt by remember {
+        mutableStateOf(CheckmatePrefs.getLong(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT, 0L))
+    }
+    if (lastError != null) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Icon(Icons.Default.Warning, null, tint = AccentRed,
+                    modifier = Modifier.padding(top = 2.dp, end = 8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Last targeted-test attempt failed", fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold, color = AccentRed)
+                    Text(lastError ?: "", fontSize = 12.sp, color = White90,
+                        modifier = Modifier.padding(top = 2.dp))
+                    if (lastErrorAt > 0L) {
+                        Text(relativeTimeAgo(lastErrorAt), fontSize = 11.sp, color = White30,
+                            modifier = Modifier.padding(top = 2.dp))
+                    }
+                    TextButton(
+                        onClick = {
+                            CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR)
+                            CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT)
+                            lastError = null
+                            lastErrorAt = 0L
+                        },
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.padding(top = 2.dp)
+                    ) { Text("Dismiss", fontSize = 11.sp, color = White60) }
+                }
+            }
+        }
+        HorizontalDivider(color = White10)
+    }
 
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Testmate Base URL", fontSize = 12.sp, color = White60,
@@ -1142,6 +1193,13 @@ private fun TestmateSettings() {
                     IconButton(onClick = {
                         CheckmatePrefs.putString(TestmateApi.PREF_TOKEN, token.trim())
                         tokenSaved = true
+                        // Saving a token is the fix action for the most common failure
+                        // (missing token) — clear the stale banner rather than leaving it
+                        // until the next 15-min cycle happens to succeed and clear it itself.
+                        CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR)
+                        CheckmatePrefs.remove(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT)
+                        lastError = null
+                        lastErrorAt = 0L
                     }) {
                         Icon(
                             if (tokenSaved) Icons.Default.Check else Icons.Default.Save,

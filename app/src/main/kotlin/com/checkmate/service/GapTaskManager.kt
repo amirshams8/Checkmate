@@ -2,8 +2,10 @@ package com.checkmate.service
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.ConceptWeightage
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
@@ -54,6 +56,13 @@ object GapTaskManager {
 
     private const val TAG = "GapTaskManager"
     private const val TARGETED_TEST_QUESTION_COUNT = 15
+
+    // Persisted (not just logged) so a create-test failure is visible in Settings → Test
+    // Platform without needing adb logcat — Log.w/Log.e alone rotate out of the buffer
+    // within hours, which is exactly what made a 2-day-old missing token invisible on
+    // device. Cleared on the next successful attempt, or manually from Settings.
+    const val PREF_TESTMATE_LAST_ERROR = "gap_task_testmate_last_error"
+    const val PREF_TESTMATE_LAST_ERROR_AT = "gap_task_testmate_last_error_at"
 
     // ── Daily generation ─────────────────────────────────────────────────────
 
@@ -143,16 +152,36 @@ object GapTaskManager {
         }
         val topic = GapTaskLedger.activeTopic()
 
+        // Same verbose-chapter-name problem already diagnosed for subject resolution
+        // (see ConceptWeightage's ALIASES doc): GapTaskLedger.activeChapter() is whatever
+        // free-text chapter label Testmate's own report exported (e.g. "Biomolecules-II
+        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"),
+        // not a chapter Testmate's /api/tests/targeted question bank necessarily
+        // recognizes as-is. Route it through the same canonical resolver PYQWeightage
+        // lookups already use before sending it cross-system — resolveWeightage's
+        // ALIAS/TOKEN_OVERLAP tiers exist for exactly this. Falls back to the raw
+        // chapter string if nothing resolves, so this can only help, never regress
+        // a chapter that already worked unresolved.
+        val exam = ConsultationProfile.load().examTarget
+        val subject = GapTaskLedger.activeSubject()
+        val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
+        val canonicalChapter = resolution.matchedKey ?: chapter
+        if (canonicalChapter != chapter) {
+            Log.d(TAG, "createTargetedTestIfNeeded: canonicalized chapter '$chapter' -> '$canonicalChapter' " +
+                "(method=${resolution.method})")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = conceptId,
-                chapter = chapter,
+                chapter = canonicalChapter,
                 topic = topic,
                 questionCount = TARGETED_TEST_QUESTION_COUNT,
                 pool = TestmateQuestionPool.WRONG_SKIPPED
             )
         } catch (e: Exception) {
             Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
             return
         }
 
@@ -160,11 +189,24 @@ object GapTaskManager {
             is TestmateTargetedTestOutcome.Success -> {
                 GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
                 Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                clearTestmateError()
             }
             is TestmateTargetedTestOutcome.Error -> {
                 Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+                recordTestmateError(outcome.message)
             }
         }
+    }
+
+    /** Persists the failure so it survives past logcat's buffer — see [PREF_TESTMATE_LAST_ERROR]. */
+    private fun recordTestmateError(message: String) {
+        CheckmatePrefs.putString(PREF_TESTMATE_LAST_ERROR, message)
+        CheckmatePrefs.putLong(PREF_TESTMATE_LAST_ERROR_AT, System.currentTimeMillis())
+    }
+
+    private fun clearTestmateError() {
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR)
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR_AT)
     }
 
     // ── P0b: evidence import ─────────────────────────────────────────────────
