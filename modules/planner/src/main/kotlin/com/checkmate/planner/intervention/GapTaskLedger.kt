@@ -69,6 +69,16 @@ object GapTaskLedger {
     private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
     private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
     private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
+    // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
+    // id never changed between rounds, so a round-2 request for the SAME concept got the
+    // SAME (already-completed) session back instead of a fresh one — resetForNextRound
+    // correctly asked for another round, but Testmate had no way to tell it apart from a
+    // retried round-1 call. This counter gives each round a distinct suffix (see
+    // GapTaskManager.createTargetedTestIfNeeded) so intervention_id actually changes when
+    // the round does. Round 1 stays a bare conceptId (no suffix) for backward
+    // compatibility with sessions already in flight before this fix.
+    private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
     private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
     private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
     private const val KEY_WARNING_LOG               = "gap_task_warning_log"
@@ -148,6 +158,7 @@ object GapTaskLedger {
             CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
             CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
             CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+            CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
         }
     }
 
@@ -180,6 +191,13 @@ object GapTaskLedger {
 
     fun isActiveEvidenceImported(): Boolean =
         CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+
+    /** Which P0b retest round the active concept is on — 1 for a fresh concept or one
+     *  that's never had [resetForNextRound] called, incrementing each time evidence comes
+     *  back still below mastery. See the key's own doc for why this exists: it's what lets
+     *  [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded] send Testmate a
+     *  genuinely different `intervention_id` per round instead of replaying round 1's. */
+    fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
 
     /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
      *  a targeted test was created (or already existed — see the endpoint's own idempotency
@@ -214,6 +232,11 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
+        // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
+        // replaying this same concept's round-1 id and getting the already-completed
+        // session handed straight back.
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, activeTestmateRound() + 1)
     }
 
     private fun clearActive() {
@@ -230,6 +253,7 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────

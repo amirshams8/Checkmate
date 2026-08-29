@@ -244,9 +244,29 @@ object GapTaskManager {
         // sending chapter alone is correct, same as if no topic had ever been recorded.
         val topicForApi = topic?.takeIf { it != chapter }
 
+        // BUGFIX (P0b re-intervention loop, part 2): TestmateApi.createTargetedTest is
+        // idempotent BY intervention_id — Testmate returns the same test/session on a
+        // repeated call with the same id rather than creating a new one (see that
+        // function's own doc). conceptId never changes between rounds, so round 2's
+        // request here was sending the EXACT SAME intervention_id as round 1's, and
+        // Testmate correctly handed back round 1's session — already completed by the
+        // student. That's what made "Take Test" land on an old result page: it wasn't a
+        // stale UI/WebView issue, Testmate genuinely never created a new session. Round
+        // 1 keeps the bare conceptId (no behavior change for sessions already in flight);
+        // round 2+ gets a distinct suffix from GapTaskLedger's round counter (bumped in
+        // resetForNextRound) so each round is a genuinely separate intervention as far as
+        // Testmate's idempotency check is concerned.
+        val round = GapTaskLedger.activeTestmateRound()
+        val interventionId = if (round <= 1) conceptId else "$conceptId-r$round"
+        if (round > 1) {
+            Log.d(TAG, "createTargetedTestIfNeeded: round=$round for concept=$conceptId — " +
+                "using intervention_id=$interventionId so Testmate issues a fresh session " +
+                "instead of replaying round 1's completed one")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
-                interventionId = conceptId,
+                interventionId = interventionId,
                 chapter = chapter,
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT,
