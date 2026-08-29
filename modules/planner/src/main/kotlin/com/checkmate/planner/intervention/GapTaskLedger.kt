@@ -1,5 +1,6 @@
 package com.checkmate.planner.intervention
 
+import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
 import kotlinx.serialization.Serializable
@@ -52,6 +53,8 @@ import java.util.Calendar
  * per-student keying needed.
  */
 object GapTaskLedger {
+
+    private const val TAG = "GapTaskLedger"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -143,6 +146,16 @@ object GapTaskLedger {
         val isNewConcept = previousConceptId != conceptId
         val daysServed = if (isNewConcept) 1 else previousDays + 1
 
+        // DIAGNOSTIC (round-never-increments investigation): this is the ONLY place that can
+        // silently undo a resetForNextRound() bump that just happened earlier in the SAME
+        // generateIfNeeded call — if executeTopCandidate's fresh re-rank picks a different
+        // concept than the one resolveDoneConcept just reset for retry, isNewConcept is true
+        // here and the round/session fields get wiped back to round 1 before
+        // createTargetedTestIfNeeded ever runs. Logging the before-state makes that collision
+        // visible in the same logcat window instead of two separate-looking "round=1" reads.
+        Log.d(TAG, "recordServed: previousConceptId=$previousConceptId conceptId=$conceptId " +
+            "isNewConcept=$isNewConcept currentRound=${CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1)}")
+
         CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
         CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
@@ -229,6 +242,7 @@ object GapTaskLedger {
      * next run, closing the loop that used to stop dead here.
      */
     fun resetForNextRound() {
+        val roundBefore = activeTestmateRound()
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
@@ -236,7 +250,13 @@ object GapTaskLedger {
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
         // session handed straight back.
-        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, activeTestmateRound() + 1)
+        val roundAfter = roundBefore + 1
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, roundAfter)
+        // DIAGNOSTIC (round-never-increments investigation): every write to
+        // KEY_ACTIVE_TESTMATE_ROUND should now self-announce (see the matching log in
+        // recordServed) so a later overwrite is traceable to whichever call did it, instead
+        // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
+        Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
     }
 
     private fun clearActive() {
