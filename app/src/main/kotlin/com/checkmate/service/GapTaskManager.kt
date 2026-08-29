@@ -163,12 +163,31 @@ object GapTaskManager {
      * AND mastery has genuinely cleared the bar.
      * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
      *   as before this fix.
-     * - Evidence imported and mastery >= threshold (or no mastery row at all) -> genuinely
-     *   done, cover it.
-     * - Evidence imported and mastery still < threshold -> concept stays active; only its
-     *   P0b session fields reset (see [GapTaskLedger.resetForNextRound]) so
-     *   [createTargetedTestIfNeeded] requests a brand-new Testmate retest for the SAME
-     *   concept on the next run instead of the loop silently stopping.
+     * - Evidence imported and mastery >= threshold -> genuinely done, cover it.
+     * - Evidence imported and mastery still < threshold, OR no mastery row found at all ->
+     *   concept stays active; only its P0b session fields reset (see
+     *   [GapTaskLedger.resetForNextRound]) so [createTargetedTestIfNeeded] requests a
+     *   brand-new Testmate retest for the SAME concept on the next run instead of the loop
+     *   silently stopping.
+     *
+     * BUGFIX (false-covered on conceptId drift): "no mastery row at all" used to be folded
+     * into the same branch as "mastery cleared the bar" — markCovered either way. That's
+     * only safe if a missing row genuinely means "nothing to check," but by the time this
+     * runs [GapTaskLedger.isActiveEvidenceImported] is already true, meaning REAL P0b
+     * evidence WAS imported for this exact round. [MasteryEngine.recomputeAll] re-derives
+     * its grouping key ([com.checkmate.learning.graph.KnowledgeGraph.conceptId]) from each
+     * [com.checkmate.learning.model.Question]'s own chapter/topic tag on every single run —
+     * see that class's own doc — so a retest's Testmate-tagged questions whose chapter/topic
+     * string isn't byte-for-byte identical to the original import's produces a brand-new
+     * hash bucket instead of updating this one, leaving a lookup for the OLD active
+     * conceptId returning null even though the real concept is nowhere near mastered.
+     * Confirmed live: this exact path fired while real mastery was still 0.744 (well under
+     * [MasteryEngine.MASTERY_THRESHOLD]), [GapTaskLedger.markCovered] wiped the still-
+     * unresolved concept, and the identical real gap resurfaced minutes later under a fresh
+     * conceptId — eventually exhausting Testmate's wrong/skipped question pool for that
+     * chapter (repeated fresh-round requests instead of one continuing round). Missing
+     * mastery data with evidence already imported is now treated the same as "still below
+     * threshold" — one extra retest round is far cheaper than silently abandoning a real gap.
      */
     private suspend fun resolveDoneConcept(context: Context, conceptId: String) {
         if (!GapTaskLedger.isActiveEvidenceImported()) {
@@ -186,7 +205,16 @@ object GapTaskManager {
             return // retry this check on the next generateIfNeeded run rather than guessing
         }
 
-        if (mastery == null || mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+        if (mastery == null) {
+            // BUGFIX (false-covered on conceptId drift): see doc above — evidence was
+            // already confirmed imported for this round, so a missing row here means the
+            // recomputed mastery likely landed under a different conceptId, not that
+            // there's nothing left to check. Treat as unresolved, not done.
+            Log.w(TAG, "resolveDoneConcept: concept=$conceptId has evidence imported but NO " +
+                "mastery row — likely conceptId drift (see BUGFIX doc). Treating as unresolved " +
+                "instead of covering.")
+            GapTaskLedger.resetForNextRound()
+        } else if (mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
             GapTaskLedger.markCovered(conceptId)
         } else {
             Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
