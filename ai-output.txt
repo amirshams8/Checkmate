@@ -1,352 +1,3 @@
-//===== TERMUXFILE: Testmate/app/api/tests/targeted/route.ts =====
-import { NextRequest, NextResponse } from 'next/server';
-import { getServiceClient } from '@/lib/supabase';
-import { getCurrentUserFromRequest } from '@/lib/auth';
-
-// POST /api/tests/targeted
-// Body: {
-//   intervention_id: string,       // Checkmate's GapTaskLedger concept id
-//   chapter: string,
-//   topic?: string,
-//   question_count?: number,       // default 15
-//   pool?: 'WRONG' | 'SKIPPED' | 'WRONG_SKIPPED' | 'NEW',  // default 'WRONG_SKIPPED'
-//   duration_seconds?: number      // default question_count * 90
-// }
-//
-// P0b — the "Testmate owns question selection, Checkmate owns why" endpoint. Builds a
-// student-specific test out of THIS student's own wrong/skipped history for one
-// chapter/topic (falling back to never-attempted questions from the same chapter/topic
-// if there aren't enough), then immediately creates and joins a solo session against it —
-// so Checkmate never has to also call POST /api/sessions or implement question selection
-// itself. Auth via getCurrentUserFromRequest (device-token compatible), unlike
-// POST /api/sessions, which currently only accepts the cookie session — Checkmate has no
-// browser session, so that route was never callable from the app for this.
-//
-// Idempotent on intervention_id (see db/migrations/009_targeted_tests.sql): calling this
-// again with the same intervention_id for the same user returns the SAME test/session
-// rather than generating a new test every retry.
-//
-// KNOWN LIMITATION: "SKIPPED" only catches a question the student visited and left
-// unanswered (a `responses` row with a null selected_answer) — a question in a past test
-// the student never even navigated to (no `responses` row at all) can't be detected this
-// way without diffing every past test's full question list against responses, which this
-// endpoint doesn't do. Good enough for v1; revisit if that gap turns out to matter.
-//
-// BUGFIX (Aug 2026): the WRONG/SKIPPED lookup used to pull the student's ENTIRE response
-// history (every chapter, every subject, since day one) via `.eq('user_id', ...)`, then
-// filter it down to this chapter in memory. supabase-js sends `.in()` filters as URL query
-// params, and that unbounded history was stuffed into a single GET request's `.in('id', ...)`
-// filter — fine while history was small, but it grows without bound as the student keeps
-// using the app, and eventually exceeds the HTTP gateway's URL-length limit. That produces
-// a raw, non-JSON 400 from the gateway itself (not a normal PostgREST error), which
-// supabase-js surfaces as a generic `"Bad Request"` message — indistinguishable from a real
-// query error, and unrelated to which chapter/concept was being requested (hence "fails on
-// every chapter, even a brand new one" once history crossed the threshold).
-//
-// Fixed by flipping the query order: first fetch THIS CHAPTER's (optionally topic's)
-// question-id pool from `questions` — bounded by how many questions exist for one
-// chapter, not by the student's lifetime history — then filter `responses` down to only
-// those ids. That pool is batched defensively (CHUNK_SIZE) in case a single chapter's
-// question bank is ever large enough to risk the same URL-length problem on its own.
-export async function POST(req: NextRequest) {
-  const user = await getCurrentUserFromRequest(req);
-  if (!user) {
-    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-  }
-
-  let body: Record<string, unknown>;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
-  }
-
-  const interventionId = body.intervention_id;
-  const chapter = body.chapter;
-  const topic = typeof body.topic === 'string' && body.topic.trim() ? body.topic.trim() : null;
-  const questionCount =
-    typeof body.question_count === 'number' && body.question_count > 0 ? Math.floor(body.question_count) : 15;
-  const pool = (typeof body.pool === 'string' ? body.pool.toUpperCase() : 'WRONG_SKIPPED') as
-    | 'WRONG'
-    | 'SKIPPED'
-    | 'WRONG_SKIPPED'
-    | 'NEW';
-  const durationSeconds =
-    typeof body.duration_seconds === 'number' && body.duration_seconds > 0
-      ? body.duration_seconds
-      : questionCount * 90;
-
-  if (typeof interventionId !== 'string' || !interventionId.trim()) {
-    return NextResponse.json({ error: 'intervention_id is required' }, { status: 400 });
-  }
-  if (typeof chapter !== 'string' || !chapter.trim()) {
-    return NextResponse.json({ error: 'chapter is required' }, { status: 400 });
-  }
-  if (!['WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'].includes(pool)) {
-    return NextResponse.json(
-      { error: "pool must be one of 'WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'" },
-      { status: 400 }
-    );
-  }
-
-  const supabase = getServiceClient();
-
-  // Batches any `.in('id', [...])` filter so a single request's URL can't grow unbounded —
-  // see the BUGFIX note above. 150 ids/request comfortably stays under gateway URL limits
-  // even with 36-char UUIDs.
-  const CHUNK_SIZE = 150;
-  function chunk<T>(arr: T[], size: number): T[][] {
-    const out: T[][] = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
-  }
-
-  // ── Idempotency: same student + same intervention_id => same test/session ──────────
-  const { data: existingSession, error: idempotencyError } = await supabase
-    .from('test_sessions')
-    .select('id, test_id, intervention_id')
-    .eq('intervention_id', interventionId)
-    .eq('created_by', user.id)
-    .maybeSingle();
-
-  if (idempotencyError) {
-    console.error('[targeted] idempotency check failed:', idempotencyError.message);
-    return NextResponse.json({ error: idempotencyError.message }, { status: 500 });
-  }
-
-  if (existingSession) {
-    const { data: existingTest, error: existingTestError } = await supabase
-      .from('tests')
-      .select('id, title, status, duration_seconds')
-      .eq('id', existingSession.test_id)
-      .single();
-    if (existingTestError) {
-      console.error('[targeted] existing-test lookup failed:', existingTestError.message);
-      return NextResponse.json({ error: existingTestError.message }, { status: 500 });
-    }
-    return NextResponse.json({
-      test: existingTest,
-      session: existingSession,
-      question_count: questionCount,
-      reused: true
-    });
-  }
-
-  // ── Build the candidate question pool from this student's own history ──────────────
-  type CandidateRow = {
-    id: string;
-    question_text: string;
-    question_image_url: string | null;
-    question_data: unknown;
-    options: unknown;
-    option_images: unknown;
-    correct_answer: string | null;
-    marks: number | null;
-    negative_marks: number | null;
-    chapter: string | null;
-    topic: string | null;
-    difficulty: string | null;
-    question_type: string | null;
-    explanation: string | null;
-    answered_at?: string | null;
-  };
-
-  const QUESTION_SELECT =
-    'id, question_text, question_image_url, question_data, options, option_images, correct_answer, marks, negative_marks, chapter, topic, difficulty, question_type, explanation';
-
-  const chosen: CandidateRow[] = [];
-  const chosenIds = new Set<string>();
-
-  if (pool === 'WRONG' || pool === 'SKIPPED' || pool === 'WRONG_SKIPPED') {
-    // Scope by CHAPTER first — bounded by this chapter's question bank, not by the
-    // student's entire lifetime response history (see BUGFIX note above).
-    let chapterQuestionsQuery = supabase.from('questions').select('id').eq('chapter', chapter);
-    if (topic) chapterQuestionsQuery = chapterQuestionsQuery.eq('topic', topic);
-    const { data: chapterQuestions, error: chapterQError } = await chapterQuestionsQuery;
-    if (chapterQError) {
-      console.error('[targeted] chapter question-pool lookup failed:', chapterQError.message);
-      return NextResponse.json({ error: chapterQError.message }, { status: 500 });
-    }
-    const chapterQuestionIds = (chapterQuestions ?? []).map((q) => q.id);
-
-    if (chapterQuestionIds.length > 0) {
-      // Fetch this student's responses restricted to THIS chapter's question ids only,
-      // batched defensively in case one chapter's bank is itself very large.
-      const responseRows: { question_id: string; selected_answer: string | null; is_correct: boolean | null; answered_at: string | null }[] = [];
-      for (const idsBatch of chunk(chapterQuestionIds, CHUNK_SIZE)) {
-        const { data: batch, error: rError } = await supabase
-          .from('responses')
-          .select('question_id, selected_answer, is_correct, answered_at')
-          .eq('user_id', user.id)
-          .in('question_id', idsBatch);
-        if (rError) {
-          console.error('[targeted] responses lookup failed:', rError.message);
-          return NextResponse.json({ error: rError.message }, { status: 500 });
-        }
-        if (batch) responseRows.push(...batch);
-      }
-
-      if (responseRows.length > 0) {
-        const uniqueAnsweredIds = Array.from(new Set(responseRows.map((r) => r.question_id)));
-        const questionById = new Map<string, CandidateRow>();
-        for (const idsBatch of chunk(uniqueAnsweredIds, CHUNK_SIZE)) {
-          const { data: qBatch, error: qError } = await supabase
-            .from('questions')
-            .select(QUESTION_SELECT)
-            .in('id', idsBatch);
-          if (qError) {
-            console.error('[targeted] candidate-question lookup failed:', qError.message);
-            return NextResponse.json({ error: qError.message }, { status: 500 });
-          }
-          for (const q of qBatch ?? []) questionById.set(q.id, q as CandidateRow);
-        }
-
-        const wantWrong = pool === 'WRONG' || pool === 'WRONG_SKIPPED';
-        const wantSkipped = pool === 'SKIPPED' || pool === 'WRONG_SKIPPED';
-
-        // Most-recent-first, and de-duped by question_id (a question can have been
-        // attempted in more than one past test session) — keep only the latest attempt
-        // at each one.
-        const sorted = [...responseRows].sort(
-          (a, b) => new Date(b.answered_at ?? 0).getTime() - new Date(a.answered_at ?? 0).getTime()
-        );
-
-        for (const r of sorted) {
-          if (chosen.length >= questionCount) break;
-          if (chosenIds.has(r.question_id)) continue;
-          const q = questionById.get(r.question_id);
-          if (!q) continue;
-
-          const isWrong = r.is_correct === false;
-          const isSkipped = r.selected_answer === null || r.selected_answer === undefined;
-          if ((wantWrong && isWrong) || (wantSkipped && isSkipped)) {
-            chosen.push(q);
-            chosenIds.add(r.question_id);
-          }
-        }
-      }
-    }
-  }
-
-  // ── Backfill (or serve entirely, for pool === 'NEW') from never-attempted questions ──
-  if (chosen.length < questionCount) {
-    // Only needs to know WHICH of this chapter's questions the student has already
-    // attempted, so scope this the same bounded way — not the student's full history.
-    let backfillQuery = supabase.from('questions').select(QUESTION_SELECT).eq('chapter', chapter).limit(questionCount * 3); // overfetch — some will be filtered out below
-    if (topic) backfillQuery = backfillQuery.eq('topic', topic);
-
-    const { data: backfillCandidates, error: bError } = await backfillQuery;
-    if (bError) {
-      console.error('[targeted] backfill lookup failed:', bError.message);
-      return NextResponse.json({ error: bError.message }, { status: 500 });
-    }
-
-    const backfillIds = (backfillCandidates ?? []).map((q) => q.id);
-    const attemptedIds = new Set<string>();
-    for (const idsBatch of chunk(backfillIds, CHUNK_SIZE)) {
-      const { data: attempted, error: aError } = await supabase
-        .from('responses')
-        .select('question_id')
-        .eq('user_id', user.id)
-        .in('question_id', idsBatch);
-      if (aError) {
-        console.error('[targeted] attempted-ids lookup failed:', aError.message);
-        return NextResponse.json({ error: aError.message }, { status: 500 });
-      }
-      for (const r of attempted ?? []) attemptedIds.add(r.question_id);
-    }
-
-    for (const q of backfillCandidates ?? []) {
-      if (chosen.length >= questionCount) break;
-      if (chosenIds.has(q.id)) continue;
-      if (attemptedIds.has(q.id)) continue; // "NEW" means genuinely never attempted
-      chosen.push(q as CandidateRow);
-      chosenIds.add(q.id);
-    }
-  }
-
-  if (chosen.length === 0) {
-    return NextResponse.json(
-      { error: `No questions available for chapter "${chapter}"${topic ? ` / topic "${topic}"` : ''} yet.` },
-      { status: 422 }
-    );
-  }
-
-  // ── Create the test, copy the chosen questions into it, start a solo session ────────
-  const { data: newTest, error: testError } = await supabase
-    .from('tests')
-    .insert({
-      title: `Repair: ${chapter}${topic ? ` — ${topic}` : ''}`,
-      status: 'published', // system-generated from already-tagged questions — skip draft/review
-      owner_user_id: user.id,
-      generated_from: { intervention_id: interventionId, chapter, topic, pool, question_count: questionCount },
-      duration_seconds: durationSeconds
-    })
-    .select()
-    .single();
-  if (testError) {
-    console.error('[targeted] test insert failed:', testError.message);
-    return NextResponse.json({ error: testError.message }, { status: 500 });
-  }
-
-  const questionRows = chosen.map((q, i) => ({
-    test_id: newTest.id,
-    question_number: i + 1,
-    question_text: q.question_text,
-    question_image_url: q.question_image_url,
-    question_data: q.question_data,
-    options: q.options,
-    option_images: q.option_images,
-    correct_answer: q.correct_answer,
-    marks: q.marks ?? 4,
-    negative_marks: q.negative_marks ?? 1,
-    chapter: q.chapter,
-    topic: q.topic,
-    difficulty: q.difficulty,
-    question_type: q.question_type,
-    explanation: q.explanation,
-    origin_question_id: q.id,
-    tag_source: 'targeted_copy'
-  }));
-
-  const { error: qInsertError } = await supabase.from('questions').insert(questionRows);
-  if (qInsertError) {
-    console.error('[targeted] question copy insert failed:', qInsertError.message);
-    return NextResponse.json({ error: qInsertError.message }, { status: 500 });
-  }
-
-  const { data: session, error: sessionError } = await supabase
-    .from('test_sessions')
-    .insert({
-      test_id: newTest.id,
-      mode: 'solo',
-      server_start_time: new Date().toISOString(),
-      duration_seconds: durationSeconds,
-      status: 'live',
-      created_by: user.id,
-      intervention_id: interventionId
-    })
-    .select()
-    .single();
-  if (sessionError) {
-    console.error('[targeted] session insert failed:', sessionError.message);
-    return NextResponse.json({ error: sessionError.message }, { status: 500 });
-  }
-
-  const { error: joinError } = await supabase
-    .from('session_participants')
-    .insert({ session_id: session.id, user_id: user.id });
-  if (joinError) {
-    console.error('[targeted] session join failed:', joinError.message);
-    return NextResponse.json({ error: joinError.message }, { status: 500 });
-  }
-
-  return NextResponse.json(
-    { test: newTest, session, question_count: questionRows.length, reused: false },
-    { status: 201 }
-  );
-}
-
 //===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
 package com.checkmate.service
 
@@ -360,6 +11,9 @@ import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
@@ -433,7 +87,7 @@ object GapTaskManager {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
 
-        resolveActiveConceptState()
+        resolveActiveConceptState(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
@@ -456,19 +110,70 @@ object GapTaskManager {
     }
 
     /**
-     * If [GapTaskLedger]'s active concept's task has actually reached DONE, marks it covered
-     * BEFORE re-ranking — otherwise today's run would still see it as active (streak intact)
-     * for the few seconds between "the student finished it" and "the ledger found out," and
-     * [LearningInterventionOrchestrator] would have no way to know without this being called
-     * first. Safe to call with nothing active (both lookups return null and this no-ops).
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, resolves whether
+     * the concept is truly finished (see [resolveDoneConcept]) BEFORE re-ranking — otherwise
+     * today's run would still see it as active (streak intact) for the few seconds between
+     * "the student finished it" and "the ledger found out," and [LearningInterventionOrchestrator]
+     * would have no way to know without this being called first. Safe to call with nothing
+     * active (both lookups return null and this no-ops).
      */
-    private fun resolveActiveConceptState() {
+    private suspend fun resolveActiveConceptState(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val taskId = GapTaskLedger.activeTaskId() ?: return
         val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
         val task = findTask(taskId, dayKey) ?: return
         if (task.state == TaskState.DONE) {
+            resolveDoneConcept(context, conceptId)
+        }
+    }
+
+    /**
+     * BUGFIX (P0b re-intervention loop): a task reaching DONE only means the student finished
+     * the *review task* — it says nothing about whether the concept itself is actually
+     * mastered. The previous behavior called [GapTaskLedger.markCovered] unconditionally as
+     * soon as the task hit DONE, which permanently retired the concept even when the Testmate
+     * retest evidence for that exact concept came back still below
+     * [MasteryEngine.MASTERY_THRESHOLD]. Once covered, [LearningInterventionOrchestrator]
+     * never re-ranks that concept again no matter how weak it stays — this is what silently
+     * broke the "retest -> still weak -> another targeted retest" cycle the whole P0b loop
+     * exists for (confirmed live: report -> targeted test -> retest submitted -> evidence
+     * imported -> mastery recomputed still below threshold -> no next retest was ever
+     * requested, because the concept had already been marked covered the moment its task
+     * card was checked off).
+     *
+     * Now: only mark covered once P0b evidence has actually been imported for this concept
+     * AND mastery has genuinely cleared the bar.
+     * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
+     *   as before this fix.
+     * - Evidence imported and mastery >= threshold (or no mastery row at all) -> genuinely
+     *   done, cover it.
+     * - Evidence imported and mastery still < threshold -> concept stays active; only its
+     *   P0b session fields reset (see [GapTaskLedger.resetForNextRound]) so
+     *   [createTargetedTestIfNeeded] requests a brand-new Testmate retest for the SAME
+     *   concept on the next run instead of the loop silently stopping.
+     */
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String) {
+        if (!GapTaskLedger.isActiveEvidenceImported()) {
             GapTaskLedger.markCovered(conceptId)
+            return
+        }
+
+        val mastery = try {
+            withContext(Dispatchers.IO) {
+                LearningDatabase.getInstance(context).masteryDao()
+                    .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            return // retry this check on the next generateIfNeeded run rather than guessing
+        }
+
+        if (mastery == null || mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+            GapTaskLedger.markCovered(conceptId)
+        } else {
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+                "(${mastery.mastery}) after evidence — requesting another targeted retest round")
+            GapTaskLedger.resetForNextRound()
         }
     }
 
@@ -651,9 +356,10 @@ days running — this is the escalated warning, not the first nudge. Rules:
      * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
      * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
      * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
-     * interrupting with a warning would be counterproductive) and clears/covers it instead of
-     * warning if it turns out to already be DONE (belt-and-suspenders alongside
-     * [resolveActiveConceptState], which normally catches this first).
+     * interrupting with a warning would be counterproductive) and resolves it (see
+     * [resolveDoneConcept]) instead of warning if it turns out to already be DONE
+     * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
+     * first).
      */
     suspend fun escalationCheckIfNeeded(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
@@ -668,7 +374,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val task = findTask(taskId, dayKey)
 
         if (task == null || task.state == TaskState.DONE) {
-            if (task?.state == TaskState.DONE) GapTaskLedger.markCovered(conceptId)
+            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId)
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
@@ -726,7 +432,6 @@ days running — this is the escalated warning, not the first nudge. Rules:
     }
 }
 
-
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
 package com.checkmate.planner.intervention
 
@@ -754,9 +459,13 @@ import java.util.Calendar
  * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
  * covering four things:
  * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
- *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
- *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
- *    skips covered concepts when walking the ranked candidate list.
+ *    `TaskState.DONE` *and* a mastery recheck against real P0b evidence confirms it actually
+ *    cleared [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — never merely
+ *    once a task was created for it, and never merely because the task was checked off with
+ *    mastery still weak (see [markCovered] and [resetForNextRound] docs for why task-DONE
+ *    alone isn't the right signal — that conflation is what silently broke the P0b
+ *    retest-until-mastered loop). [LearningInterventionOrchestrator] skips covered concepts
+ *    when walking the ranked candidate list.
  * 2. **The active concept's streak** — how many consecutive days the current gap concept
  *    has been re-served without reaching DONE, which is exactly the escalation-depth input
  *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
@@ -768,7 +477,9 @@ import java.util.Calendar
  *    [recordTestmateSession]), and whether that session's result has already been turned
  *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
  *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
- *    creates the targeted test at most once per concept and imports its result at most once.
+ *    creates the targeted test at most once per concept PER ROUND and imports its result at
+ *    most once per round. [resetForNextRound] clears just this slot when a round's evidence
+ *    came back still below mastery, so the SAME concept can start a fresh round.
  *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
  *    map, since there is only ever one active gap concept at a time in this single-user app.
  *
@@ -804,13 +515,18 @@ object GapTaskLedger {
         coveredIds().contains(conceptId)
 
     /**
-     * Marks [conceptId] covered — call this ONLY once the gap-task's own `TaskState`
-     * reaches DONE, never at task-creation time. Creation-time marking would mean an
-     * ignored task silently "counts" as covered and the orchestrator moves on to the next
-     * gap, permanently abandoning the one the student never actually did — the opposite of
-     * "till every gap is covered." Clears the active-concept pointer if [conceptId] was it,
-     * so the next [recordServed] call for a different concept starts a fresh streak instead
-     * of inheriting this one's day count.
+     * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
+     * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
+     * DONE, AND (once P0b evidence exists) a mastery recheck actually cleared
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — see
+     * [com.checkmate.service.GapTaskManager]'s `resolveDoneConcept`. Never call this merely
+     * because a task once existed for the concept, and never merely because the task reached
+     * DONE while mastery is still known to be weak (use [resetForNextRound] for that case
+     * instead) — either would mean an unfinished gap silently "counts" as covered and the
+     * orchestrator moves on, permanently abandoning the one the student hasn't actually
+     * closed — the opposite of "till every gap is covered." Clears the active-concept pointer
+     * if [conceptId] was it, so the next [recordServed] call for a different concept starts a
+     * fresh streak instead of inheriting this one's day count.
      */
     fun markCovered(conceptId: String) {
         val updated = coveredIds() + conceptId
@@ -833,14 +549,17 @@ object GapTaskLedger {
     /**
      * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
      * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
-     * SAME concept already active (re-served because it wasn't finished); starts a fresh
-     * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * SAME concept already active (re-served because it wasn't finished, or because it's
+     * starting a new P0b round after [resetForNextRound]); starts a fresh streak at 1 for a
+     * new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
      * (e.g. day-level intents) — there's nothing to track streak-wise for those.
      *
      * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
      * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
-     * day must leave an already-created session alone, since the whole point of re-serving
-     * it is that the student hasn't taken that session yet.
+     * day while its current round's session is still outstanding must leave that session
+     * alone, since the whole point of re-serving it is that the student hasn't taken that
+     * session yet. Once a round's evidence comes back still below mastery, those fields get
+     * reset separately by [resetForNextRound], not here.
      */
     fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
         val conceptId = candidate.conceptId ?: return
@@ -911,6 +630,25 @@ object GapTaskLedger {
      *  session every 15 minutes for the rest of the day. */
     fun markActiveEvidenceImported() {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+    }
+
+    /**
+     * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
+     * when the active concept's task reached DONE but a mastery recheck against real Testmate
+     * retest evidence showed it's still below
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — the student finished
+     * the *review task*, but the concept itself isn't mastered yet. Clears only the P0b
+     * session fields (test id, session id, evidence-imported flag) — deliberately NEVER
+     * touches [markCovered]'s covered-set, and NEVER touches the active concept/day-streak
+     * fields, since this concept is still active and its streak should keep counting. With
+     * these three fields blank again, [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     * reads "no session yet" and requests a fresh Testmate retest for the SAME concept on the
+     * next run, closing the loop that used to stop dead here.
+     */
+    fun resetForNextRound() {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
     }
 
     private fun clearActive() {
@@ -989,78 +727,4 @@ object GapTaskLedger {
         val cal = Calendar.getInstance()
         return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
     }
-}
-
-//===== TERMUXFILE: Testmate/app/login/LoginForm.tsx =====
-'use client';
-
-import { useState } from 'react';
-import { useSearchParams } from 'next/navigation';
-import { getBrowserClient } from '@/lib/supabase-browser';
-
-export default function LoginForm() {
-  const [email, setEmail] = useState('');
-  const [status, setStatus] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  // ?next=/test/<id> arrives here from test/[id]/page.tsx redirecting an
-  // unauthenticated visitor before they've joined a session — without
-  // forwarding it through to the magic link, /auth/callback has no way to
-  // know where the person was trying to go and falls back to its own
-  // default (/admin/tests), stranding a student who just wanted to join a
-  // group session back on a page they can't use.
-  const searchParams = useSearchParams();
-  const next = searchParams.get('next');
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    setStatus('Sending magic link...');
-
-    const supabase = getBrowserClient();
-    const redirectTo = next
-      ? `${window.location.origin}/auth/callback?next=${encodeURIComponent(next)}`
-      : `${window.location.origin}/auth/callback`;
-
-    // BUGFIX: supabase-js normally RETURNS a failure as { error } here, but some
-    // failure modes (a dropped connection, a CORS block, a malformed URL from a bad
-    // env var) cause signInWithOtp to THROW instead of resolving. Without a catch,
-    // execution never reached setStatus/setBusy(false) below, leaving the button
-    // stuck on "Sending..." forever with no feedback and no way to recover short of
-    // reloading the page. try/catch/finally here means any failure — thrown or
-    // returned — ends up retryable instead of stuck.
-    try {
-      const { error } = await supabase.auth.signInWithOtp({
-        email,
-        options: { emailRedirectTo: redirectTo }
-      });
-      setStatus(error ? `Error: ${error.message}` : 'Check your email for the login link.');
-    } catch (err) {
-      setStatus(`Error: ${err instanceof Error ? err.message : 'Could not reach the server. Check your connection and try again.'}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <main className="auth-shell">
-      <h1 className="auth-title">Log in</h1>
-      <form onSubmit={handleSubmit}>
-        <label className="form-field">
-          <span className="form-label">Email</span>
-          <input
-            type="email"
-            className="form-input"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-          />
-        </label>
-        <button type="submit" className="btn-submit" disabled={busy}>
-          {busy ? 'Sending...' : 'Send magic link'}
-        </button>
-      </form>
-      {status && <p className="status-line">{status}</p>}
-    </main>
-  );
 }
