@@ -10,6 +10,9 @@ import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
@@ -83,7 +86,7 @@ object GapTaskManager {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
 
-        resolveActiveConceptState()
+        resolveActiveConceptState(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
@@ -106,19 +109,70 @@ object GapTaskManager {
     }
 
     /**
-     * If [GapTaskLedger]'s active concept's task has actually reached DONE, marks it covered
-     * BEFORE re-ranking — otherwise today's run would still see it as active (streak intact)
-     * for the few seconds between "the student finished it" and "the ledger found out," and
-     * [LearningInterventionOrchestrator] would have no way to know without this being called
-     * first. Safe to call with nothing active (both lookups return null and this no-ops).
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, resolves whether
+     * the concept is truly finished (see [resolveDoneConcept]) BEFORE re-ranking — otherwise
+     * today's run would still see it as active (streak intact) for the few seconds between
+     * "the student finished it" and "the ledger found out," and [LearningInterventionOrchestrator]
+     * would have no way to know without this being called first. Safe to call with nothing
+     * active (both lookups return null and this no-ops).
      */
-    private fun resolveActiveConceptState() {
+    private suspend fun resolveActiveConceptState(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val taskId = GapTaskLedger.activeTaskId() ?: return
         val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
         val task = findTask(taskId, dayKey) ?: return
         if (task.state == TaskState.DONE) {
+            resolveDoneConcept(context, conceptId)
+        }
+    }
+
+    /**
+     * BUGFIX (P0b re-intervention loop): a task reaching DONE only means the student finished
+     * the *review task* — it says nothing about whether the concept itself is actually
+     * mastered. The previous behavior called [GapTaskLedger.markCovered] unconditionally as
+     * soon as the task hit DONE, which permanently retired the concept even when the Testmate
+     * retest evidence for that exact concept came back still below
+     * [MasteryEngine.MASTERY_THRESHOLD]. Once covered, [LearningInterventionOrchestrator]
+     * never re-ranks that concept again no matter how weak it stays — this is what silently
+     * broke the "retest -> still weak -> another targeted retest" cycle the whole P0b loop
+     * exists for (confirmed live: report -> targeted test -> retest submitted -> evidence
+     * imported -> mastery recomputed still below threshold -> no next retest was ever
+     * requested, because the concept had already been marked covered the moment its task
+     * card was checked off).
+     *
+     * Now: only mark covered once P0b evidence has actually been imported for this concept
+     * AND mastery has genuinely cleared the bar.
+     * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
+     *   as before this fix.
+     * - Evidence imported and mastery >= threshold (or no mastery row at all) -> genuinely
+     *   done, cover it.
+     * - Evidence imported and mastery still < threshold -> concept stays active; only its
+     *   P0b session fields reset (see [GapTaskLedger.resetForNextRound]) so
+     *   [createTargetedTestIfNeeded] requests a brand-new Testmate retest for the SAME
+     *   concept on the next run instead of the loop silently stopping.
+     */
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String) {
+        if (!GapTaskLedger.isActiveEvidenceImported()) {
             GapTaskLedger.markCovered(conceptId)
+            return
+        }
+
+        val mastery = try {
+            withContext(Dispatchers.IO) {
+                LearningDatabase.getInstance(context).masteryDao()
+                    .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            return // retry this check on the next generateIfNeeded run rather than guessing
+        }
+
+        if (mastery == null || mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+            GapTaskLedger.markCovered(conceptId)
+        } else {
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+                "(${mastery.mastery}) after evidence — requesting another targeted retest round")
+            GapTaskLedger.resetForNextRound()
         }
     }
 
@@ -301,9 +355,10 @@ days running — this is the escalated warning, not the first nudge. Rules:
      * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
      * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
      * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
-     * interrupting with a warning would be counterproductive) and clears/covers it instead of
-     * warning if it turns out to already be DONE (belt-and-suspenders alongside
-     * [resolveActiveConceptState], which normally catches this first).
+     * interrupting with a warning would be counterproductive) and resolves it (see
+     * [resolveDoneConcept]) instead of warning if it turns out to already be DONE
+     * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
+     * first).
      */
     suspend fun escalationCheckIfNeeded(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
@@ -318,7 +373,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val task = findTask(taskId, dayKey)
 
         if (task == null || task.state == TaskState.DONE) {
-            if (task?.state == TaskState.DONE) GapTaskLedger.markCovered(conceptId)
+            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId)
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
