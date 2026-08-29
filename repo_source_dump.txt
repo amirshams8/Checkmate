@@ -2320,6 +2320,9 @@ import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
@@ -2393,7 +2396,7 @@ object GapTaskManager {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
 
-        resolveActiveConceptState()
+        resolveActiveConceptState(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
@@ -2416,19 +2419,70 @@ object GapTaskManager {
     }
 
     /**
-     * If [GapTaskLedger]'s active concept's task has actually reached DONE, marks it covered
-     * BEFORE re-ranking — otherwise today's run would still see it as active (streak intact)
-     * for the few seconds between "the student finished it" and "the ledger found out," and
-     * [LearningInterventionOrchestrator] would have no way to know without this being called
-     * first. Safe to call with nothing active (both lookups return null and this no-ops).
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, resolves whether
+     * the concept is truly finished (see [resolveDoneConcept]) BEFORE re-ranking — otherwise
+     * today's run would still see it as active (streak intact) for the few seconds between
+     * "the student finished it" and "the ledger found out," and [LearningInterventionOrchestrator]
+     * would have no way to know without this being called first. Safe to call with nothing
+     * active (both lookups return null and this no-ops).
      */
-    private fun resolveActiveConceptState() {
+    private suspend fun resolveActiveConceptState(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val taskId = GapTaskLedger.activeTaskId() ?: return
         val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
         val task = findTask(taskId, dayKey) ?: return
         if (task.state == TaskState.DONE) {
+            resolveDoneConcept(context, conceptId)
+        }
+    }
+
+    /**
+     * BUGFIX (P0b re-intervention loop): a task reaching DONE only means the student finished
+     * the *review task* — it says nothing about whether the concept itself is actually
+     * mastered. The previous behavior called [GapTaskLedger.markCovered] unconditionally as
+     * soon as the task hit DONE, which permanently retired the concept even when the Testmate
+     * retest evidence for that exact concept came back still below
+     * [MasteryEngine.MASTERY_THRESHOLD]. Once covered, [LearningInterventionOrchestrator]
+     * never re-ranks that concept again no matter how weak it stays — this is what silently
+     * broke the "retest -> still weak -> another targeted retest" cycle the whole P0b loop
+     * exists for (confirmed live: report -> targeted test -> retest submitted -> evidence
+     * imported -> mastery recomputed still below threshold -> no next retest was ever
+     * requested, because the concept had already been marked covered the moment its task
+     * card was checked off).
+     *
+     * Now: only mark covered once P0b evidence has actually been imported for this concept
+     * AND mastery has genuinely cleared the bar.
+     * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
+     *   as before this fix.
+     * - Evidence imported and mastery >= threshold (or no mastery row at all) -> genuinely
+     *   done, cover it.
+     * - Evidence imported and mastery still < threshold -> concept stays active; only its
+     *   P0b session fields reset (see [GapTaskLedger.resetForNextRound]) so
+     *   [createTargetedTestIfNeeded] requests a brand-new Testmate retest for the SAME
+     *   concept on the next run instead of the loop silently stopping.
+     */
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String) {
+        if (!GapTaskLedger.isActiveEvidenceImported()) {
             GapTaskLedger.markCovered(conceptId)
+            return
+        }
+
+        val mastery = try {
+            withContext(Dispatchers.IO) {
+                LearningDatabase.getInstance(context).masteryDao()
+                    .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            return // retry this check on the next generateIfNeeded run rather than guessing
+        }
+
+        if (mastery == null || mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+            GapTaskLedger.markCovered(conceptId)
+        } else {
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+                "(${mastery.mastery}) after evidence — requesting another targeted retest round")
+            GapTaskLedger.resetForNextRound()
         }
     }
 
@@ -2611,9 +2665,10 @@ days running — this is the escalated warning, not the first nudge. Rules:
      * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
      * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
      * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
-     * interrupting with a warning would be counterproductive) and clears/covers it instead of
-     * warning if it turns out to already be DONE (belt-and-suspenders alongside
-     * [resolveActiveConceptState], which normally catches this first).
+     * interrupting with a warning would be counterproductive) and resolves it (see
+     * [resolveDoneConcept]) instead of warning if it turns out to already be DONE
+     * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
+     * first).
      */
     suspend fun escalationCheckIfNeeded(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
@@ -2628,7 +2683,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val task = findTask(taskId, dayKey)
 
         if (task == null || task.state == TaskState.DONE) {
-            if (task?.state == TaskState.DONE) GapTaskLedger.markCovered(conceptId)
+            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId)
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
@@ -24676,9 +24731,13 @@ import java.util.Calendar
  * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
  * covering four things:
  * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
- *    `TaskState.DONE`, never merely once a task was created for it (see [markCovered] doc
- *    for why creation alone isn't the right signal). [LearningInterventionOrchestrator]
- *    skips covered concepts when walking the ranked candidate list.
+ *    `TaskState.DONE` *and* a mastery recheck against real P0b evidence confirms it actually
+ *    cleared [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — never merely
+ *    once a task was created for it, and never merely because the task was checked off with
+ *    mastery still weak (see [markCovered] and [resetForNextRound] docs for why task-DONE
+ *    alone isn't the right signal — that conflation is what silently broke the P0b
+ *    retest-until-mastered loop). [LearningInterventionOrchestrator] skips covered concepts
+ *    when walking the ranked candidate list.
  * 2. **The active concept's streak** — how many consecutive days the current gap concept
  *    has been re-served without reaching DONE, which is exactly the escalation-depth input
  *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
@@ -24690,7 +24749,9 @@ import java.util.Calendar
  *    [recordTestmateSession]), and whether that session's result has already been turned
  *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
  *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
- *    creates the targeted test at most once per concept and imports its result at most once.
+ *    creates the targeted test at most once per concept PER ROUND and imports its result at
+ *    most once per round. [resetForNextRound] clears just this slot when a round's evidence
+ *    came back still below mastery, so the SAME concept can start a fresh round.
  *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
  *    map, since there is only ever one active gap concept at a time in this single-user app.
  *
@@ -24726,13 +24787,18 @@ object GapTaskLedger {
         coveredIds().contains(conceptId)
 
     /**
-     * Marks [conceptId] covered — call this ONLY once the gap-task's own `TaskState`
-     * reaches DONE, never at task-creation time. Creation-time marking would mean an
-     * ignored task silently "counts" as covered and the orchestrator moves on to the next
-     * gap, permanently abandoning the one the student never actually did — the opposite of
-     * "till every gap is covered." Clears the active-concept pointer if [conceptId] was it,
-     * so the next [recordServed] call for a different concept starts a fresh streak instead
-     * of inheriting this one's day count.
+     * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
+     * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
+     * DONE, AND (once P0b evidence exists) a mastery recheck actually cleared
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — see
+     * [com.checkmate.service.GapTaskManager]'s `resolveDoneConcept`. Never call this merely
+     * because a task once existed for the concept, and never merely because the task reached
+     * DONE while mastery is still known to be weak (use [resetForNextRound] for that case
+     * instead) — either would mean an unfinished gap silently "counts" as covered and the
+     * orchestrator moves on, permanently abandoning the one the student hasn't actually
+     * closed — the opposite of "till every gap is covered." Clears the active-concept pointer
+     * if [conceptId] was it, so the next [recordServed] call for a different concept starts a
+     * fresh streak instead of inheriting this one's day count.
      */
     fun markCovered(conceptId: String) {
         val updated = coveredIds() + conceptId
@@ -24755,14 +24821,17 @@ object GapTaskLedger {
     /**
      * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
      * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
-     * SAME concept already active (re-served because it wasn't finished); starts a fresh
-     * streak at 1 for a new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * SAME concept already active (re-served because it wasn't finished, or because it's
+     * starting a new P0b round after [resetForNextRound]); starts a fresh streak at 1 for a
+     * new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
      * (e.g. day-level intents) — there's nothing to track streak-wise for those.
      *
      * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
      * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
-     * day must leave an already-created session alone, since the whole point of re-serving
-     * it is that the student hasn't taken that session yet.
+     * day while its current round's session is still outstanding must leave that session
+     * alone, since the whole point of re-serving it is that the student hasn't taken that
+     * session yet. Once a round's evidence comes back still below mastery, those fields get
+     * reset separately by [resetForNextRound], not here.
      */
     fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
         val conceptId = candidate.conceptId ?: return
@@ -24833,6 +24902,25 @@ object GapTaskLedger {
      *  session every 15 minutes for the rest of the day. */
     fun markActiveEvidenceImported() {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+    }
+
+    /**
+     * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
+     * when the active concept's task reached DONE but a mastery recheck against real Testmate
+     * retest evidence showed it's still below
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — the student finished
+     * the *review task*, but the concept itself isn't mastered yet. Clears only the P0b
+     * session fields (test id, session id, evidence-imported flag) — deliberately NEVER
+     * touches [markCovered]'s covered-set, and NEVER touches the active concept/day-streak
+     * fields, since this concept is still active and its streak should keep counting. With
+     * these three fields blank again, [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     * reads "no session yet" and requests a fresh Testmate retest for the SAME concept on the
+     * next run, closing the loop that used to stop dead here.
+     */
+    fun resetForNextRound() {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
     }
 
     private fun clearActive() {
