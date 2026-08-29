@@ -2,6 +2,8 @@ package com.checkmate.planner.intervention
 
 import android.content.Context
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
 import java.util.UUID
 
 /**
@@ -38,6 +40,23 @@ import java.util.UUID
  * this" both stay accurate. A concept only ever becomes covered when its task reaches
  * `TaskState.DONE` (see [GapTaskLedger.markCovered]'s own doc) — never merely because a
  * task once existed for it — so an ignored gap-task keeps being re-served, not abandoned.
+ *
+ * BUGFIX (duplicate same-round task): "re-served" above does NOT mean "re-created."
+ * [GapTaskLedger.isCovered] is only true once a task reaches DONE *and* mastery clears the
+ * bar — it says nothing about a concept whose task is still PENDING/ACTIVE/PAUSED/SKIPPED
+ * from an earlier call. Before this fix, [executeTopCandidate] had no check for that case at
+ * all: every call minted a fresh [idGenerator] taskId and created a brand-new [StudyTask]
+ * for the top candidate, full stop. Confirmed live: [com.checkmate.service.GapTaskManager]
+ * ran twice ~5 minutes apart for the same still-unresolved concept (round 2's retest task,
+ * never touched by the student) and got a SECOND new task on the second call, silently
+ * orphaning the first — [GapTaskLedger]'s active-task pointer moved to the new one, leaving
+ * the old one sitting in [PlanStore] as a duplicate that nothing will ever resolve. See
+ * [RejectionSource.AlreadyActive]: when the candidate's concept is already
+ * [GapTaskLedger.activeConceptId] AND that pointer's task still exists and hasn't reached
+ * DONE, the walk stops here instead of minting another one — no change to the DONE case
+ * ([GapTaskManager.resolveDoneConcept]/[GapTaskLedger.resetForNextRound] still leave the old
+ * DONE task's id in place and a *new* task for the new round is exactly what should happen
+ * there, and does: this guard only fires when the existing task is NOT DONE).
  *
  * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
  * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
@@ -77,6 +96,13 @@ class LearningInterventionOrchestrator(
          *  gap-task previously reached DONE, so the daily walk moves on to the next
          *  ranked candidate instead of re-serving a concept the student already finished. */
         object AlreadyCovered : RejectionSource()
+        /** BUGFIX (duplicate same-round task): this candidate's concept is already
+         *  [GapTaskLedger.activeConceptId], and that pointer's task ([GapTaskLedger.activeTaskId]
+         *  in [GapTaskLedger.activeTaskDayKey]'s plan) still exists and hasn't reached DONE —
+         *  the concept is mid-round, not finished and not abandoned, so no new task is
+         *  created and the walk stops rather than falling through to a lower-ranked
+         *  candidate (that would silently switch which concept is being served). */
+        object AlreadyActive : RejectionSource()
     }
 
     /** One candidate that was ranked but did not end up as a task — see class doc's
@@ -115,8 +141,9 @@ class LearningInterventionOrchestrator(
     /**
      * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
      * ranked order and executes the first one that clears the covered-concept check,
-     * mapping, policy validation, and execution — see class doc for why this stops at one
-     * instead of creating a task per candidate, and for [GapTaskLedger]'s role in the walk.
+     * the already-active check, mapping, policy validation, and execution — see class doc
+     * for why this stops at one instead of creating a task per candidate, and for
+     * [GapTaskLedger]'s role in the walk.
      */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
@@ -137,6 +164,33 @@ class LearningInterventionOrchestrator(
                     timestamp = now
                 )
                 return@forEachIndexed
+            }
+
+            // BUGFIX (duplicate same-round task): concept is already the active one and its
+            // task hasn't reached DONE yet — nothing to do. Stop the whole walk here (not
+            // return@forEachIndexed) so an unresolved active concept never gets silently
+            // swapped for a lower-ranked candidate just because this call happened to run
+            // again before the student touched the existing task.
+            if (conceptId != null && conceptId == GapTaskLedger.activeConceptId()) {
+                val activeTaskId = GapTaskLedger.activeTaskId()
+                val activeDayKey = GapTaskLedger.activeTaskDayKey()
+                val existingTask = activeTaskId?.let { id ->
+                    PlanStore.todayTasks.value.find { it.id == id }
+                        ?: activeDayKey?.let { key -> PlanStore.loadDay(key).find { it.id == id } }
+                }
+                if (existingTask != null && existingTask.state != TaskState.DONE) {
+                    return OrchestrationResult(
+                        outcome = OrchestrationOutcome.NoExecutableCandidate,
+                        rejections = rejections + CandidateRejection(
+                            candidate = candidate,
+                            rank = rank,
+                            source = RejectionSource.AlreadyActive,
+                            detail = "concept $conceptId already has an unresolved task " +
+                                "(${existingTask.id}, state=${existingTask.state}) — not creating a duplicate",
+                            timestamp = now
+                        )
+                    )
+                }
             }
 
             val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
