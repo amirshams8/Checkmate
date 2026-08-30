@@ -108,6 +108,49 @@ object PlanStore {
     }
 
     /**
+     * BUGFIX (P0b AlreadyActive-guard bypass via silent no-op revert): [markTask] only ever
+     * mutates [_todayTasks] (via [updateTask] -> [persist], both hardcoded to [todayKey]).
+     * Every READ path that needs a task from an arbitrary day already falls back to
+     * [loadDay] ([findTask] in GapTaskManager, [LearningInterventionOrchestrator]'s
+     * activeUnresolvedTask) — but there was no equivalent WRITE fallback. Confirmed live:
+     * GapTaskManager.resolveDoneConcept's "evidence not imported yet, revert taskId to
+     * PENDING" call used plain `markTask(taskId, PENDING)`. When the active task's
+     * dayKey ([GapTaskLedger.activeTaskDayKey]) wasn't today's key, `updateTask`'s
+     * `.map { if (it.id == taskId) ... }` against `_todayTasks.value` matched nothing,
+     * `persist()` re-saved today's (unrelated) list, and the task's real DONE state in
+     * `plan_<dayKey>` was never touched. The task then stayed reported as DONE — so
+     * LearningInterventionOrchestrator.executeTopCandidate's AlreadyActive guard (which
+     * treats a DONE task as "nothing blocking") let a fresh task get created for the same
+     * still-unresolved concept, while GapTaskLedger's session/round fields were untouched
+     * (this branch never calls resetForNextRound), so the new task pointed straight back at
+     * the OLD, already-submitted Testmate session — reproducing exactly the "retest button
+     * reopens the old result page" symptom. This targets the correct day's persisted list
+     * directly instead of assuming "today," and only touches [_todayTasks] when [dayKey] IS
+     * today's — same "today's live list first" contract every read path already follows.
+     * Returns true if a matching task was actually found and updated, so a caller that needs
+     * to know whether the revert actually landed (rather than silently doing nothing) can log
+     * or branch on it instead of assuming success the way the old markTask call did.
+     */
+    fun markTaskInDay(dayKey: String, taskId: String, state: TaskState): Boolean {
+        if (dayKey == todayKey()) {
+            val found = _todayTasks.value.any { it.id == taskId }
+            if (found) markTask(taskId, state)
+            return found
+        }
+        val existing = loadDay(dayKey)
+        val found = existing.any { it.id == taskId }
+        if (!found) return false
+        val updated = existing.map {
+            if (it.id == taskId) {
+                it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+            } else it
+        }
+        CheckmatePrefs.putString("plan_$dayKey", json.encodeToString(updated))
+        CheckmatePrefs.putLong("tasks_updated_at_$dayKey", System.currentTimeMillis())
+        return true
+    }
+
+    /**
      * Blueprint 2.6: records the session's real focus time — as measured by
      * AttentionCycleManager's tick loop, which freezes while PAUSED (see
      * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both

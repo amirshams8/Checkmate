@@ -148,7 +148,7 @@ object GapTaskManager {
         }
         Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
         if (task.state == TaskState.DONE) {
-            resolveDoneConcept(context, conceptId)
+            resolveDoneConcept(context, conceptId, dayKey)
         }
     }
 
@@ -225,8 +225,18 @@ object GapTaskManager {
      * chapter (repeated fresh-round requests instead of one continuing round). Missing
      * mastery data with evidence already imported is now treated the same as "still below
      * threshold" — one extra retest round is far cheaper than silently abandoning a real gap.
+     *
+     * BUGFIX (revert-to-PENDING silent no-op via day-key mismatch): [dayKey] is now required
+     * from the caller (both already have it in scope) instead of this function reaching for
+     * [PlanStore]'s today-only [PlanStore.markTask] — see [PlanStore.markTaskInDay]'s own doc
+     * for the full mechanism. Without the correct day, the "evidence not imported, revert to
+     * PENDING" branch below silently failed to revert anything whenever the active task
+     * wasn't from strictly today, leaving [LearningInterventionOrchestrator.executeTopCandidate]'s
+     * AlreadyActive guard blind to the true PENDING intent and creating a duplicate task for
+     * the same still-unresolved concept — confirmed live via the round-stuck-at-1 /
+     * redirect-to-old-result repro.
      */
-    private suspend fun resolveDoneConcept(context: Context, conceptId: String) {
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String, dayKey: String) {
         if (!GapTaskLedger.isActiveEvidenceImported()) {
             val round = GapTaskLedger.activeTestmateRound()
             val sessionId = GapTaskLedger.activeTestmateSessionId()
@@ -259,8 +269,18 @@ object GapTaskManager {
             }
             Log.d(TAG, "resolveDoneConcept: concept=$conceptId evidence NOT imported yet " +
                 "(round=$round, sessionId=$sessionId) — deferring resolution instead of " +
-                "covering (see BUGFIX note), reverting taskId=$taskId to PENDING")
-            PlanStore.markTask(taskId, TaskState.PENDING)
+                "covering (see BUGFIX note), reverting taskId=$taskId (dayKey=$dayKey) to PENDING")
+            // BUGFIX: was PlanStore.markTask(taskId, PENDING) — today-list-only, silently
+            // no-op'd for a task whose dayKey wasn't today's (see PlanStore.markTaskInDay doc
+            // and this function's own class doc). Logging the outcome so a future miss (task
+            // genuinely missing from both today's list AND plan_$dayKey) is visible instead
+            // of silently trusted.
+            val reverted = PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            if (!reverted) {
+                Log.w(TAG, "resolveDoneConcept: concept=$conceptId taskId=$taskId dayKey=$dayKey " +
+                    "— revert-to-PENDING found no matching task in plan_$dayKey either; " +
+                    "AlreadyActive guard may still see this as DONE next run")
+            }
             return
         }
 
@@ -520,7 +540,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val task = findTask(taskId, dayKey)
 
         if (task == null || task.state == TaskState.DONE) {
-            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId)
+            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId, dayKey)
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
