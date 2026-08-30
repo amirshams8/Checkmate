@@ -89,11 +89,30 @@ object GapTaskManager {
      * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
     suspend fun generateIfNeeded(context: Context) {
+        // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
+        // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
+        // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
+        // 15-min cycle, same cadence as evidencePollIfNeeded, NOT only once per calendar
+        // day. The active concept's task can legitimately go DONE-with-evidence-imported
+        // more than once in a single day (a fast student, or a same-day repro/test cycle),
+        // and each time it does, the loop needs to advance the round and request the next
+        // Testmate retest THE SAME DAY — not sit inert until hasGeneratedToday resets
+        // tomorrow. Confirmed live: with this gated, marking the round-2 task Done and
+        // re-importing its evidence same-day did nothing at all until
+        // gap_task_last_generated_day was manually deleted from prefs to force a fresh
+        // generateIfNeeded run — the ONLY code path that ever calls
+        // resolveActiveConceptState/createTargetedTestIfNeeded. Both are cheap, ledger-
+        // driven, and safely no-op with nothing active, so running them unconditionally
+        // here is safe — unlike the StudentModel/PerformanceAnalyzer pipeline below, which
+        // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
+        // part.
+        resolveActiveConceptState(context)
+        createTargetedTestIfNeeded()
+
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
 
         repairLegacyNullTopicsIfNeeded(context)
-        resolveActiveConceptState(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
