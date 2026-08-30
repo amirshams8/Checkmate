@@ -196,9 +196,28 @@ class LearningInterventionOrchestrator(
      * for why this has to run independent of ranking order rather than folded into the
      * per-candidate loop below.
      */
+    /**
+     * BUGFIX (unsynchronized ledger race): [com.checkmate.ui.testresults.TestResultsViewModel
+     * .executeTopIntervention] calls this directly on `Dispatchers.IO`, bypassing
+     * [com.checkmate.service.GapTaskManager] entirely — a genuinely separate call chain
+     * from [com.checkmate.service.GapTaskManager.generateIfNeeded]'s own now-locked path,
+     * racing against it for the same [GapTaskLedger] active-round/session state
+     * ([GapTaskLedger.recordServed] below is the write half of that race). Routed through
+     * [GapTaskLedger.withLock] here so both chains serialize; that same lock is reentrant
+     * per-coroutine (see its doc), so calling this from INSIDE
+     * [com.checkmate.service.GapTaskManager]'s own locked entry points runs inline instead
+     * of deadlocking against the lock its caller is already holding.
+     */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
         now: Long = System.currentTimeMillis()
+    ): OrchestrationResult = GapTaskLedger.withLock {
+        executeTopCandidateLocked(report, now)
+    }
+
+    private suspend fun executeTopCandidateLocked(
+        report: LearningDecisionEngine.DecisionReport,
+        now: Long
     ): OrchestrationResult {
         val rejections = mutableListOf<CandidateRejection>()
 

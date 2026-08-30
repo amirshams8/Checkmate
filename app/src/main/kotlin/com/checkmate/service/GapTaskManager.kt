@@ -88,7 +88,19 @@ object GapTaskManager {
      * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
      * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
-    suspend fun generateIfNeeded(context: Context) {
+    /**
+     * BUGFIX (unsynchronized ledger race): this whole body used to run un-serialized
+     * against the two other call chains that also read-then-write [GapTaskLedger]'s
+     * active-round/session state ([LearningInterventionOrchestrator.executeTopCandidate]
+     * called directly from [com.checkmate.ui.testresults.TestResultsViewModel], and this
+     * same function called from [com.checkmate.ui.home.HomeViewModel.confirmCompletion]).
+     * See [GapTaskLedger.withLock]'s own doc for the concrete failure this closes.
+     */
+    suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
+        generateIfNeededLocked(context)
+    }
+
+    private suspend fun generateIfNeededLocked(context: Context) {
         // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
         // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
         // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
@@ -480,7 +492,15 @@ object GapTaskManager {
      * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
      * up to 24 hours later.
      */
-    suspend fun evidencePollIfNeeded(context: Context) {
+    /** BUGFIX (unsynchronized ledger race): see [GapTaskLedger.withLock]'s doc — this
+     *  reads then, once the student's submitted result lands, writes
+     *  [GapTaskLedger.markActiveEvidenceImported], the exact read-then-write shape the
+     *  other two entry points also race against. */
+    suspend fun evidencePollIfNeeded(context: Context) = GapTaskLedger.withLock {
+        evidencePollIfNeededLocked(context)
+    }
+
+    private suspend fun evidencePollIfNeededLocked(context: Context) {
         if (GapTaskLedger.isActiveEvidenceImported()) return
         val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
 
@@ -546,7 +566,15 @@ days running — this is the escalated warning, not the first nudge. Rules:
      * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
      * first).
      */
-    suspend fun escalationCheckIfNeeded(context: Context) {
+    /** BUGFIX (unsynchronized ledger race): can call [resolveDoneConcept] ->
+     *  [GapTaskLedger.resetForNextRound] and [createTargetedTestIfNeeded] on the same
+     *  active-concept state the other two entry points touch — see
+     *  [GapTaskLedger.withLock]'s doc. */
+    suspend fun escalationCheckIfNeeded(context: Context) = GapTaskLedger.withLock {
+        escalationCheckIfNeededLocked(context)
+    }
+
+    private suspend fun escalationCheckIfNeededLocked(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasEscalatedToday(todayKey)) return
 

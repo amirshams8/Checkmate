@@ -3,11 +3,16 @@ package com.checkmate.planner.intervention
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.Calendar
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
 /**
  * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
@@ -359,5 +364,59 @@ object GapTaskLedger {
     fun todayKey(): String {
         val cal = Calendar.getInstance()
         return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+
+    // ── Mutual exclusion ────────────────────────────────────────────────────
+
+    /**
+     * Serializes every read-then-write sequence against this ledger's active-concept /
+     * P0b-round / session state. Same shape as [TaskEscrow]'s own per-key `Mutex` +
+     * `withLock` (see its class doc: "the actual correctness boundary is in-process
+     * mutual exclusion, not a DB transaction") — this ledger is the single-active-concept
+     * singleton the whole gap-task subsystem assumes is only ever touched one call at a
+     * time, which stopped being guaranteed once THREE independent, unsynchronized call
+     * chains started reading/writing it:
+     *  1. ReminderService's 15-min loop -> GapTaskManager.generateIfNeeded /
+     *     escalationCheckIfNeeded / evidencePollIfNeeded
+     *  2. TestResultsViewModel.executeTopIntervention -> LearningInterventionOrchestrator
+     *     .executeTopCandidate directly, bypassing GapTaskManager, on Dispatchers.IO
+     *  3. HomeViewModel.confirmCompletion -> GapTaskManager.generateIfNeeded, on
+     *     viewModelScope
+     * Two of these landing close enough in time can both read the same round before
+     * either writes, independently bump it, and produce two different Testmate
+     * intervention_ids for what should be one round — see this class's own doc and
+     * [resetForNextRound]'s doc for the round-counter mechanism this races against.
+     *
+     * A single object-level [Mutex] (not per-key like [TaskEscrow]'s) is correct here
+     * specifically because this ledger only ever tracks ONE active concept at a time
+     * (see class doc) — there's no second key to key a lock off of.
+     *
+     * Reentrant by coroutine: [GapTaskManager.generateIfNeeded] and
+     * [GapTaskManager.escalationCheckIfNeeded] each call into
+     * [LearningInterventionOrchestrator.executeTopCandidate] from WITHIN their own
+     * already-locked section. Without reentrancy, that nested call would try to
+     * re-acquire a [Mutex] its own caller is still holding and deadlock the first time
+     * this path actually runs. [LockOwnerElement] in the coroutine's context is how a
+     * nested call recognizes "this call chain already holds the lock" and runs its block
+     * inline instead of re-acquiring. This only protects a single already-serialized call
+     * chain against itself — two genuinely different callers (e.g. the ReminderService
+     * loop and a HomeViewModel tap) still serialize through [mutex] exactly as intended.
+     */
+    private val mutex = Mutex()
+
+    private object LockOwnerKey : CoroutineContext.Key<LockOwnerElement>
+    private class LockOwnerElement : CoroutineContext.Element {
+        override val key: CoroutineContext.Key<*> get() = LockOwnerKey
+    }
+
+    suspend fun <T> withLock(block: suspend () -> T): T {
+        if (coroutineContext[LockOwnerKey] != null) {
+            // Already inside this lock on this call chain (e.g. GapTaskManager's own
+            // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
+            return block()
+        }
+        return mutex.withLock {
+            withContext(LockOwnerElement()) { block() }
+        }
     }
 }
