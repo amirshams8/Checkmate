@@ -7,11 +7,13 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ActionExecutor
+import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.InterventionDatabase
 import com.checkmate.planner.intervention.InterventionState
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.intervention.PlanStoreTaskMutator
 import com.checkmate.planner.intervention.TaskEscrow
+import com.checkmate.planner.model.TaskState
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -66,6 +68,16 @@ class LearningInterventionOrchestratorIntegrationTest {
     fun tearDown() {
         createdTaskIds.forEach { PlanStore.removeTask(it) }
         createdTaskIds.clear()
+        // BUGFIX (test isolation): executeTopCandidate's successful path always calls
+        // GapTaskLedger.recordServed, which writes into the same real, on-device
+        // CheckmatePrefs every test method in this class shares. Without clearing it here,
+        // whichever concept a test last served stays "active" in GapTaskLedger forever —
+        // the very next test (in this class or a future run of it) then hits the
+        // AlreadyActive guard against a concept it never created, for reasons that have
+        // nothing to do with what that test is actually checking. GapTaskLedger exposes no
+        // direct "clear everything" call — markCovered(id) is the only public path that
+        // clears the active pointer, so it doubles as cleanup here.
+        GapTaskLedger.activeConceptId()?.let { GapTaskLedger.markCovered(it) }
         db.close()
     }
 
@@ -164,5 +176,106 @@ class LearningInterventionOrchestratorIntegrationTest {
         assertNotNull("winning task must have an intervention transaction", transaction)
         assertEquals(InterventionState.COMPLETED, transaction!!.currentState)
         assertTrue(InterventionState.COMPLETED in InterventionState.TERMINAL_STATES)
+    }
+
+    /**
+     * BUGFIX (duplicate task via re-ranking, part 2) regression test — the exact scenario
+     * [LearningInterventionOrchestrator]'s class doc "Confirmed live" note describes: a
+     * still-unresolved active concept's candidate drops out of a later run's ranking
+     * entirely while a completely different concept gets promoted to the top (and only)
+     * spot. Deliberately only exercised here, not in the JVM-only
+     * [com.checkmate.planner.intervention.LearningInterventionOrchestratorTest]: the
+     * up-front guard reads [GapTaskLedger.activeConceptId]/[GapTaskLedger.activeTaskId],
+     * which are [CheckmatePrefs]-backed and silently no-op (always null/false) without a
+     * real Android Context — a JVM unit test can never observe this guard actually firing.
+     */
+    @Test
+    fun reRankPromotingADifferentConceptDoesNotOrphanTheStillActiveTask() = runBlocking {
+        // Defensive: see tearDown's own doc — clear out anything a previous run left active
+        // so this test's assertions are unambiguously about ITS round 1, not a leftover one.
+        GapTaskLedger.activeConceptId()?.let { GapTaskLedger.markCovered(it) }
+
+        val suffix = System.currentTimeMillis()
+        val roundOneConceptId = "regression-active-$suffix"
+        val promotedConceptId = "regression-promoted-$suffix"
+
+        // Round 1: sole candidate, so it becomes the active concept with a fresh PENDING task.
+        val roundOneCandidate = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 10.0,
+            conceptId = roundOneConceptId,
+            subject = "Physics",
+            chapter = "Rotational Motion",
+            durationMinutes = 25,
+            rationale = "round 1"
+        )
+        val roundOneResult = orchestrator.executeTopCandidate(
+            LearningDecisionEngine.DecisionReport(
+                studentId = "integration-test-student",
+                examType = "NEET",
+                generatedAt = System.currentTimeMillis(),
+                candidates = listOf(roundOneCandidate)
+            )
+        )
+        val roundOneCreated =
+            roundOneResult.outcome as LearningInterventionOrchestrator.OrchestrationOutcome.Created
+        createdTaskIds += roundOneCreated.taskId
+
+        // Sanity: round 1 really did leave a still-unresolved active task/concept behind —
+        // the precondition the rest of this test is checking the guard against.
+        assertEquals(roundOneConceptId, GapTaskLedger.activeConceptId())
+        val roundOneTask = PlanStore.todayTasks.value.find { it.id == roundOneCreated.taskId }
+        assertNotNull(roundOneTask)
+        assertEquals(TaskState.PENDING, roundOneTask!!.state)
+
+        val tasksAfterRoundOne = PlanStore.todayTasks.value
+
+        // Round 2: a fresh re-rank where roundOneConceptId's candidate has dropped out of the
+        // list entirely (e.g. it no longer clears LearningDecisionEngine's inclusion
+        // threshold this run) and a DIFFERENT concept is now the top (and only) candidate.
+        // Mastery on roundOneConceptId hasn't moved — its task is still PENDING — so this
+        // must not create a task for the promoted concept either.
+        val promotedCandidate = candidate(
+            intent = LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            priorityScore = 20.0,
+            conceptId = promotedConceptId,
+            subject = "Chemistry",
+            chapter = "Mole Concept",
+            durationMinutes = 25,
+            rationale = "round 2 - re-ranked promotion"
+        )
+        val roundTwoResult = orchestrator.executeTopCandidate(
+            LearningDecisionEngine.DecisionReport(
+                studentId = "integration-test-student",
+                examType = "NEET",
+                generatedAt = System.currentTimeMillis(),
+                candidates = listOf(promotedCandidate)
+            )
+        )
+
+        // The walk must be blocked entirely, not fall through to the promoted candidate.
+        assertEquals(
+            LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate,
+            roundTwoResult.outcome
+        )
+        assertEquals(1, roundTwoResult.rejections.size)
+        val rejection = roundTwoResult.rejections.single()
+        assertTrue(rejection.source is LearningInterventionOrchestrator.RejectionSource.AlreadyActive)
+        // Attributed to the promoted candidate (roundOneConceptId isn't in this run's list at
+        // all), so the rejection record still points at something real.
+        assertEquals(promotedConceptId, rejection.candidate.conceptId)
+        assertEquals(1, rejection.rank)
+
+        // No new task was created for the promoted concept, and no second task appeared —
+        // exactly the "second call created a second task, orphaning the first" bug.
+        val tasksAfterRoundTwo = PlanStore.todayTasks.value
+        assertEquals(tasksAfterRoundOne.size, tasksAfterRoundTwo.size)
+        assertNull(tasksAfterRoundTwo.find { it.conceptId == promotedConceptId })
+
+        // The original round-1 task is untouched and still the active one.
+        assertEquals(roundOneConceptId, GapTaskLedger.activeConceptId())
+        val roundOneTaskStill = tasksAfterRoundTwo.find { it.id == roundOneCreated.taskId }
+        assertNotNull(roundOneTaskStill)
+        assertEquals(TaskState.PENDING, roundOneTaskStill!!.state)
     }
 }
