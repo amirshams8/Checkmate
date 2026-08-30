@@ -2511,7 +2511,19 @@ object GapTaskManager {
      * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
      * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
-    suspend fun generateIfNeeded(context: Context) {
+    /**
+     * BUGFIX (unsynchronized ledger race): this whole body used to run un-serialized
+     * against the two other call chains that also read-then-write [GapTaskLedger]'s
+     * active-round/session state ([LearningInterventionOrchestrator.executeTopCandidate]
+     * called directly from [com.checkmate.ui.testresults.TestResultsViewModel], and this
+     * same function called from [com.checkmate.ui.home.HomeViewModel.confirmCompletion]).
+     * See [GapTaskLedger.withLock]'s own doc for the concrete failure this closes.
+     */
+    suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
+        generateIfNeededLocked(context)
+    }
+
+    private suspend fun generateIfNeededLocked(context: Context) {
         // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
         // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
         // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
@@ -2903,7 +2915,15 @@ object GapTaskManager {
      * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
      * up to 24 hours later.
      */
-    suspend fun evidencePollIfNeeded(context: Context) {
+    /** BUGFIX (unsynchronized ledger race): see [GapTaskLedger.withLock]'s doc — this
+     *  reads then, once the student's submitted result lands, writes
+     *  [GapTaskLedger.markActiveEvidenceImported], the exact read-then-write shape the
+     *  other two entry points also race against. */
+    suspend fun evidencePollIfNeeded(context: Context) = GapTaskLedger.withLock {
+        evidencePollIfNeededLocked(context)
+    }
+
+    private suspend fun evidencePollIfNeededLocked(context: Context) {
         if (GapTaskLedger.isActiveEvidenceImported()) return
         val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
 
@@ -2969,7 +2989,15 @@ days running — this is the escalated warning, not the first nudge. Rules:
      * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
      * first).
      */
-    suspend fun escalationCheckIfNeeded(context: Context) {
+    /** BUGFIX (unsynchronized ledger race): can call [resolveDoneConcept] ->
+     *  [GapTaskLedger.resetForNextRound] and [createTargetedTestIfNeeded] on the same
+     *  active-concept state the other two entry points touch — see
+     *  [GapTaskLedger.withLock]'s doc. */
+    suspend fun escalationCheckIfNeeded(context: Context) = GapTaskLedger.withLock {
+        escalationCheckIfNeededLocked(context)
+    }
+
+    private suspend fun escalationCheckIfNeededLocked(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasEscalatedToday(todayKey)) return
 
@@ -25144,11 +25172,16 @@ package com.checkmate.planner.intervention
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.Calendar
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
 /**
  * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
@@ -25500,6 +25533,60 @@ object GapTaskLedger {
     fun todayKey(): String {
         val cal = Calendar.getInstance()
         return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+
+    // ── Mutual exclusion ────────────────────────────────────────────────────
+
+    /**
+     * Serializes every read-then-write sequence against this ledger's active-concept /
+     * P0b-round / session state. Same shape as [TaskEscrow]'s own per-key `Mutex` +
+     * `withLock` (see its class doc: "the actual correctness boundary is in-process
+     * mutual exclusion, not a DB transaction") — this ledger is the single-active-concept
+     * singleton the whole gap-task subsystem assumes is only ever touched one call at a
+     * time, which stopped being guaranteed once THREE independent, unsynchronized call
+     * chains started reading/writing it:
+     *  1. ReminderService's 15-min loop -> GapTaskManager.generateIfNeeded /
+     *     escalationCheckIfNeeded / evidencePollIfNeeded
+     *  2. TestResultsViewModel.executeTopIntervention -> LearningInterventionOrchestrator
+     *     .executeTopCandidate directly, bypassing GapTaskManager, on Dispatchers.IO
+     *  3. HomeViewModel.confirmCompletion -> GapTaskManager.generateIfNeeded, on
+     *     viewModelScope
+     * Two of these landing close enough in time can both read the same round before
+     * either writes, independently bump it, and produce two different Testmate
+     * intervention_ids for what should be one round — see this class's own doc and
+     * [resetForNextRound]'s doc for the round-counter mechanism this races against.
+     *
+     * A single object-level [Mutex] (not per-key like [TaskEscrow]'s) is correct here
+     * specifically because this ledger only ever tracks ONE active concept at a time
+     * (see class doc) — there's no second key to key a lock off of.
+     *
+     * Reentrant by coroutine: [GapTaskManager.generateIfNeeded] and
+     * [GapTaskManager.escalationCheckIfNeeded] each call into
+     * [LearningInterventionOrchestrator.executeTopCandidate] from WITHIN their own
+     * already-locked section. Without reentrancy, that nested call would try to
+     * re-acquire a [Mutex] its own caller is still holding and deadlock the first time
+     * this path actually runs. [LockOwnerElement] in the coroutine's context is how a
+     * nested call recognizes "this call chain already holds the lock" and runs its block
+     * inline instead of re-acquiring. This only protects a single already-serialized call
+     * chain against itself — two genuinely different callers (e.g. the ReminderService
+     * loop and a HomeViewModel tap) still serialize through [mutex] exactly as intended.
+     */
+    private val mutex = Mutex()
+
+    private object LockOwnerKey : CoroutineContext.Key<LockOwnerElement>
+    private class LockOwnerElement : CoroutineContext.Element {
+        override val key: CoroutineContext.Key<*> get() = LockOwnerKey
+    }
+
+    suspend fun <T> withLock(block: suspend () -> T): T {
+        if (coroutineContext[LockOwnerKey] != null) {
+            // Already inside this lock on this call chain (e.g. GapTaskManager's own
+            // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
+            return block()
+        }
+        return mutex.withLock {
+            withContext(LockOwnerElement()) { block() }
+        }
     }
 }
 
@@ -26740,9 +26827,28 @@ class LearningInterventionOrchestrator(
      * for why this has to run independent of ranking order rather than folded into the
      * per-candidate loop below.
      */
+    /**
+     * BUGFIX (unsynchronized ledger race): [com.checkmate.ui.testresults.TestResultsViewModel
+     * .executeTopIntervention] calls this directly on `Dispatchers.IO`, bypassing
+     * [com.checkmate.service.GapTaskManager] entirely — a genuinely separate call chain
+     * from [com.checkmate.service.GapTaskManager.generateIfNeeded]'s own now-locked path,
+     * racing against it for the same [GapTaskLedger] active-round/session state
+     * ([GapTaskLedger.recordServed] below is the write half of that race). Routed through
+     * [GapTaskLedger.withLock] here so both chains serialize; that same lock is reentrant
+     * per-coroutine (see its doc), so calling this from INSIDE
+     * [com.checkmate.service.GapTaskManager]'s own locked entry points runs inline instead
+     * of deadlocking against the lock its caller is already holding.
+     */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
         now: Long = System.currentTimeMillis()
+    ): OrchestrationResult = GapTaskLedger.withLock {
+        executeTopCandidateLocked(report, now)
+    }
+
+    private suspend fun executeTopCandidateLocked(
+        report: LearningDecisionEngine.DecisionReport,
+        now: Long
     ): OrchestrationResult {
         val rejections = mutableListOf<CandidateRejection>()
 
