@@ -49,10 +49,31 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     // background loop only shows up here the next time this screen recomposes (e.g.
     // switching tabs and back), not the instant it's created. Cheap enough (a couple of
     // SharedPreferences reads) that recomputing on every recomposition is fine.
-    val activeConceptId = GapTaskLedger.activeConceptId()
+    // BUGFIX (round-2 task redirects to round-1's result page): this used to match by
+    // task.conceptId == activeConceptId, which is concept-wide — the OLD, already-
+    // completed round-1 task and the NEW round-2 task share the same conceptId (it's
+    // the same concept being retested), so BOTH task cards resolved to the exact same
+    // activeSessionId and both "Take repair test" buttons deep-linked to whichever
+    // session GapTaskLedger currently had on file. Confirmed live: that was still
+    // round 1's already-submitted session, so tapping the round-2 card's button opened
+    // round 1's session URL and Testmate correctly redirected to round 1's result page
+    // — it wasn't a WebView/redirect bug, the wrong session id was being handed to the
+    // WebView to begin with.
+    //
+    // GapTaskLedger.activeTaskId() is updated on every GapTaskLedger.recordServed()
+    // call — including the one that fires when round 2's task is created — and is
+    // already the ledger's own source of truth for which task is presently being
+    // tracked (see that function's doc). Matching on task.id == activeTaskId instead of
+    // conceptId means only the CURRENT round's task card can ever show a repair-test
+    // button: a stale prior-round card (same concept, old task id) no longer matches at
+    // all, and the current round's card only shows a button once its OWN session has
+    // actually been created (activeSessionId reset to blank by resetForNextRound()
+    // until createTargetedTestIfNeeded() populates a fresh one for this round) — no
+    // button is safer than a button pointing at the wrong round's session.
+    val activeTaskId    = GapTaskLedger.activeTaskId()
     val activeSessionId = GapTaskLedger.activeTestmateSessionId()
     fun repairSessionFor(task: StudyTask): String? =
-        if (task.conceptId != null && task.conceptId == activeConceptId) activeSessionId else null
+        if (task.id == activeTaskId) activeSessionId else null
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
