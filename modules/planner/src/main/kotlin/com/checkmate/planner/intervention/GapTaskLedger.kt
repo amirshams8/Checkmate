@@ -3,6 +3,10 @@ package com.checkmate.planner.intervention
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -106,6 +110,43 @@ object GapTaskLedger {
     private const val KEY_WARNING_LOG               = "gap_task_warning_log"
     private const val MAX_WARNING_LOG_ENTRIES       = 50
 
+    // ── Reactive change signal (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
+    //
+    // Every field this object exposes is CheckmatePrefs-backed — plain SharedPreferences,
+    // with no Flow/observable of its own. [com.checkmate.ui.home.HomeScreen] used to call
+    // activeTaskId()/activeTestmateSessionId() straight from inside its @Composable body,
+    // which only re-runs when something IT collects via collectAsState (i.e.
+    // HomeViewModel.state, itself driven only by [com.checkmate.planner.PlanStore
+    // .todayTasks]) actually emits. That's fine for the round-desync case where a PlanStore
+    // write happens alongside the ledger write (e.g. resolveDoneConcept's evidence-not-
+    // imported-yet branch, which does revert the task via PlanStore.markTaskInDay) — but
+    // resolveDoneConcept's OTHER branch (evidence imported, mastery still below threshold)
+    // calls [resetForNextRound] then [com.checkmate.service.GapTaskManager
+    // .createTargetedTestIfNeeded] records the new round's session via
+    // [recordTestmateSession] — neither of those touches PlanStore at all. Both run from
+    // ReminderService's 15-minute background loop, entirely outside Compose. Confirmed
+    // live: with HomeScreen open and idle across that loop's tick, the round-2 session got
+    // created correctly, but the screen never recomposed to see it — repairSessionFor's
+    // activeSessionId stayed pinned to whatever it read at the LAST unrelated recompose,
+    // which (right after round 1's task went DONE) was round 1's own already-submitted
+    // session id. Tapping "Take repair test" then opened THAT session, and Testmate
+    // correctly redirected to its already-completed result page — this was never a
+    // session-creation or WebView-caching bug, the UI simply never learned a new session
+    // existed.
+    //
+    // A monotonic counter, not the state itself: every mutating function below that
+    // changes anything HomeScreen reads bumps this after writing (recordServed,
+    // recordTestmateSession, markActiveEvidenceImported, resetForNextRound, markCovered).
+    // [com.checkmate.ui.home.HomeViewModel] collects it and re-reads the ledger's live
+    // accessors into HomeState on every emission, the same "some background loop wrote
+    // through prefs, now push a fresh snapshot into Compose state" shape
+    // [com.checkmate.planner.PlanStore]'s own StateFlow already establishes for tasks —
+    // this just extends that same reactivity to the P0b session fields instead of leaving
+    // them as an unobserved side channel.
+    private val _version = MutableStateFlow(0L)
+    val version: StateFlow<Long> = _version.asStateFlow()
+    private fun bumpVersion() { _version.update { it + 1 } }
+
     // ── Covered concepts ────────────────────────────────────────────────────
 
     fun isCovered(conceptId: String): Boolean =
@@ -132,6 +173,7 @@ object GapTaskLedger {
         if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
             clearActive()
         }
+        bumpVersion()
     }
 
     private fun coveredIds(): Set<String> =
@@ -198,6 +240,7 @@ object GapTaskLedger {
             CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
             CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
         }
+        bumpVersion()
     }
 
     // BUGFIX: this was the one accessor in this object missing the blank-filter every
@@ -247,6 +290,7 @@ object GapTaskLedger {
     fun recordTestmateSession(testId: String, sessionId: String) {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
+        bumpVersion()
     }
 
     /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
@@ -255,6 +299,7 @@ object GapTaskLedger {
      *  session every 15 minutes for the rest of the day. */
     fun markActiveEvidenceImported() {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+        bumpVersion()
     }
 
     /**
@@ -286,6 +331,13 @@ object GapTaskLedger {
         // recordServed) so a later overwrite is traceable to whichever call did it, instead
         // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
         Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
+        // BUGFIX (r1-result-on-r2-screen, background-loop case): this is the write that
+        // used to leave HomeScreen stranded — see the [version] field's own doc. Bumping
+        // here means HomeViewModel is notified the moment the session/round fields go
+        // blank (so the repair-test button correctly disappears while round 2's request
+        // is in flight), and again when recordTestmateSession populates the fresh one —
+        // instead of the whole transition being invisible until some unrelated recompose.
+        bumpVersion()
     }
 
     private fun clearActive() {

@@ -27,7 +27,6 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.checkmate.core.DailyChecklist
 import com.checkmate.planner.FreeSlotCalculator
-import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -44,11 +43,9 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
 
     // P0b: which task (if any) is the active gap concept's, and does it have a
     // Testmate targeted-repair test waiting (see GapTaskManager.createTargetedTestIfNeeded).
-    // Read fresh each recomposition rather than remembered — GapTaskLedger is
-    // CheckmatePrefs-backed, not Flow-backed, so a session created by ReminderService's
-    // background loop only shows up here the next time this screen recomposes (e.g.
-    // switching tabs and back), not the instant it's created. Cheap enough (a couple of
-    // SharedPreferences reads) that recomputing on every recomposition is fine.
+    // Sourced from `state` (HomeState.activeGapTaskId/activeRepairSessionId), not read
+    // directly off GapTaskLedger here — see the BUGFIX note below for why a direct,
+    // per-composition ledger read wasn't enough on its own.
     // BUGFIX (round-2 task redirects to round-1's result page): this used to match by
     // task.conceptId == activeConceptId, which is concept-wide — the OLD, already-
     // completed round-1 task and the NEW round-2 task share the same conceptId (it's
@@ -70,8 +67,20 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     // actually been created (activeSessionId reset to blank by resetForNextRound()
     // until createTargetedTestIfNeeded() populates a fresh one for this round) — no
     // button is safer than a button pointing at the wrong round's session.
-    val activeTaskId    = GapTaskLedger.activeTaskId()
-    val activeSessionId = GapTaskLedger.activeTestmateSessionId()
+    //
+    // BUGFIX (r1-result-on-r2-screen, background-loop case): these two used to be read
+    // straight off GapTaskLedger here, inside the composable body — correct as of
+    // whatever HomeScreen's LAST recomposition happened to be, but ReminderService's
+    // background loop can advance a P0b round (resetForNextRound + recordTestmateSession,
+    // both CheckmatePrefs-only, no PlanStore write) with nothing to trigger a fresh
+    // recomposition in between. See GapTaskLedger.version's own doc for the full repro:
+    // a student sitting on HomeScreen across that loop's tick could tap "Take repair
+    // test" and still get round 1's already-submitted session. Reading from `state`
+    // instead — populated by HomeViewModel's own GapTaskLedger.version collector — means
+    // this value is live the moment the ledger changes, not just the moment HomeScreen
+    // happens to recompose for some unrelated reason.
+    val activeTaskId    = state.activeGapTaskId
+    val activeSessionId = state.activeRepairSessionId
     fun repairSessionFor(task: StudyTask): String? =
         if (task.id == activeTaskId) activeSessionId else null
 

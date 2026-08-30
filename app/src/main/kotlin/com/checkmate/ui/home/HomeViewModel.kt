@@ -13,6 +13,7 @@ import com.checkmate.core.TodayContext
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -41,7 +42,15 @@ data class HomeState(
     val completionPromptTask: StudyTask?   = null,
     // ── Task Sync (two-device) ── true only while a manual sync tap is in flight.
     val syncEnabled:        Boolean        = false,
-    val syncing:            Boolean        = false
+    val syncing:            Boolean        = false,
+    // ── P0b (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
+    // Snapshot of GapTaskLedger's active-concept P0b state, refreshed every time
+    // GapTaskLedger.version changes — see that field's own doc for why reading the
+    // ledger straight from inside HomeScreen's @Composable body isn't enough on its
+    // own. null/null means no gap-task is currently mid-round (nothing to show a
+    // repair-test button for).
+    val activeGapTaskId:     String?        = null,
+    val activeRepairSessionId: String?      = null
 )
 
 class HomeViewModel : ViewModel() {
@@ -57,7 +66,7 @@ class HomeViewModel : ViewModel() {
 
     init {
         _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
-        loadTodayPlan(); loadStreak(); loadPsycheMessage()
+        loadTodayPlan(); loadStreak(); loadPsycheMessage(); loadGapTaskSession()
         pullSync()
     }
 
@@ -116,6 +125,30 @@ class HomeViewModel : ViewModel() {
 
     private fun loadStreak() {
         viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
+    }
+
+    /**
+     * BUGFIX (r1-result-on-r2-screen, background-loop case): GapTaskLedger's P0b session
+     * fields are CheckmatePrefs-backed with no observable of their own, so ReminderService's
+     * background loop (resolveDoneConcept's low-mastery branch -> resetForNextRound, then
+     * createTargetedTestIfNeeded -> recordTestmateSession) used to update them with nothing
+     * telling Compose to notice — see GapTaskLedger.version's own doc for the full repro.
+     * Collecting that version counter here and re-reading the ledger's live accessors into
+     * HomeState on every emission is what makes those background writes actually reach
+     * HomeScreen, the same way PlanStore.todayTasks already does for task mutations.
+     * GapTaskLedger.version starts at 0 and this collect fires once immediately (StateFlow
+     * always replays its current value to a new collector), so the very first snapshot is
+     * populated without waiting for any actual change.
+     */
+    private fun loadGapTaskSession() {
+        viewModelScope.launch {
+            GapTaskLedger.version.collect {
+                _state.update { it.copy(
+                    activeGapTaskId        = GapTaskLedger.activeTaskId(),
+                    activeRepairSessionId  = GapTaskLedger.activeTestmateSessionId()
+                )}
+            }
+        }
     }
 
     private fun loadPsycheMessage() {
