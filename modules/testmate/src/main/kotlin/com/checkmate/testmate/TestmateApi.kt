@@ -175,7 +175,17 @@ object TestmateApi {
         val payload = JSONObject().apply {
             put("intervention_id", interventionId)
             put("chapter", chapter)
-            topic?.takeIf { it.isNotBlank() }?.let { put("topic", it) }
+            // BUGFIX (topic-"null" 422 loop): isNotBlank() alone doesn't catch a [topic]
+            // that holds the literal 4-character string "null" — that's non-blank text,
+            // not a null reference, so it used to sail through and get sent verbatim as
+            // "topic":"null", which is the exact text Testmate's 422 error echoed back.
+            // See GapTaskLedger.sanitizeTopicOrChapter's doc for where that string
+            // actually originates (a Question row corrupted by this same class's own
+            // now-fixed parseResult bug, before this fix shipped). Guarding here too,
+            // not just at the GapTaskLedger/GapTaskManager source, since this is the
+            // last point before the value leaves the device.
+            topic?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                ?.let { put("topic", it) }
             put("question_count", questionCount)
             put("pool", pool.name)
         }

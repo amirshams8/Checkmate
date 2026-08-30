@@ -35,6 +35,17 @@ interface ConceptDao {
 
     @Query("SELECT * FROM concepts WHERE exam = :exam")
     suspend fun getByExam(exam: String): List<Concept>
+
+    // BUGFIX (topic-"null" 422 loop, one-time data repair): companion to
+    // QuestionDao.repairLiteralNullTopics — Concept rows already rebuilt from a poisoned
+    // Question row (see that query's doc) carry the same literal "null" string in their
+    // own `topic` column (Concept.topic is non-null, so it was never a real SQL NULL to
+    // begin with; "unknown" is this column's actual "no topic" sentinel — see Concept.kt's
+    // class doc). Falls back to `chapter` on repair, matching MasteryEngine.recomputeAll's
+    // own `sampleQuestion?.topic ?: sampleQuestion?.chapter ?: "unknown"` fallback chain,
+    // so a repaired row reads the same as if the corruption had never happened.
+    @Query("UPDATE concepts SET topic = chapter WHERE topic = 'null'")
+    suspend fun repairLiteralNullTopics(): Int
 }
 
 @Dao

@@ -67,6 +67,12 @@ object GapTaskManager {
     const val PREF_TESTMATE_LAST_ERROR = "gap_task_testmate_last_error"
     const val PREF_TESTMATE_LAST_ERROR_AT = "gap_task_testmate_last_error_at"
 
+    // BUGFIX (topic-"null" 422 loop, one-time data repair): once-ever guard for
+    // repairLegacyNullTopicsIfNeeded — the repair itself is a cheap single UPDATE per
+    // table, but there's no reason to run it on every generateIfNeeded call for the rest
+    // of this install's life once it's confirmed done.
+    private const val PREF_REPAIRED_LEGACY_NULL_TOPICS = "gap_task_repaired_legacy_null_topics_v1"
+
     // ── Daily generation ─────────────────────────────────────────────────────
 
     /**
@@ -86,6 +92,7 @@ object GapTaskManager {
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
 
+        repairLegacyNullTopicsIfNeeded(context)
         resolveActiveConceptState(context)
 
         try {
@@ -142,6 +149,36 @@ object GapTaskManager {
         Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
         if (task.state == TaskState.DONE) {
             resolveDoneConcept(context, conceptId)
+        }
+    }
+
+    /**
+     * BUGFIX (topic-"null" 422 loop, one-time data repair): a JSON `null` topic used to
+     * survive TestmateApi.parseResult's bare optString() calls as the literal string
+     * "null" instead of a real Kotlin null — see that class's parseResult doc and
+     * GapTaskLedger.sanitizeTopicOrChapter's doc for the full chain. That fix stops NEW
+     * corruption, but does nothing for Question/Concept rows already written to Room
+     * before this build — MasteryEngine.recomputeAll re-derives Concept.topic from a
+     * sample Question row on every single recompute, so an already-poisoned row keeps
+     * re-poisoning GapTaskLedger's active topic (and therefore the Testmate request
+     * payload) forever, purely patching the client never fixes it. Runs once ever per
+     * install (see [PREF_REPAIRED_LEGACY_NULL_TOPICS]) since it's a permanent repair, not
+     * an ongoing condition — every future write already goes through the parseResult fix
+     * plus the GapTaskLedger/TestmateApi sanitize guards.
+     */
+    private suspend fun repairLegacyNullTopicsIfNeeded(context: Context) {
+        if (CheckmatePrefs.getBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, false)) return
+        try {
+            val db = LearningDatabase.getInstance(context)
+            val questionsFixed = withContext(Dispatchers.IO) { db.questionDao().repairLiteralNullTopics() }
+            val conceptsFixed = withContext(Dispatchers.IO) { db.conceptDao().repairLiteralNullTopics() }
+            Log.d(TAG, "repairLegacyNullTopicsIfNeeded: fixed $questionsFixed question row(s), " +
+                "$conceptsFixed concept row(s) with literal topic=\"null\"")
+            CheckmatePrefs.putBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, true)
+        } catch (e: Exception) {
+            // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
+            // runs again on the next generateIfNeeded call instead of silently giving up.
+            Log.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
         }
     }
 
@@ -326,7 +363,13 @@ object GapTaskManager {
         // see that function's own doc, matching Concept.kt's "topic then equals chapter" convention).
         // Only forward topic when it's a genuinely distinct value from the raw chapter; otherwise
         // sending chapter alone is correct, same as if no topic had ever been recorded.
-        val topicForApi = topic?.takeIf { it != chapter }
+        //
+        // BUGFIX (topic-"null" 422 loop): GapTaskLedger.activeTopic() now sanitizes the literal
+        // string "null" itself, so this filter is redundant for anything served from here on.
+        // Kept anyway as defense-in-depth for [topic] values that reach this function some other
+        // way, and because "it != chapter" alone was never a substitute for a blank/literal-null
+        // check to begin with.
+        val topicForApi = topic?.takeIf { it != chapter && !it.equals("null", ignoreCase = true) }
 
         // BUGFIX (P0b re-intervention loop, part 2): TestmateApi.createTargetedTest is
         // idempotent BY intervention_id — Testmate returns the same test/session on a

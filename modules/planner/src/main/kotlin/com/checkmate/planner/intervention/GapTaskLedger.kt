@@ -82,6 +82,20 @@ object GapTaskLedger {
     // the round does. Round 1 stays a bare conceptId (no suffix) for backward
     // compatibility with sessions already in flight before this fix.
     private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
+    // literal 4-character string "null" (not a real null reference) whenever they were
+    // ultimately derived from a Question row whose topic column was corrupted by the
+    // now-fixed TestmateApi.parseResult bare-optString bug — a JSON null surviving as
+    // the text "null", written to Room, then re-surfaced by MasteryEngine.recomputeAll
+    // every time it rebuilds a Concept from that same poisoned row. `candidate.topic ?:
+    // candidate.chapter ?: ""` never catches this because the value ISN'T null — the
+    // Elvis operator only fires on a real null reference. Filtering it out here, at the
+    // single place every active-topic/active-chapter read and write funnels through,
+    // means neither a fresh instance of this bug nor a not-yet-repaired historical one
+    // can reach GapTaskManager's Testmate request payload or any UI string.
+    private fun sanitizeTopicOrChapter(value: String?): String? =
+        value?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+
     private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
     private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
     private const val KEY_WARNING_LOG               = "gap_task_warning_log"
@@ -162,7 +176,13 @@ object GapTaskLedger {
         CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
         CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
         CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, candidate.topic ?: candidate.chapter ?: "")
+        // BUGFIX (topic-"null" 422 loop): see sanitizeTopicOrChapter's own doc — candidate.topic
+        // can hold the literal string "null" from a still-poisoned Question row, which would
+        // otherwise sail straight past the `?:` fallback below since it isn't a real null.
+        CheckmatePrefs.putString(
+            KEY_ACTIVE_TOPIC,
+            sanitizeTopicOrChapter(candidate.topic) ?: sanitizeTopicOrChapter(candidate.chapter) ?: ""
+        )
         CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
         CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
         CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
@@ -188,7 +208,11 @@ object GapTaskLedger {
     fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
     fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
     fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
-    fun activeTopic(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null)?.takeIf { it.isNotBlank() }
+    // BUGFIX (topic-"null" 422 loop): defense-in-depth alongside the write-side sanitize in
+    // recordServed — filters out a literal "null" written before this fix shipped, on any
+    // existing install that hasn't re-served a concept (and so hasn't re-run recordServed)
+    // since updating.
+    fun activeTopic(): String? = sanitizeTopicOrChapter(CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null))
     fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
     fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
     fun activeExpectedGain(): Double =

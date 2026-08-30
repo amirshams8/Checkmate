@@ -39,6 +39,19 @@ interface QuestionDao {
 
     @Query("SELECT COUNT(*) FROM questions")
     suspend fun count(): Int
+
+    // BUGFIX (topic-"null" 422 loop, one-time data repair): rows written before the
+    // TestmateApi.parseResult bare-optString fix have `topic` set to the literal
+    // 4-character string "null" instead of a real SQL NULL, whenever the source JSON's
+    // "topic" field was itself JSON null. MasteryEngine.recomputeAll re-derives every
+    // Concept's topic straight from a sample Question row (`sampleQuestion?.topic ?:
+    // ...`), so a poisoned row here keeps re-poisoning Concept/GapTaskLedger on every
+    // future mastery recompute even after the parsing fix ships — this repairs the
+    // already-written rows so that stops. Returns the number of rows fixed, purely so
+    // the one-time caller (see GapTaskManager.repairLegacyNullTopicsIfNeeded) can log
+    // whether it actually did anything.
+    @Query("UPDATE questions SET topic = NULL WHERE topic = 'null'")
+    suspend fun repairLiteralNullTopics(): Int
 }
 
 @Dao
