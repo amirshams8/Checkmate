@@ -559,7 +559,27 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val task = findTask(taskId, dayKey)
 
         if (task == null || task.state == TaskState.DONE) {
-            if (task?.state == TaskState.DONE) resolveDoneConcept(context, conceptId, dayKey)
+            if (task?.state == TaskState.DONE) {
+                resolveDoneConcept(context, conceptId, dayKey)
+                // BUGFIX (r1-result-on-r2-screen): resolveDoneConcept can call
+                // GapTaskLedger.resetForNextRound() (still-below-mastery / conceptId-drift
+                // branches), which clears the active session so a new round can be
+                // requested — but it doesn't request one itself. generateIfNeeded() always
+                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded() right
+                // after (see that function's own BUGFIX note); this path didn't, so a round
+                // reset discovered here sat un-actioned until the next generateIfNeeded
+                // cycle, by which point a fresh re-rank can pick a different top concept and
+                // recordServed's isNewConcept branch silently abandons this round's request —
+                // leaving the old round-1 Testmate session as the only one on file even
+                // though the ledger had already moved to round 2 (confirmed via repro log:
+                // resetForNextRound round 1->2 for biomolecules-ii, immediately followed by
+                // recordServed picking up an unrelated concept with no
+                // createTargetedTestIfNeeded ever firing for biomolecules' round 2). Calling
+                // it here too closes that gap the same way generateIfNeeded already does;
+                // it's a no-op whenever resolveDoneConcept covered the concept outright or
+                // deferred it back to PENDING, since both leave no active concept id.
+                createTargetedTestIfNeeded()
+            }
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
