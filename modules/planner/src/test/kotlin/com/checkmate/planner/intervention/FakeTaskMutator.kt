@@ -1,65 +1,10 @@
-package com.checkmate.planner.intervention
-
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-
-/**
- * In-memory [TaskMutator] for [ActionExecutorTest] — mirrors PlanStore's real mutation
- * semantics (including the totalPausedMs accounting [resumeTask] does) closely enough to
- * exercise ActionExecutor's branching without touching Android SharedPreferences.
- */
-class FakeTaskMutator(seed: List<StudyTask> = emptyList()) : TaskMutator {
-
-    private val tasks: MutableMap<String, StudyTask> = seed.associateBy { it.id }.toMutableMap()
-
-    fun currentState(taskId: String): StudyTask? = tasks[taskId]
-
-    override fun findTask(taskId: String): StudyTask? = tasks[taskId]
-
-    override fun startTask(taskId: String) {
-        tasks[taskId] = tasks.getValue(taskId).copy(state = TaskState.ACTIVE)
-    }
-
     override fun resumeTask(taskId: String, resumedAt: Long) {
         val task = tasks.getValue(taskId)
-        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        val pausedAt = task.pausedAt
+        val elapsed = if (pausedAt != null && pausedAt > 0L) resumedAt - pausedAt else 0L
         tasks[taskId] = task.copy(
             state = TaskState.ACTIVE,
             pausedAt = null,
             totalPausedMs = task.totalPausedMs + elapsed
         )
     }
-
-    override fun pauseTask(taskId: String, pausedAt: Long) {
-        val task = tasks.getValue(taskId)
-        tasks[taskId] = task.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = task.pauseCount + 1)
-    }
-
-    override fun reduceDuration(taskId: String, newDurationMinutes: Int) {
-        tasks[taskId] = tasks.getValue(taskId).copy(durationMinutes = newDurationMinutes)
-    }
-
-    override fun rescheduleTask(taskId: String, newScheduledStartTime: String) {
-        tasks[taskId] = tasks.getValue(taskId).copy(scheduledStartTime = newScheduledStartTime)
-    }
-
-    /** P0a — mirrors [PlanStoreTaskMutator.createTask]'s field mapping so
-     *  ActionExecutorTest exercises the same shape production actually builds. */
-    override fun createTask(taskId: String, request: CreateTaskRequest): StudyTask {
-        val task = StudyTask(
-            id = taskId,
-            subject = request.subject,
-            topic = request.topic,
-            durationMinutes = request.durationMinutes,
-            priority = request.priority,
-            taskType = request.taskType,
-            scheduledStartTime = request.scheduledStartTime,
-            rationale = request.rationale,
-            learningIntent = request.learningIntent,
-            conceptId = request.conceptId,
-            targetedConceptIds = request.targetedConceptIds
-        )
-        tasks[taskId] = task
-        return task
-    }
-}
