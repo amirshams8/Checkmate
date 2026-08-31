@@ -87,23 +87,74 @@ class LearningInterventionMapperTest {
         assertEquals("Angular Momentum", request!!.topic)
     }
 
-    // ── Out-of-scope intents (deliberately not wired in P0a) ────────────
+    // ── SCHEDULE_RETENTION_TEST / START_MOCK (P0a continuation — now supported) ──
 
     @Test
-    fun `SCHEDULE_RETENTION_TEST is not mapped`() {
+    fun `SCHEDULE_RETENTION_TEST maps to a REVISION CreateTaskRequest carrying the concept id`() {
         val request = LearningInterventionMapper.toCreateTaskRequest(
             candidate(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST)
         )
+        assertTrue(request != null)
+        request!!
+        assertEquals("Physics", request.subject)
+        assertEquals("Rotational Motion", request.topic)
+        assertEquals(25, request.durationMinutes)
+        assertEquals(TaskType.REVISION, request.taskType)
+        assertEquals("SCHEDULE_RETENTION_TEST", request.learningIntent)
+        assertEquals("phy_rotational_inertia", request.conceptId)
+        assertEquals(listOf("phy_rotational_inertia"), request.targetedConceptIds)
+    }
+
+    @Test
+    fun `a SCHEDULE_RETENTION_TEST candidate with no subject is not mapped`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, subject = null)
+        )
         assertNull(request)
     }
 
     @Test
-    fun `START_MOCK is not mapped`() {
+    fun `START_MOCK maps to a whole-syllabus PRACTICE CreateTaskRequest regardless of subject, chapter, topic, or conceptId`() {
+        // START_MOCK candidates always arrive with subject/chapter/topic/conceptId null in
+        // production (LearningDecisionEngine.macroCandidates) — this is the one intent the
+        // mapper's own doc says is exempt from the general subject-required decline below.
         val request = LearningInterventionMapper.toCreateTaskRequest(
-            candidate(LearningDecisionEngine.LearningInterventionIntent.START_MOCK)
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.START_MOCK,
+                conceptId = null,
+                subject = null,
+                chapter = null,
+                topic = null
+            )
         )
-        assertNull(request)
+        assertTrue(request != null)
+        request!!
+        assertEquals("Full Syllabus", request.subject)
+        assertEquals("Full-Length Mock Test", request.topic)
+        assertEquals(TaskType.PRACTICE, request.taskType)
+        assertEquals("START_MOCK", request.learningIntent)
+        assertNull(request.conceptId)
+        assertEquals(emptyList<String>(), request.targetedConceptIds)
     }
+
+    @Test
+    fun `START_MOCK carries the candidate's durationMinutes and rationale through unchanged`() {
+        val request = LearningInterventionMapper.toCreateTaskRequest(
+            candidate(
+                LearningDecisionEngine.LearningInterventionIntent.START_MOCK,
+                conceptId = null,
+                subject = null,
+                chapter = null,
+                topic = null,
+                durationMinutes = 180,
+                rationale = "Full-length mock due before exam"
+            )
+        )
+        assertEquals(180, request!!.durationMinutes)
+        assertEquals("Full-length mock due before exam", request.rationale)
+    }
+
+    // ── Out-of-scope intents (deliberately not wired in P0a) ────────────
 
     @Test
     fun `REPLAN_DAY is not mapped`() {

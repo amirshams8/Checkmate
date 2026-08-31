@@ -359,6 +359,106 @@ class PolicyValidatorTest {
         assertRejectedWith(result, RejectionReason.INVALID_RESCHEDULE_TIME)
     }
 
+// ── SCHEDULE_RETENTION_TEST / START_MOCK create requests (P0a continuation) ──
+
+    @Test
+    fun `SCHEDULE_RETENTION_TEST create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-12",
+            createTaskRequest(learningIntent = "SCHEDULE_RETENTION_TEST")
+        )
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    @Test
+    fun `START_MOCK create request is permitted`() {
+        val result = PolicyValidator.validateCreateTask(
+            "new-task-13",
+            createTaskRequest(learningIntent = "START_MOCK")
+        )
+        assertTrue(result is PolicyResult.Permitted)
+    }
+
+    // ── validateReplanDay (P0a continuation) ────────────────────────────
+
+    @Test
+    fun `validateReplanDay with a non-blank escrowKey is permitted`() {
+        val result = PolicyValidator.validateReplanDay("replan:2026_243")
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.ReplanDay
+        assertEquals("replan:2026_243", action.escrowKey)
+    }
+
+    @Test
+    fun `validateReplanDay with a blank escrowKey is rejected`() {
+        val result = PolicyValidator.validateReplanDay("")
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `validateReplanDay with a whitespace-only escrowKey is rejected`() {
+        val result = PolicyValidator.validateReplanDay("   ")
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    // ── validateAdjustDifficulty (P0a continuation) ─────────────────────
+
+    @Test
+    fun `validateAdjustDifficulty with valid REDUCE fields is permitted`() {
+        val result = PolicyValidator.validateAdjustDifficulty(
+            "phy_rotational_inertia",
+            DifficultyDirection.REDUCE,
+            "difficulty:phy_rotational_inertia"
+        )
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.AdjustDifficulty
+        assertEquals("phy_rotational_inertia", action.conceptId)
+        assertEquals(DifficultyDirection.REDUCE, action.direction)
+        assertEquals("difficulty:phy_rotational_inertia", action.escrowKey)
+    }
+
+    @Test
+    fun `validateAdjustDifficulty with valid INCREASE fields is permitted`() {
+        val result = PolicyValidator.validateAdjustDifficulty(
+            "phy_rotational_inertia",
+            DifficultyDirection.INCREASE,
+            "difficulty:phy_rotational_inertia"
+        )
+        assertTrue(result is PolicyResult.Permitted)
+        val action = (result as PolicyResult.Permitted).action as PermittedAction.AdjustDifficulty
+        assertEquals(DifficultyDirection.INCREASE, action.direction)
+    }
+
+    @Test
+    fun `validateAdjustDifficulty with a null conceptId is rejected`() {
+        val result = PolicyValidator.validateAdjustDifficulty(
+            null,
+            DifficultyDirection.REDUCE,
+            "difficulty:phy_rotational_inertia"
+        )
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `validateAdjustDifficulty with a blank conceptId is rejected`() {
+        val result = PolicyValidator.validateAdjustDifficulty(
+            "   ",
+            DifficultyDirection.REDUCE,
+            "difficulty:phy_rotational_inertia"
+        )
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
+    @Test
+    fun `validateAdjustDifficulty with a blank escrowKey is rejected`() {
+        val result = PolicyValidator.validateAdjustDifficulty(
+            "phy_rotational_inertia",
+            DifficultyDirection.REDUCE,
+            ""
+        )
+        assertRejectedWith(result, RejectionReason.MALFORMED_INTENT)
+    }
+
     private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
         assertTrue("expected Rejected but was $result", result is PolicyResult.Rejected)
         assertEquals(reason, (result as PolicyResult.Rejected).reason)

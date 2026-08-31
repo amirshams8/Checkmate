@@ -32,11 +32,15 @@ class ActionExecutorTest {
         totalPausedMs = totalPausedMs
     )
 
-    private class Fixture(task: StudyTask) {
+    private class Fixture(
+        task: StudyTask,
+        val planReplanner: FakePlanReplanner? = null,
+        val difficultyMutator: FakeDifficultyMutator? = null
+    ) {
         val dao = FakeInterventionTransactionDao()
         val escrow = TaskEscrow(dao)
         val mutator = FakeTaskMutator(listOf(task))
-        val executor = ActionExecutor(dao, escrow, mutator)
+        val executor = ActionExecutor(dao, escrow, mutator, planReplanner, difficultyMutator)
         val taskId = task.id
 
         suspend fun acquire(now: Long = 1_000L): InterventionTransaction =
@@ -45,7 +49,10 @@ class ActionExecutorTest {
 
         /** P0a — CREATE_TASK escrows on a caller-generated id that doesn't identify an
          *  existing task yet (see [PermittedAction.CreateTask]'s doc), so tests that
-         *  exercise it acquire on a fresh id instead of [taskId]. */
+         *  exercise it acquire on a fresh id instead of [taskId]. Reused (P0a continuation)
+         *  by REPLAN_DAY/AdjustDifficulty tests, which escrow on a synthetic, non-StudyTask
+         *  key the same way — see [PermittedAction.ReplanDay]/[PermittedAction.AdjustDifficulty]'s
+         *  own docs. */
         suspend fun acquireFor(id: String, now: Long = 1_000L): InterventionTransaction =
             (escrow.acquire(id, InterventionTriggerType.LATE_START, now = now)
                     as EscrowAcquireResult.Acquired).transaction
@@ -330,5 +337,153 @@ class ActionExecutorTest {
         f.executor.execute(tx.transactionId, PermittedAction.CreateTask(newTaskId, createTaskRequest()))
 
         assertNull(f.mutator.currentState(newTaskId)?.scheduledStartTime)
+    }
+
+    // ── REPLAN_DAY (Upgrade Blueprint Phase 2.4/2.5, P0a continuation) ────
+
+    @Test
+    fun `replan day applies, calls PlanReplanner once, and completes the transaction`() = runTest {
+        val replanner = FakePlanReplanner()
+        val f = Fixture(task(), planReplanner = replanner)
+        val key = "replan:2026_243"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReplanDay(key))
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals(1, replanner.callCount)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `replan day with no PlanReplanner wired fails and resolves EXECUTION_FAILED`() = runTest {
+        val f = Fixture(task()) // planReplanner defaults to null
+        val key = "replan:2026_243"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReplanDay(key))
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `replan day where PlanReplanner throws is caught and resolves EXECUTION_FAILED, not a propagated exception`() = runTest {
+        val replanner = FakePlanReplanner(throwOnReplan = RuntimeException("AdaptivePlanner blew up"))
+        val f = Fixture(task(), planReplanner = replanner)
+        val key = "replan:2026_243"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(tx.transactionId, PermittedAction.ReplanDay(key))
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(1, replanner.callCount)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `duplicate delivery of a completed ReplanDay transaction does not replan a second time`() = runTest {
+        val replanner = FakePlanReplanner()
+        val f = Fixture(task(), planReplanner = replanner)
+        val key = "replan:2026_243"
+        val tx = f.acquireFor(key)
+
+        val first = f.executor.execute(tx.transactionId, PermittedAction.ReplanDay(key))
+        assertTrue(first is ExecutionOutcome.Applied)
+        assertEquals(1, replanner.callCount)
+
+        // Same transactionId delivered again — the primary already-terminal guard catches
+        // this before applyReplanDay ever runs a second time. Unlike CreateTask/ReduceDuration,
+        // there is no live-state re-check possible for ReplanDay (see its own applyX doc), so
+        // this primary guard is the ONLY thing preventing a duplicate delivery from wiping the
+        // day's plan twice.
+        val second = f.executor.execute(tx.transactionId, PermittedAction.ReplanDay(key))
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+        assertEquals(1, replanner.callCount)
+    }
+
+    // ── REDUCE_DIFFICULTY / INCREASE_DIFFICULTY (Upgrade Blueprint Phase 2.4/2.5, P0a continuation) ─
+
+    @Test
+    fun `adjust difficulty applies and records the direction`() = runTest {
+        val mutator = FakeDifficultyMutator()
+        val f = Fixture(task(), difficultyMutator = mutator)
+        val key = "difficulty:phy_rotational_inertia"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(
+            tx.transactionId,
+            PermittedAction.AdjustDifficulty("phy_rotational_inertia", DifficultyDirection.REDUCE, key)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals(DifficultyDirection.REDUCE, mutator.current("phy_rotational_inertia"))
+        assertEquals(1, mutator.adjustCallCount)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `adjust difficulty to the direction already recorded is a no-op and does not rewrite it`() = runTest {
+        val mutator = FakeDifficultyMutator(seed = mapOf("phy_rotational_inertia" to DifficultyDirection.INCREASE))
+        val f = Fixture(task(), difficultyMutator = mutator)
+        val key = "difficulty:phy_rotational_inertia"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(
+            tx.transactionId,
+            PermittedAction.AdjustDifficulty("phy_rotational_inertia", DifficultyDirection.INCREASE, key)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.NoOpAlreadyApplied)
+        assertEquals(0, mutator.adjustCallCount)
+        assertEquals(InterventionState.COMPLETED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `adjust difficulty from REDUCE to INCREASE overwrites the recorded direction`() = runTest {
+        val mutator = FakeDifficultyMutator(seed = mapOf("phy_rotational_inertia" to DifficultyDirection.REDUCE))
+        val f = Fixture(task(), difficultyMutator = mutator)
+        val key = "difficulty:phy_rotational_inertia"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(
+            tx.transactionId,
+            PermittedAction.AdjustDifficulty("phy_rotational_inertia", DifficultyDirection.INCREASE, key)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Applied)
+        assertEquals(DifficultyDirection.INCREASE, mutator.current("phy_rotational_inertia"))
+        assertEquals(1, mutator.adjustCallCount)
+    }
+
+    @Test
+    fun `adjust difficulty with no DifficultyMutator wired fails and resolves EXECUTION_FAILED`() = runTest {
+        val f = Fixture(task()) // difficultyMutator defaults to null
+        val key = "difficulty:phy_rotational_inertia"
+        val tx = f.acquireFor(key)
+
+        val outcome = f.executor.execute(
+            tx.transactionId,
+            PermittedAction.AdjustDifficulty("phy_rotational_inertia", DifficultyDirection.REDUCE, key)
+        )
+
+        assertTrue(outcome is ExecutionOutcome.Failed)
+        assertEquals(InterventionState.EXECUTION_FAILED, f.dao.getById(tx.transactionId)?.currentState)
+    }
+
+    @Test
+    fun `duplicate delivery of a completed AdjustDifficulty transaction does not adjust a second time`() = runTest {
+        val mutator = FakeDifficultyMutator()
+        val f = Fixture(task(), difficultyMutator = mutator)
+        val key = "difficulty:phy_rotational_inertia"
+        val tx = f.acquireFor(key)
+        val action = PermittedAction.AdjustDifficulty("phy_rotational_inertia", DifficultyDirection.REDUCE, key)
+
+        val first = f.executor.execute(tx.transactionId, action)
+        assertTrue(first is ExecutionOutcome.Applied)
+
+        val second = f.executor.execute(tx.transactionId, action)
+        assertEquals(ExecutionOutcome.TransactionAlreadyResolved, second)
+        assertEquals(1, mutator.adjustCallCount)
     }
 }
