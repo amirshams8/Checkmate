@@ -28,6 +28,14 @@ import java.time.format.DateTimeParseException
  * LearningInterventionMapper (deterministic, not an LLM), never from an [LlmIntent], so it
  * doesn't belong inside the `when (type)` dispatch above. Same "code decides" principle,
  * same [PolicyResult] shape, different input — see [CreateTaskRequest]'s own doc.
+ *
+ * P0a continuation: [validateReplanDay] and [validateAdjustDifficulty] are two more such
+ * entry points, for the two remaining shapes of LearningDecisionEngine-originated action
+ * that aren't CreateTaskRequest-shaped at all — REPLAN_DAY regenerates the whole day's
+ * plan rather than creating one task, and REDUCE_DIFFICULTY/INCREASE_DIFFICULTY record a
+ * per-concept preference rather than mutating a StudyTask. Neither takes a [PolicyState]
+ * either, for the same reason [validateCreateTask] doesn't: there's no existing StudyTask
+ * whose live state matters — only the request's own fields.
  */
 object PolicyValidator {
 
@@ -40,11 +48,23 @@ object PolicyValidator {
      *  a session-length break. */
     const val MAX_BREAK_MINUTES = 30
 
-    /** P0a scope, per LearningDecisionEngine's own scoping note: SCHEDULE_RETENTION_TEST,
-     *  START_MOCK, REPLAN_DAY, and difficulty mutation are explicitly not wired to task
-     *  creation yet. A CreateTaskRequest naming any of those (or an unrecognized string)
-     *  is rejected rather than silently coerced into one of these three. */
-    val SUPPORTED_LEARNING_INTENTS = setOf("REPAIR_CONCEPT", "START_DIAGNOSTIC", "ASSIGN_TARGETED_SET")
+    /**
+     * P0a scope, per LearningDecisionEngine's own scoping note. Originally REPAIR_CONCEPT/
+     * START_DIAGNOSTIC/ASSIGN_TARGETED_SET only; the P0a continuation adds
+     * SCHEDULE_RETENTION_TEST and START_MOCK, since both are genuine study SESSIONS with
+     * a positive duration — the same CreateTaskRequest shape as the original three, just a
+     * different [com.checkmate.planner.model.TaskType] (see LearningInterventionMapper).
+     * REPLAN_DAY, REDUCE_DIFFICULTY, and INCREASE_DIFFICULTY are deliberately NOT added
+     * here — they were never task-creation shaped (REPLAN_DAY has no subject/topic/
+     * duration to speak of; a difficulty adjustment isn't a session at all) and are wired
+     * through [validateReplanDay]/[validateAdjustDifficulty] instead. A CreateTaskRequest
+     * naming any of those three (or an unrecognized string) is rejected rather than
+     * silently coerced into one of the five supported here.
+     */
+    val SUPPORTED_LEARNING_INTENTS = setOf(
+        "REPAIR_CONCEPT", "START_DIAGNOSTIC", "ASSIGN_TARGETED_SET",
+        "SCHEDULE_RETENTION_TEST", "START_MOCK"
+    )
 
     private val RESCHEDULE_TIME_REGEX = Regex("^([01]\\d|2[0-3]):[0-5]\\d$")
 
@@ -189,7 +209,8 @@ object PolicyValidator {
             return reject(
                 RejectionReason.UNSUPPORTED_LEARNING_INTENT,
                 "learningIntent=$intent not yet wired for task creation " +
-                    "(P0a scope: REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET only)"
+                    "(P0a scope: REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET/" +
+                    "SCHEDULE_RETENTION_TEST/START_MOCK only)"
             )
         }
 
@@ -200,6 +221,41 @@ object PolicyValidator {
         }
 
         return PolicyResult.Permitted(PermittedAction.CreateTask(taskId, request))
+    }
+
+    /**
+     * P0a continuation (REPLAN_DAY). No [PolicyState] parameter, same reasoning as
+     * [validateCreateTask] — there is no existing StudyTask whose live state matters here;
+     * the only thing to validate is that [escrowKey] (the caller-generated, non-StudyTask
+     * [TaskEscrow] key — see [PermittedAction.ReplanDay]'s own doc) actually exists.
+     * REPLAN_DAY carries no other fields to check: unlike a CreateTaskRequest, "regenerate
+     * today's plan" has no subject/topic/duration of its own.
+     */
+    fun validateReplanDay(escrowKey: String): PolicyResult {
+        if (escrowKey.isBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "escrowKey must not be blank")
+        }
+        return PolicyResult.Permitted(PermittedAction.ReplanDay(escrowKey))
+    }
+
+    /**
+     * P0a continuation (REDUCE_DIFFICULTY/INCREASE_DIFFICULTY). Same no-[PolicyState]
+     * shape as [validateReplanDay] — only [conceptId] and [escrowKey] need to be
+     * non-blank; [direction] is already a closed enum by the time it reaches here, so
+     * there's nothing further to validate about it.
+     */
+    fun validateAdjustDifficulty(
+        conceptId: String?,
+        direction: DifficultyDirection,
+        escrowKey: String
+    ): PolicyResult {
+        if (conceptId.isNullOrBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "conceptId must not be blank")
+        }
+        if (escrowKey.isBlank()) {
+            return reject(RejectionReason.MALFORMED_INTENT, "escrowKey must not be blank")
+        }
+        return PolicyResult.Permitted(PermittedAction.AdjustDifficulty(conceptId, direction, escrowKey))
     }
 
     private fun reject(reason: RejectionReason, detail: String) = PolicyResult.Rejected(reason, detail)

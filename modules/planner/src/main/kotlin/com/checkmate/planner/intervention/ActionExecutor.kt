@@ -32,11 +32,24 @@ import com.checkmate.planner.model.TaskState
  * duplicate transaction delivery (the exact scenario the class doc above is about) finds
  * the task already there and returns [ExecutionOutcome.NoOpAlreadyApplied] instead of a
  * second StudyTask.
+ *
+ * P0a continuation (REPLAN_DAY/REDUCE_DIFFICULTY/INCREASE_DIFFICULTY): [planReplanner] and
+ * [difficultyMutator] are optional and default to null, same "additive, every existing
+ * call site keeps compiling" convention [TaskEscrow.ledgerWriter] already established —
+ * every pre-existing 3-arg `ActionExecutor(dao, escrow, mutator)` call site (e.g.
+ * [InterventionTriggerWorker], which only ever handles behavior intents and has no reason
+ * to know about either seam) keeps working unchanged. When either is null and the matching
+ * action is executed anyway, [applyReplanDay]/[applyAdjustDifficulty] resolve
+ * [ExecutionOutcome.Failed] rather than silently pretending success — an honest "not wired
+ * yet" rather than a false COMPLETED, same reasoning [applyStartTask] already uses for "task
+ * no longer exists."
  */
 class ActionExecutor(
     private val transactionDao: InterventionTransactionDao,
     private val taskEscrow: TaskEscrow,
-    private val taskMutator: TaskMutator
+    private val taskMutator: TaskMutator,
+    private val planReplanner: PlanReplanner? = null,
+    private val difficultyMutator: DifficultyMutator? = null
 ) {
 
     suspend fun execute(
@@ -75,12 +88,14 @@ class ActionExecutor(
         return outcome
     }
 
-    private fun applyAction(action: PermittedAction, now: Long): ExecutionOutcome = when (action) {
+    private suspend fun applyAction(action: PermittedAction, now: Long): ExecutionOutcome = when (action) {
         is PermittedAction.StartTask -> applyStartTask(action, now)
         is PermittedAction.ReduceDuration -> applyReduceDuration(action)
         is PermittedAction.RescheduleTask -> applyRescheduleTask(action)
         is PermittedAction.ShortBreak -> applyShortBreak(action, now)
         is PermittedAction.CreateTask -> applyCreateTask(action)
+        is PermittedAction.ReplanDay -> applyReplanDay(action)
+        is PermittedAction.AdjustDifficulty -> applyAdjustDifficulty(action, now)
         PermittedAction.KeepPlan, PermittedAction.NoAction, PermittedAction.RequestClarification ->
             ExecutionOutcome.NotApplicable(action)
         PermittedAction.RequestGuardian -> ExecutionOutcome.RequiresGuardianEscalation
@@ -164,6 +179,45 @@ class ActionExecutor(
         return ExecutionOutcome.Applied(action)
     }
 
+    /**
+     * P0a continuation (REPLAN_DAY). Unlike every applyX above (including
+     * [applyCreateTask]), there is no [TaskMutator] involved at all — [PermittedAction
+     * .ReplanDay] doesn't identify a StudyTask, it regenerates and replaces the whole
+     * day's list via [PlanReplanner]. No live-state re-check is possible or meaningful
+     * here the way it is for a single task: "has today's plan already been replanned"
+     * is exactly what [ReplanDayLedger] (consulted by [LearningInterventionOrchestrator]
+     * before this ever runs, not here) already answers — this function's only remaining
+     * job is to actually run the regeneration and translate a thrown exception into a
+     * [ExecutionOutcome.Failed] instead of letting it propagate out of the FSM.
+     */
+    private suspend fun applyReplanDay(action: PermittedAction.ReplanDay): ExecutionOutcome {
+        val replanner = planReplanner
+            ?: return ExecutionOutcome.Failed(action, "PlanReplanner not wired")
+        return try {
+            replanner.replanToday()
+            ExecutionOutcome.Applied(action)
+        } catch (e: Exception) {
+            ExecutionOutcome.Failed(action, "replanToday() threw: ${e.message}")
+        }
+    }
+
+    /**
+     * P0a continuation (REDUCE_DIFFICULTY/INCREASE_DIFFICULTY). Same defensive-guard shape
+     * as [applyReduceDuration]/[applyRescheduleTask] — re-reads the live preference via
+     * [DifficultyMutator.current] and short-circuits to [ExecutionOutcome.NoOpAlreadyApplied]
+     * if [action.direction] is already what's recorded, rather than writing an identical
+     * value again.
+     */
+    private fun applyAdjustDifficulty(action: PermittedAction.AdjustDifficulty, now: Long): ExecutionOutcome {
+        val mutator = difficultyMutator
+            ?: return ExecutionOutcome.Failed(action, "DifficultyMutator not wired")
+        if (mutator.current(action.conceptId) == action.direction) {
+            return ExecutionOutcome.NoOpAlreadyApplied(action)
+        }
+        mutator.adjust(action.conceptId, action.direction, now)
+        return ExecutionOutcome.Applied(action)
+    }
+
     private fun describe(outcome: ExecutionOutcome): String = when (outcome) {
         is ExecutionOutcome.Applied -> "Applied ${outcome.action::class.simpleName}"
         is ExecutionOutcome.NoOpAlreadyApplied -> "No-op — ${outcome.action::class.simpleName} already in effect"
@@ -181,7 +235,9 @@ sealed class ExecutionOutcome {
     object RequiresGuardianEscalation : ExecutionOutcome()
     /** The live task no longer supports this action — state changed (or the task was
      *  deleted) between PolicyValidator's snapshot and execution. Resolves the
-     *  transaction as EXECUTION_FAILED, not USER_ABORTED. */
+     *  transaction as EXECUTION_FAILED, not USER_ABORTED. Also used (P0a continuation)
+     *  for ReplanDay/AdjustDifficulty when the corresponding seam isn't wired, or when
+     *  [PlanReplanner.replanToday] throws — see those applyX functions' own docs. */
     data class Failed(val action: PermittedAction, val reason: String) : ExecutionOutcome()
     /** Duplicate delivery of a transaction that already resolved — see class doc. */
     object TransactionAlreadyResolved : ExecutionOutcome()

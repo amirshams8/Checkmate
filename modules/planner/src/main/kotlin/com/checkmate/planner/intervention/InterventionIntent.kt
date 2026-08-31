@@ -25,6 +25,13 @@ import com.checkmate.planner.model.StudyTask
  * keep closed — see LearningDecisionEngine's own doc on why task creation is scoped as
  * "its own design pass with its own PolicyValidator rules, not an incidental addition to
  * this one."
+ *
+ * P0a continuation (SCHEDULE_RETENTION_TEST/START_MOCK/REPLAN_DAY/REDUCE_DIFFICULTY/
+ * INCREASE_DIFFICULTY): same reasoning applies to [PermittedAction.ReplanDay] and
+ * [PermittedAction.AdjustDifficulty] below — both are deterministic,
+ * LearningDecisionEngine-originated actions with their own [PolicyValidator] entry
+ * points ([PolicyValidator.validateReplanDay] / [PolicyValidator.validateAdjustDifficulty]),
+ * never reachable through [LlmIntent]/[InterventionIntentType] either.
  */
 enum class InterventionIntentType {
     START_TASK,
@@ -91,11 +98,47 @@ sealed class PermittedAction {
      * every other PermittedAction case.
      */
     data class CreateTask(val taskId: String, val request: CreateTaskRequest) : PermittedAction()
+    /**
+     * P0a continuation (SCHEDULE_RETENTION_TEST/START_MOCK/REPLAN_DAY/REDUCE_DIFFICULTY/
+     * INCREASE_DIFFICULTY) — Upgrade Blueprint Phase 2.4/2.5. Whole-day plan
+     * regeneration — unlike every case above, there is no single StudyTask this mutates.
+     * REPLAN_DAY REPLACES the entire day's task list (see [PlanReplanner]), which is what
+     * [LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY]'s own doc means by
+     * "the current plan itself may need restructuring, not just more of the same
+     * sessions" — a fundamentally different shape from CreateTask's purely additive
+     * [com.checkmate.planner.PlanStore.createTask].
+     *
+     * [escrowKey] is a synthetic, non-StudyTask [TaskEscrow] key (see
+     * [LearningInterventionOrchestrator]'s own doc on why this still goes through escrow
+     * even though it isn't task-scoped) — carried here only so [ActionExecutor]'s
+     * duplicate-delivery guard/idempotency logging has something to reference; the actual
+     * work happens through [PlanReplanner], not by looking this key up as a task id.
+     */
+    data class ReplanDay(val escrowKey: String) : PermittedAction()
+    /**
+     * P0a continuation. [conceptId]/[direction] mirror
+     * [LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY]/
+     * [.INCREASE_DIFFICULTY]'s own classifyIntent() signal shape (high-mastery +
+     * CARELESS/TIME_PRESSURE errors -> INCREASE; heavy, high-rate errors at low mastery
+     * -> REDUCE) — see [DifficultyMutator] for where this actually gets recorded, and
+     * that interface's own HONEST GAP note on what does (and doesn't yet) read it back.
+     * [escrowKey] plays the same non-StudyTask escrow role as [ReplanDay.escrowKey].
+     */
+    data class AdjustDifficulty(
+        val conceptId: String,
+        val direction: DifficultyDirection,
+        val escrowKey: String
+    ) : PermittedAction()
     object KeepPlan : PermittedAction()
     object RequestClarification : PermittedAction()
     object RequestGuardian : PermittedAction()
     object NoAction : PermittedAction()
 }
+
+/** Which way a concept's question-difficulty tier should move — see
+ *  [PermittedAction.AdjustDifficulty]'s own doc for the signal shape each direction
+ *  responds to. */
+enum class DifficultyDirection { REDUCE, INCREASE }
 
 enum class RejectionReason {
     UNRECOGNIZED_INTENT,
@@ -108,10 +151,13 @@ enum class RejectionReason {
     INVALID_RESCHEDULE_TIME,
     MALFORMED_INTENT,
     /** Upgrade Blueprint Phase 2.4/2.5 (P0a): a CreateTaskRequest named a
-     *  learningIntent outside this pass's scope (REPAIR_CONCEPT / START_DIAGNOSTIC /
-     *  ASSIGN_TARGETED_SET) — e.g. SCHEDULE_RETENTION_TEST, START_MOCK, REPLAN_DAY, or a
-     *  difficulty mutation. Rejected explicitly rather than silently creating a task
-     *  nobody has scoped a shape for yet — see LearningInterventionMapper's own doc. */
+     *  learningIntent outside this pass's scope. As of the P0a continuation this is
+     *  REPAIR_CONCEPT / START_DIAGNOSTIC / ASSIGN_TARGETED_SET / SCHEDULE_RETENTION_TEST /
+     *  START_MOCK — REPLAN_DAY, REDUCE_DIFFICULTY, and INCREASE_DIFFICULTY are still never
+     *  valid here because they aren't CreateTaskRequest-shaped at all (see
+     *  [PolicyValidator.validateReplanDay]/[PolicyValidator.validateAdjustDifficulty],
+     *  their own separate entry points). Rejected explicitly rather than silently creating
+     *  a task nobody has scoped a shape for — see LearningInterventionMapper's own doc. */
     UNSUPPORTED_LEARNING_INTENT
 }
 

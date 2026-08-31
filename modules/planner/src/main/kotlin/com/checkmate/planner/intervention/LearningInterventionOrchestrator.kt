@@ -15,9 +15,8 @@ import java.util.UUID
  * helper, promoted to a real production class:
  * ```
  * LearningDecisionEngine.DecisionReport -> LearningInterventionOrchestrator
- *     -> (per candidate, highest priorityScore first) LearningInterventionMapper
- *     -> CreateTaskRequest -> PolicyValidator -> TaskEscrow -> ActionExecutor
- *     -> TaskMutator.createTask() -> PlanStore -> StudyTask
+ *     -> (per candidate, highest priorityScore first) resolveRoute()
+ *     -> PolicyValidator -> TaskEscrow -> ActionExecutor -> {PlanStore | PlanReplanner | DifficultyMutator}
  * ```
  *
  * Deliberately does NOT create one task per candidate. [DecisionReport.candidates] is
@@ -25,22 +24,49 @@ import java.util.UUID
  * every candidate into a task would just as capacity-blind as never having ranked them at
  * all, defeating the entire point of [com.checkmate.learning.analytics.ScoreGainEstimator]
  * and today's finite study time. [executeTopCandidate] instead walks the ranking in order
- * and stops at the first candidate that clears every stage — mapping, policy, and
+ * and stops at the first candidate that clears every stage — routing, policy, and
  * execution. An earlier, higher-ranked candidate that fails any stage is recorded (never
  * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
  * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
+ *
+ * P0a continuation (SCHEDULE_RETENTION_TEST/START_MOCK/REPLAN_DAY/REDUCE_DIFFICULTY/
+ * INCREASE_DIFFICULTY): originally every executable path here ended in a
+ * [PermittedAction.CreateTask] — this class assumed a real StudyTask was always the
+ * output. That's no longer true: REPLAN_DAY resolves to [PermittedAction.ReplanDay] (no
+ * StudyTask at all — the whole day's plan is replaced) and REDUCE_DIFFICULTY/
+ * INCREASE_DIFFICULTY resolve to [PermittedAction.AdjustDifficulty] (a per-concept
+ * preference, not a task). [resolveRoute] is the per-candidate dispatch that picks which
+ * shape applies and which [PolicyValidator] entry point validates it; [OrchestrationOutcome
+ * .Created] still exists as a single shape for all three, since [ActionExecutor.execute]
+ * itself is already generic over [PermittedAction] — only the *building* of the action
+ * differs per intent, not its execution or escrow handling.
+ *
+ * Both REPLAN_DAY and REDUCE_DIFFICULTY/INCREASE_DIFFICULTY still go through [TaskEscrow]
+ * even though neither is task-scoped — [Route.escrowKey] is a synthetic, non-StudyTask key
+ * ("replan:&lt;dayKey&gt;" / "difficulty:&lt;conceptId&gt;", see [resolveRoute]) rather than
+ * a real StudyTask id, so escrow still serializes concurrent deliveries the same way it
+ * does for every other action here, without TaskEscrow itself needing to know these two
+ * cases aren't task mutations.
+ *
+ * [GapTaskLedger.recordServed] tracking is deliberately narrower than "every successfully
+ * executed candidate" — see [GAP_LEDGER_TRACKED_INTENTS]. Only REPAIR_CONCEPT/
+ * START_DIAGNOSTIC/ASSIGN_TARGETED_SET participate in GapTaskLedger's single-active-concept
+ * streak and P0b Testmate-round tracking; SCHEDULE_RETENTION_TEST/START_MOCK create real
+ * tasks but are a different KIND of session (a recall check / a whole-student mock, not a
+ * gap-repair session) and are not folded into that machinery, and REPLAN_DAY/
+ * REDUCE_DIFFICULTY/INCREASE_DIFFICULTY aren't task-scoped at all. Recording any of these
+ * five into GapTaskLedger's active-concept pointer would risk exactly the kind of
+ * cross-purpose state collision that ledger's own bugfix history is full of examples of —
+ * see [ConceptDifficultyLedger]'s doc for the same reasoning applied to difficulty storage.
  *
  * Daily-cadence wiring ([com.checkmate.service.GapTaskManager] calls [executeTopCandidate]
  * once a day, not just once at import time): without something remembering what was
  * already served, re-running the same-shaped [LearningDecisionEngine.decideFromReport]
  * output tomorrow would just re-pick today's exact candidate forever, since mastery hasn't
- * moved without the P0b evidence loop. [GapTaskLedger] is that memory — a candidate whose
- * concept is already [GapTaskLedger.isCovered] is skipped here (see [RejectionSource.AlreadyCovered])
- * before it's even mapped, and a successful [OrchestrationOutcome.Created] records itself
- * via [GapTaskLedger.recordServed] so the NEXT run's escalation depth and "which concept is
- * this" both stay accurate. A concept only ever becomes covered when its task reaches
- * `TaskState.DONE` (see [GapTaskLedger.markCovered]'s own doc) — never merely because a
- * task once existed for it — so an ignored gap-task keeps being re-served, not abandoned.
+ * moved without the P0b evidence loop. [GapTaskLedger] is that memory for the three
+ * gap-repair intents; [ReplanDayLedger] is the equivalent once-a-day guard for REPLAN_DAY
+ * specifically (see its own doc — TaskEscrow alone cannot provide this, since a resolved
+ * transaction never blocks a fresh acquire()).
  *
  * BUGFIX (duplicate same-round task): "re-served" above does NOT mean "re-created."
  * [GapTaskLedger.isCovered] is only true once a task reaches DONE *and* mastery clears the
@@ -94,7 +120,7 @@ import java.util.UUID
  * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
  * rather than widening that enum for this pass; this class keeps that same choice (see
  * [LEARNING_ENGINE_TRIGGER]) so both the test-only pipeline and this production one agree
- * on what gets persisted.
+ * on what gets persisted — including for REPLAN_DAY/AdjustDifficulty, which reuse it too.
  *
  * This class does not itself decide *when* to run — it consumes an already-built
  * [LearningDecisionEngine.DecisionReport]. [com.checkmate.ui.testresults.TestResultsViewModel]
@@ -108,20 +134,34 @@ class LearningInterventionOrchestrator(
     private val dayKeyProvider: () -> String = { GapTaskLedger.todayKey() }
 ) {
 
-    /** Why a candidate never became a task — kept as a distinct type from
+    /** Why a candidate never became an executed action — kept as a distinct type from
      *  [RejectionReason] because a candidate can fail before policy is ever consulted
      *  (see [NotMappable]), and collapsing that into a fake [RejectionReason] would
-     *  misattribute a mapper decision to PolicyValidator. */
+     *  misattribute a routing decision to PolicyValidator. */
     sealed class RejectionSource {
-        /** [LearningInterventionMapper.toCreateTaskRequest] returned null — the intent is
-         *  outside P0a's mapped scope, or the candidate is missing subject/topic. */
+        /** No [Route] could be built for this candidate's intent at all — either the
+         *  intent has no CreateTaskRequest/ReplanDay/AdjustDifficulty shape defined (not
+         *  possible today, since [resolveRoute] covers all eight
+         *  [LearningDecisionEngine.LearningInterventionIntent] values, but kept as a
+         *  distinct case rather than an exception for forward-compatibility with a future
+         *  ninth intent), or a REDUCE_DIFFICULTY/INCREASE_DIFFICULTY candidate arrived with
+         *  no [LearningDecisionEngine.CandidateIntervention.conceptId] (never expected in
+         *  practice — [LearningDecisionEngine.conceptCandidates] always sets one for these
+         *  two intents — but not assumed away), or (unchanged from the original P0a scope)
+         *  [LearningInterventionMapper.toCreateTaskRequest] returned null for a candidate
+         *  whose intent it does cover, because it's missing subject/topic. */
         object NotMappable : RejectionSource()
-        /** [PolicyValidator.validateCreateTask] rejected the mapped request. */
+        /** [PolicyValidator]'s relevant entry point (`validateCreateTask` /
+         *  `validateReplanDay` / `validateAdjustDifficulty`) rejected the built request. */
         data class PolicyRejected(val reason: RejectionReason) : RejectionSource()
-        /** The freshly generated [taskId][UUID] collided with a task already under
-         *  escrow — expected to be effectively unreachable given UUID generation, kept
-         *  as a named case rather than a thrown exception so a candidate this happens to
-         *  is recorded like any other rejection instead of aborting the whole walk. */
+        /** The freshly generated escrow key collided with something already under escrow
+         *  — for CreateTask-shaped candidates this is a caller-generated taskId
+         *  (effectively unreachable given UUID generation); for REPLAN_DAY/
+         *  REDUCE_DIFFICULTY/INCREASE_DIFFICULTY the escrow key is deterministic (see
+         *  [resolveRoute]), so this is the real, reachable "a negotiation for this exact
+         *  key is already in flight" case for those three. Kept as a named case rather
+         *  than a thrown exception so a candidate this happens to is recorded like any
+         *  other rejection instead of aborting the whole walk. */
         object TaskIdCollision : RejectionSource()
         /** [GapTaskLedger.isCovered] already true for this candidate's concept — its
          *  gap-task previously reached DONE, so the daily walk moves on to the next
@@ -137,9 +177,15 @@ class LearningInterventionOrchestrator(
          *  run's ranking currently prefers — no task is created for anything else, and no
          *  new task is created for the active concept either, until it's genuinely resolved. */
         object AlreadyActive : RejectionSource()
+        /** P0a continuation: [ReplanDayLedger.hasReplannedToday] already true — today's
+         *  plan has already been regenerated once; a second REPLAN_DAY this same day would
+         *  silently wipe whatever the student has done against the first replan since. See
+         *  [ReplanDayLedger]'s own doc for why [TaskEscrow] alone can't provide this
+         *  guard. */
+        object AlreadyReplannedToday : RejectionSource()
     }
 
-    /** One candidate that was ranked but did not end up as a task — see class doc's
+    /** One candidate that was ranked but did not end up executed — see class doc's
      *  "failures are first-class" requirement. `rank` is 1-based position in
      *  [LearningDecisionEngine.DecisionReport.candidates], preserved here because the
      *  candidate itself carries no id of its own. */
@@ -152,10 +198,21 @@ class LearningInterventionOrchestrator(
     )
 
     sealed class OrchestrationOutcome {
-        /** The candidate that made it all the way through, plus what
-         *  [ActionExecutor.execute] returned for it — callers that care whether the
-         *  StudyTask really landed (vs. e.g. [ExecutionOutcome.NoOpAlreadyApplied]) read
-         *  that from here rather than assuming success. */
+        /**
+         * The candidate that made it all the way through, plus what
+         * [ActionExecutor.execute] returned for it — callers that care whether the action
+         * really landed (vs. e.g. [ExecutionOutcome.NoOpAlreadyApplied]) read that from
+         * here rather than assuming success.
+         *
+         * P0a continuation: [taskId] is a real StudyTask id only for CreateTask-shaped
+         * candidates (REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET/
+         * SCHEDULE_RETENTION_TEST/START_MOCK). For REPLAN_DAY/REDUCE_DIFFICULTY/
+         * INCREASE_DIFFICULTY it holds the synthetic [Route.escrowKey] instead (see
+         * [resolveRoute]) — never a StudyTask id — since neither action creates or
+         * identifies one. A caller that needs to know which shape it's looking at should
+         * switch on `candidate.intent` (or on `executionOutcome`'s action type) first,
+         * rather than assuming [taskId] always names something in [PlanStore].
+         */
         data class Created(
             val candidate: LearningDecisionEngine.CandidateIntervention,
             val rank: Int,
@@ -171,6 +228,63 @@ class LearningInterventionOrchestrator(
         val outcome: OrchestrationOutcome,
         val rejections: List<CandidateRejection>
     )
+
+    /**
+     * P0a continuation. What [resolveRoute] builds for one candidate before policy/escrow
+     * ever run — [escrowKey] is either a real StudyTask id (about-to-be-created, for
+     * CreateTask-shaped candidates) or a synthetic, deterministic key for REPLAN_DAY/
+     * REDUCE_DIFFICULTY/INCREASE_DIFFICULTY (see class doc). [tracksGapLedger] is false for
+     * everything except the original three P0a intents — see class doc's
+     * [GAP_LEDGER_TRACKED_INTENTS] note.
+     */
+    private data class Route(
+        val escrowKey: String,
+        val policyResult: PolicyResult,
+        val tracksGapLedger: Boolean
+    )
+
+    /**
+     * Per-candidate dispatch — tries the CreateTask shape first (via
+     * [LearningInterventionMapper.toCreateTaskRequest], which itself returns null for any
+     * intent outside its own scope), then falls back to REPLAN_DAY / REDUCE_DIFFICULTY /
+     * INCREASE_DIFFICULTY's own shapes. Returns null only when NONE of those apply — see
+     * [RejectionSource.NotMappable].
+     */
+    private fun resolveRoute(
+        candidate: LearningDecisionEngine.CandidateIntervention,
+        dayKey: String
+    ): Route? {
+        val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
+        if (request != null) {
+            val taskId = idGenerator()
+            return Route(
+                escrowKey = taskId,
+                policyResult = PolicyValidator.validateCreateTask(taskId, request),
+                tracksGapLedger = candidate.intent in GAP_LEDGER_TRACKED_INTENTS
+            )
+        }
+
+        return when (candidate.intent) {
+            LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> {
+                val key = "replan:$dayKey"
+                Route(key, PolicyValidator.validateReplanDay(key), tracksGapLedger = false)
+            }
+            LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY,
+            LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> {
+                val conceptId = candidate.conceptId ?: return null
+                val direction = if (candidate.intent ==
+                    LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY
+                ) {
+                    DifficultyDirection.REDUCE
+                } else {
+                    DifficultyDirection.INCREASE
+                }
+                val key = "difficulty:$conceptId"
+                Route(key, PolicyValidator.validateAdjustDifficulty(conceptId, direction, key), tracksGapLedger = false)
+            }
+            else -> null
+        }
+    }
 
     /** Looks up the active concept's task, the same "today's live list first, fall back to
      *  loadDay" pattern [com.checkmate.service.GapTaskManager.findTask] already uses — kept
@@ -189,12 +303,13 @@ class LearningInterventionOrchestrator(
     /**
      * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
      * ranked order and executes the first one that clears the covered-concept check,
-     * mapping, policy validation, and execution — see class doc for why this stops at one
-     * instead of creating a task per candidate, and for [GapTaskLedger]'s role in the walk.
-     * Before any of that, checks once whether [GapTaskLedger.activeConceptId] still has an
-     * unresolved task — see class doc's "part 2" BUGFIX and [RejectionSource.AlreadyActive]
-     * for why this has to run independent of ranking order rather than folded into the
-     * per-candidate loop below.
+     * routing ([resolveRoute]), policy validation, and execution — see class doc for why
+     * this stops at one instead of executing a candidate per action, and for
+     * [GapTaskLedger]/[ReplanDayLedger]'s roles in the walk. Before any of that, checks
+     * once whether [GapTaskLedger.activeConceptId] still has an unresolved task — see
+     * class doc's "part 2" BUGFIX and [RejectionSource.AlreadyActive] for why this has to
+     * run independent of ranking order rather than folded into the per-candidate loop
+     * below.
      */
     /**
      * BUGFIX (unsynchronized ledger race): [com.checkmate.ui.testresults.TestResultsViewModel
@@ -220,6 +335,7 @@ class LearningInterventionOrchestrator(
         now: Long
     ): OrchestrationResult {
         val rejections = mutableListOf<CandidateRejection>()
+        val dayKey = dayKeyProvider()
 
         // BUGFIX (duplicate task via re-ranking, part 2): resolved ONCE, before any
         // candidate is walked, so a re-rank that promotes a different concept to rank 1
@@ -272,22 +388,35 @@ class LearningInterventionOrchestrator(
                 return@forEachIndexed
             }
 
-            val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
-            if (request == null) {
+            // P0a continuation: REPLAN_DAY's own once-a-day guard — see ReplanDayLedger's
+            // doc on why escrow alone can't provide this.
+            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY &&
+                ReplanDayLedger.hasReplannedToday(dayKey)
+            ) {
                 rejections += CandidateRejection(
                     candidate = candidate,
                     rank = rank,
-                    source = RejectionSource.NotMappable,
-                    detail = "intent ${candidate.intent} is not mappable to a CreateTaskRequest " +
-                        "(outside P0a scope, or missing subject/topic)",
+                    source = RejectionSource.AlreadyReplannedToday,
+                    detail = "today's plan ($dayKey) has already been replanned once",
                     timestamp = now
                 )
                 return@forEachIndexed
             }
 
-            val taskId = idGenerator()
+            val route = resolveRoute(candidate, dayKey)
+            if (route == null) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.NotMappable,
+                    detail = "intent ${candidate.intent} is not mappable to an executable action " +
+                        "(outside every route's scope, or missing required fields)",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
 
-            when (val policyResult = PolicyValidator.validateCreateTask(taskId, request)) {
+            when (val policyResult = route.policyResult) {
                 is PolicyResult.Rejected -> {
                     rejections += CandidateRejection(
                         candidate = candidate,
@@ -299,27 +428,31 @@ class LearningInterventionOrchestrator(
                 }
 
                 is PolicyResult.Permitted -> {
-                    when (val acquireResult = taskEscrow.acquire(taskId, LEARNING_ENGINE_TRIGGER, now)) {
+                    when (val acquireResult = taskEscrow.acquire(route.escrowKey, LEARNING_ENGINE_TRIGGER, now)) {
                         is EscrowAcquireResult.AlreadyHeld -> {
                             rejections += CandidateRejection(
                                 candidate = candidate,
                                 rank = rank,
                                 source = RejectionSource.TaskIdCollision,
-                                detail = "generated taskId $taskId already under escrow",
+                                detail = "escrow key ${route.escrowKey} already under escrow",
                                 timestamp = now
                             )
                         }
 
                         is EscrowAcquireResult.Acquired -> {
-                            val action = policyResult.action as PermittedAction.CreateTask
                             val executionOutcome = actionExecutor.execute(
                                 acquireResult.transaction.transactionId,
-                                action,
+                                policyResult.action,
                                 now
                             )
-                            GapTaskLedger.recordServed(candidate, taskId, dayKeyProvider())
+                            if (route.tracksGapLedger) {
+                                GapTaskLedger.recordServed(candidate, route.escrowKey, dayKey)
+                            }
+                            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY) {
+                                ReplanDayLedger.markReplannedToday(dayKey)
+                            }
                             return OrchestrationResult(
-                                outcome = OrchestrationOutcome.Created(candidate, rank, taskId, executionOutcome),
+                                outcome = OrchestrationOutcome.Created(candidate, rank, route.escrowKey, executionOutcome),
                                 rejections = rejections
                             )
                         }
@@ -335,18 +468,38 @@ class LearningInterventionOrchestrator(
         /** See class doc's "Trigger type" note. */
         val LEARNING_ENGINE_TRIGGER = InterventionTriggerType.BACKLOG_RISK
 
+        /** See class doc's "GapTaskLedger tracking" note — only these three participate
+         *  in the single-active-concept streak / P0b Testmate-round tracking. */
+        private val GAP_LEDGER_TRACKED_INTENTS = setOf(
+            LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
+            LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
+            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
+        )
+
         /**
          * Production wiring — same [InterventionDatabase]/[OutcomeLedgerWriter]/
          * [PlanStoreTaskMutator] construction [InterventionReconciliation.runAtStartup]
          * already uses, so this and the reconciliation sweep never disagree about which
-         * database or ledger a transaction was written through.
+         * database or ledger a transaction was written through. P0a continuation: also
+         * wires [AdaptivePlanReplanner]/[LedgerDifficultyMutator] into the [ActionExecutor]
+         * this factory builds, so REPLAN_DAY/REDUCE_DIFFICULTY/INCREASE_DIFFICULTY are
+         * actually executable in production, not just recognized. [InterventionTriggerWorker]'s
+         * own, separate [ActionExecutor] construction deliberately does NOT get these two —
+         * that worker only ever handles behavior intents (see its own doc) and has no
+         * learning-engine candidate to build either action from.
          */
         fun from(context: Context): LearningInterventionOrchestrator {
             val db = InterventionDatabase.getInstance(context)
             val dao = db.interventionTransactionDao()
             val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
             val escrow = TaskEscrow(dao, ledgerWriter)
-            val executor = ActionExecutor(dao, escrow, PlanStoreTaskMutator())
+            val executor = ActionExecutor(
+                dao,
+                escrow,
+                PlanStoreTaskMutator(),
+                planReplanner = AdaptivePlanReplanner(context),
+                difficultyMutator = LedgerDifficultyMutator()
+            )
             return LearningInterventionOrchestrator(escrow, executor)
         }
     }
