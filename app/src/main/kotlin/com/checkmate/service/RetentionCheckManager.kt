@@ -67,7 +67,8 @@ object RetentionCheckManager {
     suspend fun createRetentionTestsIfNeeded() {
         val pending = RetentionTaskLedger.pendingSessionCreation()
         for (session in pending) {
-            val chapter = session.chapter?.takeIf { it.isNotBlank() } ?: run {
+            val chapter = session.chapter?.takeIf { it.isNotBlank() }
+            if (chapter == null) {
                 Log.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
                 continue
             }
