@@ -56,8 +56,20 @@ class ReminderService : Service() {
                 // task just sat there until the app restarted. Runs first each cycle so every
                 // check below it (checkPendingTasks, ProactiveMentor, GapTaskManager) sees the
                 // cleaned-up list. See PlanStore.cleanupCompletedIfDue's own doc for the 9 PM
-                // guard and the tomorrow-carry-forward for still-unresolved tasks.
-                try { PlanStore.cleanupCompletedIfDue() } catch (_: Exception) {}
+                // guard and the tomorrow-carry-forward for still-unresolved tasks. When it
+                // returns non-null, tasks were carried onto tomorrow's plan — push that day's
+                // list to TaskSyncManager right away instead of leaving it stranded locally
+                // until some unrelated future edit happens to touch tomorrow's plan and
+                // trigger a push (PlanStore itself stays sync-unaware; this is the one place
+                // that bridges the two, same as HomeViewModel already does for today's list).
+                try {
+                    val carried = PlanStore.cleanupCompletedIfDue()
+                    if (carried != null) {
+                        withContext(Dispatchers.IO) {
+                            TaskSyncManager.pushTasks(carried.tasks, carried.dayKey, carried.updatedAt)
+                        }
+                    }
+                } catch (_: Exception) {}
                 checkPendingTasks()
                 // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
                 // nothing's been started by the configured hour. No-ops after the first fire

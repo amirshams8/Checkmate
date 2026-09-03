@@ -226,6 +226,16 @@ object PlanStore {
     private const val KEY_LAST_EOD_CLEANUP_DAY = "plan_last_eod_cleanup_day"
 
     /**
+     * Returned by [cleanupCompletedIfDue] when tasks were carried onto tomorrow's plan, so
+     * the app layer (ReminderService) can push that exact day's list to TaskSyncManager
+     * without PlanStore itself importing anything sync/network-related — same "this module
+     * stays local-storage-only" boundary [persist]'s doc already describes. [tasks] is the
+     * FULL merged list for [dayKey] (not just the newly-carried ones), matching what
+     * TaskSyncManager.pushTasks already expects: a whole-list replace, not a delta.
+     */
+    data class CarryForwardPush(val dayKey: String, val tasks: List<StudyTask>, val updatedAt: Long)
+
+    /**
      * Bugfix ("old tasks not clearing at end of day"): [_todayTasks] was only ever populated
      * at process start ([init]/[reload]) or by a local write ([persist]) — nothing re-derived
      * it when the day moved on, so a DONE/SKIPPED task just sat in the list, and in Compose,
@@ -233,11 +243,11 @@ object PlanStore {
      * ReminderService's existing 15-min loop so it actually runs while the app is alive,
      * not just at cold start.
      *
-     * No-ops before [EOD_CLEAR_HOUR] (9 PM) local time, and no-ops again once it's already
-     * run for [todayKey]'s date — [KEY_LAST_EOD_CLEANUP_DAY] is claimed BEFORE the list is
-     * touched specifically so a crash mid-cleanup can't leave the guard unset and cause the
-     * next 15-min tick to re-run the carry-forward below and duplicate tasks onto tomorrow's
-     * plan ("misswiring" the reminders on the ones that are still pending).
+     * No-ops (returns null) before [EOD_CLEAR_HOUR] (9 PM) local time, and no-ops again once
+     * it's already run for [todayKey]'s date — [KEY_LAST_EOD_CLEANUP_DAY] is claimed BEFORE
+     * the list is touched specifically so a crash mid-cleanup can't leave the guard unset and
+     * cause the next 15-min tick to re-run the carry-forward below and duplicate tasks onto
+     * tomorrow's plan ("misswiring" the reminders on the ones that are still pending).
      *
      * DONE/SKIPPED tasks are dropped — nothing left to remind about. Everything still
      * unresolved (PENDING/ACTIVE/PAUSED) is left untouched in [_todayTasks] — it keeps
@@ -245,29 +255,38 @@ object PlanStore {
      * exactly as before — and is ALSO copied onto tomorrow's persisted plan
      * (plan_<tomorrowKey>), deduped by task id, so it isn't simply abandoned the moment the
      * real calendar day rolls over and PlanStore starts reading a different SharedPrefs key.
+     * That write also stamps tasks_updated_at_<tomorrowKey> (same convention [persist] uses
+     * for today, and [markTaskInDay] already uses for an arbitrary day) instead of leaving it
+     * at 0L, and returns a [CarryForwardPush] so the caller can push the carried list to sync
+     * immediately rather than waiting on some unrelated future edit to that day's plan to
+     * happen to trigger a push.
      */
-    fun cleanupCompletedIfDue() {
+    fun cleanupCompletedIfDue(): CarryForwardPush? {
         val cal = Calendar.getInstance()
-        if (cal.get(Calendar.HOUR_OF_DAY) < EOD_CLEAR_HOUR) return
+        if (cal.get(Calendar.HOUR_OF_DAY) < EOD_CLEAR_HOUR) return null
 
         val key = todayKey()
-        if (CheckmatePrefs.getString(KEY_LAST_EOD_CLEANUP_DAY, "") == key) return
+        if (CheckmatePrefs.getString(KEY_LAST_EOD_CLEANUP_DAY, "") == key) return null
         CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
 
         val current = _todayTasks.value
         val unresolved = current.filter { it.state != TaskState.DONE && it.state != TaskState.SKIPPED }
         if (unresolved.size != current.size) persist(unresolved)
 
-        if (unresolved.isNotEmpty()) {
-            val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
-            val tomorrowKey = keyForDay(tomorrowCal)
-            val existingTomorrow = loadDay(tomorrowKey)
-            val existingIds = existingTomorrow.map { it.id }.toSet()
-            val carried = unresolved.filterNot { it.id in existingIds }
-            if (carried.isNotEmpty()) {
-                CheckmatePrefs.putString("plan_$tomorrowKey", json.encodeToString(existingTomorrow + carried))
-            }
-        }
+        if (unresolved.isEmpty()) return null
+
+        val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
+        val tomorrowKey = keyForDay(tomorrowCal)
+        val existingTomorrow = loadDay(tomorrowKey)
+        val existingIds = existingTomorrow.map { it.id }.toSet()
+        val carried = unresolved.filterNot { it.id in existingIds }
+        if (carried.isEmpty()) return null
+
+        val merged = existingTomorrow + carried
+        val stamp = System.currentTimeMillis()
+        CheckmatePrefs.putString("plan_$tomorrowKey", json.encodeToString(merged))
+        CheckmatePrefs.putLong("tasks_updated_at_$tomorrowKey", stamp)
+        return CarryForwardPush(tomorrowKey, merged, stamp)
     }
 
     fun getStreakDays(): Int {

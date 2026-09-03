@@ -54,19 +54,29 @@ object TaskSyncManager {
     fun isEnabled(): Boolean = syncCode() != null
 
     /**
-     * Pushes today's task list up to the worker under the configured sync code.
-     * No-op if no sync code is set (sync is opt-in — an unconfigured device never
-     * phones home). Must be called from a background thread; failures are logged
-     * and swallowed so a flaky connection never blocks a local task action.
+     * Pushes a task list up to the worker under the configured sync code, tagged with
+     * [dayKey]/[updatedAt]. Defaults to today's ([PlanStore.currentDayKey]/
+     * [PlanStore.getLastUpdatedAt]) so every existing call site — which only ever pushes
+     * today's list — is unaffected. The two params exist so PlanStore.cleanupCompletedIfDue's
+     * 9 PM tomorrow-carry-forward can push under the FUTURE day's key/timestamp instead of
+     * silently tagging it as today's, which would make pullTasksIfNewer's dayKey check
+     * reject it everywhere until midnight and then still tag it wrong. No-op if no sync code
+     * is set (sync is opt-in — an unconfigured device never phones home). Must be called from
+     * a background thread; failures are logged and swallowed so a flaky connection never
+     * blocks a local task action.
      */
-    fun pushTasks(tasks: List<StudyTask>) {
+    fun pushTasks(
+        tasks: List<StudyTask>,
+        dayKey: String = PlanStore.currentDayKey(),
+        updatedAt: Long = PlanStore.getLastUpdatedAt()
+    ) {
         val code = syncCode() ?: return
         try {
             val tasksJson = json.encodeToString(tasks)
             val payload = JSONObject().apply {
                 put("code", code)
-                put("dayKey", PlanStore.currentDayKey())
-                put("updatedAt", PlanStore.getLastUpdatedAt())
+                put("dayKey", dayKey)
+                put("updatedAt", updatedAt)
                 put("tasks", JSONArray(tasksJson))
             }
             val body = payload.toString().toRequestBody("application/json".toMediaType())
