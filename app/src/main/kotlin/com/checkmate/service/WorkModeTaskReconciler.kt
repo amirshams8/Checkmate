@@ -2,6 +2,7 @@ package com.checkmate.service
 
 import android.content.Context
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.CoroutineScope
