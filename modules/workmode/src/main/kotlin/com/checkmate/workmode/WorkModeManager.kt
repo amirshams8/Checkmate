@@ -199,6 +199,17 @@ object WorkModeManager {
         }
     }
 
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
+     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
+     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
+     * that a guardian toggled on manually or that the hardcoded schedule opened,
+     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
+     * fix; nothing outside this object needed to read it.
+     */
+    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
     /** Returns package names of apps to block. */
     fun getBlockedApps(): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
@@ -221,4 +232,14 @@ object WorkModeManager {
         else
             context.startService(intent)
     }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * public (was folded into the private SOURCE_* consts before this fix) so
+     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
+     * own activate() calls and compare against [activeSource]. Kept as a plain
+     * string constant to match every other source tag's storage as raw
+     * CheckmatePrefs strings.
+     */
+    const val SOURCE_TASK = "task"
 }

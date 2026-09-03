@@ -21,6 +21,7 @@ import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ReminderService
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.StudyStateSyncManager
+import com.checkmate.service.WorkModeTaskReconciler
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.ScrollGuard
@@ -50,6 +51,11 @@ class CheckmateApp : Application() {
         // doing this in BootReceiver). This must run after
         // CheckmateState.init() above.
         WorkModeManager.init(this)
+        // BUGFIX: notification-panel "Start" and cross-device task sync never
+        // activated WorkMode — see WorkModeTaskReconciler's own doc. Must run after
+        // WorkModeManager.init(this) immediately above, same ordering requirement as
+        // every other WorkModeManager-dependent call in this method.
+        WorkModeTaskReconciler.start(this)
         WorkModeScheduleReceiver.scheduleDailyAlarms(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
         // Every 30 min: pushes an app-usage Telegram alert + caches it in the
