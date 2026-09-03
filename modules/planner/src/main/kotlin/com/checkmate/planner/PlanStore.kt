@@ -220,6 +220,56 @@ object PlanStore {
         return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
     }
 
+    // ── End-of-day cleanup (9 PM) ────────────────────────────────────────────
+
+    private const val EOD_CLEAR_HOUR = 21 // 9 PM — DONE/SKIPPED tasks clear, everything else keeps reminding
+    private const val KEY_LAST_EOD_CLEANUP_DAY = "plan_last_eod_cleanup_day"
+
+    /**
+     * Bugfix ("old tasks not clearing at end of day"): [_todayTasks] was only ever populated
+     * at process start ([init]/[reload]) or by a local write ([persist]) — nothing re-derived
+     * it when the day moved on, so a DONE/SKIPPED task just sat in the list, and in Compose,
+     * forever, until the app process happened to restart. This is the fix: called from
+     * ReminderService's existing 15-min loop so it actually runs while the app is alive,
+     * not just at cold start.
+     *
+     * No-ops before [EOD_CLEAR_HOUR] (9 PM) local time, and no-ops again once it's already
+     * run for [todayKey]'s date — [KEY_LAST_EOD_CLEANUP_DAY] is claimed BEFORE the list is
+     * touched specifically so a crash mid-cleanup can't leave the guard unset and cause the
+     * next 15-min tick to re-run the carry-forward below and duplicate tasks onto tomorrow's
+     * plan ("misswiring" the reminders on the ones that are still pending).
+     *
+     * DONE/SKIPPED tasks are dropped — nothing left to remind about. Everything still
+     * unresolved (PENDING/ACTIVE/PAUSED) is left untouched in [_todayTasks] — it keeps
+     * showing on Today and keeps triggering ReminderService.checkPendingTasks()'s nudge
+     * exactly as before — and is ALSO copied onto tomorrow's persisted plan
+     * (plan_<tomorrowKey>), deduped by task id, so it isn't simply abandoned the moment the
+     * real calendar day rolls over and PlanStore starts reading a different SharedPrefs key.
+     */
+    fun cleanupCompletedIfDue() {
+        val cal = Calendar.getInstance()
+        if (cal.get(Calendar.HOUR_OF_DAY) < EOD_CLEAR_HOUR) return
+
+        val key = todayKey()
+        if (CheckmatePrefs.getString(KEY_LAST_EOD_CLEANUP_DAY, "") == key) return
+        CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+
+        val current = _todayTasks.value
+        val unresolved = current.filter { it.state != TaskState.DONE && it.state != TaskState.SKIPPED }
+        if (unresolved.size != current.size) persist(unresolved)
+
+        if (unresolved.isNotEmpty()) {
+            val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
+            val tomorrowKey = keyForDay(tomorrowCal)
+            val existingTomorrow = loadDay(tomorrowKey)
+            val existingIds = existingTomorrow.map { it.id }.toSet()
+            val carried = unresolved.filterNot { it.id in existingIds }
+            if (carried.isNotEmpty()) {
+                CheckmatePrefs.putString("plan_$tomorrowKey", json.encodeToString(existingTomorrow + carried))
+            }
+        }
+    }
+
     fun getStreakDays(): Int {
         var streak = 0
         val cal = Calendar.getInstance()

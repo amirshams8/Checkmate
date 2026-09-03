@@ -51,6 +51,13 @@ class ReminderService : Service() {
         startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
         scope.launch {
             while (isActive) {
+                // Bugfix ("old tasks not clearing at end of day"): PlanStore.todayTasks is
+                // only ever populated at process start or by a local write, so a DONE/SKIPPED
+                // task just sat there until the app restarted. Runs first each cycle so every
+                // check below it (checkPendingTasks, ProactiveMentor, GapTaskManager) sees the
+                // cleaned-up list. See PlanStore.cleanupCompletedIfDue's own doc for the 9 PM
+                // guard and the tomorrow-carry-forward for still-unresolved tasks.
+                try { PlanStore.cleanupCompletedIfDue() } catch (_: Exception) {}
                 checkPendingTasks()
                 // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
                 // nothing's been started by the configured hour. No-ops after the first fire
