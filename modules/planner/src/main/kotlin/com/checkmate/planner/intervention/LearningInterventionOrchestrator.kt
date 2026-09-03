@@ -240,7 +240,13 @@ class LearningInterventionOrchestrator(
     private data class Route(
         val escrowKey: String,
         val policyResult: PolicyResult,
-        val tracksGapLedger: Boolean
+        val tracksGapLedger: Boolean,
+        // Closes the retention-check evidence loop (next-session-retention-loop.txt):
+        // true only for SCHEDULE_RETENTION_TEST — see [RETENTION_LEDGER_TRACKED_INTENTS]
+        // and [RetentionTaskLedger]'s own class doc for why this is a separate, lighter-
+        // weight ledger rather than folding SCHEDULE_RETENTION_TEST into
+        // [GAP_LEDGER_TRACKED_INTENTS] outright.
+        val tracksRetentionLedger: Boolean = false
     )
 
     /**
@@ -260,7 +266,8 @@ class LearningInterventionOrchestrator(
             return Route(
                 escrowKey = taskId,
                 policyResult = PolicyValidator.validateCreateTask(taskId, request),
-                tracksGapLedger = candidate.intent in GAP_LEDGER_TRACKED_INTENTS
+                tracksGapLedger = candidate.intent in GAP_LEDGER_TRACKED_INTENTS,
+                tracksRetentionLedger = candidate.intent in RETENTION_LEDGER_TRACKED_INTENTS
             )
         }
 
@@ -388,6 +395,25 @@ class LearningInterventionOrchestrator(
                 return@forEachIndexed
             }
 
+            // Closes the retention-check evidence loop (next-session-retention-loop.txt):
+            // don't stack a second outstanding retention check on the same concept while
+            // an earlier one's Testmate evidence hasn't landed yet. Deliberately per-
+            // concept, not a single global slot like GapTaskLedger's AlreadyActive block
+            // above — several different concepts can genuinely have their own unresolved
+            // retention check in flight at once (see RetentionTaskLedger's own class doc).
+            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST &&
+                conceptId != null && RetentionTaskLedger.hasUnresolvedForConcept(conceptId)
+            ) {
+                rejections += CandidateRejection(
+                    candidate = candidate,
+                    rank = rank,
+                    source = RejectionSource.AlreadyActive,
+                    detail = "concept $conceptId already has an unresolved retention check in flight",
+                    timestamp = now
+                )
+                return@forEachIndexed
+            }
+
             // P0a continuation: REPLAN_DAY's own once-a-day guard — see ReplanDayLedger's
             // doc on why escrow alone can't provide this.
             if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY &&
@@ -448,6 +474,9 @@ class LearningInterventionOrchestrator(
                             if (route.tracksGapLedger) {
                                 GapTaskLedger.recordServed(candidate, route.escrowKey, dayKey)
                             }
+                            if (route.tracksRetentionLedger) {
+                                RetentionTaskLedger.record(candidate, route.escrowKey, dayKey)
+                            }
                             if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY) {
                                 ReplanDayLedger.markReplannedToday(dayKey)
                             }
@@ -474,6 +503,23 @@ class LearningInterventionOrchestrator(
             LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
             LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
             LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
+        )
+
+        /**
+         * Closes the retention-check evidence loop (next-session-retention-loop.txt).
+         * SCHEDULE_RETENTION_TEST creates a real StudyTask (see [LearningInterventionMapper])
+         * but was never added to [GAP_LEDGER_TRACKED_INTENTS] — deliberately, per that set's
+         * own doc, since folding it into GapTaskLedger's single-active-concept slot risks the
+         * exact cross-purpose collisions that ledger's bugfix history is full of (a retention
+         * check for concept A could stomp a gap-repair round in progress for concept B, or
+         * vice versa). [RetentionTaskLedger] is the separate, per-task memory that lets
+         * [com.checkmate.service.RetentionCheckManager] request a Testmate session and import
+         * its evidence the same way [com.checkmate.service.GapTaskManager] already does for
+         * REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET — without touching GapTaskLedger
+         * at all.
+         */
+        private val RETENTION_LEDGER_TRACKED_INTENTS = setOf(
+            LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
         )
 
         /**

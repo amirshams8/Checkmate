@@ -81,8 +81,15 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     // happens to recompose for some unrelated reason.
     val activeTaskId    = state.activeGapTaskId
     val activeSessionId = state.activeRepairSessionId
+    // Retention-check evidence loop (next-session-retention-loop.txt): reuses this exact
+    // "show a Take test button when this task has a live Testmate session" mechanism for
+    // RETENTION CHECK tasks too, instead of threading a second showXTestButton/onOpenXTest
+    // pair through every composable below (TaskList/TaskCard/DayTimeline all already take
+    // this one (StudyTask) -> String? function). state.activeRetentionSessions is keyed by
+    // taskId (see HomeViewModel.loadRetentionSessions) since — unlike the single active gap
+    // concept above — several retention checks can have their own live session at once.
     fun repairSessionFor(task: StudyTask): String? =
-        if (task.id == activeTaskId) activeSessionId else null
+        if (task.id == activeTaskId) activeSessionId else state.activeRetentionSessions[task.id]
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
@@ -1063,7 +1070,11 @@ private fun TaskCard(
                 ) {
                     Icon(Icons.Default.Quiz, null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Take repair test", fontWeight = FontWeight.SemiBold)
+                    // Retention-check evidence loop: this same button now also fires for
+                    // RETENTION CHECK tasks (see repairSessionFor's own doc above) — "Take
+                    // test" reads correctly for both a gap-repair retest and a retention
+                    // recall check, without needing task-type-specific label plumbing.
+                    Text("Take test", fontWeight = FontWeight.SemiBold)
                 }
             }
 

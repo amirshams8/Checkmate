@@ -14,6 +14,7 @@ import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
@@ -50,7 +51,14 @@ data class HomeState(
     // own. null/null means no gap-task is currently mid-round (nothing to show a
     // repair-test button for).
     val activeGapTaskId:     String?        = null,
-    val activeRepairSessionId: String?      = null
+    val activeRepairSessionId: String?      = null,
+    // Retention-check evidence loop (next-session-retention-loop.txt): unlike the single
+    // active gap-repair slot above, several RETENTION CHECK tasks can have their own
+    // outstanding Testmate session at once — see RetentionTaskLedger's own class doc for
+    // why this is keyed by taskId instead of one active-session field. Only entries whose
+    // session has actually been created are included (a task still waiting on
+    // RetentionCheckManager.createRetentionTestsIfNeeded has no sessionId yet).
+    val activeRetentionSessions: Map<String, String> = emptyMap()
 )
 
 class HomeViewModel : ViewModel() {
@@ -67,6 +75,7 @@ class HomeViewModel : ViewModel() {
     init {
         _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
         loadTodayPlan(); loadStreak(); loadPsycheMessage(); loadGapTaskSession()
+        loadRetentionSessions()
         pullSync()
     }
 
@@ -147,6 +156,28 @@ class HomeViewModel : ViewModel() {
                     activeGapTaskId        = GapTaskLedger.activeTaskId(),
                     activeRepairSessionId  = GapTaskLedger.activeTestmateSessionId()
                 )}
+            }
+        }
+    }
+
+    /**
+     * Retention-check evidence loop (next-session-retention-loop.txt): same "CheckmatePrefs
+     * write has no observable of its own, so collect the ledger's version counter and
+     * re-snapshot into Compose state" shape [loadGapTaskSession] already uses for
+     * GapTaskLedger, applied to [RetentionTaskLedger] instead. RetentionCheckManager runs
+     * from ReminderService's background loop, entirely outside Compose, so without this
+     * collector HomeScreen would never notice a retention session becoming available to take.
+     */
+    private fun loadRetentionSessions() {
+        viewModelScope.launch {
+            RetentionTaskLedger.version.collect {
+                // pendingEvidence() is exactly "has a session, evidence not imported yet" —
+                // pendingSessionCreation() entries never have a sessionId by definition, so
+                // there's nothing to add from that list here.
+                val sessions = RetentionTaskLedger.pendingEvidence()
+                    .mapNotNull { entry -> entry.testmateSessionId?.let { entry.taskId to it } }
+                    .toMap()
+                _state.update { it.copy(activeRetentionSessions = sessions) }
             }
         }
     }

@@ -98,6 +98,16 @@ class ReminderService : Service() {
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
                 try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Retention-check evidence loop (next-session-retention-loop.txt): requests a
+                // Testmate session for any RETENTION CHECK task that doesn't have one yet —
+                // see RetentionCheckManager's own doc for why this is a separate ledger/
+                // manager from the gap-repair pair above rather than folded into it.
+                try { RetentionCheckManager.createRetentionTestsIfNeeded() } catch (_: Exception) {}
+                // Retention-check evidence loop, return arrow: polls any outstanding retention
+                // session and, once submitted, imports real QuestionAttempt/LearningEvent
+                // evidence — same every-cycle (not once/day) cadence as the gap-repair poll
+                // above, for the same reason (the student can submit at any time).
+                try { RetentionCheckManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 try { pollRemoteOverride() } catch (_: Exception) {}
                 delay(15 * 60 * 1000L) // check every 15 min
