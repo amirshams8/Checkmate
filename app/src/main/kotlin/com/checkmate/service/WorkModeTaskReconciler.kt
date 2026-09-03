@@ -7,9 +7,7 @@ import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
 /**
@@ -48,6 +46,14 @@ import kotlinx.coroutines.flow.onEach
  * before Work Mode is actually enforcing. This reconciler is the single source of
  * truth for the two paths that had no coverage at all; on the in-app path it's a
  * harmless, idempotent no-op alongside the direct call that already works.
+ *
+ * BUGFIX (silent delay never enforced): also the single place that releases
+ * WorkModeManager's overdue-enforcement idempotency guard once a task leaves
+ * PENDING — see [WorkModeManager.retainOverdueEnforcementOnly]'s own doc for why this
+ * function, specifically, is the right home for that cleanup (it already observes
+ * every task-state transition regardless of cause, ACTIVE-state consequences and
+ * overdue-PENDING consequences are two sides of the same "what does this task's
+ * state mean for WorkMode right now" question this object already owns).
  */
 object WorkModeTaskReconciler {
 
@@ -56,28 +62,30 @@ object WorkModeTaskReconciler {
     /** Call once from CheckmateApp.onCreate, after WorkModeManager.init(this). */
     fun start(context: Context) {
         PlanStore.todayTasks
-            .map { tasks -> tasks.any { it.state == TaskState.ACTIVE || it.state == TaskState.PAUSED } }
-            .distinctUntilChanged()
-            .onEach { hasLiveTask -> reconcile(context, hasLiveTask) }
+            .onEach { tasks -> reconcile(context, tasks) }
             .launchIn(scope)
     }
 
-    private fun reconcile(context: Context, hasLiveTask: Boolean) {
+    private fun reconcile(context: Context, tasks: List<StudyTask>) {
+        val hasLiveTask = tasks.any { it.state == TaskState.ACTIVE || it.state == TaskState.PAUSED }
+
         if (hasLiveTask) {
             if (!WorkModeManager.isActive.value) {
                 WorkModeManager.activate(context, source = WorkModeManager.SOURCE_TASK)
             }
-            return
-        }
-
-        // No live task. Only release Work Mode if WE were the one holding it open —
-        // never stomp on a MANUAL guardian toggle or the hardcoded SCHEDULE window,
-        // both of which are legitimately independent of any single task's state.
-        // deactivate() itself still re-checks WorkModeSchedule and refuses to actually
-        // turn off if the 19:00-02:00 window is live, same guard markDone/markSkip
-        // already rely on.
-        if (WorkModeManager.isActive.value && WorkModeManager.activeSource() == WorkModeManager.SOURCE_TASK) {
+        } else if (WorkModeManager.isActive.value && WorkModeManager.activeSource() == WorkModeManager.SOURCE_TASK) {
+            // No live task, and WE were the one holding Work Mode open — never stomp on a
+            // MANUAL guardian toggle or the hardcoded SCHEDULE window, both legitimately
+            // independent of any single task's state. deactivate() itself still re-checks
+            // WorkModeSchedule and refuses to actually turn off if the 19:00-02:00 window
+            // is live, same guard markDone/markSkip already rely on.
             WorkModeManager.deactivate(context)
         }
+
+        // BUGFIX (silent delay never enforced): release the overdue-enforcement guard for
+        // any task id that's no longer PENDING — see WorkModeManager.retainOverdueEnforcementOnly's
+        // own doc.
+        val stillPendingIds = tasks.filter { it.state == TaskState.PENDING }.map { it.id }.toSet()
+        WorkModeManager.retainOverdueEnforcementOnly(stillPendingIds)
     }
 }

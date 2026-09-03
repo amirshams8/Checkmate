@@ -27,6 +27,20 @@ object TriggerEvaluator {
     /** Past this, TASK_NOT_STARTED escalates to LATE_START. */
     const val LATE_ESCALATION_THRESHOLD_MINUTES = 10
 
+    /**
+     * BUGFIX (silent delay never enforced): past this, a still-PENDING task stops being
+     * "just another notification" and gets a real consequence — WorkMode lockdown +
+     * escalation watchlist, via [OverdueEnforcementGateway]. Deliberately just a threshold
+     * compared against [TriggerSignal.lateMinutes], the same value [evaluate] already
+     * computes — this is not a second lateness calculation, and nothing here changes what
+     * [evaluate] returns or how it's computed. See InterventionTriggerWorker's own doc for
+     * why 30 is a threshold to compare against, not a real-time deadline: the periodic
+     * worker that reads this has a 15-minute WorkManager floor and no guaranteed exact
+     * cadence, so this can legitimately fire anywhere from ~30 to ~44 minutes late
+     * depending on when the worker last happened to run — that's expected, not a bug.
+     */
+    const val OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES = 30
+
     data class TriggerSignal(val triggerType: InterventionTriggerType, val lateMinutes: Int)
 
     /**

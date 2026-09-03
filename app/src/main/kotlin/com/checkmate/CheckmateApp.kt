@@ -10,6 +10,7 @@ import com.checkmate.planner.intervention.InterventionGuardianGateway
 import com.checkmate.planner.intervention.InterventionNotificationBridge
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
+import com.checkmate.planner.intervention.OverdueEnforcementBridge
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.service.BehaviorLedgerSyncManager
@@ -17,6 +18,7 @@ import com.checkmate.service.DayHistorySyncManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
+import com.checkmate.service.OverdueEnforcementCoordinator
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ReminderService
 import com.checkmate.service.ScreenCaptureManager
@@ -56,6 +58,13 @@ class CheckmateApp : Application() {
         // WorkModeManager.init(this) immediately above, same ordering requirement as
         // every other WorkModeManager-dependent call in this method.
         WorkModeTaskReconciler.start(this)
+        // BUGFIX (silent delay never enforced): wires the overdue-PENDING enforcement
+        // gateway InterventionTriggerWorker calls into — see OverdueEnforcementCoordinator
+        // and OverdueEnforcementGateway's own docs. Same settable-gateway pattern as
+        // InterventionNotificationBridge.gateway / InterventionGuardianBridge.gateway just
+        // below; grouped with the WorkMode wiring above instead since this one specifically
+        // depends on WorkModeManager being initialized first.
+        OverdueEnforcementBridge.gateway = OverdueEnforcementCoordinator
         WorkModeScheduleReceiver.scheduleDailyAlarms(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
         // Every 30 min: pushes an app-usage Telegram alert + caches it in the

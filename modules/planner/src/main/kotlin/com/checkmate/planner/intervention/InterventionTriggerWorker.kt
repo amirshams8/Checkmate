@@ -38,6 +38,17 @@ import com.checkmate.planner.PlanStore
  * race window between it and the acquire call; acquire() already returns AlreadyHeld
  * safely if something else (a concurrent run, or a manually-triggered intervention) beat
  * this one to it.
+ *
+ * BUGFIX (silent delay never enforced): also runs [OverdueEnforcementBridge] for every
+ * fired signal whose lateMinutes has crossed
+ * [TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES] — independent of, and before,
+ * the escrow/notification bookkeeping below, since escrow tracks the notification
+ * transaction's own state (NEGOTIATING, TTL_EXPIRED, ...), not whether real enforcement
+ * has been applied. A task can be re-notified every cycle forever (escrow keeps expiring
+ * and re-acquiring) while enforcement itself only actually applies once — see
+ * OverdueEnforcementGateway's own doc on why idempotency lives on the gateway side, not
+ * here. This worker only ever reads [TriggerEvaluator]'s existing lateMinutes; it does not
+ * compute lateness itself, here or anywhere else.
  */
 class InterventionTriggerWorker(
     context: Context,
@@ -56,6 +67,17 @@ class InterventionTriggerWorker(
 
         PlanStore.todayTasks.value.forEach { task ->
             val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
+
+            // BUGFIX (silent delay never enforced): real consequence for a badly-overdue
+            // PENDING task, independent of whatever this cycle's notification escrow below
+            // ends up doing. Fires every cycle past threshold — OverdueEnforcementBridge's
+            // implementation is responsible for only actually applying anything once per
+            // overdue episode (see its own doc) and for never mutating this task's state.
+            if (signal.lateMinutes >= TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES) {
+                OverdueEnforcementBridge.gateway?.applyOverdueEnforcement(
+                    applicationContext, task, signal.lateMinutes
+                )
+            }
 
             val ttlMillis = if (gateway != null) {
                 InterventionNotificationBridge.PROMPT_TTL_MILLIS

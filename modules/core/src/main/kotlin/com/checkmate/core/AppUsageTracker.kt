@@ -156,6 +156,41 @@ object AppUsageTracker {
     }
 
     /**
+     * BUGFIX (silent delay never enforced — "block whichever app is eating the most time
+     * during the overdue window"): same bucketed-and-grouped approach as [getTodayUsage],
+     * parameterized to an arbitrary [startMillis, endMillis) range instead of "today" and
+     * returning only the single top entry. Used by `app`'s OverdueEnforcementCoordinator
+     * to find what the student has actually been doing since the task's scheduled start
+     * time, rather than only ever blocking the fixed DEFAULT_ESCALATION_WATCHLIST — a
+     * procrastinating student's actual time sink (a game, a browser tab, anything not on
+     * that fixed list) is exactly what a static watchlist can't catch. Returns null (never
+     * throws) if Usage Access isn't granted, the range is empty/inverted, or nothing
+     * cleared the same 1-minute-of-usage floor [getTodayUsage] already applies.
+     */
+    fun getTopAppInRange(context: Context, startMillis: Long, endMillis: Long): AppUsageEntry? {
+        if (!hasUsageAccess(context)) return null
+        if (endMillis <= startMillis) return null
+
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val stats = try {
+            usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startMillis, endMillis)
+        } catch (e: Exception) {
+            null
+        } ?: return null
+
+        val pm = context.packageManager
+        return stats
+            .filter { it.totalTimeInForeground >= 60_000L && it.packageName != context.packageName }
+            .groupBy { it.packageName }
+            .map { (pkg, group) -> pkg to group.sumOf { it.totalTimeInForeground } }
+            .mapNotNull { (pkg, millis) ->
+                val label = resolveLabel(pm, pkg) ?: return@mapNotNull null
+                AppUsageEntry(pkg, label, millis)
+            }
+            .maxByOrNull { it.foregroundMillis }
+    }
+
+    /**
      * Last [days] days of total foreground screen time, oldest first —
      * feeds a Digital-Wellbeing-style weekly history bar chart.
      */
