@@ -1,2813 +1,500 @@
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/RetentionTaskLedger.kt =====
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+package com.checkmate.workmode
 
-package com.checkmate.planner.intervention
-
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.learning.engine.LearningDecisionEngine
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-
-/**
- * next-session-retention-loop.txt — closes the RETENTION CHECK execution/evidence gap:
- * ```
- * RetentionEngine: REVIEW -> SCHEDULE_RETENTION_TEST -> RETENTION CHECK task (already worked)
- *     -> [THIS] launch a Testmate retention session for this exact task
- *     -> student answers questions -> Testmate result
- *     -> [existing] TargetedTestEvidenceImporter -> QuestionAttempt + LearningEvent
- *     -> MasteryEngine.recomputeAll -> RetentionEngine sees fresh lastSeen/mastery
- *        on its own next decideFromReport pass (no new decision-push code needed here —
- *        see class doc's "no new logic" note below)
- * ```
- *
- * ROOT CAUSE this replaces: SCHEDULE_RETENTION_TEST is intentionally excluded from
- * [LearningInterventionOrchestrator]'s `GAP_LEDGER_TRACKED_INTENTS` — only REPAIR_CONCEPT/
- * START_DIAGNOSTIC/ASSIGN_TARGETED_SET participate in [GapTaskLedger]'s single-active-concept
- * tracking. That means a RETENTION CHECK task was, until now, a plain StudyTask: marking it
- * DONE only updated focus/behavior stats, never mastery or lastSeen for that concept, because
- * nothing ever requested a Testmate session or polled for its result the way
- * [com.checkmate.service.GapTaskManager] already does for the three gap-repair intents.
- *
- * WHY A SEPARATE LEDGER, NOT [GapTaskLedger] ITSELF: that ledger's own class doc is explicit
- * that it tracks exactly ONE active concept at a time — deliberately, since gap-repair is a
- * single-active-concept streak ("one gap-repair task a day, cycling through every gap... until
- * each one is actually done"). Retention checks have no such constraint: several concepts can
- * legitimately clear the HIGH-mastery/HIGH-risk REVIEW bar in the same [RetentionEngine.decideAll]
- * pass, and each gets its own RETENTION CHECK task independent of whatever gap-repair concept is
- * currently active. Joining GAP_LEDGER_TRACKED_INTENTS outright would mean a retention check for
- * concept A silently overwriting the active-concept pointer for a gap-repair round already in
- * progress on concept B (or vice versa) — exactly the kind of cross-purpose collision
- * [GapTaskLedger]'s own bugfix history is full of examples of. This object instead tracks one
- * entry PER RETENTION TASK, keyed by taskId, with no single "active" slot at all.
- *
- * WHY NO ROUND-RETRY LOGIC (unlike [GapTaskLedger]'s P0b round counter): a gap-repair task that
- * comes back still below [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] needs
- * another round of the SAME repair, requested explicitly (`resetForNextRound`). A retention
- * check has no equivalent "try again immediately" step — once its evidence is imported, mastery
- * and `lastSeen` are already up to date, and [RetentionEngine.decide] will naturally re-classify
- * the concept (REVIEW again, MOVE_ON, or even TEACH) the next time
- * [com.checkmate.service.GapTaskManager.generateIfNeeded]'s daily pass re-runs
- * `LearningDecisionEngine.decideFromReport` — which can, on its own, produce a brand-new
- * SCHEDULE_RETENTION_TEST candidate (a fresh taskId, a fresh entry here) if the concept is still
- * at risk. No extra "next decision" push belongs in this file — see the CONSTRAINT in
- * next-session-retention-loop.txt: RetentionEngine's 14-day decay and REVIEW/TEACH/MOVE_ON
- * thresholds are untouched by this change.
- *
- * CheckmatePrefs-backed, same pattern as [GapTaskLedger] and [com.checkmate.planner.PlanStore].
- * Single-user app — no per-student keying needed.
- */
-object RetentionTaskLedger {
-
-    private const val TAG = "RetentionTaskLedger"
-
-    private val json = Json { ignoreUnknownKeys = true }
-
-    private const val KEY_SESSIONS = "retention_task_sessions"
-
-    // Unresolved entries are always kept in full (there should only ever be a handful
-    // outstanding at once — one per concept currently at REVIEW risk). Resolved entries
-    // are capped so a long-lived install doesn't grow this pref forever — same reasoning
-    // as GapTaskLedger.WarningLogEntry's own MAX_WARNING_LOG_ENTRIES cap.
-    private const val MAX_RESOLVED_KEPT = 30
-
-    @Serializable
-    data class RetentionSession(
-        val taskId: String,
-        val dayKey: String,
-        val conceptId: String?,
-        val subject: String?,
-        val chapter: String?,
-        val topic: String?,
-        val testmateTestId: String? = null,
-        val testmateSessionId: String? = null,
-        val evidenceImported: Boolean = false,
-        val createdAt: Long = System.currentTimeMillis()
-    )
-
-    // Same reactive-change-signal shape as GapTaskLedger.version — CheckmatePrefs writes
-    // from ReminderService's background loop (RetentionCheckManager) have no observable of
-    // their own otherwise, and HomeViewModel needs to notice a session becoming available
-    // to take, same as it already does for GapTaskLedger's P0b fields.
-    private val _version = MutableStateFlow(0L)
-    val version: StateFlow<Long> = _version.asStateFlow()
-    private fun bumpVersion() { _version.update { it + 1 } }
-
-    private fun all(): List<RetentionSession> =
-        CheckmatePrefs.getString(KEY_SESSIONS, null)?.let {
-            try {
-                json.decodeFromString(it)
-            } catch (e: Exception) {
-                Log.e(TAG, "corrupt retention session list, resetting: ${e.message}", e)
-                emptyList()
-            }
-        } ?: emptyList()
-
-    private fun save(sessions: List<RetentionSession>) {
-        val unresolved = sessions.filter { !it.evidenceImported }
-        val resolved = sessions.filter { it.evidenceImported }
-            .sortedByDescending { it.createdAt }
-            .take(MAX_RESOLVED_KEPT)
-        CheckmatePrefs.putString(KEY_SESSIONS, json.encodeToString(unresolved + resolved))
-    }
-
-    /**
-     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
-     * SCHEDULE_RETENTION_TEST candidate is turned into a real StudyTask (see that class's
-     * `Route.tracksRetentionLedger`). Idempotent on [taskId] so a retried orchestrator call
-     * for the same task never duplicates the entry.
-     */
-    fun record(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
-        val existing = all()
-        if (existing.any { it.taskId == taskId }) return
-        val entry = RetentionSession(
-            taskId = taskId,
-            dayKey = dayKey,
-            conceptId = candidate.conceptId,
-            subject = candidate.subject,
-            chapter = candidate.chapter,
-            // Same "null" -> real-null defense GapTaskLedger.sanitizeTopicOrChapter applies —
-            // candidate.topic can carry the literal string "null" from a still-poisoned
-            // Question row (see that function's own doc for the full chain).
-            topic = candidate.topic?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
-        )
-        save(existing + entry)
-        Log.d(TAG, "record: taskId=$taskId concept=${candidate.conceptId} chapter=${candidate.chapter}")
-        bumpVersion()
-    }
-
-    /**
-     * True while [conceptId] already has an outstanding (evidence not yet imported)
-     * retention task — [LearningInterventionOrchestrator] checks this per-candidate so a
-     * fresh daily re-rank can't pile up a second retention check for the same concept while
-     * the first one's Testmate session is still unsubmitted.
-     */
-    fun hasUnresolvedForConcept(conceptId: String): Boolean =
-        all().any { it.conceptId == conceptId && !it.evidenceImported }
-
-    /** Entries with no Testmate session created yet — [com.checkmate.service.RetentionCheckManager]
-     *  drives these through [com.checkmate.testmate.TestmateApi.createTargetedTest]. */
-    fun pendingSessionCreation(): List<RetentionSession> =
-        all().filter { it.testmateSessionId.isNullOrBlank() && !it.evidenceImported }
-
-    /** Entries with a session on file whose result hasn't been imported yet —
-     *  [com.checkmate.service.RetentionCheckManager] polls these every cycle, same cadence
-     *  as [com.checkmate.service.GapTaskManager.evidencePollIfNeeded]. */
-    fun pendingEvidence(): List<RetentionSession> =
-        all().filter { !it.testmateSessionId.isNullOrBlank() && !it.evidenceImported }
-
-    /** For UI wiring (HomeScreen's "take test" button) — the sessionId to open for a
-     *  specific StudyTask, or null if this task has no retention session at all (not a
-     *  retention task, or its session hasn't been created yet). */
-    fun sessionIdForTask(taskId: String): String? =
-        all().firstOrNull { it.taskId == taskId }?.testmateSessionId?.takeIf { it.isNotBlank() }
-
-    /** Called once by [com.checkmate.service.RetentionCheckManager] right after Testmate
-     *  confirms a targeted test was created (or already existed — the endpoint is
-     *  idempotent by intervention_id) for this task. */
-    fun recordTestmateSession(taskId: String, testId: String, sessionId: String) {
-        val updated = all().map {
-            if (it.taskId == taskId) it.copy(testmateTestId = testId, testmateSessionId = sessionId) else it
-        }
-        save(updated)
-        bumpVersion()
-    }
-
-    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
-     *  QuestionAttempt/LearningEvent rows for this task's session — stops
-     *  [com.checkmate.service.RetentionCheckManager] from re-polling/re-importing an
-     *  already-scored session every 15 minutes, and (via [save]'s resolved-cap) lets this
-     *  entry eventually age out instead of tracking it forever. */
-    fun markEvidenceImported(taskId: String) {
-        val updated = all().map { if (it.taskId == taskId) it.copy(evidenceImported = true) else it }
-        save(updated)
-        bumpVersion()
-    }
-
-    fun entry(taskId: String): RetentionSession? = all().firstOrNull { it.taskId == taskId }
-}
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/LearningInterventionOrchestrator.kt =====
-
-
-package com.checkmate.planner.intervention
-
-import android.content.Context
-import com.checkmate.learning.engine.LearningDecisionEngine
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import java.util.UUID
-
-/**
- * Upgrade Blueprint Phase 2.4/2.5 (P0a) — the single production call site that was still
- * missing: [LearningInterventionMapper]'s own doc names this exact orchestration as "not
- * yet existing as a single call site," and [LearningInterventionCreateTaskIntegrationTest]
- * only exercises the chain a test-local `runPipeline` helper wires by hand. This is that
- * helper, promoted to a real production class:
- * ```
- * LearningDecisionEngine.DecisionReport -> LearningInterventionOrchestrator
- *     -> (per candidate, highest priorityScore first) resolveRoute()
- *     -> PolicyValidator -> TaskEscrow -> ActionExecutor -> {PlanStore | PlanReplanner | DifficultyMutator}
- * ```
- *
- * Deliberately does NOT create one task per candidate. [DecisionReport.candidates] is
- * already ranked by [LearningDecisionEngine.CandidateIntervention.priorityScore] — turning
- * every candidate into a task would just as capacity-blind as never having ranked them at
- * all, defeating the entire point of [com.checkmate.learning.analytics.ScoreGainEstimator]
- * and today's finite study time. [executeTopCandidate] instead walks the ranking in order
- * and stops at the first candidate that clears every stage — routing, policy, and
- * execution. An earlier, higher-ranked candidate that fails any stage is recorded (never
- * silently dropped, see [CandidateRejection]) and the walk falls through to the next one,
- * exactly the "try candidate #2 if policy allows" behavior a ranked list implies.
- *
- * P0a continuation (SCHEDULE_RETENTION_TEST/START_MOCK/REPLAN_DAY/REDUCE_DIFFICULTY/
- * INCREASE_DIFFICULTY): originally every executable path here ended in a
- * [PermittedAction.CreateTask] — this class assumed a real StudyTask was always the
- * output. That's no longer true: REPLAN_DAY resolves to [PermittedAction.ReplanDay] (no
- * StudyTask at all — the whole day's plan is replaced) and REDUCE_DIFFICULTY/
- * INCREASE_DIFFICULTY resolve to [PermittedAction.AdjustDifficulty] (a per-concept
- * preference, not a task). [resolveRoute] is the per-candidate dispatch that picks which
- * shape applies and which [PolicyValidator] entry point validates it; [OrchestrationOutcome
- * .Created] still exists as a single shape for all three, since [ActionExecutor.execute]
- * itself is already generic over [PermittedAction] — only the *building* of the action
- * differs per intent, not its execution or escrow handling.
- *
- * Both REPLAN_DAY and REDUCE_DIFFICULTY/INCREASE_DIFFICULTY still go through [TaskEscrow]
- * even though neither is task-scoped — [Route.escrowKey] is a synthetic, non-StudyTask key
- * ("replan:&lt;dayKey&gt;" / "difficulty:&lt;conceptId&gt;", see [resolveRoute]) rather than
- * a real StudyTask id, so escrow still serializes concurrent deliveries the same way it
- * does for every other action here, without TaskEscrow itself needing to know these two
- * cases aren't task mutations.
- *
- * [GapTaskLedger.recordServed] tracking is deliberately narrower than "every successfully
- * executed candidate" — see [GAP_LEDGER_TRACKED_INTENTS]. Only REPAIR_CONCEPT/
- * START_DIAGNOSTIC/ASSIGN_TARGETED_SET participate in GapTaskLedger's single-active-concept
- * streak and P0b Testmate-round tracking; SCHEDULE_RETENTION_TEST/START_MOCK create real
- * tasks but are a different KIND of session (a recall check / a whole-student mock, not a
- * gap-repair session) and are not folded into that machinery, and REPLAN_DAY/
- * REDUCE_DIFFICULTY/INCREASE_DIFFICULTY aren't task-scoped at all. Recording any of these
- * five into GapTaskLedger's active-concept pointer would risk exactly the kind of
- * cross-purpose state collision that ledger's own bugfix history is full of examples of —
- * see [ConceptDifficultyLedger]'s doc for the same reasoning applied to difficulty storage.
- *
- * Daily-cadence wiring ([com.checkmate.service.GapTaskManager] calls [executeTopCandidate]
- * once a day, not just once at import time): without something remembering what was
- * already served, re-running the same-shaped [LearningDecisionEngine.decideFromReport]
- * output tomorrow would just re-pick today's exact candidate forever, since mastery hasn't
- * moved without the P0b evidence loop. [GapTaskLedger] is that memory for the three
- * gap-repair intents; [ReplanDayLedger] is the equivalent once-a-day guard for REPLAN_DAY
- * specifically (see its own doc — TaskEscrow alone cannot provide this, since a resolved
- * transaction never blocks a fresh acquire()).
- *
- * BUGFIX (duplicate same-round task): "re-served" above does NOT mean "re-created."
- * [GapTaskLedger.isCovered] is only true once a task reaches DONE *and* mastery clears the
- * bar — it says nothing about a concept whose task is still PENDING/ACTIVE/PAUSED/SKIPPED
- * from an earlier call. The original version of this fix had no check for that case at
- * all: every call minted a fresh [idGenerator] taskId and created a brand-new [StudyTask]
- * for the top candidate, full stop. Confirmed live: [com.checkmate.service.GapTaskManager]
- * ran twice ~5 minutes apart for the same still-unresolved concept (round 2's retest task,
- * never touched by the student) and got a SECOND new task on the second call, silently
- * orphaning the first — [GapTaskLedger]'s active-task pointer moved to the new one, leaving
- * the old one sitting in [PlanStore] as a duplicate that nothing will ever resolve.
- *
- * BUGFIX (duplicate task via re-ranking, part 2): the first fix above checked the active
- * concept ONLY while iterating the candidate whose own `conceptId` happened to equal
- * [GapTaskLedger.activeConceptId] — which only blocks anything if the active concept is
- * still the one this run's fresh re-rank puts at (or ahead of) the point the walk reaches
- * it. [LearningDecisionEngine.decideFromReport] re-ranks from scratch on every call — a
- * shift in gain estimates (e.g. from P0b evidence just imported for some OTHER concept, or
- * simply floating-point noise in [com.checkmate.learning.analytics.ScoreGainEstimator])
- * can promote a different concept to rank 1 between two calls even though the active
- * concept's own mastery hasn't moved at all. When that happens, the walk reaches the NEW
- * top candidate first, finds nothing wrong with IT specifically (its own conceptId isn't
- * covered, and it isn't the active one, so the old per-candidate check never fired for it),
- * creates a task, and returns — the still-unresolved active concept's task never gets
- * looked at, and its still-PENDING task is silently orphaned exactly like the first bug,
- * just reached through a different path. Confirmed live: with concept 56718eb2 active and
- * its round-2 task still PENDING, a fresh re-rank promoted concept 293376bd to rank 1;
- * [GapTaskLedger.recordServed] logged `isNewConcept=true` for 293376bd, meaning the old
- * per-candidate AlreadyActive check never triggered — it was still there, just never
- * reached, because the walk had already created and returned a task for 293376bd before
- * getting anywhere near 56718eb2's position in the list.
- *
- * Fix: the active-concept check now runs ONCE, up front, independent of ranking — see
- * [RejectionSource.AlreadyActive]. If [GapTaskLedger.activeConceptId] has a task that
- * exists and hasn't reached DONE, the ENTIRE walk is blocked before any candidate is even
- * considered for creation, regardless of whether that concept still appears at rank 1, at
- * some lower rank, or has dropped out of this run's candidate list altogether (a candidate
- * can vanish from the ranked list for reasons unrelated to being finished — e.g. it no
- * longer clears whatever inclusion threshold [LearningDecisionEngine.decideFromReport]
- * applies — and a missing candidate is not evidence the concept is done; only
- * [GapTaskManager.resolveDoneConcept] gets to decide that, via real mastery evidence). This
- * still does NOT change the DONE case: once the active concept's task reaches DONE,
- * [GapTaskManager.resolveDoneConcept] either covers it ([GapTaskLedger.markCovered]) or
- * clears just its P0b session fields for a new round ([GapTaskLedger.resetForNextRound]) —
- * either way the active-task lookup below finds no non-DONE task, the block does not apply,
- * and the walk proceeds normally (a fresh task for a new round, or a fresh task for a newly
- * promoted concept once the old one is genuinely covered).
- *
- * Trigger type: no existing [InterventionTriggerType] names "the learning engine decided
- * this task should exist" — [LearningInterventionCreateTaskIntegrationTest] flagged the
- * same gap and picked [InterventionTriggerType.BACKLOG_RISK] as the closest existing fit
- * rather than widening that enum for this pass; this class keeps that same choice (see
- * [LEARNING_ENGINE_TRIGGER]) so both the test-only pipeline and this production one agree
- * on what gets persisted — including for REPLAN_DAY/AdjustDifficulty, which reuse it too.
- *
- * This class does not itself decide *when* to run — it consumes an already-built
- * [LearningDecisionEngine.DecisionReport]. [com.checkmate.ui.testresults.TestResultsViewModel]
- * calls it once per fresh test import; [com.checkmate.service.GapTaskManager] calls it once
- * per day thereafter — see that class's own doc for the daily trigger.
- */
-class LearningInterventionOrchestrator(
-    private val taskEscrow: TaskEscrow,
-    private val actionExecutor: ActionExecutor,
-    private val idGenerator: () -> String = { UUID.randomUUID().toString() },
-    private val dayKeyProvider: () -> String = { GapTaskLedger.todayKey() }
-) {
-
-    /** Why a candidate never became an executed action — kept as a distinct type from
-     *  [RejectionReason] because a candidate can fail before policy is ever consulted
-     *  (see [NotMappable]), and collapsing that into a fake [RejectionReason] would
-     *  misattribute a routing decision to PolicyValidator. */
-    sealed class RejectionSource {
-        /** No [Route] could be built for this candidate's intent at all — either the
-         *  intent has no CreateTaskRequest/ReplanDay/AdjustDifficulty shape defined (not
-         *  possible today, since [resolveRoute] covers all eight
-         *  [LearningDecisionEngine.LearningInterventionIntent] values, but kept as a
-         *  distinct case rather than an exception for forward-compatibility with a future
-         *  ninth intent), or a REDUCE_DIFFICULTY/INCREASE_DIFFICULTY candidate arrived with
-         *  no [LearningDecisionEngine.CandidateIntervention.conceptId] (never expected in
-         *  practice — [LearningDecisionEngine.conceptCandidates] always sets one for these
-         *  two intents — but not assumed away), or (unchanged from the original P0a scope)
-         *  [LearningInterventionMapper.toCreateTaskRequest] returned null for a candidate
-         *  whose intent it does cover, because it's missing subject/topic. */
-        object NotMappable : RejectionSource()
-        /** [PolicyValidator]'s relevant entry point (`validateCreateTask` /
-         *  `validateReplanDay` / `validateAdjustDifficulty`) rejected the built request. */
-        data class PolicyRejected(val reason: RejectionReason) : RejectionSource()
-        /** The freshly generated escrow key collided with something already under escrow
-         *  — for CreateTask-shaped candidates this is a caller-generated taskId
-         *  (effectively unreachable given UUID generation); for REPLAN_DAY/
-         *  REDUCE_DIFFICULTY/INCREASE_DIFFICULTY the escrow key is deterministic (see
-         *  [resolveRoute]), so this is the real, reachable "a negotiation for this exact
-         *  key is already in flight" case for those three. Kept as a named case rather
-         *  than a thrown exception so a candidate this happens to is recorded like any
-         *  other rejection instead of aborting the whole walk. */
-        object TaskIdCollision : RejectionSource()
-        /** [GapTaskLedger.isCovered] already true for this candidate's concept — its
-         *  gap-task previously reached DONE, so the daily walk moves on to the next
-         *  ranked candidate instead of re-serving a concept the student already finished. */
-        object AlreadyCovered : RejectionSource()
-        /** BUGFIX (duplicate task via re-ranking, part 2): [GapTaskLedger.activeConceptId]
-         *  has a task ([GapTaskLedger.activeTaskId] in [GapTaskLedger.activeTaskDayKey]'s
-         *  plan) that still exists and hasn't reached DONE — the concept is mid-round, not
-         *  finished and not abandoned. Checked ONCE up front against the whole walk, not
-         *  per iterated candidate (see class doc's "part 2" note on why the original
-         *  per-candidate version of this check could be skipped entirely by a re-rank),
-         *  so this blocks the walk even when the active concept isn't the candidate this
-         *  run's ranking currently prefers — no task is created for anything else, and no
-         *  new task is created for the active concept either, until it's genuinely resolved. */
-        object AlreadyActive : RejectionSource()
-        /** P0a continuation: [ReplanDayLedger.hasReplannedToday] already true — today's
-         *  plan has already been regenerated once; a second REPLAN_DAY this same day would
-         *  silently wipe whatever the student has done against the first replan since. See
-         *  [ReplanDayLedger]'s own doc for why [TaskEscrow] alone can't provide this
-         *  guard. */
-        object AlreadyReplannedToday : RejectionSource()
-    }
-
-    /** One candidate that was ranked but did not end up executed — see class doc's
-     *  "failures are first-class" requirement. `rank` is 1-based position in
-     *  [LearningDecisionEngine.DecisionReport.candidates], preserved here because the
-     *  candidate itself carries no id of its own. */
-    data class CandidateRejection(
-        val candidate: LearningDecisionEngine.CandidateIntervention,
-        val rank: Int,
-        val source: RejectionSource,
-        val detail: String,
-        val timestamp: Long
-    )
-
-    sealed class OrchestrationOutcome {
-        /**
-         * The candidate that made it all the way through, plus what
-         * [ActionExecutor.execute] returned for it — callers that care whether the action
-         * really landed (vs. e.g. [ExecutionOutcome.NoOpAlreadyApplied]) read that from
-         * here rather than assuming success.
-         *
-         * P0a continuation: [taskId] is a real StudyTask id only for CreateTask-shaped
-         * candidates (REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET/
-         * SCHEDULE_RETENTION_TEST/START_MOCK). For REPLAN_DAY/REDUCE_DIFFICULTY/
-         * INCREASE_DIFFICULTY it holds the synthetic [Route.escrowKey] instead (see
-         * [resolveRoute]) — never a StudyTask id — since neither action creates or
-         * identifies one. A caller that needs to know which shape it's looking at should
-         * switch on `candidate.intent` (or on `executionOutcome`'s action type) first,
-         * rather than assuming [taskId] always names something in [PlanStore].
-         */
-        data class Created(
-            val candidate: LearningDecisionEngine.CandidateIntervention,
-            val rank: Int,
-            val taskId: String,
-            val executionOutcome: ExecutionOutcome
-        ) : OrchestrationOutcome()
-        /** Every candidate in the report was rejected (or the report had none to begin
-         *  with) — [OrchestrationResult.rejections] carries the full detail. */
-        object NoExecutableCandidate : OrchestrationOutcome()
-    }
-
-    data class OrchestrationResult(
-        val outcome: OrchestrationOutcome,
-        val rejections: List<CandidateRejection>
-    )
-
-    /**
-     * P0a continuation. What [resolveRoute] builds for one candidate before policy/escrow
-     * ever run — [escrowKey] is either a real StudyTask id (about-to-be-created, for
-     * CreateTask-shaped candidates) or a synthetic, deterministic key for REPLAN_DAY/
-     * REDUCE_DIFFICULTY/INCREASE_DIFFICULTY (see class doc). [tracksGapLedger] is false for
-     * everything except the original three P0a intents — see class doc's
-     * [GAP_LEDGER_TRACKED_INTENTS] note.
-     */
-    private data class Route(
-        val escrowKey: String,
-        val policyResult: PolicyResult,
-        val tracksGapLedger: Boolean,
-        // Closes the retention-check evidence loop (next-session-retention-loop.txt):
-        // true only for SCHEDULE_RETENTION_TEST — see [RETENTION_LEDGER_TRACKED_INTENTS]
-        // and [RetentionTaskLedger]'s own class doc for why this is a separate, lighter-
-        // weight ledger rather than folding SCHEDULE_RETENTION_TEST into
-        // [GAP_LEDGER_TRACKED_INTENTS] outright.
-        val tracksRetentionLedger: Boolean = false
-    )
-
-    /**
-     * Per-candidate dispatch — tries the CreateTask shape first (via
-     * [LearningInterventionMapper.toCreateTaskRequest], which itself returns null for any
-     * intent outside its own scope), then falls back to REPLAN_DAY / REDUCE_DIFFICULTY /
-     * INCREASE_DIFFICULTY's own shapes. Returns null only when NONE of those apply — see
-     * [RejectionSource.NotMappable].
-     */
-    private fun resolveRoute(
-        candidate: LearningDecisionEngine.CandidateIntervention,
-        dayKey: String
-    ): Route? {
-        val request = LearningInterventionMapper.toCreateTaskRequest(candidate)
-        if (request != null) {
-            val taskId = idGenerator()
-            return Route(
-                escrowKey = taskId,
-                policyResult = PolicyValidator.validateCreateTask(taskId, request),
-                tracksGapLedger = candidate.intent in GAP_LEDGER_TRACKED_INTENTS,
-                tracksRetentionLedger = candidate.intent in RETENTION_LEDGER_TRACKED_INTENTS
-            )
-        }
-
-        return when (candidate.intent) {
-            LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY -> {
-                val key = "replan:$dayKey"
-                Route(key, PolicyValidator.validateReplanDay(key), tracksGapLedger = false)
-            }
-            LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY,
-            LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY -> {
-                val conceptId = candidate.conceptId ?: return null
-                val direction = if (candidate.intent ==
-                    LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY
-                ) {
-                    DifficultyDirection.REDUCE
-                } else {
-                    DifficultyDirection.INCREASE
-                }
-                val key = "difficulty:$conceptId"
-                Route(key, PolicyValidator.validateAdjustDifficulty(conceptId, direction, key), tracksGapLedger = false)
-            }
-            else -> null
-        }
-    }
-
-    /** Looks up the active concept's task, the same "today's live list first, fall back to
-     *  loadDay" pattern [com.checkmate.service.GapTaskManager.findTask] already uses — kept
-     *  as a private duplicate rather than a shared helper since planner has no visibility
-     *  into `app`'s GapTaskManager (same direction every other cross-module boundary in
-     *  this package already respects). Returns null if there is no active concept, no
-     *  active task recorded for it, or the task can't be found in either place. */
-    private fun activeUnresolvedTask(): StudyTask? {
-        val taskId = GapTaskLedger.activeTaskId() ?: return null
-        val dayKey = GapTaskLedger.activeTaskDayKey()
-        val task = PlanStore.todayTasks.value.find { it.id == taskId }
-            ?: dayKey?.let { key -> PlanStore.loadDay(key).find { it.id == taskId } }
-        return task?.takeIf { it.state != TaskState.DONE }
-    }
-
-    /**
-     * Walks [report.candidates][LearningDecisionEngine.DecisionReport.candidates] in
-     * ranked order and executes the first one that clears the covered-concept check,
-     * routing ([resolveRoute]), policy validation, and execution — see class doc for why
-     * this stops at one instead of executing a candidate per action, and for
-     * [GapTaskLedger]/[ReplanDayLedger]'s roles in the walk. Before any of that, checks
-     * once whether [GapTaskLedger.activeConceptId] still has an unresolved task — see
-     * class doc's "part 2" BUGFIX and [RejectionSource.AlreadyActive] for why this has to
-     * run independent of ranking order rather than folded into the per-candidate loop
-     * below.
-     */
-    /**
-     * BUGFIX (unsynchronized ledger race): [com.checkmate.ui.testresults.TestResultsViewModel
-     * .executeTopIntervention] calls this directly on `Dispatchers.IO`, bypassing
-     * [com.checkmate.service.GapTaskManager] entirely — a genuinely separate call chain
-     * from [com.checkmate.service.GapTaskManager.generateIfNeeded]'s own now-locked path,
-     * racing against it for the same [GapTaskLedger] active-round/session state
-     * ([GapTaskLedger.recordServed] below is the write half of that race). Routed through
-     * [GapTaskLedger.withLock] here so both chains serialize; that same lock is reentrant
-     * per-coroutine (see its doc), so calling this from INSIDE
-     * [com.checkmate.service.GapTaskManager]'s own locked entry points runs inline instead
-     * of deadlocking against the lock its caller is already holding.
-     */
-    suspend fun executeTopCandidate(
-        report: LearningDecisionEngine.DecisionReport,
-        now: Long = System.currentTimeMillis()
-    ): OrchestrationResult = GapTaskLedger.withLock {
-        executeTopCandidateLocked(report, now)
-    }
-
-    private suspend fun executeTopCandidateLocked(
-        report: LearningDecisionEngine.DecisionReport,
-        now: Long
-    ): OrchestrationResult {
-        val rejections = mutableListOf<CandidateRejection>()
-        val dayKey = dayKeyProvider()
-
-        // BUGFIX (duplicate task via re-ranking, part 2): resolved ONCE, before any
-        // candidate is walked, so a re-rank that promotes a different concept to rank 1
-        // can never slip a new task past a still-unresolved active one — see class doc.
-        val activeConceptId = GapTaskLedger.activeConceptId()
-        if (activeConceptId != null) {
-            val blockingTask = activeUnresolvedTask()
-            if (blockingTask != null) {
-                // Attribute the rejection to whichever candidate this run's ranking would
-                // otherwise have picked, so the log still shows what got preempted — even
-                // when that candidate is a completely different concept than the one
-                // actually blocking. Falls back to the active concept's own candidate (if
-                // this run's report still contains it) and, failing that, to the report's
-                // own top entry, purely so the CandidateRejection record has something real
-                // to point at; none of these branches change WHETHER the walk is blocked.
-                val attributed = report.candidates.firstOrNull { it.conceptId == activeConceptId }
-                    ?: report.candidates.firstOrNull()
-                if (attributed != null) {
-                    val attributedRank = report.candidates.indexOf(attributed) + 1
-                    val switchNote = if (attributed.conceptId != activeConceptId) {
-                        " (this run's re-rank currently prefers concept ${attributed.conceptId} " +
-                            "instead — the active concept still wins until it's resolved)"
-                    } else ""
-                    rejections += CandidateRejection(
-                        candidate = attributed,
-                        rank = attributedRank,
-                        source = RejectionSource.AlreadyActive,
-                        detail = "concept $activeConceptId already has an unresolved task " +
-                            "(${blockingTask.id}, state=${blockingTask.state}) — not creating " +
-                            "a new task while it's pending$switchNote",
-                        timestamp = now
-                    )
-                }
-                return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
-            }
-        }
-
-        report.candidates.forEachIndexed { index, candidate ->
-            val rank = index + 1
-
-            val conceptId = candidate.conceptId
-            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
-                rejections += CandidateRejection(
-                    candidate = candidate,
-                    rank = rank,
-                    source = RejectionSource.AlreadyCovered,
-                    detail = "concept $conceptId already reached DONE on a previous gap-task run",
-                    timestamp = now
-                )
-                return@forEachIndexed
-            }
-
-            // Closes the retention-check evidence loop (next-session-retention-loop.txt):
-            // don't stack a second outstanding retention check on the same concept while
-            // an earlier one's Testmate evidence hasn't landed yet. Deliberately per-
-            // concept, not a single global slot like GapTaskLedger's AlreadyActive block
-            // above — several different concepts can genuinely have their own unresolved
-            // retention check in flight at once (see RetentionTaskLedger's own class doc).
-            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST &&
-                conceptId != null && RetentionTaskLedger.hasUnresolvedForConcept(conceptId)
-            ) {
-                rejections += CandidateRejection(
-                    candidate = candidate,
-                    rank = rank,
-                    source = RejectionSource.AlreadyActive,
-                    detail = "concept $conceptId already has an unresolved retention check in flight",
-                    timestamp = now
-                )
-                return@forEachIndexed
-            }
-
-            // P0a continuation: REPLAN_DAY's own once-a-day guard — see ReplanDayLedger's
-            // doc on why escrow alone can't provide this.
-            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY &&
-                ReplanDayLedger.hasReplannedToday(dayKey)
-            ) {
-                rejections += CandidateRejection(
-                    candidate = candidate,
-                    rank = rank,
-                    source = RejectionSource.AlreadyReplannedToday,
-                    detail = "today's plan ($dayKey) has already been replanned once",
-                    timestamp = now
-                )
-                return@forEachIndexed
-            }
-
-            val route = resolveRoute(candidate, dayKey)
-            if (route == null) {
-                rejections += CandidateRejection(
-                    candidate = candidate,
-                    rank = rank,
-                    source = RejectionSource.NotMappable,
-                    detail = "intent ${candidate.intent} is not mappable to an executable action " +
-                        "(outside every route's scope, or missing required fields)",
-                    timestamp = now
-                )
-                return@forEachIndexed
-            }
-
-            when (val policyResult = route.policyResult) {
-                is PolicyResult.Rejected -> {
-                    rejections += CandidateRejection(
-                        candidate = candidate,
-                        rank = rank,
-                        source = RejectionSource.PolicyRejected(policyResult.reason),
-                        detail = policyResult.detail,
-                        timestamp = now
-                    )
-                }
-
-                is PolicyResult.Permitted -> {
-                    when (val acquireResult = taskEscrow.acquire(route.escrowKey, LEARNING_ENGINE_TRIGGER, now)) {
-                        is EscrowAcquireResult.AlreadyHeld -> {
-                            rejections += CandidateRejection(
-                                candidate = candidate,
-                                rank = rank,
-                                source = RejectionSource.TaskIdCollision,
-                                detail = "escrow key ${route.escrowKey} already under escrow",
-                                timestamp = now
-                            )
-                        }
-
-                        is EscrowAcquireResult.Acquired -> {
-                            val executionOutcome = actionExecutor.execute(
-                                acquireResult.transaction.transactionId,
-                                policyResult.action,
-                                now
-                            )
-                            if (route.tracksGapLedger) {
-                                GapTaskLedger.recordServed(candidate, route.escrowKey, dayKey)
-                            }
-                            if (route.tracksRetentionLedger) {
-                                RetentionTaskLedger.record(candidate, route.escrowKey, dayKey)
-                            }
-                            if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY) {
-                                ReplanDayLedger.markReplannedToday(dayKey)
-                            }
-                            return OrchestrationResult(
-                                outcome = OrchestrationOutcome.Created(candidate, rank, route.escrowKey, executionOutcome),
-                                rejections = rejections
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
-    }
-
-    companion object {
-        /** See class doc's "Trigger type" note. */
-        val LEARNING_ENGINE_TRIGGER = InterventionTriggerType.BACKLOG_RISK
-
-        /** See class doc's "GapTaskLedger tracking" note — only these three participate
-         *  in the single-active-concept streak / P0b Testmate-round tracking. */
-        private val GAP_LEDGER_TRACKED_INTENTS = setOf(
-            LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
-            LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC,
-            LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
-        )
-
-        /**
-         * Closes the retention-check evidence loop (next-session-retention-loop.txt).
-         * SCHEDULE_RETENTION_TEST creates a real StudyTask (see [LearningInterventionMapper])
-         * but was never added to [GAP_LEDGER_TRACKED_INTENTS] — deliberately, per that set's
-         * own doc, since folding it into GapTaskLedger's single-active-concept slot risks the
-         * exact cross-purpose collisions that ledger's bugfix history is full of (a retention
-         * check for concept A could stomp a gap-repair round in progress for concept B, or
-         * vice versa). [RetentionTaskLedger] is the separate, per-task memory that lets
-         * [com.checkmate.service.RetentionCheckManager] request a Testmate session and import
-         * its evidence the same way [com.checkmate.service.GapTaskManager] already does for
-         * REPAIR_CONCEPT/START_DIAGNOSTIC/ASSIGN_TARGETED_SET — without touching GapTaskLedger
-         * at all.
-         */
-        private val RETENTION_LEDGER_TRACKED_INTENTS = setOf(
-            LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
-        )
-
-        /**
-         * Production wiring — same [InterventionDatabase]/[OutcomeLedgerWriter]/
-         * [PlanStoreTaskMutator] construction [InterventionReconciliation.runAtStartup]
-         * already uses, so this and the reconciliation sweep never disagree about which
-         * database or ledger a transaction was written through. P0a continuation: also
-         * wires [AdaptivePlanReplanner]/[LedgerDifficultyMutator] into the [ActionExecutor]
-         * this factory builds, so REPLAN_DAY/REDUCE_DIFFICULTY/INCREASE_DIFFICULTY are
-         * actually executable in production, not just recognized. [InterventionTriggerWorker]'s
-         * own, separate [ActionExecutor] construction deliberately does NOT get these two —
-         * that worker only ever handles behavior intents (see its own doc) and has no
-         * learning-engine candidate to build either action from.
-         */
-        fun from(context: Context): LearningInterventionOrchestrator {
-            val db = InterventionDatabase.getInstance(context)
-            val dao = db.interventionTransactionDao()
-            val ledgerWriter = OutcomeLedgerWriter(db.outcomeLedgerDao())
-            val escrow = TaskEscrow(dao, ledgerWriter)
-            val executor = ActionExecutor(
-                dao,
-                escrow,
-                PlanStoreTaskMutator(),
-                planReplanner = AdaptivePlanReplanner(context),
-                difficultyMutator = LedgerDifficultyMutator()
-            )
-            return LearningInterventionOrchestrator(escrow, executor)
-        }
-    }
-}
-
-
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/RetentionCheckManager.kt =====
-
-package com.checkmate.service
-
-import android.content.Context
-import android.util.Log
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.planner.intervention.RetentionTaskLedger
-import com.checkmate.testmate.TestmateApi
-import com.checkmate.testmate.TestmateQuestionPool
-import com.checkmate.testmate.TestmateResultOutcome
-import com.checkmate.testmate.TestmateTargetedTestOutcome
-
-/**
- * next-session-retention-loop.txt — the RETENTION CHECK execution/evidence path. Mirrors
- * [GapTaskManager]'s P0b Testmate session/evidence functions exactly (same
- * [TestmateApi.createTargetedTest] -> [TestmateApi.fetchResult] -> [TargetedTestEvidenceImporter]
- * pipeline, reused rather than duplicated), but driven off
- * [com.checkmate.planner.intervention.RetentionTaskLedger] instead of
- * [com.checkmate.planner.intervention.GapTaskLedger] — see that ledger's own class doc for why
- * retention checks get a separate, per-task ledger instead of joining GapTaskLedger's
- * single-active-concept slot.
- *
- * Both entry points are called from [ReminderService]'s existing 15-min loop, same wiring
- * pattern as every [GapTaskManager] function already there. Neither is gated to once/day —
- * [createRetentionTestsIfNeeded] should fire the moment a RETENTION CHECK task exists with no
- * session yet, and [evidencePollIfNeeded] should pick up a submitted result as soon as it's
- * there, same reasoning as [GapTaskManager.createTargetedTestIfNeeded]/`evidencePollIfNeeded`.
- *
- * Deliberately does NOT push a new retention decision anywhere itself — see
- * [RetentionTaskLedger]'s own doc for why that isn't needed: [MasteryEngine.recomputeAll]
- * (called inside [TargetedTestEvidenceImporter.import]) already refreshes `lastSeen`/mastery
- * for the concept, and [com.checkmate.learning.engine.RetentionEngine.decide] re-reads that on
- * its own next pass through [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport]
- * (i.e. [GapTaskManager.generateIfNeeded]'s next daily run). RetentionEngine's 14-day decay and
- * REVIEW/TEACH/MOVE_ON thresholds are untouched — this file only closes the evidence loop
- * around it, per next-session-retention-loop.txt's explicit constraint.
- */
-object RetentionCheckManager {
-
-    private const val TAG = "RetentionCheckManager"
-
-    // A retention check is a short recall probe, not a full repair set — sized to match
-    // LearningDecisionEngine.RETENTION_TEST_MINUTES (10 min), the StudyTask duration a
-    // SCHEDULE_RETENTION_TEST candidate already carries.
-    private const val RETENTION_QUESTION_COUNT = 10
-
-    // HONEST GAP (flagged, not silently worked around): TestmateQuestionPool only offers
-    // WRONG / SKIPPED / WRONG_SKIPPED / NEW — there is no "previously answered correctly,
-    // retest for recall" pool, which is what a genuine retention probe should draw from.
-    // WRONG_SKIPPED is the closest available option and is what this uses today, but it
-    // means a "retention check" and a gap-repair retest currently pull from the same
-    // question pool on the Testmate side — testing what the student got wrong before, not
-    // whether they still remember what they'd already gotten right. Properly closing this
-    // needs a MASTERED/CORRECT pool added to Testmate's own `/api/tests/targeted` endpoint
-    // (testmate2.vercel.app) — that's a Testmate-side change, out of scope for this
-    // Checkmate-client-only pass, and NOT something to route around with client-side
-    // filtering of Testmate's response (Testmate selects the question set server-side).
-    private val RETENTION_POOL = TestmateQuestionPool.WRONG_SKIPPED
-
-    /**
-     * For every RETENTION CHECK task that doesn't have a Testmate session yet, requests one.
-     * `intervention_id = retention-<taskId>` is already unique per task (every retention
-     * task gets its own taskId from [LearningInterventionOrchestrator]), so — unlike
-     * [GapTaskManager]'s P0b round counter — there's no round-suffix bookkeeping needed here;
-     * a retry of an already-created session is naturally idempotent via Testmate's own
-     * intervention_id de-dupe (see [TestmateApi.createTargetedTest]'s own doc).
-     */
-    suspend fun createRetentionTestsIfNeeded() {
-        val pending = RetentionTaskLedger.pendingSessionCreation()
-        for (session in pending) {
-            val chapter = session.chapter?.takeIf { it.isNotBlank() }
-            if (chapter == null) {
-                Log.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
-                continue
-            }
-            // Same "only forward topic when it's genuinely distinct from chapter" rule
-            // GapTaskManager.createTargetedTestIfNeeded applies, for the same reason:
-            // GapTaskLedger/RetentionTaskLedger both fall back to the raw chapter string as
-            // their "no real topic" sentinel.
-            val topic = session.topic?.takeIf { it != chapter }
-
-            val interventionId = "retention-${session.taskId}"
-            val outcome = try {
-                TestmateApi.createTargetedTest(
-                    interventionId = interventionId,
-                    chapter = chapter,
-                    topic = topic,
-                    questionCount = RETENTION_QUESTION_COUNT,
-                    pool = RETENTION_POOL
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
-                continue
-            }
-
-            when (outcome) {
-                is TestmateTargetedTestOutcome.Success -> {
-                    RetentionTaskLedger.recordTestmateSession(
-                        session.taskId, outcome.test.testId, outcome.test.sessionId
-                    )
-                    Log.d(TAG, "retention test ready: taskId=${session.taskId} session=${outcome.test.sessionId}")
-                }
-                is TestmateTargetedTestOutcome.Error -> {
-                    Log.w(TAG, "createTargetedTest error for taskId=${session.taskId}: ${outcome.message}")
-                }
-            }
-        }
-    }
-
-    /**
-     * Every 15-min cycle: for every RETENTION CHECK task with a Testmate session whose
-     * result hasn't been imported yet, fetches it and — once the student has actually
-     * submitted (an [TestmateResultOutcome.Error], including Testmate's "no result yet" 404,
-     * just means try again next cycle) — hands the per-question breakdown to
-     * [TargetedTestEvidenceImporter], the exact same import path
-     * [GapTaskManager.evidencePollIfNeeded] already uses for gap-repair retests. This is
-     * the actual "student answers questions -> Testmate result -> QuestionAttempt +
-     * LearningEvent -> MasteryEngine" arrow the retention loop was missing.
-     */
-    suspend fun evidencePollIfNeeded(context: Context) {
-        val pending = RetentionTaskLedger.pendingEvidence()
-        for (session in pending) {
-            val sessionId = session.testmateSessionId ?: continue
-
-            val outcome = try {
-                TestmateApi.fetchResult(sessionId)
-            } catch (e: Exception) {
-                Log.w(TAG, "evidencePollIfNeeded fetch threw for taskId=${session.taskId}: ${e.message}")
-                continue
-            }
-            val result = when (outcome) {
-                is TestmateResultOutcome.Success -> outcome.result
-                is TestmateResultOutcome.Error -> continue // not submitted yet (or a real failure) — retry next cycle
-            }
-            if (result.breakdown.isEmpty()) continue // submitted but no per-question data yet
-
-            try {
-                val exam = ConsultationProfile.load().examTarget
-                TargetedTestEvidenceImporter.import(
-                    context = context,
-                    sessionId = sessionId,
-                    exam = exam,
-                    chapter = session.chapter,
-                    topic = session.topic,
-                    result = result,
-                    // Distinct source tag from gap-repair's "testmate_targeted" so a
-                    // LearningEvent/Question row's provenance is honest about which loop
-                    // produced it, without needing a schema change to either model.
-                    source = "testmate_retention"
-                )
-                RetentionTaskLedger.markEvidenceImported(session.taskId)
-                Log.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
-            } catch (e: Exception) {
-                Log.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
-            }
-        }
-    }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/ReminderService.kt =====
-
-
-package com.checkmate.service
-
-import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.IBinder
-import androidx.core.app.NotificationCompat
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.TaskState
-import com.checkmate.workmode.UninstallGuard
-import kotlinx.coroutines.*
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.StudyMode
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
-class ReminderService : Service() {
-    companion object {
-        private const val CHANNEL_ID = "reminder_channel"
-        private const val NOTIF_ID   = 55
-        // Mentor v2 (spec 3.5): same Cloudflare Worker StatusReporter already pushes to.
-        // NOTE: the worker-side route that lets a guardian issue an "unlock"/"override"
-        // command via Telegram and have it show up here isn't part of this Android repo —
-        // this only polls a /override-status endpoint and expects {"override": true|false}
-        // back. Add the matching route to worker.js to make this live end-to-end; until then
-        // this poll just always sees false and grantRemoteOverride() is never called, so it's
-        // a safe no-op rather than a broken dependency.
-        private const val OVERRIDE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/override-status"
+object WorkModeManager {
 
-        fun start(context: Context) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                context.startForegroundService(Intent(context, ReminderService::class.java))
-            else
-                context.startService(Intent(context, ReminderService::class.java))
+    private const val KEY_ACTIVE_SOURCE = "work_mode_active_source"
+    private const val SOURCE_MANUAL   = "manual"
+    private const val SOURCE_SCHEDULE = "schedule"
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown window.
+    private const val KEY_LOCKDOWN_UNTIL     = "post_skip_lockdown_until"
+    private const val DEFAULT_LOCKDOWN_MIN   = 45
+    private const val KEY_LOCKDOWN_MINUTES   = "post_skip_lockdown_minutes"
+    // Fixed default watchlist for the escalation window — deliberately broader than the
+    // permanent blocklist since it's temporary. Guardian can extend it via
+    // "escalation_watchlist" (comma-separated package names), same storage pattern as
+    // getBlockedApps()/getBlockedDomains(). Package names, not labels — matched directly
+    // against AccessibilityEvent.packageName in AppAutomationService.
+    private val DEFAULT_ESCALATION_WATCHLIST = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",   // TikTok
+        "com.snapchat.android",
+        "com.facebook.katana",
+        "com.twitter.android",
+        "com.reddit.frontpage"
+    )
+
+    // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
+    private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
+    private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    /**
+     * Call once from CheckmateApp.onCreate and BootReceiver, after
+     * CheckmatePrefs.init()/CheckmateState.init(). Syncs the in-memory flag
+     * with whatever was persisted before this process started — previously
+     * _isActive always reset to false on a fresh process even if the
+     * student had an active session, which silently turned off app
+     * blocking until the app UI was reopened. Also immediately reconciles
+     * against the hardcoded schedule.
+     */
+    fun init(context: Context) {
+        TrustedTime.refreshIfNeeded(context)
+        _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
+        evaluateSchedule(context)
+    }
+
+    fun activate(context: Context, source: String = SOURCE_MANUAL) {
+        CheckmateState.setMode(context, StudyMode.STUDY)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, source)
+        _isActive.value = true
+        startService(context)
+    }
+
+    /**
+     * Turns Work Mode off. Returns true if it actually turned off.
+     *
+     * Returns false — and leaves blocking ON — if the hardcoded daily
+     * schedule (WorkModeSchedule) is currently in force and no guardian PIN
+     * unlock is active. This is what closes the "mark the task done/skip it,
+     * then browse freely until the next one" loophole during the
+     * 19:00-02:00 window: block mode isn't tied to any single task while
+     * the schedule says it should be on.
+     */
+    fun deactivate(context: Context): Boolean {
+        DistractionGuard.reset()
+        if (WorkModeSchedule.isWithinScheduledWindow() && !UninstallGuard.isUnlocked()) {
+            // Whatever session requested this deactivate (e.g. a manual task
+            // finishing) is over, but the hardcoded schedule is still in force.
+            // Hand the active-source tag back to "schedule" so evaluateSchedule()
+            // can auto-release Work Mode once the window itself ends — otherwise
+            // this stays tagged as the task's source (e.g. "manual") forever, the
+            // natural-end auto-release check never matches, and blocking silently
+            // continues past the hardcoded window until manually toggled off.
+            CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
+            return false
+        }
+        CheckmateState.setMode(context, StudyMode.NORMAL)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, "")
+        _isActive.value = false
+        context.stopService(Intent(context, WorkModeService::class.java))
+        return true
+    }
+
+    fun toggle(context: Context) {
+        if (_isActive.value) deactivate(context) else activate(context)
+    }
+
+    /**
+     * True whenever app/website blocking must be enforced right now —
+     * either a manual/task session is active, or the hardcoded 19:00-02:00
+     * window is live. AppAutomationService keys blocking decisions off
+     * this instead of the raw [isActive] flag, so the hardcoded window
+     * can't be bypassed just by never starting a task, or by the
+     * accessibility-service process restarting and losing in-memory state.
+     */
+    fun isEnforcing(): Boolean = _isActive.value || WorkModeSchedule.isWithinScheduledWindow()
+
+    /**
+     * True when Work Mode settings (Blocked Apps, Blocked Websites, Focus
+     * Cycle toggles, Guardian Telegram Chat ID) must be read-only in the UI.
+     *
+     * Locked permanently as soon as a guardian PIN exists — NOT just while
+     * a session/the hardcoded window is enforcing. Before any PIN has been
+     * generated (first launch / initial setup) these stay open so the
+     * guardian can configure them once. After that, the only way past this
+     * gate is a guardian PIN unlock — the same UninstallGuard mechanism
+     * that gates uninstall protection, so there's still exactly one PIN,
+     * and the student never sees it either way. Tying this to enforcement
+     * state alone used to leave a window (outside 19:00-02:00, no active
+     * session) where these were freely editable; that loophole is now closed.
+     */
+    // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —
+    // even a correct guardian PIN unlock doesn't reopen settings while the recent skip rate
+    // is over threshold. This is deliberate escalation, not a bug: a guardian who's just
+    // unlocked settings during a bad week should still see them locked back down once the
+    // unlock window (UNLOCK_WINDOW_MS in UninstallGuard) lapses, same as before — the new
+    // clause only matters while skipRateExceedsThreshold() is true, which requires an actual
+    // sustained skip pattern (see DEFAULT_ESCALATION_THRESHOLD), not a one-off.
+    // Recommended mitigation for the "guardian genuinely needs in during an escalation"
+    // case: UninstallGuard.grantRemoteOverride() (Telegram-command driven, see that file) —
+    // it bypasses this gate entirely rather than fighting it.
+    fun settingsLocked(): Boolean =
+        UninstallGuard.hasPinConfigured() &&
+        !UninstallGuard.hasRemoteOverride() &&
+        (!UninstallGuard.isUnlocked() || skipRateExceedsThreshold())
+
+    /**
+     * Mentor v2 (spec 3.5): reads the skip rate PsycheEngine.refreshBehaviorSummaryCache()
+     * writes into "recent_skip_rate" (a plain CheckmatePrefs bridge, same pattern as the
+     * "behavior_summary" cache — :modules:workmode has no dependency on :modules:psyche, so
+     * this avoids adding one). Threshold is configurable via "escalation_skip_threshold";
+     * defaults to DEFAULT_ESCALATION_THRESHOLD.
+     */
+    fun skipRateExceedsThreshold(): Boolean {
+        val rate = CheckmatePrefs.getString("recent_skip_rate", "0")?.toFloatOrNull() ?: 0f
+        val threshold = CheckmatePrefs.getString(KEY_ESCALATION_THRESHOLD, null)?.toFloatOrNull()
+            ?: DEFAULT_ESCALATION_THRESHOLD
+        return rate > threshold
+    }
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown.
+
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip(). */
+    fun startPostSkipLockdown(context: Context) {
+        val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
+            .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
+        val until = System.currentTimeMillis() + minutes * 60 * 1000L
+        CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+    }
+
+    /** True while a post-skip lockdown window is active. AppAutomationService checks this
+     *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
+     *  grace period for apps on [getEscalationWatchlist]. */
+    fun isInPostSkipLockdown(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
+
+    /** Package names blocked on first foreground during a post-skip lockdown window — the
+     *  permanent blocklist plus a fixed distraction-prone watchlist (extendable via prefs). */
+    fun getEscalationWatchlist(): Set<String> {
+        val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
+        val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet
+    }
+
+    /**
+     * Reconciles [isActive] with the hardcoded schedule. Call on app start,
+     * boot, from the twice-daily schedule alarms (WorkModeScheduleReceiver),
+     * and periodically from the accessibility service.
+     *
+     * Only ever force-starts or force-stops sessions that IT started
+     * (tracked via [KEY_ACTIVE_SOURCE] = "schedule") — a manual task session
+     * that happens to be running is never auto-cancelled here, and a manual
+     * session that outlasts the window keeps running under student control
+     * exactly as before.
+     */
+    fun evaluateSchedule(context: Context) {
+        val inWindow = WorkModeSchedule.isWithinScheduledWindow()
+        val currentSource = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "")
+
+        if (inWindow && !_isActive.value) {
+            activate(context, source = SOURCE_SCHEDULE)
+        } else if (!inWindow && _isActive.value && currentSource == SOURCE_SCHEDULE) {
+            // Window ended naturally and nothing manual took over — release
+            // it without requiring a PIN, since this isn't a student action.
+            deactivate(context)
         }
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private val httpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(8, TimeUnit.SECONDS)
-            .build()
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
+     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
+     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
+     * that a guardian toggled on manually or that the hardcoded schedule opened,
+     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
+     * fix; nothing outside this object needed to read it.
+     */
+    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
+    /** Returns package names of apps to block. */
+    fun getBlockedApps(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
-    override fun onCreate() {
-        super.onCreate()
-        createChannel()
-        startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
-        scope.launch {
-            while (isActive) {
-                // Bugfix ("old tasks not clearing at end of day"): PlanStore.todayTasks is
-                // only ever populated at process start or by a local write, so a DONE/SKIPPED
-                // task just sat there until the app restarted. Runs first each cycle so every
-                // check below it (checkPendingTasks, ProactiveMentor, GapTaskManager) sees the
-                // cleaned-up list. See PlanStore.cleanupCompletedIfDue's own doc for the 9 PM
-                // guard and the tomorrow-carry-forward for still-unresolved tasks. When it
-                // returns non-null, tasks were carried onto tomorrow's plan — push that day's
-                // list to TaskSyncManager right away instead of leaving it stranded locally
-                // until some unrelated future edit happens to touch tomorrow's plan and
-                // trigger a push (PlanStore itself stays sync-unaware; this is the one place
-                // that bridges the two, same as HomeViewModel already does for today's list).
-                try {
-                    val carried = PlanStore.cleanupCompletedIfDue()
-                    if (carried != null) {
-                        withContext(Dispatchers.IO) {
-                            TaskSyncManager.pushTasks(carried.tasks, carried.dayKey, carried.updatedAt)
-                        }
-                    }
-                } catch (_: Exception) {}
-                checkPendingTasks()
-                // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
-                // nothing's been started by the configured hour. No-ops after the first fire
-                // each day (see ProactiveMentor.idleCheckIfNeeded's day-key guard).
-                try { ProactiveMentor.idleCheckIfNeeded(applicationContext) } catch (_: Exception) {}
-                // "No tasks in plan == no study": once-daily check for a multi-day gap with
-                // no plan/completion, nudges the student and alerts the guardian. Same
-                // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
-                try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
-                // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
-                // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
-                try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
-                // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
-                // own class doc always said was still missing — runs the analysis pipeline once
-                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. Also
-                // requests the P0b Testmate targeted test for whatever concept ends up active.
-                // See GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
-                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
-                // Gap-task escalation: warns the student, with escalating persuasion, when the
-                // currently-active gap concept has gone unaddressed for more than a day — see
-                // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
-                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
-                // P0b: the actual evidence-loop return arrow — polls the active concept's
-                // Testmate targeted-test session and, once it's submitted, imports real
-                // QuestionAttempt/LearningEvent evidence instead of leaving mastery to move
-                // only off the task's DONE flag. Deliberately every cycle, not once/day — see
-                // GapTaskManager.evidencePollIfNeeded's own doc.
-                try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
-                // Retention-check evidence loop (next-session-retention-loop.txt): requests a
-                // Testmate session for any RETENTION CHECK task that doesn't have one yet —
-                // see RetentionCheckManager's own doc for why this is a separate ledger/
-                // manager from the gap-repair pair above rather than folded into it.
-                try { RetentionCheckManager.createRetentionTestsIfNeeded() } catch (_: Exception) {}
-                // Retention-check evidence loop, return arrow: polls any outstanding retention
-                // session and, once submitted, imports real QuestionAttempt/LearningEvent
-                // evidence — same every-cycle (not once/day) cadence as the gap-repair poll
-                // above, for the same reason (the student can submit at any time).
-                try { RetentionCheckManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
-                // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
-                try { pollRemoteOverride() } catch (_: Exception) {}
-                delay(15 * 60 * 1000L) // check every 15 min
-            }
-        }
+    /**
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
+     */
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
-    private suspend fun checkPendingTasks() {
-        val tasks = PlanStore.getTodayTasksSnapshot()
-        val pending = tasks.filter { it.state == TaskState.PENDING }
-        if (pending.isNotEmpty()) {
-            val next = pending.first()
-            CheckmateTTS.speak(this, "Reminder: ${next.subject} — ${next.topic} is pending.")
-        }
+    private fun startService(context: Context) {
+        val intent = Intent(context, WorkModeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
     }
 
-    /** See OVERRIDE_URL note above — safe no-op until the worker-side route exists. */
-    private suspend fun pollRemoteOverride() = withContext(Dispatchers.IO) {
-        val chatId = TelegramAlertBot.getChatId() ?: return@withContext
-        val request = Request.Builder()
-            .url("$OVERRIDE_URL?chatId=$chatId")
-            .get()
-            .build()
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return@withContext
-            val body = response.body?.string() ?: return@withContext
-            val overridden = JSONObject(body).optBoolean("override", false)
-            if (overridden) UninstallGuard.grantRemoteOverride()
-        }
-    }
-
-    private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setContentTitle("Checkmate")
-        .setContentText(text)
-        .setSmallIcon(android.R.drawable.ic_dialog_info)
-        .setOngoing(true)
-        .setPriority(NotificationCompat.PRIORITY_LOW)
-        .build()
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-        }
-    }
-
-    override fun onDestroy() { scope.cancel(); super.onDestroy() }
-    override fun onBind(intent: Intent?): IBinder? = null
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * public (was folded into the private SOURCE_* consts before this fix) so
+     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
+     * own activate() calls and compare against [activeSource]. Kept as a plain
+     * string constant to match every other source tag's storage as raw
+     * CheckmatePrefs strings.
+     */
+    const val SOURCE_TASK = "task"
 }
 
 
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeViewModel.kt =====
-
-
-package com.checkmate.ui.home
+//===== FILE: app/src/main/kotlin/com/checkmate/service/WorkModeTaskReconciler.kt =====
+package com.checkmate.service
 
 import android.content.Context
-import android.content.Intent
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import android.app.Activity
-import com.checkmate.core.AppUsageTracker
-import com.checkmate.core.AttentionCycleManager
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.core.TodayContext
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.GapTaskLedger
-import com.checkmate.planner.intervention.RetentionTaskLedger
-import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
-import com.checkmate.planner.model.TaskType
-import com.checkmate.psyche.PsycheEngine
-import com.checkmate.service.AttentionCycleService
-import com.checkmate.service.FloatingAttentionService
-import com.checkmate.service.GapTaskManager
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.service.TaskSyncManager
 import com.checkmate.workmode.WorkModeManager
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 
-data class HomeState(
-    val tasks:             List<StudyTask> = emptyList(),
-    val activeTaskId:      String?         = null,
-    val completedToday:    Int             = 0,
-    val streakDays:        Int             = 0,
-    val psycheMessage:     String          = "",
-    val consecutiveSkips:  Int             = 0,
-    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──
-    // Non-null exactly while the corresponding dialog should be showing on HomeScreen.
-    val intentionPromptTask:  StudyTask?   = null,
-    val completionPromptTask: StudyTask?   = null,
-    // ── Task Sync (two-device) ── true only while a manual sync tap is in flight.
-    val syncEnabled:        Boolean        = false,
-    val syncing:            Boolean        = false,
-    // ── P0b (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
-    // Snapshot of GapTaskLedger's active-concept P0b state, refreshed every time
-    // GapTaskLedger.version changes — see that field's own doc for why reading the
-    // ledger straight from inside HomeScreen's @Composable body isn't enough on its
-    // own. null/null means no gap-task is currently mid-round (nothing to show a
-    // repair-test button for).
-    val activeGapTaskId:     String?        = null,
-    val activeRepairSessionId: String?      = null,
-    // Retention-check evidence loop (next-session-retention-loop.txt): unlike the single
-    // active gap-repair slot above, several RETENTION CHECK tasks can have their own
-    // outstanding Testmate session at once — see RetentionTaskLedger's own class doc for
-    // why this is keyed by taskId instead of one active-session field. Only entries whose
-    // session has actually been created are included (a task still waiting on
-    // RetentionCheckManager.createRetentionTestsIfNeeded has no sessionId yet).
-    val activeRetentionSessions: Map<String, String> = emptyMap()
-)
+/**
+ * BUGFIX: notification-panel "Start" and cross-device task sync never activated
+ * WorkMode.
+ *
+ * [WorkModeManager.activate] used to be called from exactly one place —
+ * HomeViewModel.launchTask(), which only runs when the student taps Start inside
+ * the app UI. Two other paths flip a task to [TaskState.ACTIVE] without ever going
+ * through launchTask():
+ *   1. The notification "Start" action — InterventionActionReceiver.handleStart()
+ *      -> ActionExecutor -> PlanStoreTaskMutator.startTask() -> PlanStore.setTaskActive(),
+ *      a pure data write with no side effects.
+ *   2. Cross-device sync — HomeViewModel.pullSync()/syncNow() -> TaskSyncManager
+ *      .pullTasksIfNewer() -> PlanStore.saveTodayTasks(remote), which can silently
+ *      repaint a task as ACTIVE (started on the other device) without this device's
+ *      WorkModeManager ever hearing about it.
+ *
+ * Rather than patching WorkModeManager.activate() calls into each of those call
+ * sites individually (and risk missing the next one), this makes WorkMode a
+ * function of task state: every task mutation, from any origin, already funnels
+ * through PlanStore.todayTasks (see HomeViewModel.loadTodayPlan's own doc on that
+ * guarantee), so subscribing here once covers all current and future start paths.
+ *
+ * Deliberately lives in `app`, not in :modules:workmode or :modules:planner — those
+ * two modules don't depend on each other (:modules:workmode only depends on
+ * :modules:core; :modules:planner never references workmode), and `app` is the only
+ * module that sees both. Same cross-module wiring pattern as
+ * InterventionNotificationBridge.gateway, set from CheckmateApp.onCreate.
+ *
+ * Deliberately additive, not a replacement for the existing direct
+ * WorkModeManager.activate()/deactivate() calls in HomeViewModel's in-app Start/
+ * Done/Skip flow: those calls run synchronously before the app-launch/service-start
+ * work that follows them in the same function, and moving that onto this reactive
+ * subscriber's timing would risk the target app or AttentionCycleService starting
+ * before Work Mode is actually enforcing. This reconciler is the single source of
+ * truth for the two paths that had no coverage at all; on the in-app path it's a
+ * harmless, idempotent no-op alongside the direct call that already works.
+ */
+object WorkModeTaskReconciler {
 
-class HomeViewModel : ViewModel() {
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private val _state = MutableStateFlow(HomeState())
-    val state: StateFlow<HomeState> = _state.asStateFlow()
-
-    // MainActivity observes this to launch the MediaProjection system dialog
-    private val _requestProjection = MutableSharedFlow<StudyTask>(extraBufferCapacity = 1)
-    val requestProjection: SharedFlow<StudyTask> = _requestProjection.asSharedFlow()
-
-    private var pendingTask: StudyTask? = null
-
-    init {
-        _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
-        loadTodayPlan(); loadStreak(); loadPsycheMessage(); loadGapTaskSession()
-        loadRetentionSessions()
-        pullSync()
+    /** Call once from CheckmateApp.onCreate, after WorkModeManager.init(this). */
+    fun start(context: Context) {
+        PlanStore.todayTasks
+            .map { tasks -> tasks.any { it.state == TaskState.ACTIVE || it.state == TaskState.PAUSED } }
+            .distinctUntilChanged()
+            .onEach { hasLiveTask -> reconcile(context, hasLiveTask) }
+            .launchIn(scope)
     }
 
-    /**
-     * Every emission of PlanStore.todayTasks — i.e. every local task mutation, since
-     * all of PlanStore's writes funnel through the same StateFlow — also pushes today's
-     * plan to TaskSyncManager. This is the single hook point for auto-sync: add/remove/
-     * edit-duration/schedule/start/pause/resume/done/skip all end up here without
-     * needing a push call added at each individual call site. TaskSyncManager itself
-     * no-ops instantly if no sync code is configured, so this is free on a device that
-     * hasn't opted into sync. Runs on a plain background thread (not viewModelScope),
-     * same convention as StatusReporter/GuardianNotifier elsewhere in the app, since
-     * it's fire-and-forget and outlives any single Compose recomposition anyway.
-     */
-    private fun loadTodayPlan() {
-        viewModelScope.launch {
-            PlanStore.todayTasks.collect { tasks ->
-                _state.update { it.copy(
-                    tasks          = tasks,
-                    completedToday = tasks.count { t -> t.state == TaskState.DONE },
-                    activeTaskId   = tasks.firstOrNull { t ->
-                        t.state == TaskState.ACTIVE || t.state == TaskState.PAUSED
-                    }?.id
-                )}
-                if (TaskSyncManager.isEnabled()) {
-                    Thread { TaskSyncManager.pushTasks(tasks) }.start()
-                }
+    private fun reconcile(context: Context, hasLiveTask: Boolean) {
+        if (hasLiveTask) {
+            if (!WorkModeManager.isActive.value) {
+                WorkModeManager.activate(context, source = WorkModeManager.SOURCE_TASK)
             }
+            return
         }
-    }
 
-    /**
-     * Pulls the other device's copy of today's plan if it's newer, silently, once —
-     * called from init so opening the app on either device picks up whatever the
-     * other one last did. See syncNow() for the manual on-demand version (HomeHeader's
-     * sync button), which is the only way to re-check without relaunching the screen.
-     */
-    private fun pullSync() {
-        if (!TaskSyncManager.isEnabled()) return
-        Thread {
-            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
-            if (remote != null) PlanStore.saveTodayTasks(remote)
-        }.start()
-    }
-
-    /** Manual sync trigger for HomeHeader's sync icon — same pull as init, plus a brief spinner. */
-    fun syncNow() {
-        if (!TaskSyncManager.isEnabled()) return
-        _state.update { it.copy(syncing = true) }
-        Thread {
-            val remote = TaskSyncManager.pullTasksIfNewer(PlanStore.getLastUpdatedAt())
-            if (remote != null) PlanStore.saveTodayTasks(remote)
-            _state.update { it.copy(syncing = false) }
-        }.start()
-    }
-
-    private fun loadStreak() {
-        viewModelScope.launch { _state.update { it.copy(streakDays = PlanStore.getStreakDays()) } }
-    }
-
-    /**
-     * BUGFIX (r1-result-on-r2-screen, background-loop case): GapTaskLedger's P0b session
-     * fields are CheckmatePrefs-backed with no observable of their own, so ReminderService's
-     * background loop (resolveDoneConcept's low-mastery branch -> resetForNextRound, then
-     * createTargetedTestIfNeeded -> recordTestmateSession) used to update them with nothing
-     * telling Compose to notice — see GapTaskLedger.version's own doc for the full repro.
-     * Collecting that version counter here and re-reading the ledger's live accessors into
-     * HomeState on every emission is what makes those background writes actually reach
-     * HomeScreen, the same way PlanStore.todayTasks already does for task mutations.
-     * GapTaskLedger.version starts at 0 and this collect fires once immediately (StateFlow
-     * always replays its current value to a new collector), so the very first snapshot is
-     * populated without waiting for any actual change.
-     */
-    private fun loadGapTaskSession() {
-        viewModelScope.launch {
-            GapTaskLedger.version.collect {
-                _state.update { it.copy(
-                    activeGapTaskId        = GapTaskLedger.activeTaskId(),
-                    activeRepairSessionId  = GapTaskLedger.activeTestmateSessionId()
-                )}
-            }
-        }
-    }
-
-    /**
-     * Retention-check evidence loop (next-session-retention-loop.txt): same "CheckmatePrefs
-     * write has no observable of its own, so collect the ledger's version counter and
-     * re-snapshot into Compose state" shape [loadGapTaskSession] already uses for
-     * GapTaskLedger, applied to [RetentionTaskLedger] instead. RetentionCheckManager runs
-     * from ReminderService's background loop, entirely outside Compose, so without this
-     * collector HomeScreen would never notice a retention session becoming available to take.
-     */
-    private fun loadRetentionSessions() {
-        viewModelScope.launch {
-            RetentionTaskLedger.version.collect {
-                // pendingEvidence() is exactly "has a session, evidence not imported yet" —
-                // pendingSessionCreation() entries never have a sessionId by definition, so
-                // there's nothing to add from that list here.
-                val sessions = RetentionTaskLedger.pendingEvidence()
-                    .mapNotNull { entry -> entry.testmateSessionId?.let { entry.taskId to it } }
-                    .toMap()
-                _state.update { it.copy(activeRetentionSessions = sessions) }
-            }
-        }
-    }
-
-    private fun loadPsycheMessage() {
-        viewModelScope.launch {
-            _state.update { it.copy(psycheMessage = PsycheEngine.getDailyMorningMessage()) }
-        }
-    }
-
-    /**
-     * Adds a manually-created task to today's plan.
-     * Uses PlanStore.addCustomTask() which is additive only — it appends onto
-     * whatever is already in today's list (AI-generated or previously added custom
-     * tasks) and never overwrites/clears them. isCustom = true is what later lets
-     * HomeScreen show the duration-edit affordance only for tasks added this way.
-     * The StudyTask is otherwise identical in shape to a generated one, so it
-     * automatically renders in the same TaskCard, drives AttentionCycleService/
-     * WorkModeManager the same way via startTask(), and triggers the same
-     * GuardianNotifier WhatsApp "task started" ping plus the same end-of-day
-     * WhatsApp/Telegram report — no extra wiring required.
-     *
-     * scheduledStartTime is now resolved via findNextFreeSlot() instead of being left
-     * null — previously every custom task landed in Timeline view's "Unscheduled"
-     * section unconditionally, since only AdaptivePlanner's generated plan ever ran
-     * assignScheduledTimes(). A custom task that genuinely doesn't fit anywhere in
-     * today's free time still comes back null and still falls into "Unscheduled" —
-     * that part is unchanged.
-     */
-    fun addCustomTask(context: Context, subject: String, topic: String, durationMinutes: Int, taskType: TaskType = TaskType.OTHER) {
-        val cleanSubject  = subject.trim()
-        val cleanTopic    = topic.trim()
-        val cleanDuration = durationMinutes.coerceIn(5, 240)
-        if (cleanSubject.isBlank() || cleanTopic.isBlank()) return
-
-        val task = StudyTask(
-            subject            = cleanSubject,
-            topic              = cleanTopic,
-            durationMinutes    = cleanDuration,
-            isCustom           = true,
-            taskType           = taskType,
-            scheduledStartTime = findNextFreeSlot(cleanDuration)
-        )
-        PlanStore.addCustomTask(task)
-        CheckmateTTS.speak(context, "Custom task added. $cleanSubject, $cleanTopic, $cleanDuration minutes.")
-    }
-
-    /**
-     * Mirrors AdaptivePlanner.assignScheduledTimes() for a single manually-added task:
-     * today's free slots (study window minus ConsultationProfile.blockedSlots) minus
-     * whatever today's plan has already scheduled, first-fit. Reads study_start/study_end
-     * straight from CheckmatePrefs — the same keys PlannerViewModel persists them under —
-     * so this doesn't need the Plan screen's ViewModel in scope. Returns null when nothing
-     * today has room, same as the generated-plan path.
-     */
-    private fun findNextFreeSlot(durationMinutes: Int): String? {
-        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
-        val studyEnd   = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
-        val profile    = ConsultationProfile.load()
-
-        val freeSlots = FreeSlotCalculator.computeFreeSlots(profile.blockedSlots, studyStart, studyEnd)
-        val occupied  = PlanStore.todayTasks.value.mapNotNull { t ->
-            val start = t.scheduledStartTime ?: return@mapNotNull null
-            val startMinute = FreeSlotCalculator.parseTimeOrNull(start) ?: return@mapNotNull null
-            startMinute to (startMinute + t.durationMinutes)
-        }
-        val remaining = FreeSlotCalculator.subtractOccupied(freeSlots, occupied)
-        return FreeSlotCalculator.firstFitStart(durationMinutes, remaining)
-            ?.let { FreeSlotCalculator.formatMinutes(it) }
-    }
-
-    /**
-     * Manually assigns/edits a task's scheduledStartTime — the "Schedule" action on an
-     * Unscheduled TaskCard in Timeline view. Available for both custom and generated
-     * tasks: a generated task can end up unscheduled too when the day's plan doesn't fit
-     * today's free time (see AdaptivePlanner.assignScheduledTimes), and until now there
-     * was no way to fix that from HomeScreen except deleting and re-adding it. Same
-     * PENDING-only guard as editTaskDuration/removeTask — once a task is running its
-     * position on the timeline isn't meaningful to change.
-     */
-    fun scheduleTask(task: StudyTask, hhmm: String) {
-        if (task.state != TaskState.PENDING) return
-        PlanStore.updateTaskSchedule(task.id, hhmm)
-    }
-
-    /**
-     * Sets a task's start AND end time directly — the clock-icon action on TaskCard,
-     * available on both List and Timeline views for any PENDING task (scheduled or not).
-     * endHHmm must be strictly after startHHmm (same-day only, no overnight wraparound);
-     * durationMinutes is derived from the difference so it and scheduledStartTime can
-     * never drift apart from each other. Same PENDING-only guard as scheduleTask() /
-     * editTaskDuration() — a task that's already ACTIVE/PAUSED has a running timer that
-     * shouldn't be resliced underneath it.
-     */
-    fun rescheduleTask(task: StudyTask, startHHmm: String, endHHmm: String) {
-        if (task.state != TaskState.PENDING) return
-        val startMinute = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return
-        val endMinute   = FreeSlotCalculator.parseTimeOrNull(endHHmm) ?: return
-        val duration    = endMinute - startMinute
-        if (duration <= 0) return
-        PlanStore.updateTaskScheduleAndDuration(task.id, startHHmm, duration)
-    }
-
-    /**
-     * Edits the duration of a custom task. Only allowed for tasks created via
-     * addCustomTask (isCustom = true) and only while still PENDING — once a task
-     * is ACTIVE/PAUSED its timer has already started inside AttentionCycleService,
-     * so changing durationMinutes underneath it would desync the running countdown.
-     * Generated (AI-planned) tasks are intentionally left untouched here — their
-     * duration comes from AdaptivePlanner's PYQ-weighted scheduling logic.
-     */
-    fun editTaskDuration(task: StudyTask, newDurationMinutes: Int) {
-        if (!task.isCustom || task.state != TaskState.PENDING) return
-        val clamped = newDurationMinutes.coerceIn(5, 240)
-        PlanStore.updateTaskDuration(task.id, clamped)
-    }
-
-    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
-    fun removeTask(task: StudyTask) {
-        if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
-        PlanStore.removeTask(task.id)
-    }
-
-    /**
-     * Blueprint 10.1: Intention Declaration.
-     * Tapping "Start Now" no longer launches the session directly — it first
-     * surfaces the "What will you study?" prompt on HomeScreen via
-     * intentionPromptTask. The actual launch (media projection check, service
-     * starts, WorkMode activation, etc.) is deferred to
-     * confirmIntentionAndStart() once the student answers.
-     */
-    fun startTask(context: Context, task: StudyTask) {
-        _state.update { it.copy(intentionPromptTask = task) }
-    }
-
-    fun dismissIntentionPrompt() {
-        _state.update { it.copy(intentionPromptTask = null) }
-    }
-
-    /** Called from HomeScreen's IntentionDialog once the student confirms their intention. */
-    fun confirmIntentionAndStart(context: Context, task: StudyTask, intentionText: String) {
-        val clean = intentionText.trim().ifBlank { task.topic }
-        PlanStore.setIntention(task.id, clean)
-        _state.update { it.copy(intentionPromptTask = null) }
-        if (ScreenCaptureManager.isReady()) {
-            launchTask(context, task)
-        } else {
-            pendingTask = task
-            _requestProjection.tryEmit(task)
-        }
-    }
-
-    /**
-     * Called by MainActivity after user approves the MediaProjection dialog.
-     * resultCode + data are forwarded into AttentionCycleService's start intent so that
-     * getMediaProjection() is called only AFTER startForeground() runs inside the service.
-     * Fix for: SecurityException: Media projections require a foreground service of type
-     *          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-     */
-    fun onProjectionGranted(context: Context, resultCode: Int, data: Intent?) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        AttentionCycleService.start(
-            context,
-            task.id,
-            task.topic,
-            task.durationMinutes.toLong(),
-            projectionResultCode = resultCode,
-            projectionData       = data
-        )
-        launchTask(context, task, serviceAlreadyStarted = true)
-    }
-
-    fun onProjectionDenied(context: Context) {
-        val task = pendingTask ?: return
-        pendingTask = null
-        launchTask(context, task)
-    }
-
-    private fun launchTask(context: Context, task: StudyTask, serviceAlreadyStarted: Boolean = false) {
-        viewModelScope.launch {
-            WorkModeManager.activate(context)
-            val mappedPkg = CheckmatePrefs.getString("app_map_${task.subject}", null)
-            mappedPkg?.let { pkg ->
-                context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    ?.let { context.startActivity(it) }
-            }
-            if (!serviceAlreadyStarted) {
-                AttentionCycleService.start(context, task.id, task.topic, task.durationMinutes.toLong())
-            }
-            FloatingAttentionService.start(context)
-            CheckmateTTS.speak(context, "Starting ${task.subject}. Focus for ${task.durationMinutes} minutes.")
-            PlanStore.setTaskActive(task.id)
-            _state.update { it.copy(activeTaskId = task.id, consecutiveSkips = 0) }
-            GuardianNotifier.notifyTaskStarted(context, task.subject, task.topic, task.durationMinutes)
-        }
-    }
-
-    /**
-     * Blueprint 10.1: Session Check-In.
-     * Replaces the old direct call to markDone() from the "Done" button —
-     * surfaces the "Did you finish it?" prompt on HomeScreen via
-     * completionPromptTask first. The actual completion (service stop, state
-     * update, TTS) happens in confirmCompletion() once the student answers.
-     */
-    fun requestCompletion(context: Context, task: StudyTask) {
-        _state.update { it.copy(completionPromptTask = task) }
-    }
-
-    fun dismissCompletionPrompt() {
-        _state.update { it.copy(completionPromptTask = null) }
-    }
-
-    /**
-     * status is one of "YES" | "PARTIAL" | "NO" — a self-report of whether the
-     * declared intention was met. The task is still marked DONE either way
-     * (the session ended); completedStatus is a separate accountability signal
-     * (surfaced later in Stats / the weekly guardian report), not a change to
-     * task state.
-     */
-    fun confirmCompletion(context: Context, task: StudyTask, status: String) {
-        viewModelScope.launch {
-            // BUGFIX (carried over): read attention-check counts BEFORE stopping the service —
-            // AttentionCycleService.stop() triggers onDestroy() -> AttentionCycleManager.reset(),
-            // which zeroes checksPassed/checksMissed. Read too late (or not at all) and
-            // PsycheEngine.onTaskCompleted() always records 0/0 into BehaviorLedger regardless
-            // of how many attention checks the student actually confirmed.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
+        // No live task. Only release Work Mode if WE were the one holding it open —
+        // never stomp on a MANUAL guardian toggle or the hardcoded SCHEDULE window,
+        // both of which are legitimately independent of any single task's state.
+        // deactivate() itself still re-checks WorkModeSchedule and refuses to actually
+        // turn off if the 19:00-02:00 window is live, same guard markDone/markSkip
+        // already rely on.
+        if (WorkModeManager.isActive.value && WorkModeManager.activeSource() == WorkModeManager.SOURCE_TASK) {
             WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.DONE)
-            // BUGFIX (r1-result-on-r2-screen, mark-done race): GapTaskManager's
-            // resolveDoneConcept/resetForNextRound/createTargetedTestIfNeeded chain — the
-            // whole thing that advances a gap concept's P0b round and swaps in a fresh
-            // Testmate session — used to run ONLY from ReminderService's 15-minute
-            // background loop. Nothing on this "Done" path ever called into
-            // GapTaskManager, so marking a gap-concept review task DONE here left
-            // GapTaskLedger's active session pointer exactly where it was (still the OLD,
-            // already-completed round's session) for up to 15 minutes. HomeScreen's
-            // "Take repair test" button (see HomeScreen's repairSessionFor) reads that
-            // same ledger value on every recomposition with no freshness check of its
-            // own, so tapping it during that window opened the stale prior-round session
-            // and landed on its already-submitted result page — the identical symptom to
-            // the round-2-redirects-to-round-1's-result bug, just reached via a timing
-            // gap instead of the conceptId-vs-taskId matching bug that caused it
-            // originally. Calling generateIfNeeded() here — the same call
-            // ReminderService's loop makes — runs resolveActiveConceptState (which
-            // resolves this task now that it's DONE) immediately followed by
-            // createTargetedTestIfNeeded (which requests the next round's session) in the
-            // same synchronous pass, so by the time this suspend call returns and the
-            // screen recomposes, GapTaskLedger's active session pointer is already
-            // whatever it should be — never a stale one left for the background loop to
-            // catch up on later. Best-effort/non-fatal like every other call site of this
-            // function (see ReminderService): a failure here just means this particular
-            // gap concept waits for the next 15-minute cycle, same as before this fix,
-            // not a broken completion flow.
-            try { GapTaskManager.generateIfNeeded(context) } catch (_: Exception) {}
-            PlanStore.setCompletionStatus(task.id, status)
-            // BUGFIX (Blueprint 2.6): cycleState.totalSessionSeconds is the tick loop's real
-            // elapsed time — it freezes while PAUSED (see AttentionCycleManager.tick()), so
-            // this is genuinely "focus time, not wall clock." Previously nothing ever wrote it
-            // onto the task, so StudyTask.focusMinutes/actualMinutes — and everything downstream
-            // that reads them (BehaviorLedger's "Avg Focus" stat, Stats' "Focus Today") — always
-            // saw 0 regardless of how long the student actually focused.
-            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
-            PlanStore.setFocusMinutes(task.id, focusMin)
-            val completedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
-            PsycheEngine.onTaskCompleted(completedTask, cycleState.checksPassed, cycleState.checksMissed)
-            // Mentor v2 (spec 3.7): log the completion into TodayContext so AdaptivePlanner
-            // sees what's actually been finished today, then refresh the cached summary
-            // AdaptivePlanner reads (previously-dead "behavior_summary" pref — see PsycheEngine).
-            TodayContext.appendUpdate("Completed ${task.subject}: ${task.topic} (${task.taskType})")
-            PsycheEngine.refreshBehaviorSummaryCache()
-            val spoken = when (status) {
-                "NO"      -> "Noted. Every session still counts — reset for the next one."
-                "PARTIAL" -> "Task marked complete. Partial progress logged."
-                else      -> "Task complete. Well done."
-            }
-            CheckmateTTS.speak(context, spoken)
-            val msg = PsycheEngine.getDailyMorningMessage()
-            _state.update { it.copy(
-                activeTaskId         = null,
-                psycheMessage        = msg,
-                consecutiveSkips     = 0,
-                completionPromptTask = null
-            ) }
-        }
-    }
-
-    fun markSkip(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            // Same fix as confirmCompletion() — capture before stop()/reset() wipes the counts.
-            val cycleState = AttentionCycleManager.currentState()
-            AttentionCycleService.stop(context)
-            FloatingAttentionService.stop(context)
-            WorkModeManager.deactivate(context)
-            ScreenCaptureManager.release()
-            PlanStore.markTask(task.id, TaskState.SKIPPED)
-            // BUGFIX (Blueprint 2.6): same focus-time fix as confirmCompletion() — a skipped
-            // session still did real focus minutes before the skip, worth recording rather
-            // than leaving at the StudyTask default of 0.
-            val focusMin = (cycleState.totalSessionSeconds / 60).toInt().coerceAtLeast(0)
-            PlanStore.setFocusMinutes(task.id, focusMin)
-            val skippedTask = task.copy(focusMinutes = focusMin, actualMinutes = focusMin)
-            // Mentor v2 (spec 3.6): capture whatever app was most recently foregrounded so the
-            // skip event — and any guardian alert built from it — can name the actual cause.
-            val distractionApp = try {
-                AppUsageTracker.getMostRecentForegroundApp(context)
-            } catch (_: Exception) { null }
-            PsycheEngine.onTaskSkipped(skippedTask, cycleState.checksPassed, cycleState.checksMissed, distractionApp)
-            // Mentor v2 (spec 3.7): keep the planner's cached behavior summary current on
-            // skips too, not just completions, so a same-day regenerate reflects the skip.
-            PsycheEngine.refreshBehaviorSummaryCache()
-            // Mentor v2 (spec 3.4): opens the escalation-watchlist lockdown window — checked by
-            // AppAutomationService alongside the normal blocklist for the configured duration.
-            WorkModeManager.startPostSkipLockdown(context)
-            val msg = PsycheEngine.getSkipReaction(task)
-            CheckmateTTS.speak(context, msg)
-            // Mentor v2 (spec 3.2): same reaction text, also logged into Mentor's persisted
-            // chat so it's a running log, not just a spoken line that's gone once said.
-            ProactiveMentor.onSkip(context, msg)
-            val newSkips = _state.value.consecutiveSkips + 1
-            _state.update { it.copy(activeTaskId = null, psycheMessage = msg, consecutiveSkips = newSkips) }
-            if (newSkips >= 3) {
-                GuardianNotifier.notifySkipStreak(context, newSkips, "${task.subject}: ${task.topic}", distractionApp)
-            }
-        }
-    }
-
-    fun pauseTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.pauseTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendPause(context)
-        }
-    }
-
-    fun resumeTask(context: Context, task: StudyTask) {
-        viewModelScope.launch {
-            PlanStore.resumeTask(task.id, System.currentTimeMillis())
-            AttentionCycleService.sendResume(context)
         }
     }
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
+package com.checkmate
 
-
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/home/HomeScreen.kt =====
-
-
-package com.checkmate.ui.home
-
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.*
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.navigation.NavController
-import com.checkmate.core.DailyChecklist
-import com.checkmate.planner.FreeSlotCalculator
+import android.app.Application
+import android.content.Context
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.intervention.InterventionGuardianBridge
+import com.checkmate.planner.intervention.InterventionGuardianGateway
+import com.checkmate.planner.intervention.InterventionNotificationBridge
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.planner.intervention.InterventionTriggerScheduler
 import com.checkmate.planner.model.StudyTask
-import com.checkmate.planner.model.TaskState
-import com.checkmate.planner.model.TaskType
-import com.checkmate.ui.theme.*
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.BehaviorLedgerSyncManager
+import com.checkmate.service.DayHistorySyncManager
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.InterventionNotifier
+import com.checkmate.service.OutcomeLedgerSyncManager
+import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.ReminderService
+import com.checkmate.service.ScreenCaptureManager
+import com.checkmate.service.StudyStateSyncManager
+import com.checkmate.service.WorkModeTaskReconciler
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.UninstallAlertListener
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
 
-// Blueprint 4.3: HomeScreen view toggle — LIST is the original flat list, TIMELINE
-// lays tasks out by StudyTask.scheduledStartTime (see FreeSlotCalculator/AdaptivePlanner).
-private enum class HomeViewMode { LIST, TIMELINE }
+class CheckmateApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        CheckmatePrefs.init(this)
+        CheckmateState.init(this)
+        CheckmateTTS.init(this)
+        // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
+        // opens BehaviorDatabase, imports any pre-upgrade CheckmatePrefs event history
+        // into it once, and loads the in-memory read cache — see BehaviorLedger.init()'s
+        // own doc for why this runs synchronously here, same as CheckmatePrefs.init()
+        // right above. Must run before anything below can call BehaviorLedger or
+        // PsycheEngine (WorkModeManager.init() does, via the skip-rate check).
+        BehaviorLedger.init(this)
 
-@Composable
-fun HomeScreen(navController: NavController, vm: HomeViewModel) {
-    val state   by vm.state.collectAsState()
-    val context = LocalContext.current
+        // Reconcile Work Mode with the hardcoded daily schedule (usual
+        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
+        // Sunday/Wednesday) and re-arm the four daily boundary alarms
+        // (AlarmManager repeating alarms don't survive a reboot, hence also
+        // doing this in BootReceiver). This must run after
+        // CheckmateState.init() above.
+        WorkModeManager.init(this)
+        // BUGFIX: notification-panel "Start" and cross-device task sync never
+        // activated WorkMode — see WorkModeTaskReconciler's own doc. Must run after
+        // WorkModeManager.init(this) immediately above, same ordering requirement as
+        // every other WorkModeManager-dependent call in this method.
+        WorkModeTaskReconciler.start(this)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
+        GuardianNotifier.scheduleEndOfDaySummary(this)
+        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
+        // worker's KV for the on-demand "usage" command (see worker.js).
+        GuardianNotifier.scheduleUsageReports(this)
+        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
+        // guardian report via WhatsApp + Telegram. Previously never
+        // scheduled anywhere, which is why the weekly report never sent.
+        GuardianNotifier.scheduleWeeklyReport(this)
+        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
 
-    // P0b: which task (if any) is the active gap concept's, and does it have a
-    // Testmate targeted-repair test waiting (see GapTaskManager.createTargetedTestIfNeeded).
-    // Sourced from `state` (HomeState.activeGapTaskId/activeRepairSessionId), not read
-    // directly off GapTaskLedger here — see the BUGFIX note below for why a direct,
-    // per-composition ledger read wasn't enough on its own.
-    // BUGFIX (round-2 task redirects to round-1's result page): this used to match by
-    // task.conceptId == activeConceptId, which is concept-wide — the OLD, already-
-    // completed round-1 task and the NEW round-2 task share the same conceptId (it's
-    // the same concept being retested), so BOTH task cards resolved to the exact same
-    // activeSessionId and both "Take repair test" buttons deep-linked to whichever
-    // session GapTaskLedger currently had on file. Confirmed live: that was still
-    // round 1's already-submitted session, so tapping the round-2 card's button opened
-    // round 1's session URL and Testmate correctly redirected to round 1's result page
-    // — it wasn't a WebView/redirect bug, the wrong session id was being handed to the
-    // WebView to begin with.
-    //
-    // GapTaskLedger.activeTaskId() is updated on every GapTaskLedger.recordServed()
-    // call — including the one that fires when round 2's task is created — and is
-    // already the ledger's own source of truth for which task is presently being
-    // tracked (see that function's doc). Matching on task.id == activeTaskId instead of
-    // conceptId means only the CURRENT round's task card can ever show a repair-test
-    // button: a stale prior-round card (same concept, old task id) no longer matches at
-    // all, and the current round's card only shows a button once its OWN session has
-    // actually been created (activeSessionId reset to blank by resetForNextRound()
-    // until createTargetedTestIfNeeded() populates a fresh one for this round) — no
-    // button is safer than a button pointing at the wrong round's session.
-    //
-    // BUGFIX (r1-result-on-r2-screen, background-loop case): these two used to be read
-    // straight off GapTaskLedger here, inside the composable body — correct as of
-    // whatever HomeScreen's LAST recomposition happened to be, but ReminderService's
-    // background loop can advance a P0b round (resetForNextRound + recordTestmateSession,
-    // both CheckmatePrefs-only, no PlanStore write) with nothing to trigger a fresh
-    // recomposition in between. See GapTaskLedger.version's own doc for the full repro:
-    // a student sitting on HomeScreen across that loop's tick could tap "Take repair
-    // test" and still get round 1's already-submitted session. Reading from `state`
-    // instead — populated by HomeViewModel's own GapTaskLedger.version collector — means
-    // this value is live the moment the ledger changes, not just the moment HomeScreen
-    // happens to recompose for some unrelated reason.
-    val activeTaskId    = state.activeGapTaskId
-    val activeSessionId = state.activeRepairSessionId
-    // Retention-check evidence loop (next-session-retention-loop.txt): reuses this exact
-    // "show a Take test button when this task has a live Testmate session" mechanism for
-    // RETENTION CHECK tasks too, instead of threading a second showXTestButton/onOpenXTest
-    // pair through every composable below (TaskList/TaskCard/DayTimeline all already take
-    // this one (StudyTask) -> String? function). state.activeRetentionSessions is keyed by
-    // taskId (see HomeViewModel.loadRetentionSessions) since — unlike the single active gap
-    // concept above — several retention checks can have their own live session at once.
-    fun repairSessionFor(task: StudyTask): String? =
-        if (task.id == activeTaskId) activeSessionId else state.activeRetentionSessions[task.id]
+        // Previously missing — nothing anywhere in the app called
+        // ReminderService.start(), so its 15-min loop (checkPendingTasks,
+        // ProactiveMentor.idleCheckIfNeeded/consistencyCheckIfNeeded/
+        // holidayPromptIfNeeded, and GapTaskManager.generateIfNeeded/
+        // escalationCheckIfNeeded) never ran on a fresh install/process start.
+        // Mirrors the other always-on schedulers above (WorkModeManager,
+        // GuardianNotifier) that get armed unconditionally from here; also
+        // re-armed from BootReceiver since a plain Service doesn't survive
+        // reboot the way InterventionTriggerScheduler's WorkManager job does.
+        ReminderService.start(this)
 
-    var showAddTaskDialog by remember { mutableStateOf(false) }
-    var editingTask        by remember { mutableStateOf<StudyTask?>(null) }
-    var schedulingTask      by remember { mutableStateOf<StudyTask?>(null) }
-    var viewMode            by remember { mutableStateOf(HomeViewMode.LIST) }
+        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
+        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
+        // where a worker run could find InterventionNotificationBridge.gateway still null
+        // and silently fall back to the deterministic path when a notification was actually
+        // intended. InterventionNotifier is `app`'s implementation — the only module that
+        // can see both Android's NotificationManager and psyche's ContextBuilder at once
+        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
+        InterventionNotificationBridge.gateway = InterventionNotifier
 
-    Box(modifier = Modifier.fillMaxSize().background(BgDark)) {
-        LazyColumn(
-            modifier            = Modifier.fillMaxSize(),
-            contentPadding      = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            item {
-                HomeHeader(
-                    completedCount = state.completedToday,
-                    totalCount     = state.tasks.size,
-                    streakDays     = state.streakDays,
-                    syncEnabled    = state.syncEnabled,
-                    syncing        = state.syncing,
-                    onSync         = { vm.syncNow() }
-                )
+        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
+        // intent always resolved the transaction, but nothing downstream ever notified
+        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
+        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
+        // this just gives the intervention pipeline a way to call it without planner
+        // depending on `app` directly.
+        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
+            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
+                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
             }
-            item { DayProgressBar(completed = state.completedToday, total = state.tasks.size) }
-            if (state.psycheMessage.isNotBlank()) {
-                item { PsycheMessageCard(message = state.psycheMessage) }
-            }
-            if (state.tasks.isEmpty()) {
-                item { EmptyPlanCard(onPlan = { navController.navigate("planner") }, onAddCustom = { showAddTaskDialog = true }) }
-            } else {
-                item { ViewModeToggle(viewMode = viewMode, onChange = { viewMode = it }) }
-
-                if (viewMode == HomeViewMode.LIST) {
-                    items(state.tasks, key = { it.id }) { task ->
-                        TaskCard(
-                            task           = task,
-                            isActive       = state.activeTaskId == task.id,
-                            showRepairTestButton = repairSessionFor(task) != null,
-                            onOpenRepairTest      = { repairSessionFor(task)?.let { navController.navigate("test_web/$it") } },
-                            onStart        = { vm.startTask(context, task) },
-                            onDone         = { vm.requestCompletion(context, task) },
-                            onSkip         = { vm.markSkip(context, task) },
-                            onPause        = { vm.pauseTask(context, task) },
-                            onResume       = { vm.resumeTask(context, task) },
-                            onRemove       = { vm.removeTask(task) },
-                            onEditDuration = { editingTask = task },
-                            onSchedule     = { schedulingTask = task }
-                        )
-                    }
-                } else {
-                    item {
-                        TimelineView(
-                            tasks          = state.tasks,
-                            activeTaskId   = state.activeTaskId,
-                            repairSessionFor = ::repairSessionFor,
-                            onOpenRepairTest  = { sessionId -> navController.navigate("test_web/$sessionId") },
-                            onStart        = { vm.startTask(context, it) },
-                            onDone         = { vm.requestCompletion(context, it) },
-                            onSkip         = { vm.markSkip(context, it) },
-                            onPause        = { vm.pauseTask(context, it) },
-                            onResume       = { vm.resumeTask(context, it) },
-                            onRemove       = { vm.removeTask(it) },
-                            onEditDuration = { editingTask = it },
-                            onSchedule     = { schedulingTask = it }
-                        )
-                    }
-                }
-
-                item {
-                    TextButton(onClick = { showAddTaskDialog = true }) {
-                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = AccentGreen)
-                        Spacer(Modifier.width(4.dp))
-                        Text("Add Custom Task", color = AccentGreen, fontWeight = FontWeight.SemiBold)
-                    }
-                }
-            }
-
-            // ── Daily Checklist ──────────────────────────────────────────────
-            item { ChecklistSection() }
-
-            item { Spacer(Modifier.height(72.dp)) }
         }
 
-        FloatingActionButton(
-            onClick        = { showAddTaskDialog = true },
-            containerColor = AccentGreen,
-            modifier       = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(20.dp)
-        ) {
-            Icon(Icons.Default.Add, contentDescription = "Add custom task", tint = Color.Black)
+        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
+        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
+        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
+        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
+        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
+        // reconciliation call added to BootReceiver below.
+        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
+        InterventionReconciliation.runAtStartup(this)
+
+        // Step 12 wiring: reinstall-recovery restore for the Outcome Ledger, mirroring
+        // the profile pull pattern (ProfileSyncManager.pullProfileIfLocalEmpty) but at
+        // app startup rather than lazily on a specific screen open — there's no single
+        // "ledger screen" whose open would naturally trigger this the way Planner/
+        // ConsultationProfile do for the profile pull. No-op if the local ledger table
+        // already has rows, or if no sync_code is configured — see
+        // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
+        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // "Sync everything" pass: same reinstall-recovery restore, same startup call
+        // site, for the behavior event ledger (BehaviorDatabase — see
+        // BehaviorLedgerSyncManager's own doc for why this is a separate table/sync
+        // manager from the Outcome Ledger above rather than merged into it). No-op if
+        // local rows already exist or no sync_code is configured.
+        BehaviorLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // Same "sync everything" pass for the two synchronous-OkHttp managers
+        // (StudyStateSyncManager / DayHistorySyncManager — see their own docs).
+        // Backgrounded explicitly, unlike the two calls just above: those two own
+        // an internal IO-scoped coroutine and return immediately regardless of
+        // caller thread, these two block on client.newCall().execute() directly,
+        // and Application.onCreate() itself runs on the main thread.
+        Thread {
+            StudyStateSyncManager.pullStateIfEmpty()
+            DayHistorySyncManager.pullMissingDays()
+        }.start()
+
+        // Wire real screenshot capture via MediaProjection into DistractionGuard
+        // (and ScrollGuard, which reuses the same listener/pipeline for its
+        // "scroll" kind — see ScrollGuard.kt)
+        val distractionListener = object : DistractionListener {
+            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
+                Thread {
+                    val uri = ScreenCaptureManager.capture(context)
+                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
+                }.start()
+                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
+                // the guardian-facing alert above — this is student-facing, not parent-facing.
+                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
+            }
         }
-    }
+        DistractionGuard.listener = distractionListener
+        ScrollGuard.listener = distractionListener
 
-    if (showAddTaskDialog) {
-        AddCustomTaskDialog(
-            onDismiss = { showAddTaskDialog = false },
-            onConfirm = { subject, topic, duration, taskType ->
-                vm.addCustomTask(context, subject, topic, duration, taskType)
-                showAddTaskDialog = false
-            }
-        )
-    }
-
-    editingTask?.let { task ->
-        EditDurationDialog(
-            task      = task,
-            onDismiss = { editingTask = null },
-            onConfirm = { newDuration ->
-                vm.editTaskDuration(task, newDuration)
-                editingTask = null
-            }
-        )
-    }
-
-    schedulingTask?.let { task ->
-        ScheduleTaskDialog(
-            task      = task,
-            onDismiss = { schedulingTask = null },
-            onConfirm = { start, end ->
-                vm.rescheduleTask(task, start, end)
-                schedulingTask = null
-            }
-        )
-    }
-
-    // ── Blueprint 10.1: Intention Declaration + Session Check-In ──────────────
-    state.intentionPromptTask?.let { task ->
-        IntentionDialog(
-            task      = task,
-            onDismiss = { vm.dismissIntentionPrompt() },
-            onConfirm = { intentionText -> vm.confirmIntentionAndStart(context, task, intentionText) }
-        )
-    }
-
-    state.completionPromptTask?.let { task ->
-        CompletionCheckDialog(
-            task     = task,
-            onSelect = { status -> vm.confirmCompletion(context, task, status) }
-        )
-    }
-}
-
-// ── Blueprint 4.3: LIST / TIMELINE toggle ──────────────────────────────────────
-
-@Composable
-private fun ViewModeToggle(viewMode: HomeViewMode, onChange: (HomeViewMode) -> Unit) {
-    Row(
-        modifier              = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        HomeViewMode.values().forEach { mode ->
-            val selected = mode == viewMode
-            Surface(
-                modifier = Modifier.weight(1f).clickable { onChange(mode) },
-                shape    = RoundedCornerShape(10.dp),
-                color    = if (selected) AccentGreen.copy(alpha = 0.15f) else BgCard,
-                border   = BorderStroke(1.dp, if (selected) AccentGreen.copy(alpha = 0.5f) else White10)
-            ) {
-                Row(
-                    modifier              = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment     = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = if (mode == HomeViewMode.LIST) Icons.Default.ViewList else Icons.Default.Schedule,
-                        contentDescription = null,
-                        tint     = if (selected) AccentGreen else White60,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text       = if (mode == HomeViewMode.LIST) "List" else "Timeline",
-                        fontSize   = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color      = if (selected) AccentGreen else White60
-                    )
-                }
+        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
+        // (via :workmode's UninstallGuard) into GuardianNotifier.
+        UninstallGuard.listener = object : UninstallAlertListener {
+            override fun onGuardedScreenBlocked(context: Context, reason: String) {
+                Thread {
+                    GuardianNotifier.notifyUninstallAttempt(context, reason)
+                }.start()
             }
         }
     }
 }
-
-/**
- * Blueprint 4.3: tasks laid out as a vertical day strip, grouped by
- * StudyTask.scheduledStartTime and color-coded by subject (via the same
- * subjectColor() used on TaskCard's badge). Tasks the planner couldn't fit
- * into a free slot (scheduledStartTime == null — see AdaptivePlanner.
- * assignScheduledTimes) are listed separately under "Unscheduled" rather than
- * silently dropped. Each row still renders the full interactive TaskCard, so
- * Start/Pause/Done/Skip work exactly the same as in LIST view.
- */
-@Composable
-private fun TimelineView(
-    tasks:          List<StudyTask>,
-    activeTaskId:   String?,
-    repairSessionFor: (StudyTask) -> String?,     // NEW (P0b) — see HomeScreen's own doc
-    onOpenRepairTest: (String) -> Unit,             // NEW (P0b) — receives the sessionId to open
-    onStart:        (StudyTask) -> Unit,
-    onDone:         (StudyTask) -> Unit,
-    onSkip:         (StudyTask) -> Unit,
-    onPause:        (StudyTask) -> Unit,
-    onResume:       (StudyTask) -> Unit,
-    onRemove:       (StudyTask) -> Unit,
-    onEditDuration: (StudyTask) -> Unit,
-    onSchedule:     (StudyTask) -> Unit
-) {
-    val scheduled   = tasks.filter { !it.scheduledStartTime.isNullOrBlank() }
-        .sortedBy { FreeSlotCalculator.parseTimeOrNull(it.scheduledStartTime!!) ?: Int.MAX_VALUE }
-    val unscheduled = tasks.filter { it.scheduledStartTime.isNullOrBlank() }
-
-    Column {
-        scheduled.forEach { task ->
-            TimelineRow(
-                task           = task,
-                isActive       = activeTaskId == task.id,
-                showRepairTestButton = repairSessionFor(task) != null,
-                onOpenRepairTest      = { repairSessionFor(task)?.let(onOpenRepairTest) },
-                onStart        = { onStart(task) },
-                onDone         = { onDone(task) },
-                onSkip         = { onSkip(task) },
-                onPause        = { onPause(task) },
-                onResume       = { onResume(task) },
-                onRemove       = { onRemove(task) },
-                onEditDuration = { onEditDuration(task) },
-                onSchedule     = { onSchedule(task) }
-            )
-        }
-        if (unscheduled.isNotEmpty()) {
-            if (scheduled.isNotEmpty()) Spacer(Modifier.height(4.dp))
-            Text(
-                "UNSCHEDULED",
-                fontSize      = 11.sp,
-                fontWeight    = FontWeight.Bold,
-                letterSpacing = 1.5.sp,
-                color         = White30,
-                fontFamily    = FontFamily.Monospace,
-                modifier      = Modifier.padding(bottom = 8.dp)
-            )
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                unscheduled.forEach { task ->
-                    TaskCard(
-                        task           = task,
-                        isActive       = activeTaskId == task.id,
-                        showRepairTestButton = repairSessionFor(task) != null,
-                        onOpenRepairTest      = { repairSessionFor(task)?.let(onOpenRepairTest) },
-                        onStart        = { onStart(task) },
-                        onDone         = { onDone(task) },
-                        onSkip         = { onSkip(task) },
-                        onPause        = { onPause(task) },
-                        onResume       = { onResume(task) },
-                        onRemove       = { onRemove(task) },
-                        onEditDuration = { onEditDuration(task) },
-                        onSchedule     = { onSchedule(task) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TimelineRow(
-    task:           StudyTask,
-    isActive:       Boolean,
-    showRepairTestButton: Boolean,      // NEW (P0b)
-    onOpenRepairTest: () -> Unit,        // NEW (P0b)
-    onStart:        () -> Unit,
-    onDone:         () -> Unit,
-    onSkip:         () -> Unit,
-    onPause:        () -> Unit,
-    onResume:       () -> Unit,
-    onRemove:       () -> Unit,
-    onEditDuration: () -> Unit,
-    onSchedule:     () -> Unit
-) {
-    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-        Column(
-            modifier             = Modifier.width(52.dp).padding(top = 4.dp),
-            horizontalAlignment  = Alignment.CenterHorizontally
-        ) {
-            Text(
-                task.scheduledStartTime ?: "--:--",
-                fontSize   = 11.sp,
-                color      = White60,
-                fontFamily = FontFamily.Monospace
-            )
-            Spacer(Modifier.height(6.dp))
-            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
-        }
-        Spacer(Modifier.width(10.dp))
-        Box(modifier = Modifier.weight(1f)) {
-            TaskCard(
-                task           = task,
-                isActive       = isActive,
-                showRepairTestButton = showRepairTestButton,
-                onOpenRepairTest      = onOpenRepairTest,
-                onStart        = onStart,
-                onDone         = onDone,
-                onSkip         = onSkip,
-                onPause        = onPause,
-                onResume       = onResume,
-                onRemove       = onRemove,
-                onEditDuration = onEditDuration,
-                onSchedule     = onSchedule
-            )
-        }
-    }
-}
-
-// ── Checklist Section ────────────────────────────────────────────────────────
-
-@Composable
-private fun ChecklistSection() {
-    var expanded by remember { mutableStateOf(false) }
-
-    // Load checklist items fresh each recomposition so toggle calls reflect immediately
-    var items by remember { mutableStateOf(DailyChecklist.getTodayItems()) }
-
-    // Refresh when section expands
-    LaunchedEffect(expanded) {
-        if (expanded) items = DailyChecklist.getTodayItems()
-    }
-
-    val doneCount  = items.count { it.isDone }
-    val totalCount = items.size
-    val allDone    = totalCount > 0 && doneCount == totalCount
-
-    val arrowAngle by animateFloatAsState(
-        targetValue   = if (expanded) 180f else 0f,
-        animationSpec = tween(200),
-        label         = "arrow"
-    )
-
-    Surface(
-        shape  = RoundedCornerShape(14.dp),
-        color  = BgCard,
-        border = BorderStroke(
-            1.dp,
-            if (allDone) AccentGreen.copy(alpha = 0.5f) else White10
-        )
-    ) {
-        Column {
-            // Header row — always visible, tap to expand/collapse
-            Row(
-                modifier          = Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = !expanded }
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Default.CheckCircle,
-                    contentDescription = null,
-                    tint     = if (allDone) AccentGreen else White30,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(Modifier.width(10.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        "Daily Checklist",
-                        fontSize   = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color      = White90
-                    )
-                    Text(
-                        "$doneCount / $totalCount done",
-                        fontSize = 11.sp,
-                        color    = if (allDone) AccentGreen else White60
-                    )
-                }
-                Icon(
-                    Icons.Default.KeyboardArrowDown,
-                    contentDescription = null,
-                    tint     = White30,
-                    modifier = Modifier.size(20.dp).rotate(arrowAngle)
-                )
-            }
-
-            // Expandable checklist items
-            AnimatedVisibility(
-                visible = expanded,
-                enter   = expandVertically() + fadeIn(),
-                exit    = shrinkVertically() + fadeOut()
-            ) {
-                Column {
-                    HorizontalDivider(color = White10, thickness = 0.5.dp)
-                    items.forEach { item ->
-                        Row(
-                            modifier          = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    DailyChecklist.toggleItem(item.id)
-                                    items = DailyChecklist.getTodayItems()
-                                }
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
-                                checked         = item.isDone,
-                                onCheckedChange = {
-                                    DailyChecklist.toggleItem(item.id)
-                                    items = DailyChecklist.getTodayItems()
-                                },
-                                colors = CheckboxDefaults.colors(
-                                    checkedColor   = AccentGreen,
-                                    uncheckedColor = White30
-                                )
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                text      = item.label,
-                                fontSize  = 14.sp,
-                                color     = if (item.isDone) White60 else White90,
-                                fontWeight = if (item.isDone) FontWeight.Normal else FontWeight.Medium
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                }
-            }
-        }
-    }
-}
-
-// ── Blueprint 10.1: Intention Declaration + Session Check-In dialogs ──────────
-
-/**
- * Pre-session "What will you study?" prompt. Shown from HomeScreen whenever
- * HomeState.intentionPromptTask is non-null (i.e. right after tapping "Start Now",
- * before the session actually launches). Pre-fills with the task's topic so a
- * student in a hurry can just tap Start Session, but free-text lets them commit
- * to something more specific (e.g. "finish rolling motion numericals, not just review").
- */
-@Composable
-private fun IntentionDialog(
-    task:      StudyTask,
-    onDismiss: () -> Unit,
-    onConfirm: (intentionText: String) -> Unit
-) {
-    var intention by remember { mutableStateOf(task.topic) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor   = BgCard,
-        title = {
-            Text("What will you study?", fontWeight = FontWeight.Bold, color = White90)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "${task.subject} — ${task.topic} · ${task.durationMinutes}m",
-                    fontSize = 12.sp, color = White60
-                )
-                OutlinedTextField(
-                    value         = intention,
-                    onValueChange = { intention = it },
-                    label         = { Text("Your intention", color = White30) },
-                    singleLine    = false,
-                    modifier      = Modifier.fillMaxWidth(),
-                    colors        = dialogFieldColors()
-                )
-                Text(
-                    "Writing it down raises follow-through — you'll be asked how it went right after.",
-                    fontSize = 11.sp, color = White30
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick  = { onConfirm(intention) },
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                Text("Start Session", fontWeight = FontWeight.Bold, color = Color.Black)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
-        }
-    )
-}
-
-/**
- * Post-session "Did you finish it?" check-in. Shown from HomeScreen whenever
- * HomeState.completionPromptTask is non-null (i.e. right after tapping "Done",
- * before the session actually wraps up). Dismissing outside the dialog counts
- * as YES — the session is ending regardless of how this is answered, this is
- * purely a self-report accountability signal, not a gate on completion.
- */
-@Composable
-private fun CompletionCheckDialog(
-    task:     StudyTask,
-    onSelect: (status: String) -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = { onSelect("YES") },
-        containerColor   = BgCard,
-        title = {
-            Text("Did you finish it?", fontWeight = FontWeight.Bold, color = White90)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
-                if (task.intentionText.isNotBlank() && task.intentionText != task.topic) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Your intention: \"${task.intentionText}\"",
-                        fontSize = 12.sp, color = White30
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment     = Alignment.CenterVertically
-            ) {
-                TextButton(onClick = { onSelect("NO") }) {
-                    Text("No", color = AccentRed, fontWeight = FontWeight.SemiBold)
-                }
-                TextButton(onClick = { onSelect("PARTIAL") }) {
-                    Text("Partial", color = AccentAmber, fontWeight = FontWeight.SemiBold)
-                }
-                Button(
-                    onClick = { onSelect("YES") },
-                    colors  = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-                ) {
-                    Text("Yes", fontWeight = FontWeight.Bold, color = Color.Black)
-                }
-            }
-        }
-    )
-}
-
-// ── Rest of HomeScreen (unchanged) ───────────────────────────────────────────
-
-@Composable
-private fun AddCustomTaskDialog(
-    onDismiss: () -> Unit,
-    onConfirm: (subject: String, topic: String, durationMinutes: Int, taskType: TaskType) -> Unit
-) {
-    var subject  by remember { mutableStateOf("") }
-    var topic    by remember { mutableStateOf("") }
-    var duration by remember { mutableStateOf("30") }
-    var taskType by remember { mutableStateOf(TaskType.OTHER) }
-
-    val durationInt = duration.toIntOrNull()
-    val isValid = subject.isNotBlank() && topic.isNotBlank() && durationInt != null && durationInt > 0
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor   = BgCard,
-        title = {
-            Text("Add Custom Task", fontWeight = FontWeight.Bold, color = White90)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "Slots in alongside today's plan — nothing else is removed. Duration stays editable later.",
-                    fontSize = 12.sp, color = White60
-                )
-                OutlinedTextField(
-                    value           = subject,
-                    onValueChange   = { subject = it },
-                    label           = { Text("Subject", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    colors          = dialogFieldColors()
-                )
-                OutlinedTextField(
-                    value           = topic,
-                    onValueChange   = { topic = it },
-                    label           = { Text("Topic", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    colors          = dialogFieldColors()
-                )
-                OutlinedTextField(
-                    value           = duration,
-                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
-                    label           = { Text("Duration (minutes)", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    colors          = dialogFieldColors()
-                )
-                Text("Task type", fontSize = 12.sp, color = White60)
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                ) {
-                    TaskType.values().forEach { type ->
-                        val selected = taskType == type
-                        FilterChip(
-                            selected = selected,
-                            onClick  = { taskType = type },
-                            label    = { Text(type.name, fontSize = 11.sp) },
-                            colors   = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = AccentGreen,
-                                selectedLabelColor     = Color.Black
-                            )
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick  = { durationInt?.let { onConfirm(subject.trim(), topic.trim(), it, taskType) } },
-                enabled  = isValid,
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                Text("Add Task", fontWeight = FontWeight.Bold, color = Color.Black)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
-        }
-    )
-}
-
-@Composable
-private fun EditDurationDialog(
-    task:      StudyTask,
-    onDismiss: () -> Unit,
-    onConfirm: (durationMinutes: Int) -> Unit
-) {
-    var duration by remember { mutableStateOf(task.durationMinutes.toString()) }
-    val durationInt = duration.toIntOrNull()
-    val isValid = durationInt != null && durationInt > 0
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor   = BgCard,
-        title = {
-            Text("Edit Duration", fontWeight = FontWeight.Bold, color = White90)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
-                OutlinedTextField(
-                    value           = duration,
-                    onValueChange   = { input -> if (input.all { it.isDigit() } && input.length <= 3) duration = input },
-                    label           = { Text("Duration (minutes)", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    colors          = dialogFieldColors()
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick  = { durationInt?.let(onConfirm) },
-                enabled  = isValid,
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
-        }
-    )
-}
-
-/**
- * Manual "Schedule" action, reachable via the clock icon on ANY pending TaskCard (List
- * or Timeline, scheduled or not) — lets the student set start AND end time directly
- * instead of only being able to delete and re-add a task to change its slot. End time
- * pre-fills from the task's current scheduledStartTime + durationMinutes when it already
- * has one, so opening the dialog on an already-scheduled task shows its real current
- * window rather than blank fields. durationMinutes itself is derived from end − start on
- * save (see HomeViewModel.rescheduleTask) so the two can never drift apart. Validation
- * mirrors FreeSlotCalculator's own HH:mm parsing (0-23 / 0-59), plus an end-after-start
- * check, so a bad value can't get saved onto the task.
- */
-@Composable
-private fun ScheduleTaskDialog(
-    task:      StudyTask,
-    onDismiss: () -> Unit,
-    onConfirm: (startHHmm: String, endHHmm: String) -> Unit
-) {
-    var startTime by remember { mutableStateOf(task.scheduledStartTime ?: "") }
-    var endTime by remember {
-        mutableStateOf(
-            task.scheduledStartTime
-                ?.let { FreeSlotCalculator.parseTimeOrNull(it) }
-                ?.let { FreeSlotCalculator.formatMinutes(it + task.durationMinutes) }
-                ?: ""
-        )
-    }
-
-    fun isValidTime(value: String): Boolean {
-        val parts = value.trim().split(":")
-        if (parts.size != 2) return false
-        val h = parts[0].toIntOrNull() ?: return false
-        val m = parts[1].toIntOrNull() ?: return false
-        return h in 0..23 && m in 0..59
-    }
-
-    val startValid = isValidTime(startTime)
-    val endValid   = isValidTime(endTime)
-    val orderValid = startValid && endValid &&
-        (FreeSlotCalculator.parseTimeOrNull(endTime) ?: 0) > (FreeSlotCalculator.parseTimeOrNull(startTime) ?: 0)
-    val isValid = startValid && endValid && orderValid
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor   = BgCard,
-        title = {
-            Text("Schedule Task", fontWeight = FontWeight.Bold, color = White90)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("${task.subject} — ${task.topic}", fontSize = 13.sp, color = White60)
-                OutlinedTextField(
-                    value           = startTime,
-                    onValueChange   = { input -> if (input.length <= 5) startTime = input },
-                    label           = { Text("Start time (HH:mm)", color = White30) },
-                    placeholder     = { Text("e.g. 16:30", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    colors          = dialogFieldColors()
-                )
-                OutlinedTextField(
-                    value           = endTime,
-                    onValueChange   = { input -> if (input.length <= 5) endTime = input },
-                    label           = { Text("End time (HH:mm)", color = White30) },
-                    placeholder     = { Text("e.g. 17:45", color = White30) },
-                    singleLine      = true,
-                    modifier        = Modifier.fillMaxWidth(),
-                    colors          = dialogFieldColors()
-                )
-                if (startValid && endValid && !orderValid) {
-                    Text("End time must be after start time", fontSize = 11.sp, color = AccentRed)
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick  = { if (isValid) onConfirm(startTime.trim(), endTime.trim()) },
-                enabled  = isValid,
-                colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen)
-            ) {
-                Text("Save", fontWeight = FontWeight.Bold, color = Color.Black)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = White60) }
-        }
-    )
-}
-
-@Composable
-private fun dialogFieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor   = AccentGreen,
-    unfocusedBorderColor = White30,
-    cursorColor          = AccentGreen,
-    focusedLabelColor    = AccentGreen,
-    focusedTextColor     = White90,
-    unfocusedTextColor   = White90
-)
-
-@Composable
-private fun HomeHeader(
-    completedCount: Int,
-    totalCount:     Int,
-    streakDays:     Int,
-    syncEnabled:    Boolean = false,
-    syncing:        Boolean = false,
-    onSync:         () -> Unit = {}
-) {
-    Row(
-        modifier              = Modifier.fillMaxWidth(),
-        verticalAlignment     = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column {
-            Text("Today", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = White90)
-            Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
-        }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            // Task Sync (two-device): only shown once a sync code is set in Settings →
-            // TASK SYNC. Pulls the other device's copy of today's plan on tap — auto-sync
-            // already pushes on every local change and pulls once on screen open, this is
-            // just the "check right now" affordance for the case where nothing local has
-            // changed since the last pull but the other device might have moved on.
-            if (syncEnabled) {
-                IconButton(onClick = onSync, enabled = !syncing, modifier = Modifier.size(32.dp)) {
-                    if (syncing) {
-                        CircularProgressIndicator(
-                            modifier    = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color       = AccentGreen
-                        )
-                    } else {
-                        Icon(Icons.Default.Sync, contentDescription = "Sync tasks", tint = White60, modifier = Modifier.size(18.dp))
-                    }
-                }
-            }
-            if (streakDays > 0) {
-                Surface(shape = RoundedCornerShape(20.dp), color = AccentGreen.copy(alpha = 0.12f)) {
-                    Row(
-                        modifier          = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.LocalFireDepartment, null, tint = AccentAmber, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("$streakDays day streak", fontSize = 12.sp, color = AccentAmber, fontWeight = FontWeight.SemiBold)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DayProgressBar(completed: Int, total: Int) {
-    val progress = if (total == 0) 0f else completed.toFloat() / total.toFloat()
-    val animatedProgress by animateFloatAsState(
-        targetValue   = progress,
-        animationSpec = tween(600, easing = FastOutSlowInEasing),
-        label         = "progress"
-    )
-    Column {
-        LinearProgressIndicator(
-            progress   = { animatedProgress },
-            modifier   = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-            color      = AccentGreen,
-            trackColor = White10,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text       = "${(progress * 100).toInt()}% complete",
-            fontSize   = 11.sp,
-            color      = White30,
-            fontFamily = FontFamily.Monospace
-        )
-    }
-}
-
-@Composable
-private fun PsycheMessageCard(message: String) {
-    Surface(
-        shape  = RoundedCornerShape(10.dp),
-        color  = BgCardAlt,
-        border = BorderStroke(0.5.dp, AccentBlue.copy(alpha = 0.3f))
-    ) {
-        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Psychology, null, tint = AccentBlue, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(10.dp))
-            Text(message, fontSize = 13.sp, color = White90, lineHeight = 18.sp)
-        }
-    }
-}
-
-@Composable
-private fun TaskCard(
-    task:           StudyTask,
-    isActive:       Boolean,
-    showRepairTestButton: Boolean = false,   // NEW (P0b)
-    onOpenRepairTest: () -> Unit = {},         // NEW (P0b)
-    onStart:        () -> Unit,
-    onDone:         () -> Unit,
-    onSkip:         () -> Unit,
-    onPause:        () -> Unit,
-    onResume:       () -> Unit,
-    onRemove:       () -> Unit,
-    onEditDuration: () -> Unit,
-    onSchedule:     () -> Unit
-) {
-    val isPaused    = task.state == TaskState.PAUSED
-    val borderColor = when {
-        isPaused                        -> AccentAmber
-        isActive                        -> AccentGreen
-        task.state == TaskState.DONE    -> AccentGreen.copy(alpha = 0.3f)
-        task.state == TaskState.SKIPPED -> AccentRed.copy(alpha = 0.3f)
-        else                            -> White10
-    }
-
-    Surface(
-        shape  = RoundedCornerShape(14.dp),
-        color  = if (isActive || isPaused) BgCardAlt else BgCard,
-        border = BorderStroke(1.dp, borderColor)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-
-            Row(
-                modifier              = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment     = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(subjectColor(task.subject)))
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text          = task.subject.uppercase(),
-                        fontSize      = 11.sp,
-                        fontWeight    = FontWeight.Bold,
-                        letterSpacing = 2.sp,
-                        color         = subjectColor(task.subject),
-                        fontFamily    = FontFamily.Monospace
-                    )
-                }
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (isPaused) {
-                        Surface(
-                            shape = RoundedCornerShape(4.dp),
-                            color = AccentAmber.copy(alpha = 0.15f)
-                        ) {
-                            Text(
-                                "⏸ PAUSED",
-                                fontSize   = 10.sp,
-                                color      = AccentAmber,
-                                fontWeight = FontWeight.Bold,
-                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
-                    if (task.isCustom) {
-                        Surface(
-                            shape = RoundedCornerShape(4.dp),
-                            color = AccentBlue.copy(alpha = 0.15f)
-                        ) {
-                            Text(
-                                "CUSTOM",
-                                fontSize   = 10.sp,
-                                color      = AccentBlue,
-                                fontWeight = FontWeight.Bold,
-                                modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                            )
-                        }
-                    }
-                    Text("${task.durationMinutes}m", fontSize = 12.sp, color = White60, fontFamily = FontFamily.Monospace)
-                    if (task.isCustom && task.state == TaskState.PENDING) {
-                        IconButton(onClick = onEditDuration, modifier = Modifier.size(20.dp)) {
-                            Icon(Icons.Default.Edit, null, tint = AccentBlue, modifier = Modifier.size(14.dp))
-                        }
-                    }
-                    // Clock icon: available on ANY PENDING task now, not just unscheduled
-                    // ones — opens ScheduleTaskDialog to edit start+end time directly,
-                    // whether the task already has a slot or not (Timeline + List both
-                    // render TaskCard, so this reaches it in either view).
-                    if (task.state == TaskState.PENDING) {
-                        IconButton(onClick = onSchedule, modifier = Modifier.size(20.dp)) {
-                            Icon(Icons.Default.Schedule, null, tint = AccentGreen, modifier = Modifier.size(14.dp))
-                        }
-                    }
-                    if (task.state == TaskState.PENDING) {
-                        IconButton(onClick = onRemove, modifier = Modifier.size(20.dp)) {
-                            Icon(Icons.Default.Close, null, tint = White30, modifier = Modifier.size(14.dp))
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            Text(
-                text       = task.topic,
-                fontSize   = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                color      = if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) White60 else White90
-            )
-
-            // P0b: shown regardless of task.state — the behavioral task (DONE/SKIPPED)
-            // and the linked Testmate targeted-test are two independent completions by
-            // design (see TargetedTestEvidenceImporter's doc: DONE must never stand in
-            // for real evidence), so a student who already tapped Done can still reach
-            // the test from here, and one who hasn't can take the test first if they want.
-            if (showRepairTestButton) {
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick  = onOpenRepairTest,
-                    border   = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.5f)),
-                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Default.Quiz, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    // Retention-check evidence loop: this same button now also fires for
-                    // RETENTION CHECK tasks (see repairSessionFor's own doc above) — "Take
-                    // test" reads correctly for both a gap-repair retest and a retention
-                    // recall check, without needing task-type-specific label plumbing.
-                    Text("Take test", fontWeight = FontWeight.SemiBold)
-                }
-            }
-
-            if (task.state == TaskState.DONE || task.state == TaskState.SKIPPED) {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text     = if (task.state == TaskState.DONE) "✓ Completed" else "✗ Skipped",
-                    fontSize = 12.sp,
-                    color    = if (task.state == TaskState.DONE) AccentGreen else AccentRed
-                )
-            } else {
-                Spacer(Modifier.height(12.dp))
-
-                if (isPaused) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick  = onResume,
-                            colors   = ButtonDefaults.buttonColors(containerColor = AccentAmber),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp), tint = Color.Black)
-                            Spacer(Modifier.width(6.dp))
-                            Text("Resume", fontWeight = FontWeight.Bold, color = Color.Black)
-                        }
-                        OutlinedButton(
-                            onClick = onSkip,
-                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
-                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
-                        ) { Text("Skip") }
-                    }
-                } else if (isActive) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = onPause,
-                            border  = BorderStroke(1.dp, AccentAmber.copy(alpha = 0.6f)),
-                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentAmber)
-                        ) {
-                            Icon(Icons.Default.Pause, null, modifier = Modifier.size(16.dp))
-                        }
-                        Button(
-                            onClick  = onDone,
-                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Done", fontWeight = FontWeight.Bold)
-                        }
-                        OutlinedButton(
-                            onClick = onSkip,
-                            border  = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
-                            colors  = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed)
-                        ) { Text("Skip") }
-                    }
-                } else {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick  = onStart,
-                            colors   = ButtonDefaults.buttonColors(containerColor = AccentGreen),
-                            modifier = Modifier.weight(1f),
-                            enabled  = task.state == TaskState.PENDING
-                        ) {
-                            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Start Now", fontWeight = FontWeight.Bold)
-                        }
-                        OutlinedButton(
-                            onClick  = onSkip,
-                            border   = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
-                            colors   = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
-                            enabled  = task.state == TaskState.PENDING
-                        ) { Text("Skip") }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun EmptyPlanCard(onPlan: () -> Unit, onAddCustom: () -> Unit) {
-    Surface(shape = RoundedCornerShape(14.dp), color = BgCard, border = BorderStroke(1.dp, White10)) {
-        Column(
-            modifier            = Modifier.fillMaxWidth().padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Icon(Icons.Default.EventNote, null, tint = White30, modifier = Modifier.size(40.dp))
-            Spacer(Modifier.height(12.dp))
-            Text("No plan for today", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = White90)
-            Spacer(Modifier.height(6.dp))
-            Text("Set up your exam and subjects to generate a daily plan, or add a one-off task", fontSize = 13.sp, color = White60)
-            Spacer(Modifier.height(16.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = onPlan, colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)) {
-                    Text("Create Plan", fontWeight = FontWeight.Bold, color = Color.Black)
-                }
-                OutlinedButton(
-                    onClick = onAddCustom,
-                    border  = BorderStroke(1.dp, White30),
-                    colors  = ButtonDefaults.outlinedButtonColors(contentColor = White90)
-                ) {
-                    Text("Add Custom Task")
-                }
-            }
-        }
-    }
-}
-
-private fun subjectColor(subject: String) = when (subject.lowercase()) {
-    "biology"       -> Color(0xFF00C896)
-    "chemistry"     -> Color(0xFF4A9EFF)
-    "physics"       -> Color(0xFFFFB347)
-    "math", "maths" -> Color(0xFFFF4757)
-    else            -> Color(0xFF9090A8)
-}
-
-
-
-
