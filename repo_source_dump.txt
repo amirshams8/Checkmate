@@ -36,6 +36,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── InterventionSnoozeAlarmReceiver.kt
 │   │   │   │   │   │   │   ├── MentorNotifier.kt
 │   │   │   │   │   │   │   ├── OutcomeLedgerSyncManager.kt
+│   │   │   │   │   │   │   ├── OverdueEnforcementCoordinator.kt
 │   │   │   │   │   │   │   ├── ProactiveMentor.kt
 │   │   │   │   │   │   │   ├── ProfileSyncManager.kt
 │   │   │   │   │   │   │   ├── ReminderService.kt
@@ -251,6 +252,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── LlmIntentParser.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedger.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerStats.kt
+│   │   │   │   │   │   │   │   │   ├── OverdueEnforcementGateway.kt
 │   │   │   │   │   │   │   │   │   ├── PlanReplanner.kt
 │   │   │   │   │   │   │   │   │   ├── PlanStoreTaskMutator.kt
 │   │   │   │   │   │   │   │   │   ├── PolicyValidator.kt
@@ -1054,6 +1056,7 @@ import com.checkmate.planner.intervention.InterventionGuardianGateway
 import com.checkmate.planner.intervention.InterventionNotificationBridge
 import com.checkmate.planner.intervention.InterventionReconciliation
 import com.checkmate.planner.intervention.InterventionTriggerScheduler
+import com.checkmate.planner.intervention.OverdueEnforcementBridge
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.service.BehaviorLedgerSyncManager
@@ -1061,6 +1064,7 @@ import com.checkmate.service.DayHistorySyncManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
+import com.checkmate.service.OverdueEnforcementCoordinator
 import com.checkmate.service.ProactiveMentor
 import com.checkmate.service.ReminderService
 import com.checkmate.service.ScreenCaptureManager
@@ -1100,6 +1104,13 @@ class CheckmateApp : Application() {
         // WorkModeManager.init(this) immediately above, same ordering requirement as
         // every other WorkModeManager-dependent call in this method.
         WorkModeTaskReconciler.start(this)
+        // BUGFIX (silent delay never enforced): wires the overdue-PENDING enforcement
+        // gateway InterventionTriggerWorker calls into — see OverdueEnforcementCoordinator
+        // and OverdueEnforcementGateway's own docs. Same settable-gateway pattern as
+        // InterventionNotificationBridge.gateway / InterventionGuardianBridge.gateway just
+        // below; grouped with the WorkMode wiring above instead since this one specifically
+        // depends on WorkModeManager being initialized first.
+        OverdueEnforcementBridge.gateway = OverdueEnforcementCoordinator
         WorkModeScheduleReceiver.scheduleDailyAlarms(this)
         GuardianNotifier.scheduleEndOfDaySummary(this)
         // Every 30 min: pushes an app-usage Telegram alert + caches it in the
@@ -4501,6 +4512,87 @@ object OutcomeLedgerSyncManager {
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/service/OverdueEnforcementCoordinator.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import com.checkmate.core.AppUsageTracker
+import com.checkmate.planner.intervention.OverdueEnforcementGateway
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.workmode.WorkModeManager
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+
+/**
+ * BUGFIX (silent delay never enforced): `app`'s implementation of
+ * [OverdueEnforcementGateway], wired from CheckmateApp.onCreate. Turns
+ * [InterventionTriggerWorker]'s "this PENDING task is N minutes overdue" signal into the
+ * same real consequence HomeViewModel.markSkip() already applies for an explicit Skip —
+ * WorkMode lockdown + escalation watchlist — without ever touching the task's TaskState.
+ * The task stays PENDING and stays startable; see [OverdueEnforcementGateway]'s own doc
+ * for why that distinction matters.
+ *
+ * Two things this adds beyond a plain "call startPostSkipLockdown" forward:
+ *
+ * 1. Idempotency. [InterventionTriggerWorker] calls [applyOverdueEnforcement]
+ *    unconditionally every ~15-minute cycle a task stays overdue — this checks
+ *    [WorkModeManager.hasAppliedOverdueEnforcement] first and no-ops if the task's
+ *    already been escalated, so a task that's been overdue for two hours gets exactly one
+ *    lockdown window opened for it, not a fresh one every cycle.
+ *
+ * 2. Detecting the actual distraction. Rather than relying solely on the fixed
+ *    DEFAULT_ESCALATION_WATCHLIST, this asks [AppUsageTracker.getTopAppInRange] what the
+ *    student has actually spent the most time in since the task's scheduled start time,
+ *    and folds that single package into [WorkModeManager.getEscalationWatchlist] via
+ *    [WorkModeManager.setOverdueTopApp] — catching whatever the real time sink was, watchlist
+ *    app or not, not just the seven apps that list happens to name.
+ */
+object OverdueEnforcementCoordinator : OverdueEnforcementGateway {
+
+    override fun applyOverdueEnforcement(context: Context, task: StudyTask, lateMinutes: Int) {
+        // Idempotency guard — see class doc point 1. Must be checked before anything else
+        // below runs, since re-detecting the top app and re-opening the lockdown window on
+        // every worker cycle is exactly the "09:35 lockdown, 09:50 lockdown again, 10:05
+        // lockdown again" behavior this exists to prevent.
+        if (WorkModeManager.hasAppliedOverdueEnforcement(task.id)) return
+
+        val topAppPackage = detectTopAppSinceScheduledStart(context, task)
+        WorkModeManager.setOverdueTopApp(topAppPackage)
+
+        // Reused, not duplicated: the identical consequence HomeViewModel.markSkip() opens
+        // for an explicit Skip tap. Deliberately NOT calling markSkip() itself and
+        // deliberately NOT calling PlanStore.markTask anywhere in this file — this task is
+        // still PENDING and stays PENDING; only the enforcement layer changes.
+        WorkModeManager.startPostSkipLockdown(context)
+
+        WorkModeManager.markOverdueEnforcementApplied(task.id)
+    }
+
+    /**
+     * Resolves task.scheduledStartTime ("HH:mm") against today's date to get the actual
+     * start of the window to inspect, then asks AppUsageTracker for whichever app ate the
+     * most foreground time between that moment and now. Returns null (safe no-op fold in
+     * getEscalationWatchlist) if the time string doesn't parse, Usage Access isn't
+     * granted, or nothing cleared AppUsageTracker's usage floor — [applyOverdueEnforcement]
+     * still opens the lockdown window and the fixed watchlist either way.
+     */
+    private fun detectTopAppSinceScheduledStart(context: Context, task: StudyTask): String? {
+        val scheduled = task.scheduledStartTime?.let {
+            try { LocalTime.parse(it) } catch (e: Exception) { null }
+        } ?: return null
+
+        val startMillis = scheduled.atDate(LocalDate.now())
+            .atZone(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val nowMillis = System.currentTimeMillis()
+
+        return AppUsageTracker.getTopAppInRange(context, startMillis, nowMillis)?.packageName
+    }
+}
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/service/ProactiveMentor.kt =====
 package com.checkmate.service
 
@@ -6272,9 +6364,7 @@ import com.checkmate.workmode.WorkModeManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
 /**
@@ -6313,6 +6403,14 @@ import kotlinx.coroutines.flow.onEach
  * before Work Mode is actually enforcing. This reconciler is the single source of
  * truth for the two paths that had no coverage at all; on the in-app path it's a
  * harmless, idempotent no-op alongside the direct call that already works.
+ *
+ * BUGFIX (silent delay never enforced): also the single place that releases
+ * WorkModeManager's overdue-enforcement idempotency guard once a task leaves
+ * PENDING — see [WorkModeManager.retainOverdueEnforcementOnly]'s own doc for why this
+ * function, specifically, is the right home for that cleanup (it already observes
+ * every task-state transition regardless of cause, ACTIVE-state consequences and
+ * overdue-PENDING consequences are two sides of the same "what does this task's
+ * state mean for WorkMode right now" question this object already owns).
  */
 object WorkModeTaskReconciler {
 
@@ -6321,29 +6419,31 @@ object WorkModeTaskReconciler {
     /** Call once from CheckmateApp.onCreate, after WorkModeManager.init(this). */
     fun start(context: Context) {
         PlanStore.todayTasks
-            .map { tasks -> tasks.any { it.state == TaskState.ACTIVE || it.state == TaskState.PAUSED } }
-            .distinctUntilChanged()
-            .onEach { hasLiveTask -> reconcile(context, hasLiveTask) }
+            .onEach { tasks -> reconcile(context, tasks) }
             .launchIn(scope)
     }
 
-    private fun reconcile(context: Context, hasLiveTask: Boolean) {
+    private fun reconcile(context: Context, tasks: List<StudyTask>) {
+        val hasLiveTask = tasks.any { it.state == TaskState.ACTIVE || it.state == TaskState.PAUSED }
+
         if (hasLiveTask) {
             if (!WorkModeManager.isActive.value) {
                 WorkModeManager.activate(context, source = WorkModeManager.SOURCE_TASK)
             }
-            return
-        }
-
-        // No live task. Only release Work Mode if WE were the one holding it open —
-        // never stomp on a MANUAL guardian toggle or the hardcoded SCHEDULE window,
-        // both of which are legitimately independent of any single task's state.
-        // deactivate() itself still re-checks WorkModeSchedule and refuses to actually
-        // turn off if the 19:00-02:00 window is live, same guard markDone/markSkip
-        // already rely on.
-        if (WorkModeManager.isActive.value && WorkModeManager.activeSource() == WorkModeManager.SOURCE_TASK) {
+        } else if (WorkModeManager.isActive.value && WorkModeManager.activeSource() == WorkModeManager.SOURCE_TASK) {
+            // No live task, and WE were the one holding Work Mode open — never stomp on a
+            // MANUAL guardian toggle or the hardcoded SCHEDULE window, both legitimately
+            // independent of any single task's state. deactivate() itself still re-checks
+            // WorkModeSchedule and refuses to actually turn off if the 19:00-02:00 window
+            // is live, same guard markDone/markSkip already rely on.
             WorkModeManager.deactivate(context)
         }
+
+        // BUGFIX (silent delay never enforced): release the overdue-enforcement guard for
+        // any task id that's no longer PENDING — see WorkModeManager.retainOverdueEnforcementOnly's
+        // own doc.
+        val stillPendingIds = tasks.filter { it.state == TaskState.PENDING }.map { it.id }.toSet()
+        WorkModeManager.retainOverdueEnforcementOnly(stillPendingIds)
     }
 }
 
@@ -16215,6 +16315,41 @@ object AppUsageTracker {
         return stats
             .filter { it.packageName != context.packageName }
             .sumOf { it.totalTimeInForeground }
+    }
+
+    /**
+     * BUGFIX (silent delay never enforced — "block whichever app is eating the most time
+     * during the overdue window"): same bucketed-and-grouped approach as [getTodayUsage],
+     * parameterized to an arbitrary [startMillis, endMillis) range instead of "today" and
+     * returning only the single top entry. Used by `app`'s OverdueEnforcementCoordinator
+     * to find what the student has actually been doing since the task's scheduled start
+     * time, rather than only ever blocking the fixed DEFAULT_ESCALATION_WATCHLIST — a
+     * procrastinating student's actual time sink (a game, a browser tab, anything not on
+     * that fixed list) is exactly what a static watchlist can't catch. Returns null (never
+     * throws) if Usage Access isn't granted, the range is empty/inverted, or nothing
+     * cleared the same 1-minute-of-usage floor [getTodayUsage] already applies.
+     */
+    fun getTopAppInRange(context: Context, startMillis: Long, endMillis: Long): AppUsageEntry? {
+        if (!hasUsageAccess(context)) return null
+        if (endMillis <= startMillis) return null
+
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val stats = try {
+            usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, startMillis, endMillis)
+        } catch (e: Exception) {
+            null
+        } ?: return null
+
+        val pm = context.packageManager
+        return stats
+            .filter { it.totalTimeInForeground >= 60_000L && it.packageName != context.packageName }
+            .groupBy { it.packageName }
+            .map { (pkg, group) -> pkg to group.sumOf { it.totalTimeInForeground } }
+            .mapNotNull { (pkg, millis) ->
+                val label = resolveLabel(pm, pkg) ?: return@mapNotNull null
+                AppUsageEntry(pkg, label, millis)
+            }
+            .maxByOrNull { it.foregroundMillis }
     }
 
     /**
@@ -27246,6 +27381,17 @@ import com.checkmate.planner.PlanStore
  * race window between it and the acquire call; acquire() already returns AlreadyHeld
  * safely if something else (a concurrent run, or a manually-triggered intervention) beat
  * this one to it.
+ *
+ * BUGFIX (silent delay never enforced): also runs [OverdueEnforcementBridge] for every
+ * fired signal whose lateMinutes has crossed
+ * [TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES] — independent of, and before,
+ * the escrow/notification bookkeeping below, since escrow tracks the notification
+ * transaction's own state (NEGOTIATING, TTL_EXPIRED, ...), not whether real enforcement
+ * has been applied. A task can be re-notified every cycle forever (escrow keeps expiring
+ * and re-acquiring) while enforcement itself only actually applies once — see
+ * OverdueEnforcementGateway's own doc on why idempotency lives on the gateway side, not
+ * here. This worker only ever reads [TriggerEvaluator]'s existing lateMinutes; it does not
+ * compute lateness itself, here or anywhere else.
  */
 class InterventionTriggerWorker(
     context: Context,
@@ -27264,6 +27410,17 @@ class InterventionTriggerWorker(
 
         PlanStore.todayTasks.value.forEach { task ->
             val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
+
+            // BUGFIX (silent delay never enforced): real consequence for a badly-overdue
+            // PENDING task, independent of whatever this cycle's notification escrow below
+            // ends up doing. Fires every cycle past threshold — OverdueEnforcementBridge's
+            // implementation is responsible for only actually applying anything once per
+            // overdue episode (see its own doc) and for never mutating this task's state.
+            if (signal.lateMinutes >= TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES) {
+                OverdueEnforcementBridge.gateway?.applyOverdueEnforcement(
+                    applicationContext, task, signal.lateMinutes
+                )
+            }
 
             val ttlMillis = if (gateway != null) {
                 InterventionNotificationBridge.PROMPT_TTL_MILLIS
@@ -28378,6 +28535,53 @@ object OutcomeLedgerStats {
 }
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/OverdueEnforcementGateway.kt =====
+package com.checkmate.planner.intervention
+
+import android.content.Context
+import com.checkmate.planner.model.StudyTask
+
+/**
+ * BUGFIX (silent delay never enforced): a PENDING task past
+ * [TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES] gets a real consequence —
+ * WorkMode lockdown + escalation watchlist, the same mechanism HomeViewModel.markSkip()
+ * already uses for an explicit Skip tap — instead of just another notification.
+ *
+ * Deliberately does NOT change the task's TaskState. PENDING + 47 min late is still
+ * legitimately recoverable — the student can still press Start — so this must never
+ * become SKIPPED just because nobody looked at their phone. Implementations must not
+ * call PlanStore.markTask/markSkip or anything else that mutates task state; this is
+ * enforcement only, layered on top of a task that's still, and stays, PENDING.
+ *
+ * Same settable-gateway seam as [InterventionNotificationGateway]/
+ * [InterventionGuardianGateway] — planner has no dependency on :modules:workmode (nor
+ * should it; the two modules are deliberately kept independent), so this interface is
+ * owned here and implemented by `app`'s OverdueEnforcementCoordinator, wired from
+ * CheckmateApp.onCreate alongside the other two gateways.
+ *
+ * [InterventionTriggerWorker] calls this unconditionally every worker cycle the task
+ * remains PENDING past threshold — it does not track "have I already done this for this
+ * task." Idempotency (applying the consequence once per overdue episode, not once per
+ * ~15-minute worker cycle forever) is the implementation's responsibility, via a durable
+ * per-task guard — see WorkModeManager.hasAppliedOverdueEnforcement's own doc for where
+ * that guard lives and how it gets cleared once the task leaves PENDING.
+ */
+interface OverdueEnforcementGateway {
+    /**
+     * [task] is still PENDING at call time — implementations must not mutate its
+     * TaskState. [lateMinutes] is [TriggerEvaluator]'s own computed value, already past
+     * [TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES]; implementations should
+     * not recompute lateness themselves — this is the single detection source.
+     */
+    fun applyOverdueEnforcement(context: Context, task: StudyTask, lateMinutes: Int)
+}
+
+object OverdueEnforcementBridge {
+    @Volatile
+    var gateway: OverdueEnforcementGateway? = null
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/PlanReplanner.kt =====
 package com.checkmate.planner.intervention
 
@@ -29344,6 +29548,20 @@ object TriggerEvaluator {
 
     /** Past this, TASK_NOT_STARTED escalates to LATE_START. */
     const val LATE_ESCALATION_THRESHOLD_MINUTES = 10
+
+    /**
+     * BUGFIX (silent delay never enforced): past this, a still-PENDING task stops being
+     * "just another notification" and gets a real consequence — WorkMode lockdown +
+     * escalation watchlist, via [OverdueEnforcementGateway]. Deliberately just a threshold
+     * compared against [TriggerSignal.lateMinutes], the same value [evaluate] already
+     * computes — this is not a second lateness calculation, and nothing here changes what
+     * [evaluate] returns or how it's computed. See InterventionTriggerWorker's own doc for
+     * why 30 is a threshold to compare against, not a real-time deadline: the periodic
+     * worker that reads this has a 15-minute WorkManager floor and no guaranteed exact
+     * cadence, so this can legitimately fire anywhere from ~30 to ~44 minutes late
+     * depending on when the worker last happened to run — that's expected, not a bug.
+     */
+    const val OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES = 30
 
     data class TriggerSignal(val triggerType: InterventionTriggerType, val lateMinutes: Int)
 
@@ -34755,6 +34973,14 @@ object WorkModeManager {
     private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
     private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
 
+    // BUGFIX (silent delay never enforced): idempotency ledger for overdue-PENDING
+    // enforcement, plus the dynamically-detected top-time-consuming app for the current
+    // overdue window. See hasAppliedOverdueEnforcement/markOverdueEnforcementApplied/
+    // retainOverdueEnforcementOnly/setOverdueTopApp for the actual logic; these two keys
+    // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
+    private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
+    private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
+
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
 
@@ -34869,7 +35095,14 @@ object WorkModeManager {
 
     // Mentor v2 (spec 3.4): post-skip escalation lockdown.
 
-    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip(). */
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip() —
+     *  and, as of the overdue-enforcement fix, from `app`'s OverdueEnforcementCoordinator
+     *  for a badly-overdue still-PENDING task. Deliberately the same function for both:
+     *  it's the identical consequence (temporary lockdown + escalation watchlist), just
+     *  reached by two different triggers — an explicit Skip tap, or silence past
+     *  threshold. Neither caller may pair this with a TaskState change other than what
+     *  that caller already legitimately does on its own terms (markSkip marks SKIPPED
+     *  for its own reasons; the overdue path must NOT mark anything). */
     fun startPostSkipLockdown(context: Context) {
         val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
             .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
@@ -34883,12 +35116,21 @@ object WorkModeManager {
     fun isInPostSkipLockdown(): Boolean =
         System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
 
-    /** Package names blocked on first foreground during a post-skip lockdown window — the
-     *  permanent blocklist plus a fixed distraction-prone watchlist (extendable via prefs). */
+    /**
+     * Package names blocked on first foreground during a post-skip/overdue lockdown
+     * window — the permanent blocklist, plus a fixed distraction-prone watchlist
+     * (extendable via prefs), plus (BUGFIX, silent delay never enforced) whichever single
+     * app [setOverdueTopApp] most recently recorded as the top time-consumer during an
+     * overdue-PENDING window. That last piece is what lets this catch a student's actual
+     * procrastination target — a game, a browser tab, anything not on the fixed list —
+     * rather than only ever blocking the same static seven apps.
+     */
     fun getEscalationWatchlist(): Set<String> {
         val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
         val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
-        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet
+        val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
+            ?.takeIf { it.isNotBlank() }
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
     }
 
     /**
@@ -34925,6 +35167,64 @@ object WorkModeManager {
      * fix; nothing outside this object needed to read it.
      */
     fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
+    /**
+     * BUGFIX (silent delay never enforced): true once overdue enforcement has already
+     * been applied for this specific task id. [InterventionTriggerWorker] calls
+     * [OverdueEnforcementGateway.applyOverdueEnforcement] every ~15-minute cycle the task
+     * stays PENDING past threshold — this is what stops that from re-running
+     * startPostSkipLockdown()/re-detecting the top app on every single cycle
+     * (09:35 apply, 09:50 no-op, 10:05 no-op, ...) instead of exactly once per overdue
+     * episode. Keyed on StudyTask.id (a fresh UUID per generated task — see StudyTask's
+     * own doc — never reused across days), not a global flag, so one overdue task doesn't
+     * suppress detection for a different one.
+     */
+    fun hasAppliedOverdueEnforcement(taskId: String): Boolean =
+        overdueEscalatedIds().contains(taskId)
+
+    /** Records that overdue enforcement has now been applied for [taskId] — call exactly
+     *  once, from the same code path that calls [startPostSkipLockdown] for this reason. */
+    fun markOverdueEnforcementApplied(taskId: String) {
+        persistOverdueEscalatedIds(overdueEscalatedIds() + taskId)
+    }
+
+    /**
+     * Drops every escalated-task id NOT in [stillPendingTaskIds]. Call from
+     * [com.checkmate.service.WorkModeTaskReconciler] on every PlanStore.todayTasks
+     * emission — that's the one place that already observes every task leaving PENDING,
+     * regardless of why (started, done, skipped, reverted back to PENDING by
+     * GapTaskManager's resolveDoneConcept path, or dropped off today's list entirely by
+     * day rollover). A task that's since been resolved has nothing left to guard against
+     * re-escalating, and if it ever legitimately becomes PENDING again later (the
+     * GapTaskManager revert case), it deserves a fresh overdue evaluation rather than
+     * being permanently suppressed by a stale flag from its last time around.
+     *
+     * Also clears the detected top-app watchlist entry once nothing is left escalated, so
+     * a stale detection from an already-resolved delay doesn't linger in
+     * [getEscalationWatchlist] indefinitely.
+     */
+    fun retainOverdueEnforcementOnly(stillPendingTaskIds: Set<String>) {
+        val current = overdueEscalatedIds()
+        val retained = current.intersect(stillPendingTaskIds)
+        if (retained != current) persistOverdueEscalatedIds(retained)
+        if (retained.isEmpty() && current.isNotEmpty()) setOverdueTopApp(null)
+    }
+
+    /** Records which app [com.checkmate.core.AppUsageTracker.getTopAppInRange] found was
+     *  eating the most time during the current overdue-PENDING window — folded into
+     *  [getEscalationWatchlist] alongside the fixed watchlist. Pass null to clear it. */
+    fun setOverdueTopApp(pkg: String?) {
+        CheckmatePrefs.putString(KEY_OVERDUE_TOP_APP, pkg ?: "")
+    }
+
+    private fun overdueEscalatedIds(): Set<String> {
+        val saved = CheckmatePrefs.getString(KEY_OVERDUE_ESCALATED_TASK_IDS, "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun persistOverdueEscalatedIds(ids: Set<String>) {
+        CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
+    }
 
     /** Returns package names of apps to block. */
     fun getBlockedApps(): Set<String> {
