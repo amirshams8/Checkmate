@@ -2,11 +2,18 @@ package com.checkmate.ui.testresults
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import android.util.Base64
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.URLUtil
 import android.webkit.WebView
@@ -48,6 +55,8 @@ import com.checkmate.testmate.TestmateApi
 import com.checkmate.ui.theme.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 
 private const val PREF_HISTORY = "testmate_webview_history"
 private const val HISTORY_LIMIT = 30
@@ -109,6 +118,14 @@ private fun recordVisit(url: String, title: String) {
  * the OS, but a WebView just silently swallows the navigation. We wire a
  * DownloadListener to Android's DownloadManager and forward the WebView's
  * session cookie + user agent so authenticated downloads still work.
+ *
+ * "Copy report for LLM" / "Download .md" style buttons build the file
+ * client-side as a JS Blob (`URL.createObjectURL(blob)`), which produces a
+ * `blob:` URL rather than a real network resource. DownloadManager can only
+ * fetch http/https — it has no way to reach bytes that only exist inside
+ * the page's JS heap — so those downloads are pulled out via JS instead
+ * (fetch the blob, base64-encode it, hand it to Kotlin through
+ * [BlobDownloadInterface]) and written to disk directly.
  *
  * Multi-tab + history: several WebViews can be open at once (e.g. a group
  * session in one tab, a previous test result in another) via the tab
@@ -293,6 +310,7 @@ fun TestmateWebScreen(navController: NavController, initialSessionId: String? = 
                                 settings.javaScriptEnabled = true
                                 settings.domStorageEnabled = true
                                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                addJavascriptInterface(BlobDownloadInterface(ctx), "AndroidBlobDownload")
                                 webViewClient = object : WebViewClient() {
                                     override fun onPageFinished(view: WebView, url: String?) {
                                         activeTab.loading = false
@@ -310,7 +328,35 @@ fun TestmateWebScreen(navController: NavController, initialSessionId: String? = 
                                     }
                                 }
                                 setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                                    downloadFile(ctx, url, userAgent, contentDisposition, mimeType)
+                                    if (url.startsWith("blob:")) {
+                                        // DownloadManager can't fetch blob: URLs — pull the bytes
+                                        // out of the page's JS heap instead and hand them back to
+                                        // Kotlin as base64 through BlobDownloadInterface.
+                                        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+                                        val escapedFileName = fileName.replace("\\", "\\\\").replace("'", "\\'")
+                                        val js = """
+                                            (function() {
+                                                fetch('$url')
+                                                    .then(function(res) { return res.blob(); })
+                                                    .then(function(blob) {
+                                                        var reader = new FileReader();
+                                                        reader.onloadend = function() {
+                                                            AndroidBlobDownload.onBase64Data(reader.result, '$escapedFileName');
+                                                        };
+                                                        reader.onerror = function() {
+                                                            AndroidBlobDownload.onError('Could not read blob data');
+                                                        };
+                                                        reader.readAsDataURL(blob);
+                                                    })
+                                                    .catch(function(e) {
+                                                        AndroidBlobDownload.onError(e && e.message ? e.message : 'blob fetch failed');
+                                                    });
+                                            })();
+                                        """.trimIndent()
+                                        evaluateJavascript(js, null)
+                                    } else {
+                                        downloadFile(ctx, url, userAgent, contentDisposition, mimeType)
+                                    }
                                 }
                                 tabWebViews[activeTab.id] = this
                                 loadUrl(activeTab.url)
@@ -492,6 +538,10 @@ private fun HistoryDialog(
  * copied over explicitly because DownloadManager makes its own network
  * request outside the WebView, so it doesn't automatically inherit the
  * WebView's session.
+ *
+ * Only used for real http/https download URLs. `blob:` URLs (client-built
+ * files like the "Download .md" report) are handled separately — see
+ * [BlobDownloadInterface] — since DownloadManager cannot fetch them.
  */
 private fun downloadFile(
     context: Context,
@@ -522,5 +572,84 @@ private fun downloadFile(
         Toast.makeText(context, "Downloading $fileName…", Toast.LENGTH_SHORT).show()
     } catch (e: Exception) {
         Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * JS bridge for "blob:" downloads (e.g. Testmate's "Download .md" report
+ * button, which builds the file client-side via `URL.createObjectURL`).
+ * The page reads the blob back out with `fetch` + `FileReader.readAsDataURL`
+ * and posts the resulting base64 data URL here, since a `blob:` URL only
+ * has meaning inside that page's JS heap and DownloadManager has no way to
+ * fetch it over the network.
+ *
+ * Callbacks land on the WebView's internal JS thread, not the main thread,
+ * so file I/O happens here directly (small report files) and any UI
+ * feedback (Toast) is posted back to the main looper.
+ */
+private class BlobDownloadInterface(private val context: Context) {
+
+    @JavascriptInterface
+    fun onBase64Data(dataUrl: String, fileName: String) {
+        try {
+            // dataUrl looks like "data:text/markdown;base64,SGVsbG8...".
+            val base64 = dataUrl.substringAfter(",", dataUrl)
+            val bytes = Base64.decode(base64, Base64.DEFAULT)
+            saveBytesToDownloads(context, bytes, fileName)
+            postToast("Downloaded $fileName")
+        } catch (e: Exception) {
+            postToast("Download failed: ${e.message}")
+        }
+    }
+
+    @JavascriptInterface
+    fun onError(message: String?) {
+        postToast("Download failed: ${message ?: "unknown error"}")
+    }
+
+    private fun postToast(message: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+/**
+ * Writes raw bytes straight to the device's Downloads folder. Uses
+ * MediaStore on API 29+ (scoped storage — no legacy storage permission
+ * needed), and falls back to the plain external Downloads directory +
+ * `DownloadManager.addCompletedDownload` (so it still shows up in the
+ * system Downloads app/notification) below that, matching the existing
+ * pre-Android-10 WRITE_EXTERNAL_STORAGE allowance already declared in the
+ * manifest for [downloadFile].
+ */
+private fun saveBytesToDownloads(context: Context, bytes: ByteArray, fileName: String) {
+    val mimeType = MimeTypeMap.getSingleton()
+        .getMimeTypeFromExtension(fileName.substringAfterLast('.', ""))
+        ?: "text/markdown"
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val resolver = context.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Could not create download entry")
+        resolver.openOutputStream(uri)?.use { it.write(bytes) }
+            ?: throw IllegalStateException("Could not open output stream")
+    } else {
+        @Suppress("DEPRECATION")
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        downloadsDir.mkdirs()
+        val file = File(downloadsDir, fileName)
+        FileOutputStream(file).use { it.write(bytes) }
+
+        val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        @Suppress("DEPRECATION")
+        downloadManager.addCompletedDownload(
+            fileName, fileName, true, mimeType, file.absolutePath, bytes.size.toLong(), true
+        )
     }
 }
