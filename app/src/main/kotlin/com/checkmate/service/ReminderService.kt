@@ -98,6 +98,13 @@ class ReminderService : Service() {
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
                 try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
+                // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
+                // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and
+                // VERIFY consume GapTaskLedger's own already-imported P0b evidence (just
+                // polled/imported by the call directly above, same tick) rather than firing a
+                // second competing Testmate request. See TutorCycleManager's own class doc.
+                try { TutorCycleManager.driveActiveSession(applicationContext) } catch (_: Exception) {}
                 // Retention-check evidence loop (next-session-retention-loop.txt): requests a
                 // Testmate session for any RETENTION CHECK task that doesn't have one yet —
                 // see RetentionCheckManager's own doc for why this is a separate ledger/

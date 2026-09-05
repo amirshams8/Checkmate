@@ -81,6 +81,20 @@ object GapTaskLedger {
     private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
     private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
     private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    // Phase 3 (adaptive tutor state machine) execution bridge: the tutor FSM's
+    // PRACTICE -> VERIFY transition needs real attempt counts for THIS round specifically
+    // (see com.checkmate.learning.tutor.TutorEvidence.PracticeAttempts's own doc — it must
+    // be "this practice pass," not lifetime). This P0b loop already runs the exact Testmate
+    // targeted-test request/import for the same active concept the tutor session tracks
+    // (see TutorSessionLedger.startFromCandidate, called from the same
+    // GapTaskManager.generateIfNeeded call site that serves this ledger's active concept in
+    // the first place) — rather than have TutorCycleManager fire a SECOND, competing
+    // targeted-test request for the same concept, it reads these two fields, written
+    // alongside [markActiveEvidenceImported] from the SAME TestmateResult
+    // GapTaskManager.evidencePollIfNeeded already has in hand. "Extend the existing
+    // intervention pipeline, don't replace it" applied to the tutor bridge specifically.
+    private const val KEY_ACTIVE_LAST_IMPORT_ATTEMPTS = "gap_task_active_last_import_attempts"
+    private const val KEY_ACTIVE_LAST_IMPORT_CORRECT  = "gap_task_active_last_import_correct"
     // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
     // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
     // id never changed between rounds, so a round-2 request for the SAME concept got the
@@ -296,11 +310,27 @@ object GapTaskLedger {
     /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
      *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
      *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
-     *  session every 15 minutes for the rest of the day. */
-    fun markActiveEvidenceImported() {
+     *  session every 15 minutes for the rest of the day.
+     *
+     *  [attemptCount]/[correctCount] are this round's own counts (straight from the same
+     *  `TestmateResult` GapTaskManager.evidencePollIfNeeded already has in hand when it calls
+     *  this) — see [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc for why these exist. Optional,
+     *  defaulting to 0/0, so this stays source-compatible with any other caller that only
+     *  cares about the imported flag itself. */
+    fun markActiveEvidenceImported(attemptCount: Int = 0, correctCount: Int = 0) {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, attemptCount)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, correctCount)
         bumpVersion()
     }
+
+    /** This round's attempt count from the last [markActiveEvidenceImported] call — see
+     *  [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc. 0 if nothing has been imported yet. */
+    fun activeLastImportAttemptCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+
+    /** This round's correct count from the last [markActiveEvidenceImported] call — see
+     *  [activeLastImportAttemptCount]'s own doc. */
+    fun activeLastImportCorrectCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
 
     /**
      * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
@@ -320,6 +350,8 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
@@ -354,6 +386,8 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
     }
 

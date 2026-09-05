@@ -14,6 +14,7 @@ import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
@@ -137,7 +138,14 @@ object GapTaskManager {
             val decisionReport = LearningDecisionEngine.decideFromReport(
                 report, studentModel, estimates, expectedScore
             )
-            LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            val orchestrationResult =
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
+            // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
+            // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
+            // startFromCandidate's own doc for which intents this actually applies to.
+            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
             createTargetedTestIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
@@ -545,7 +553,10 @@ object GapTaskManager {
                 topic = topic,
                 result = result
             )
-            GapTaskLedger.markActiveEvidenceImported()
+            GapTaskLedger.markActiveEvidenceImported(
+                attemptCount = result.attemptedCount,
+                correctCount = result.correctCount
+            )
         } catch (e: Exception) {
             Log.e(TAG, "evidence import failed: ${e.message}", e)
         }
