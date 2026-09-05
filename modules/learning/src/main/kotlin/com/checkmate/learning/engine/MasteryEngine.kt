@@ -5,6 +5,7 @@ import android.util.Log
 import com.checkmate.learning.graph.KnowledgeGraph
 import com.checkmate.learning.model.Concept
 import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.LearningEventType
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.model.QuestionAttempt
 import com.checkmate.learning.repository.LearningDatabase
@@ -39,7 +40,7 @@ object MasteryEngine {
 
     private const val TAG = "MasteryEngine"
 
-    const val MASTERY_THRESHOLD = 0.75
+    const val MASTERY_THRESHOLD = 0.83
     private const val RECENT_WINDOW = 10
 
     private const val W_RECENT = 0.35
@@ -48,6 +49,11 @@ object MasteryEngine {
     private const val W_RETENTION = 0.15
     private const val W_SPEED = 0.10
     private const val W_CONFIDENCE = 0.05
+    /**
+     * Weight for the skip-coverage component. Null when no skipped events exist
+     * for the concept so concepts with zero skip data are not penalised.
+     */
+    private const val W_COVERAGE = 0.10
 
     suspend fun recomputeAll(
         context: Context,
@@ -69,12 +75,28 @@ object MasteryEngine {
             )
         }
 
+        // Count skipped questions per concept so computeMastery can apply a
+        // coverage penalty without conflating skips with wrong answers in accuracy.
+        val allEvents = db.learningEventDao().getAll(studentId)
+        val skippedByConceptId: Map<String, Int> = allEvents
+            .filter { it.eventType == LearningEventType.QUESTION_SKIPPED && it.questionId != null }
+            .groupBy { event ->
+                val q = questionById[event.questionId!!]
+                KnowledgeGraph.conceptId(
+                    exam = q?.exam ?: "unknown",
+                    chapter = q?.chapter ?: "unknown",
+                    topic = q?.topic
+                )
+            }
+            .mapValues { it.value.size }
+
         val results = mutableListOf<ConceptMastery>()
         val concepts = mutableListOf<Concept>()
 
         for ((conceptId, conceptAttempts) in grouped) {
             val sorted = conceptAttempts.sortedBy { it.timestamp }
-            results.add(computeMastery(studentId, conceptId, sorted))
+            val skippedCount = skippedByConceptId[conceptId] ?: 0
+            results.add(computeMastery(studentId, conceptId, sorted, skippedCount))
 
             val sampleQuestion = questionById[sorted.last().questionId]
             concepts.add(
@@ -98,7 +120,8 @@ object MasteryEngine {
     fun computeMastery(
         studentId: String,
         conceptId: String,
-        attemptsSortedAscending: List<QuestionAttempt>
+        attemptsSortedAscending: List<QuestionAttempt>,
+        skippedCount: Int = 0
     ): ConceptMastery {
         require(attemptsSortedAscending.isNotEmpty()) { "computeMastery requires at least one attempt" }
 
@@ -115,13 +138,20 @@ object MasteryEngine {
         val difficultyPerformance: Double? = null
         val confidenceCalibration: Double? = null
 
+        // Coverage: what fraction of all questions seen by the student were actually
+        // attempted (not skipped). Null when no skip data exists — keeps the component
+        // out of renormalizedMastery entirely so zero-skip concepts are unaffected.
+        val totalSeen = attemptCount + skippedCount
+        val coverageScore: Double? = if (skippedCount > 0) attemptCount.toDouble() / totalSeen else null
+
         val mastery = renormalizedMastery(
             recentAccuracy = recentAccuracy,
             lifetimeAccuracy = lifetimeAccuracy,
             difficultyPerformance = difficultyPerformance,
             retention = retention,
             speed = speed,
-            confidenceCalibration = confidenceCalibration
+            confidenceCalibration = confidenceCalibration,
+            coverageScore = coverageScore
         )
 
         return ConceptMastery(
@@ -151,7 +181,8 @@ object MasteryEngine {
         difficultyPerformance: Double?,
         retention: Double,
         speed: Double,
-        confidenceCalibration: Double?
+        confidenceCalibration: Double?,
+        coverageScore: Double?
     ): Double {
         val components = mutableListOf(
             W_RECENT to recentAccuracy,
@@ -161,6 +192,7 @@ object MasteryEngine {
         )
         difficultyPerformance?.let { components.add(W_DIFFICULTY to it) }
         confidenceCalibration?.let { components.add(W_CONFIDENCE to it) }
+        coverageScore?.let { components.add(W_COVERAGE to it) }
 
         val weightSum = components.sumOf { it.first }
         return components.sumOf { it.first * it.second } / weightSum

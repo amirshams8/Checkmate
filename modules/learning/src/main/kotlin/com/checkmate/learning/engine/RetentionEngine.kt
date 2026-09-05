@@ -32,7 +32,7 @@ object RetentionEngine {
     // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
     // imported directly — RetentionEngine has no dependency on MasteryEngine today
     // and this avoids introducing one for a single constant.
-    const val HIGH_MASTERY_THRESHOLD = 0.75
+    const val HIGH_MASTERY_THRESHOLD = 0.83   // kept in sync with MasteryEngine.MASTERY_THRESHOLD
     const val HIGH_RISK_THRESHOLD = 0.5
 
     /** Days after which, with no further attempts, forgetting risk saturates near 1.0. */

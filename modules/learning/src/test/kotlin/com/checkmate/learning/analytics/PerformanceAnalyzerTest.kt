@@ -1,5 +1,6 @@
 package com.checkmate.learning.analytics
 
+import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.ConceptSnapshot
 import com.checkmate.learning.model.OverallLearningState
 import com.checkmate.learning.model.RetentionDecisionSnapshot
@@ -42,8 +43,8 @@ class PerformanceAnalyzerTest {
         generatedAt = 1_000L,
         overall = OverallLearningState(
             conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= 0.75 },
-            conceptsWeak = concepts.count { it.mastery < 0.75 },
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
             averageMastery = concepts.map { it.mastery }.average(),
             totalAttempts = concepts.sumOf { it.attemptCount },
             unresolvedErrorCount = 0

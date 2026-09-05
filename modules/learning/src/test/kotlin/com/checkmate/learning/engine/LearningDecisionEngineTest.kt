@@ -53,8 +53,8 @@ class LearningDecisionEngineTest {
         generatedAt = 1_000L,
         overall = OverallLearningState(
             conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= 0.75 },
-            conceptsWeak = concepts.count { it.mastery < 0.75 },
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
             averageMastery = if (concepts.isEmpty()) 0.0 else concepts.map { it.mastery }.average(),
             totalAttempts = concepts.sumOf { it.attemptCount },
             unresolvedErrorCount = unresolvedErrors.sumOf { it.occurrences }
