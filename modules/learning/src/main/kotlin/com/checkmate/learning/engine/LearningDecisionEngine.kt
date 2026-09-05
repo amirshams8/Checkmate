@@ -91,7 +91,7 @@ object LearningDecisionEngine {
      *  [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] by hand, not
      *  imported — same "not worth a cross-file dependency for one constant"
      *  convention [ScorePredictor.WEAK_MASTERY_THRESHOLD] already establishes. */
-    private const val HIGH_MASTERY_THRESHOLD = 0.75
+    private const val HIGH_MASTERY_THRESHOLD = 0.83
 
     /** Kept in sync with [ScorePredictor.ERROR_HEAVY_THRESHOLD] by hand, same
      *  "repeated errors become a distinct signal, not just low mastery" framing. */

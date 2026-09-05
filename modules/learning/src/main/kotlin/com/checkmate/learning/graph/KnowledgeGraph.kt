@@ -348,7 +348,7 @@ object KnowledgeGraph {
         conceptId: String,
         // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
         // imported directly — avoids a graph<->engine circular reference for one constant.
-        masteryThreshold: Double = 0.75
+        masteryThreshold: Double = 0.83
     ): List<Concept> {
         val db = LearningDatabase.getInstance(context)
         val prerequisiteIds = db.conceptDependencyDao().getPrerequisites(conceptId)

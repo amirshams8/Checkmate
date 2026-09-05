@@ -66,7 +66,7 @@ object ScorePredictor {
      *  by hand, not imported — same reasoning [com.checkmate.learning.engine.RetentionEngine]
      *  gives for its own `HIGH_MASTERY_THRESHOLD` copy. "Weak enough to be worth
      *  naming in a bottleneck breakdown," not a different definition of mastery. */
-    private const val WEAK_MASTERY_THRESHOLD = 0.75
+    private const val WEAK_MASTERY_THRESHOLD = 0.83
 
     /** Attempt count at which per-topic data confidence saturates to 1.0 — mirrors
      *  [ScoreGainEstimator.FULL_CONFIDENCE_ATTEMPTS] / `MasteryEngine.RECENT_WINDOW`,
