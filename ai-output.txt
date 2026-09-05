@@ -1,1036 +1,1068 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorState.kt =====
-package com.checkmate.learning.tutor
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/MasteryEngine.kt =====
+package com.checkmate.learning.engine
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.graph.KnowledgeGraph
+import com.checkmate.learning.model.Concept
+import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.LearningEventType
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.repository.LearningDatabase
 
 /**
- * Upgrade Blueprint Phase 3 ("Adaptive tutor — state machine, not a chat prompt").
+ * Upgrade Blueprint Phase 1.5 ("MasteryEngine — deterministic first, no LLM-guessed
+ * scores").
  *
- * This is the tutor state machine sitting ABOVE the existing decision/intervention
- * infrastructure, not replacing it:
- * ```
- * Evidence -> StudentModel -> Mastery/Error/Retention -> LearningDecisionEngine
- *     -> CandidateIntervention -> [TutorStateMachine] -> Orchestrator -> StudyTask
- * ```
- * [LearningDecisionEngine][com.checkmate.learning.engine.LearningDecisionEngine] still
- * decides WHAT concept is worth working on next (unchanged — see [TutorSessionLedger]'s
- * connector for the one place this file's package reads a
- * [com.checkmate.learning.engine.LearningDecisionEngine.CandidateIntervention]). This
- * state machine only governs HOW a single teaching cycle for one already-chosen concept
- * progresses once started — a strictly narrower, additive concern, not a second
- * competing decision engine.
+ * mastery = 0.35·recentAccuracy + 0.20·lifetimeAccuracy + 0.15·difficultyPerformance
+ *         + 0.15·retention + 0.10·speed + 0.05·confidenceCalibration
  *
- * States, per this session's spec:
- * ```
- * DIAGNOSE -> EXPLAIN -> PRACTICE -> VERIFY -> { MASTERED -> MOVE_ON | EXPLAIN/PRACTICE }
- * ```
- * [MASTERED] and [MOVE_ON] are kept as two distinct states rather than collapsed into
- * one, even though the transition between them never requires new evidence: [MASTERED]
- * is the moment mastery was confirmed; [MOVE_ON] is the moment that confirmation was
- * actually consumed (session closed, concept freed up for whatever
- * [com.checkmate.learning.engine.LearningDecisionEngine] ranks next). Giving the
- * close-out step its own state is what lets a caller hook "record this concept as
- * covered" at exactly one place ([MASTERED]->[MOVE_ON]) without conflating it with the
- * evidence-driven decision that produced [MASTERED] in the first place.
+ * HONEST GAP: two of the six blueprint components have no real data source yet in
+ * this codebase — Question.difficulty is always null (TestResultNormalizer never
+ * sets it; Testmate's report.md carries no difficulty field) and
+ * QuestionAttempt.confidence is always null (nothing captures a stated-confidence
+ * input anywhere). Treating a missing input as 0 would drag every mastery score
+ * down by exactly its weight regardless of actual performance, so missing
+ * components are dropped from the weighted sum and the remaining weights are
+ * renormalized to sum to 1.0 (see [renormalizedMastery]). Wire
+ * Question.difficulty / a real confidence input in here the moment either exists —
+ * nothing else needs to change.
  *
- * [ESCALATED] is not in the user-facing diagram but is required by the core invariant
- * this machine exists to enforce (see [TutorStateMachine]'s class doc): an
- * EXPLAIN/PRACTICE retry loop that never converges must terminate into something other
- * than silently declaring [MASTERED] anyway. See [TutorStateMachine.MAX_CYCLES].
+ * Concept identity: [KnowledgeGraph.conceptId] keys on (exam, chapter, topic) only —
+ * NOT subject — because TestResultNormalizer-imported Questions never carry a
+ * subject. This means a mastery row can exist for a concept before/without ever
+ * running [KnowledgeGraph.seedExamSyllabus] for that exam — [recomputeAll] below
+ * upserts a minimal [Concept] row itself from whatever Question data it has, so
+ * ConceptMastery always has a matching, queryable Concept row even with zero
+ * syllabus seeding done.
  */
-enum class TutorState {
-    DIAGNOSE,
-    EXPLAIN,
-    PRACTICE,
-    VERIFY,
-    /** Terminal-ish: mastery evidence just confirmed, close-out not yet run. */
-    MASTERED,
-    /** Terminal: close-out ran, session consumed. No further transitions valid. */
-    MOVE_ON,
-    /** Terminal: [TutorStateMachine.MAX_CYCLES] EXPLAIN/PRACTICE retries exhausted
-     *  without clearing mastery. Deliberately NOT [MASTERED] — the whole point of this
-     *  state existing is that [TutorStateMachine] must never launder "gave up" into
-     *  "succeeded". A caller (next milestone: wiring into
-     *  [com.checkmate.planner.intervention.LearningInterventionOrchestrator]) is
-     *  expected to read this as a signal to fall back to
-     *  [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY]
-     *  or a fresh [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT]
-     *  re-rank rather than assuming the concept is done — not built in this pass. */
-    ESCALATED;
+object MasteryEngine {
 
-    val isTerminal: Boolean get() = this == MOVE_ON || this == ESCALATED
-}
+    private const val TAG = "MasteryEngine"
 
-/**
- * Blueprint Phase 3's own framing: "first check known/unknown/misunderstood/forgotten,
- * then pick the type of response" — this is that four-way check, the required input to
- * the one [DIAGNOSE] transition.
- */
-enum class DiagnosticFinding {
-    /** Already knows it — skip re-teaching, go straight to a confirmation check. */
-    KNOWN,
-    /** Never learned it. */
-    UNKNOWN,
-    /** Learned it wrong — a misconception, not a gap. */
-    MISUNDERSTOOD,
-    /** Learned it correctly once, no longer retrievable — a retention lapse, not a
-     *  fresh teaching gap. Routed the same as UNKNOWN/MISUNDERSTOOD today (both need
-     *  [TutorState.EXPLAIN]); kept as its own case rather than merged so a future pass
-     *  can special-case "re-explain briefer, they've seen this before" without
-     *  reshaping this enum. */
-    FORGOTTEN
-}
+    const val MASTERY_THRESHOLD = 0.83
+    private const val RECENT_WINDOW = 10
 
-/** Blueprint's own four-way error-type-driven split for what a failed [TutorState.VERIFY]
- *  should route back to — conceptual failure re-teaches, procedural failure just needs
- *  more reps. Named independently of [com.checkmate.learning.model.ErrorType] (kept as
- *  the `.name` string on [com.checkmate.learning.model.ErrorPatternSnapshot] already) so
- *  this package doesn't need to interpret every one of that enum's members — only which
- *  bucket each one falls into (see [TutorStateMachine.classifyFailure]). */
-internal enum class VerifyFailureShape { CONCEPTUAL, PROCEDURAL }
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorEvidence.kt =====
-package com.checkmate.learning.tutor
-
-import com.checkmate.learning.model.ConceptSnapshot
-
-/**
- * What causes each [TutorState] transition — see [TutorStateMachine] for the table this
- * feeds. One evidence type per state a session can be waiting IN, not per transition, so
- * [TutorStateMachine.transition] can reject an evidence/state mismatch before it even
- * looks at the evidence's contents (see [TutorTransitionResult.Invalid]).
- *
- * Deliberately NOT keyed on anything from [com.checkmate.planner.model.StudyTask]
- * (no `TaskState.DONE`, no `checksPassed`) — that is the core invariant this file
- * exists to enforce (Phase 3 spec: "the tutor must not declare mastery because a task
- * was marked DONE"). [Verification] carries a real
- * [com.checkmate.learning.model.ConceptSnapshot] — the same mastery/retention machinery
- * [com.checkmate.learning.engine.LearningDecisionEngine] itself reads — as the only
- * thing [TutorStateMachine] is allowed to treat as proof of mastery.
- */
-sealed class TutorEvidence {
-
-    /** Answers [TutorState.DIAGNOSE]. */
-    data class Diagnostic(val finding: DiagnosticFinding) : TutorEvidence()
-
-    /** Answers [TutorState.EXPLAIN] — the mentor actually delivered *some* explanatory
-     *  response (micro-explanation / worked example / analogy / question / diagram /
-     *  derivation, per the blueprint's own "not a fixed-length essay" framing). Which
-     *  *type* of explanation was chosen is a teaching-layer concern this state machine
-     *  deliberately has no opinion on — it only needs to know teaching happened before
-     *  practice can start. */
-    object ExplanationDelivered : TutorEvidence()
-
+    private const val W_RECENT = 0.35
+    private const val W_LIFETIME = 0.20
+    private const val W_DIFFICULTY = 0.15
+    private const val W_RETENTION = 0.15
+    private const val W_SPEED = 0.10
+    private const val W_CONFIDENCE = 0.05
     /**
-     * Answers [TutorState.PRACTICE]. `attemptCount`/`correctCount` are real recorded
-     * attempts for THIS practice pass (i.e. since the current [TutorState.PRACTICE]
-     * entry, not lifetime) — [TutorStateMachine] enforces
-     * [TutorStateMachine.MIN_PRACTICE_ATTEMPTS] itself; a caller cannot shortcut the
-     * check by pre-filtering. This is the second half of the "no evidence, no
-     * advance" invariant: [TutorState.PRACTICE] -> [TutorState.VERIFY] requires this
-     * evidence to clear a real minimum, exactly like the class doc's "PRACTICE -> VERIFY
-     * should eventually require actual evidence" requirement.
+     * Weight for the skip-coverage component. Null when no skipped events exist
+     * for the concept so concepts with zero skip data are not penalised.
      */
-    data class PracticeAttempts(val attemptCount: Int, val correctCount: Int) : TutorEvidence()
+    private const val W_COVERAGE = 0.10
 
-    /**
-     * Answers [TutorState.VERIFY]. `snapshot` must be freshly rebuilt from the
-     * VERIFY-phase attempts specifically (a caller's responsibility — this class only
-     * consumes whatever [ConceptSnapshot] it's given), so a stale, pre-session snapshot
-     * can never be replayed to fake a mastery decision. `dominantErrorType` is the
-     * `.name` of the most frequent [com.checkmate.learning.model.ErrorType] behind this
-     * verification pass's wrong answers, if any — null when every attempt was correct
-     * or no error classification exists yet — and is what routes a failed VERIFY back
-     * to [TutorState.EXPLAIN] (conceptual) vs [TutorState.PRACTICE] (procedural); see
-     * [TutorStateMachine.classifyFailure].
-     */
-    data class Verification(
-        val snapshot: ConceptSnapshot,
-        val dominantErrorType: String?
-    ) : TutorEvidence()
+    suspend fun recomputeAll(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): List<ConceptMastery> {
+        val db = LearningDatabase.getInstance(context)
+        val questions = db.questionDao().getAll()
+        val attempts = db.questionAttemptDao().getAll(studentId)
+        if (attempts.isEmpty()) return emptyList()
 
-    /** Answers [TutorState.MASTERED] — the one transition that needs no new evidence
-     *  at all, since mastery was already confirmed to enter [TutorState.MASTERED] in
-     *  the first place. Exists as an explicit evidence value (rather than a no-arg
-     *  overload) so [TutorStateMachine.transition]'s signature stays uniform across
-     *  every state. */
-    object CloseOut : TutorEvidence()
-}
+        val questionById = questions.associateBy { it.id }
 
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorSession.kt =====
-package com.checkmate.learning.tutor
-
-import kotlinx.serialization.Serializable
-
-/**
- * One in-progress (or just-finished) teaching cycle for a single concept. Immutable —
- * every [TutorStateMachine.transition] call returns a NEW [TutorSession] rather than
- * mutating this one, same "derived snapshot, never mutated in place" discipline
- * [com.checkmate.learning.model.StudentModel]'s own class doc establishes. Persistence
- * (surviving process death/relaunch) is [TutorSessionLedger]'s job, not this class's —
- * this is a plain value type with no I/O of its own, so [TutorStateMachine] stays a pure
- * function of (session, evidence) that a JVM unit test can exercise with zero Android
- * dependencies.
- *
- * [Serializable]: [TutorSessionLedger] persists this directly as one JSON blob via
- * CheckmatePrefs — same "plain data, no engine/model-internal types" shape
- * [com.checkmate.planner.intervention.GapTaskLedger]'s own persisted `WarningLogEntry`
- * already establishes for its history — which is also why this type carries no
- * [com.checkmate.learning.model.ConceptSnapshot] (only [TutorEvidence.Verification]
- * does, and evidence itself is never persisted, only its effect on [state]/[history]).
- */
-@Serializable
-data class TutorSession(
-    val conceptId: String,
-    val state: TutorState,
-    /** How many EXPLAIN/PRACTICE retry loops this session has burned through after a
-     *  failed [TutorState.VERIFY] — see [TutorStateMachine.MAX_CYCLES]. Zero until the
-     *  first VERIFY failure; never decremented. */
-    val cycleCount: Int = 0,
-    val startedAt: Long,
-    val updatedAt: Long,
-    /** Full audit trail, oldest first — every transition [TutorStateMachine] has ever
-     *  accepted for this session, including the ones that looped back to EXPLAIN/
-     *  PRACTICE rather than advancing toward MASTERED. Not capped here (unlike e.g.
-     *  [com.checkmate.planner.intervention.GapTaskLedger]'s warning log) since a single
-     *  tutor session's own history is inherently small — [TutorStateMachine.MAX_CYCLES]
-     *  already bounds it. */
-    val history: List<TutorTransitionRecord> = emptyList()
-) {
-    init {
-        require(conceptId.isNotBlank()) { "TutorSession requires a non-blank conceptId" }
-        require(cycleCount >= 0) { "cycleCount cannot be negative" }
-    }
-}
-
-/** One accepted transition, kept for the session's audit trail. `reason` is a short,
- *  human-readable justification (e.g. "diagnostic=KNOWN, skipping re-teach") — the same
- *  kind of self-documenting-decision string
- *  [com.checkmate.learning.engine.LearningDecisionEngine]'s own `rationale` field on
- *  [com.checkmate.learning.engine.LearningDecisionEngine.CandidateIntervention] already
- *  establishes, not a free-text log line. */
-@Serializable
-data class TutorTransitionRecord(
-    val from: TutorState,
-    val to: TutorState,
-    val reason: String,
-    val timestamp: Long
-)
-
-/** What [TutorStateMachine.transition] returns — success carries the new session,
- *  failure carries WHY, so a caller (or a test) never has to guess whether "nothing
- *  changed" meant "already at that state" or "evidence didn't clear the bar". */
-sealed class TutorTransitionResult {
-    data class Advanced(val session: TutorSession) : TutorTransitionResult()
-
-    /** Rejected — either the evidence type doesn't match what [session]'s current
-     *  [TutorState] is waiting on, the session is already [TutorState.isTerminal], or
-     *  the evidence's own content didn't clear the bar for advancing (e.g.
-     *  [TutorEvidence.PracticeAttempts] below [TutorStateMachine.MIN_PRACTICE_ATTEMPTS]
-     *  — see that val's own doc for why this is a rejection, not a silent no-op). The
-     *  original, unmodified [session] is included so a caller doesn't need to track it
-     *  separately across a failed call. */
-    data class Invalid(val session: TutorSession, val reason: String) : TutorTransitionResult()
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorStateMachine.kt =====
-package com.checkmate.learning.tutor
-
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-
-/**
- * Upgrade Blueprint Phase 3 skeleton — "state machine, not a chat prompt." This is the
- * ONLY file that decides whether a [TutorSession] may move from one [TutorState] to
- * another; every transition [executeTopCandidate]-style caller might want has to come
- * through here, same "one file owns the decision" discipline
- * [com.checkmate.learning.engine.LearningDecisionEngine] already established for
- * candidate ranking.
- *
- * CORE INVARIANT (this session's explicit spec): the tutor must never declare mastery
- * because a task was marked DONE. Enforced structurally, not by convention — this file
- * has no import of, and no parameter of type, [com.checkmate.planner.model.StudyTask] or
- * `TaskState` anywhere. The ONLY evidence [TutorState.VERIFY] accepts is
- * [TutorEvidence.Verification], which carries a real
- * [com.checkmate.learning.model.ConceptSnapshot] — the same mastery number
- * [com.checkmate.learning.engine.LearningDecisionEngine] itself trusts. A caller cannot
- * fake this by passing "the task got checked off"; there is no parameter shape that
- * would accept it.
- *
- * SECOND INVARIANT: [TutorState.PRACTICE] -> [TutorState.VERIFY] requires real evidence
- * of practice actually happening ([MIN_PRACTICE_ATTEMPTS]), not merely "the EXPLAIN step
- * finished" — see class doc's own "PRACTICE -> VERIFY should eventually require actual
- * evidence" requirement. [TutorEvidence.PracticeAttempts] below that minimum is rejected
- * ([TutorTransitionResult.Invalid]), not silently accepted with a warning — a caller
- * cannot advance a session by simply asserting "practice happened" without the count to
- * back it.
- *
- * DELIBERATE SCOPE NOTE (session 2 discussion): [TutorEvidence.Diagnostic] is
- * intentionally coarse today (KNOWN/UNKNOWN/MISUNDERSTOOD/FORGOTTEN, scoped to the
- * existing topic-level conceptId) rather than a validated sub-concept hypothesis — no
- * finer-grained diagnosis data model exists in this codebase yet
- * ([com.checkmate.learning.graph.KnowledgeGraph.conceptId] keys on exam/chapter/topic
- * only). A future P3.1 pass (diagnostic hypothesis persistence, LLM-proposed/
- * deterministic-validated, confidence-scored) can richen what PRODUCES a
- * [DiagnosticFinding] without touching this file's transition table — [Diagnostic]
- * stays the evidence shape either way. Likewise, a failed [TutorState.VERIFY] here
- * routes directly back to [TutorState.EXPLAIN] or [TutorState.PRACTICE] (deterministic
- * re-classification of the same failure, via [classifyFailure]) rather than back to
- * [TutorState.DIAGNOSE] — reasonable today because there is no richer hypothesis to
- * revise yet; once P3.1 exists, inserting a genuine re-DIAGNOSE hop on VERIFY failure is
- * an additive change to the table below, not a rewrite of it.
- *
- * DETERMINISTIC BY DESIGN, same discipline as
- * [com.checkmate.learning.engine.LearningDecisionEngine] — no LLM call anywhere in this
- * file, and none should ever be added. An LLM may PRODUCE the [TutorEvidence] this file
- * consumes (e.g. a future LLM-assisted [DiagnosticFinding] or the explanation text
- * behind [TutorEvidence.ExplanationDelivered]) but never decides the transition itself.
- */
-object TutorStateMachine {
-
-    /** How many EXPLAIN/PRACTICE retry cycles a session may burn through after a failed
-     *  VERIFY before [TutorState.ESCALATED] fires instead of looping forever. First-pass
-     *  constant, not calibrated against real outcomes — same "flag it, don't pretend
-     *  it's derived" honesty [com.checkmate.learning.engine.LearningDecisionEngine]'s own
-     *  constants already model. */
-    const val MAX_CYCLES = 3
-
-    /** Minimum real practice attempts (this PRACTICE pass, not lifetime) before
-     *  [TutorState.VERIFY] may be entered — see class doc's SECOND INVARIANT. */
-    const val MIN_PRACTICE_ATTEMPTS = 3
-
-    /** Starts a brand-new session in [TutorState.DIAGNOSE] — the only state a session
-     *  may ever begin in. No evidence required to start; [DIAGNOSE]'s own evidence
-     *  requirement ([TutorEvidence.Diagnostic]) governs leaving it. */
-    fun start(conceptId: String, now: Long): TutorSession {
-        require(conceptId.isNotBlank()) { "start() requires a non-blank conceptId" }
-        return TutorSession(
-            conceptId = conceptId,
-            state = TutorState.DIAGNOSE,
-            cycleCount = 0,
-            startedAt = now,
-            updatedAt = now,
-            history = emptyList()
-        )
-    }
-
-    /**
-     * The one entry point every transition goes through. Returns
-     * [TutorTransitionResult.Invalid] — never throws — for: a terminal session, an
-     * evidence type that doesn't match [session]'s current state, or evidence whose own
-     * content doesn't clear the bar to advance. Every accepted transition appends exactly
-     * one [TutorTransitionRecord] to [TutorSession.history].
-     */
-    fun transition(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        if (session.state.isTerminal) {
-            return TutorTransitionResult.Invalid(
-                session,
-                "session for ${session.conceptId} is already terminal (${session.state}) — no further transitions"
+        val grouped = attempts.groupBy { attempt ->
+            val q = questionById[attempt.questionId]
+            KnowledgeGraph.conceptId(
+                exam = q?.exam ?: "unknown",
+                chapter = q?.chapter ?: "unknown",
+                topic = q?.topic
             )
         }
 
-        return when (session.state) {
-            TutorState.DIAGNOSE -> fromDiagnose(session, evidence, now)
-            TutorState.EXPLAIN -> fromExplain(session, evidence, now)
-            TutorState.PRACTICE -> fromPractice(session, evidence, now)
-            TutorState.VERIFY -> fromVerify(session, evidence, now)
-            TutorState.MASTERED -> fromMastered(session, evidence, now)
-            TutorState.MOVE_ON, TutorState.ESCALATED ->
-                TutorTransitionResult.Invalid(session, "unreachable — terminal check above already handled this")
-        }
-    }
+        // Count skipped questions per concept so computeMastery can apply a
+        // coverage penalty without conflating skips with wrong answers in accuracy.
+        val allEvents = db.learningEventDao().getAll(studentId)
+        val skippedByConceptId: Map<String, Int> = allEvents
+            .filter { it.eventType == LearningEventType.QUESTION_SKIPPED && it.questionId != null }
+            .groupBy { event ->
+                val q = questionById[event.questionId!!]
+                KnowledgeGraph.conceptId(
+                    exam = q?.exam ?: "unknown",
+                    chapter = q?.chapter ?: "unknown",
+                    topic = q?.topic
+                )
+            }
+            .mapValues { it.value.size }
 
-    // ── DIAGNOSE ─────────────────────────────────────────────────────────────
+        val results = mutableListOf<ConceptMastery>()
+        val concepts = mutableListOf<Concept>()
 
-    private fun fromDiagnose(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        val diagnostic = evidence as? TutorEvidence.Diagnostic
-            ?: return wrongEvidence(session, TutorState.DIAGNOSE, evidence)
+        for ((conceptId, conceptAttempts) in grouped) {
+            val sorted = conceptAttempts.sortedBy { it.timestamp }
+            val skippedCount = skippedByConceptId[conceptId] ?: 0
+            results.add(computeMastery(studentId, conceptId, sorted, skippedCount))
 
-        return when (diagnostic.finding) {
-            // Already knows it — no re-teach needed, go straight to a confirmation check.
-            DiagnosticFinding.KNOWN -> advance(
-                session, TutorState.VERIFY, now,
-                "diagnostic=KNOWN — skipping re-teach, confirming mastery directly"
-            )
-            DiagnosticFinding.UNKNOWN, DiagnosticFinding.MISUNDERSTOOD, DiagnosticFinding.FORGOTTEN -> advance(
-                session, TutorState.EXPLAIN, now,
-                "diagnostic=${diagnostic.finding} — needs teaching before practice"
-            )
-        }
-    }
-
-    // ── EXPLAIN ──────────────────────────────────────────────────────────────
-
-    private fun fromExplain(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        if (evidence !is TutorEvidence.ExplanationDelivered) {
-            return wrongEvidence(session, TutorState.EXPLAIN, evidence)
-        }
-        return advance(session, TutorState.PRACTICE, now, "explanation delivered — moving to guided practice")
-    }
-
-    // ── PRACTICE ─────────────────────────────────────────────────────────────
-
-    private fun fromPractice(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        val attempts = evidence as? TutorEvidence.PracticeAttempts
-            ?: return wrongEvidence(session, TutorState.PRACTICE, evidence)
-
-        require(attempts.attemptCount >= 0) { "attemptCount cannot be negative" }
-        require(attempts.correctCount in 0..attempts.attemptCount) {
-            "correctCount (${attempts.correctCount}) must be between 0 and attemptCount (${attempts.attemptCount})"
-        }
-
-        // SECOND INVARIANT — see class doc. Insufficient practice evidence is a
-        // rejection, not a silent no-op or an early pass-through to VERIFY.
-        if (attempts.attemptCount < MIN_PRACTICE_ATTEMPTS) {
-            return TutorTransitionResult.Invalid(
-                session,
-                "only ${attempts.attemptCount} practice attempt(s) recorded, need at least " +
-                    "$MIN_PRACTICE_ATTEMPTS before VERIFY can run"
-            )
-        }
-
-        return advance(
-            session, TutorState.VERIFY, now,
-            "${attempts.attemptCount} practice attempts recorded (${attempts.correctCount} correct) — verifying"
-        )
-    }
-
-    // ── VERIFY ───────────────────────────────────────────────────────────────
-
-    private fun fromVerify(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        val verification = evidence as? TutorEvidence.Verification
-            ?: return wrongEvidence(session, TutorState.VERIFY, evidence)
-
-        val snapshot = verification.snapshot
-        require(snapshot.conceptId == session.conceptId) {
-            "verification snapshot is for concept ${snapshot.conceptId}, session is for ${session.conceptId}"
-        }
-
-        val mastered = snapshot.mastery >= MasteryEngine.MASTERY_THRESHOLD &&
-            snapshot.retentionDecision != RetentionDecisionSnapshot.REVIEW
-
-        if (mastered) {
-            return advance(
-                session, TutorState.MASTERED, now,
-                "verified mastery %.2f (>= %.2f threshold), retention=%s".format(
-                    snapshot.mastery, MasteryEngine.MASTERY_THRESHOLD, snapshot.retentionDecision
+            val sampleQuestion = questionById[sorted.last().questionId]
+            concepts.add(
+                Concept(
+                    id = conceptId,
+                    exam = sampleQuestion?.exam ?: "unknown",
+                    subject = sampleQuestion?.subject,
+                    chapter = sampleQuestion?.chapter ?: "unknown",
+                    topic = sampleQuestion?.topic ?: sampleQuestion?.chapter ?: "unknown"
                 )
             )
         }
 
-        // Not mastered. Before routing back, check the retry budget — this is the
-        // ONLY place MAX_CYCLES is spent, since VERIFY is the only state that can loop.
-        if (session.cycleCount >= MAX_CYCLES) {
-            return advance(
-                session, TutorState.ESCALATED, now,
-                "mastery %.2f still below threshold after $MAX_CYCLES retry cycle(s) — escalating, " +
-                    "not looping further".format(snapshot.mastery)
-            )
-        }
+        db.conceptDao().upsertAll(concepts)
+        db.masteryDao().upsertAll(results)
+        Log.d(TAG, "Recomputed mastery for ${results.size} concept(s), student=$studentId")
+        return results
+    }
 
-        val failureShape = classifyFailure(verification.dominantErrorType)
-        val nextState = when (failureShape) {
-            VerifyFailureShape.CONCEPTUAL -> TutorState.EXPLAIN
-            VerifyFailureShape.PROCEDURAL -> TutorState.PRACTICE
-        }
-        val reason = "mastery %.2f below threshold, dominant error=%s (%s) — routing back to %s (cycle %d)".format(
-            snapshot.mastery, verification.dominantErrorType ?: "none", failureShape, nextState, session.cycleCount + 1
+    /** Pure, testable — no DB/context. Exposed for MasteryEngineTest. */
+    fun computeMastery(
+        studentId: String,
+        conceptId: String,
+        attemptsSortedAscending: List<QuestionAttempt>,
+        skippedCount: Int = 0
+    ): ConceptMastery {
+        require(attemptsSortedAscending.isNotEmpty()) { "computeMastery requires at least one attempt" }
+
+        val attemptCount = attemptsSortedAscending.size
+        val lifetimeAccuracy = attemptsSortedAscending.count { it.correct }.toDouble() / attemptCount
+        val recentSlice = attemptsSortedAscending.takeLast(RECENT_WINDOW)
+        val recentAccuracy = recentSlice.count { it.correct }.toDouble() / recentSlice.size
+        val lastSeen = attemptsSortedAscending.last().timestamp
+        val medianTime = median(attemptsSortedAscending.mapNotNull { it.timeTakenSeconds })
+        val speed = speedScore(medianTime)
+        val retention = RetentionEngine.retentionScore(lastSeen, recentAccuracy)
+
+        // difficulty / confidence: see the HONEST GAP note on the class doc. Both null today.
+        val difficultyPerformance: Double? = null
+        val confidenceCalibration: Double? = null
+
+        // Coverage: what fraction of all questions seen by the student were actually
+        // attempted (not skipped). Null when no skip data exists — keeps the component
+        // out of renormalizedMastery entirely so zero-skip concepts are unaffected.
+        val totalSeen = attemptCount + skippedCount
+        val coverageScore: Double? = if (skippedCount > 0) attemptCount.toDouble() / totalSeen else null
+
+        val mastery = renormalizedMastery(
+            recentAccuracy = recentAccuracy,
+            lifetimeAccuracy = lifetimeAccuracy,
+            difficultyPerformance = difficultyPerformance,
+            retention = retention,
+            speed = speed,
+            confidenceCalibration = confidenceCalibration,
+            coverageScore = coverageScore
         )
-        return advance(session, nextState, now, reason, incrementCycle = true)
+
+        return ConceptMastery(
+            studentId = studentId,
+            conceptId = conceptId,
+            mastery = mastery,
+            confidence = 0.0,
+            recentAccuracy = recentAccuracy,
+            lifetimeAccuracy = lifetimeAccuracy,
+            difficultyAdjustedAccuracy = difficultyPerformance,
+            medianTimeSeconds = medianTime,
+            attemptCount = attemptCount,
+            lastSeen = lastSeen,
+            lastMastered = if (mastery >= MASTERY_THRESHOLD) lastSeen else null,
+            forgettingRisk = RetentionEngine.forgettingRisk(lastSeen, mastery),
+            errorRate = 1.0 - lifetimeAccuracy,
+            learnedAt = attemptsSortedAscending.first().timestamp,
+            successfulRecallCount = attemptsSortedAscending.count { it.correct },
+            failedRecallCount = attemptsSortedAscending.count { !it.correct },
+            lastUpdated = System.currentTimeMillis()
+        )
+    }
+
+    private fun renormalizedMastery(
+        recentAccuracy: Double,
+        lifetimeAccuracy: Double,
+        difficultyPerformance: Double?,
+        retention: Double,
+        speed: Double,
+        confidenceCalibration: Double?,
+        coverageScore: Double?
+    ): Double {
+        val components = mutableListOf(
+            W_RECENT to recentAccuracy,
+            W_LIFETIME to lifetimeAccuracy,
+            W_RETENTION to retention,
+            W_SPEED to speed
+        )
+        difficultyPerformance?.let { components.add(W_DIFFICULTY to it) }
+        confidenceCalibration?.let { components.add(W_CONFIDENCE to it) }
+        coverageScore?.let { components.add(W_COVERAGE to it) }
+
+        val weightSum = components.sumOf { it.first }
+        return components.sumOf { it.first * it.second } / weightSum
     }
 
     /**
-     * Blueprint's own error taxonomy (Phase 1.6) split into two buckets: a genuine
-     * knowledge gap re-teaches ([VerifyFailureShape.CONCEPTUAL]); a knowledge-is-there-
-     * but-execution-failed error just needs more reps at the same explanation
-     * ([VerifyFailureShape.PROCEDURAL]). Same reasoning
-     * [com.checkmate.learning.engine.LearningDecisionEngine.classifyIntent] already
-     * applies when it picks INCREASE_DIFFICULTY for a high-mastery CARELESS/
-     * TIME_PRESSURE pattern instead of REPAIR_CONCEPT — that same distinction, reused
-     * here for VERIFY-failure routing instead of intervention selection. `null` (no
-     * error classification available, or every attempt was a near-miss with no single
-     * dominant type) defaults to PROCEDURAL — same "don't assume a conceptual gap
-     * without positive evidence of one" caution
-     * [com.checkmate.learning.engine.ErrorEngine.classify] already applies when it
-     * defaults an unclassifiable wrong answer to UNKNOWN_CONCEPT rather than a specific
-     * bucket it has no basis for — the difference here is which unlabeled default is
-     * SAFER for a retry loop: assuming procedural (more practice) wastes less of the
-     * student's time on a wrong hypothesis than assuming conceptual (a full re-teach)
-     * when the truth is unknown.
+     * No external timing baseline exists anywhere in this codebase (no per-question
+     * expected-time field, no exam-wide pacing constant), so this is a flat heuristic
+     * tuned for single-best-answer NEET/JEE-style MCQs, not a blueprint-specified
+     * formula. Validate against real score correlation before trusting it — same
+     * caveat the blueprint gives for the mastery formula as a whole.
      */
-    internal fun classifyFailure(dominantErrorType: String?): VerifyFailureShape = when (dominantErrorType) {
-        "UNKNOWN_CONCEPT", "MISCONCEPTION", "FORMULA_RECALL", "FORMULA_SELECTION" ->
-            VerifyFailureShape.CONCEPTUAL
-        else -> VerifyFailureShape.PROCEDURAL
+    private fun speedScore(medianTimeSeconds: Double?): Double = when {
+        medianTimeSeconds == null -> 0.5 // no timing data — neutral, not penalized
+        medianTimeSeconds <= 60.0 -> 1.0
+        medianTimeSeconds <= 120.0 -> 0.7
+        medianTimeSeconds <= 180.0 -> 0.4
+        else -> 0.2
     }
 
-    // ── MASTERED ─────────────────────────────────────────────────────────────
-
-    private fun fromMastered(session: TutorSession, evidence: TutorEvidence, now: Long): TutorTransitionResult {
-        if (evidence !is TutorEvidence.CloseOut) {
-            return wrongEvidence(session, TutorState.MASTERED, evidence)
-        }
-        return advance(session, TutorState.MOVE_ON, now, "close-out — mastery confirmation consumed")
+    private fun median(values: List<Int>): Double? {
+        if (values.isEmpty()) return null
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2.0 else sorted[mid].toDouble()
     }
-
-    // ── shared helpers ───────────────────────────────────────────────────────
-
-    private fun advance(
-        session: TutorSession,
-        to: TutorState,
-        now: Long,
-        reason: String,
-        incrementCycle: Boolean = false
-    ): TutorTransitionResult.Advanced {
-        val record = TutorTransitionRecord(from = session.state, to = to, reason = reason, timestamp = now)
-        return TutorTransitionResult.Advanced(
-            session.copy(
-                state = to,
-                cycleCount = if (incrementCycle) session.cycleCount + 1 else session.cycleCount,
-                updatedAt = now,
-                history = session.history + record
-            )
-        )
-    }
-
-    private fun wrongEvidence(
-        session: TutorSession,
-        expectedState: TutorState,
-        evidence: TutorEvidence
-    ): TutorTransitionResult.Invalid = TutorTransitionResult.Invalid(
-        session,
-        "session is in $expectedState, cannot accept ${evidence::class.simpleName} evidence"
-    )
 }
 
 
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorSessionLedger.kt =====
-package com.checkmate.learning.tutor
 
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.learning.engine.LearningDecisionEngine
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/RetentionEngine.kt =====
+package com.checkmate.learning.engine
+
+import android.content.Context
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
+import kotlin.math.exp
 
 /**
- * Upgrade Blueprint Phase 3 skeleton, item 5 ("persist the tutor state so process
- * death/relaunch doesn't reset it") and item 6 ("connect it to the existing
- * LearningDecisionEngine rather than creating another competing decision engine").
+ * Upgrade Blueprint Phase 1.7 ("RetentionEngine — answers 'does the student *still*
+ * know it,' not 'did they study it'").
  *
- * CheckmatePrefs-backed, same pattern
- * [com.checkmate.planner.intervention.GapTaskLedger] already establishes for exactly
- * the same reason: single-user app, one tutoring cycle in flight at a time, so there is
- * nowhere else for "which concept is currently mid-teaching-cycle" to live across a
- * process restart. [TutorStateMachine] itself stays a pure, Android-free function of
- * (session, evidence) — this object is the ONLY place in this package that touches
- * CheckmatePrefs, so [TutorStateMachine]'s own unit tests never need
- * `CheckmatePrefs.init()`/an Android Context, same "engine tested pure, ledger wraps
- * it with I/O" split [com.checkmate.planner.intervention.GapTaskLedger] and
- * [com.checkmate.learning.engine.LearningDecisionEngine] already model between
- * themselves.
+ * HONEST GAP: the blueprint's retention fields (learned_at, successful_recall_n,
+ * failed_recall, last_review) are stored on
+ * [com.checkmate.learning.model.ConceptMastery] itself (learnedAt /
+ * successfulRecallCount / failedRecallCount / lastSeen) rather than a separate
+ * retention table — the blueprint's own model/ listing for Phase 1.4-1.7 names
+ * Concept.kt, ConceptMastery.kt, ErrorRecord.kt only, no separate retention entity,
+ * so this reuses the mastery row rather than inventing an unlisted file.
  *
- * SINGLE ACTIVE SESSION, same justification as
- * [com.checkmate.planner.intervention.GapTaskLedger]'s own single active-concept slot:
- * there is only ever one gap-repair concept in flight in this single-user app, so a
- * second, competing tutor session has nowhere useful to run concurrently anyway — see
- * [start] for what happens when one is already active.
- *
- * NOT unit-tested at the JVM level, matching this codebase's existing convention:
- * no `GapTaskLedgerTest`/`ConceptDifficultyLedgerTest`/`ReplanDayLedgerTest` exists
- * either, since `CheckmatePrefs.ready()` requires `CheckmatePrefs.init(context)`, which
- * plain JVM unit tests don't run (see the same caveat noted against
- * `PolicyValidatorTest`/`TaskEscrowTest` elsewhere in this codebase). [TutorStateMachine]
- * — the part with actual branching logic — is exhaustively unit tested instead
- * (see `TutorStateMachineTest`); this file is a thin, mechanically-reviewable
- * read/write/serialize wrapper around it, same review bar
- * [com.checkmate.planner.intervention.GapTaskLedger] itself is held to.
+ * There is no spaced-repetition review scheduler anywhere in this codebase yet (no
+ * SM-2/Leitner implementation) — [retentionScore]/[forgettingRisk] below are a
+ * deliberately simple exponential-decay-by-days-since-last-seen model, explicitly
+ * NOT the "successful_recall_n vs failed_recall" Ebbinghaus-curve fit the blueprint
+ * gestures at. Good enough to feed [decide]'s three-way REVIEW/TEACH/MOVE_ON split;
+ * revisit if/when real forgetting-curve data (repeated recall attempts spaced over
+ * weeks) exists to fit against.
  */
-object TutorSessionLedger {
+object RetentionEngine {
 
-    private const val TAG = "TutorSessionLedger"
-    private val json = Json { ignoreUnknownKeys = true }
+    enum class RetentionDecision { REVIEW, TEACH, MOVE_ON }
 
-    private const val KEY_ACTIVE_SESSION = "tutor_active_session"
+    // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
+    // imported directly — RetentionEngine has no dependency on MasteryEngine today
+    // and this avoids introducing one for a single constant.
+    const val HIGH_MASTERY_THRESHOLD = 0.83   // kept in sync with MasteryEngine.MASTERY_THRESHOLD
+    const val HIGH_RISK_THRESHOLD = 0.5
 
-    // Same reactivity shape as GapTaskLedger.version — plain SharedPreferences has no
-    // Flow of its own, so a monotonic counter is what lets a ViewModel collecting this
-    // notice a background-loop write (e.g. GapTaskManager advancing a session outside
-    // Compose) the same way GapTaskLedger.version already does for its own fields.
-    private val _version = MutableStateFlow(0L)
-    val version: StateFlow<Long> = _version.asStateFlow()
-    private fun bumpVersion() { _version.update { it + 1 } }
+    /** Days after which, with no further attempts, forgetting risk saturates near 1.0. */
+    private const val DECAY_HALFLIFE_DAYS = 14.0
+    private const val MS_PER_DAY = 86_400_000.0
 
-    /** Current active session, if any — null when no tutor cycle is in flight. */
-    fun current(): TutorSession? =
-        CheckmatePrefs.getString(KEY_ACTIVE_SESSION, null)?.let {
-            runCatching { json.decodeFromString<TutorSession>(it) }
-                .onFailure { e -> Log.w(TAG, "failed to decode active tutor session, discarding", e) }
-                .getOrNull()
-        }
-
-    private fun persist(session: TutorSession) {
-        CheckmatePrefs.putString(KEY_ACTIVE_SESSION, json.encodeToString(session))
-        bumpVersion()
+    /**
+     * 0..1, higher = better retained. Decays from [recentAccuracy] toward 0 as days
+     * since [lastSeen] grow, so a concept nailed once three months ago scores lower
+     * than one nailed yesterday, even with identical accuracy.
+     */
+    fun retentionScore(lastSeen: Long?, recentAccuracy: Double, now: Long = System.currentTimeMillis()): Double {
+        if (lastSeen == null) return 0.0
+        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
+        val decay = exp(-daysSince / DECAY_HALFLIFE_DAYS)
+        return (recentAccuracy * decay).coerceIn(0.0, 1.0)
     }
 
-    /** Result of [start] — distinct from [TutorTransitionResult] since starting a
-     *  session isn't itself a [TutorStateMachine] transition (there is no prior
-     *  session to transition from). */
-    sealed class StartResult {
-        data class Started(val session: TutorSession) : StartResult()
-        /** A different concept already has an unresolved session in flight — see class
-         *  doc's "single active session" note. [existing] is that session, so a caller
-         *  can decide whether to surface it instead of silently dropping the request. */
-        data class AlreadyActive(val existing: TutorSession) : StartResult()
+    /** Inverse-shaped: rises with time since [lastSeen], damped by how well the concept was known. */
+    fun forgettingRisk(lastSeen: Long?, mastery: Double, now: Long = System.currentTimeMillis()): Double {
+        if (lastSeen == null) return 1.0
+        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
+        val rawRisk = 1.0 - exp(-daysSince / DECAY_HALFLIFE_DAYS)
+        // Well-mastered concepts decay slower than shakily-known ones — scale by
+        // (1 - mastery/2) so a 0.9-mastery concept's risk rises at ~55% the rate of a 0.0-mastery one.
+        return (rawRisk * (1.0 - mastery / 2.0)).coerceIn(0.0, 1.0)
     }
 
     /**
-     * Starts a fresh [TutorSession] for [conceptId] in [TutorState.DIAGNOSE], persists
-     * it, and returns it — unless a DIFFERENT concept's session is already active and
-     * unresolved (not [TutorState.isTerminal]), in which case nothing is written and
-     * [StartResult.AlreadyActive] is returned. Starting again for the SAME conceptId
-     * while one is already active returns the existing session unchanged (idempotent —
-     * a caller re-invoking this shouldn't blow away in-progress history), matching
-     * [StartResult.AlreadyActive]'s own shape so both cases are handled the same way.
-     * A session that already reached [TutorState.isTerminal] is treated as free — a
-     * fresh [start] for the same or a different concept simply overwrites it, the same
-     * "DONE clears the slot" discipline
-     * [com.checkmate.planner.intervention.GapTaskLedger.markCovered] applies to its own
-     * active-concept pointer.
+     * Blueprint §1.7 truth table:
+     * HIGH mastery + HIGH forgetting risk -> REVIEW
+     * LOW mastery                        -> TEACH
+     * HIGH mastery + LOW risk            -> MOVE ON
      */
-    fun start(conceptId: String, now: Long): StartResult {
-        val existing = current()
-        if (existing != null && !existing.state.isTerminal) {
-            return StartResult.AlreadyActive(existing)
-        }
-        val fresh = TutorStateMachine.start(conceptId, now)
-        persist(fresh)
-        return StartResult.Started(fresh)
+    fun decide(mastery: Double, forgettingRisk: Double): RetentionDecision = when {
+        mastery < HIGH_MASTERY_THRESHOLD -> RetentionDecision.TEACH
+        forgettingRisk >= HIGH_RISK_THRESHOLD -> RetentionDecision.REVIEW
+        else -> RetentionDecision.MOVE_ON
     }
 
-    /**
-     * Runs [evidence] through [TutorStateMachine.transition] against the current active
-     * session and persists the result if it advanced. Returns null if there is no
-     * active session at all — a caller shouldn't be feeding evidence to a tutor cycle
-     * that was never started (or already ended and cleared).
-     */
-    fun apply(evidence: TutorEvidence, now: Long): TutorTransitionResult? {
-        val session = current() ?: return null
-        val result = TutorStateMachine.transition(session, evidence, now)
-        if (result is TutorTransitionResult.Advanced) {
-            persist(result.session)
-        }
-        return result
-    }
-
-    /**
-     * Explicitly frees the active-session slot — call once a terminal session
-     * ([TutorState.MOVE_ON]/[TutorState.ESCALATED]) has been fully handled by the
-     * caller (e.g. [TutorState.MOVE_ON] recorded as covered somewhere analogous to
-     * [com.checkmate.planner.intervention.GapTaskLedger.markCovered] — that wiring is
-     * the next milestone, not this one). Deliberately NOT automatic on reaching a
-     * terminal state: a caller may still need to read the finished session (its
-     * [TutorSession.history], its [TutorState.ESCALATED] reason) before it disappears.
-     */
-    fun clear() {
-        CheckmatePrefs.remove(KEY_ACTIVE_SESSION)
-        bumpVersion()
-    }
-
-    // ── LearningDecisionEngine connector (item 6) ───────────────────────────
-
-    /**
-     * Intents this state machine actually governs a teaching cycle for — a single,
-     * already-identified concept that needs DIAGNOSE->EXPLAIN->PRACTICE->VERIFY. The
-     * other five [LearningDecisionEngine.LearningInterventionIntent] values don't fit
-     * this shape and are deliberately excluded, same "not every intent is this state
-     * machine's concern" boundary
-     * `com.checkmate.planner.intervention.LearningInterventionOrchestrator.GAP_LEDGER_TRACKED_INTENTS`
-     * already draws for a different subset of the same taxonomy:
-     * - [LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET] names a
-     *   whole chapter across several concepts, not one — no single `conceptId` to run a
-     *   cycle for.
-     * - [LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST] is
-     *   a recall check on an already-mastered concept, not a teaching cycle.
-     * - [LearningDecisionEngine.LearningInterventionIntent.START_MOCK]/[REPLAN_DAY] are
-     *   whole-student, not concept-scoped at all.
-     * - [LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY]/
-     *   [INCREASE_DIFFICULTY] mutate a difficulty preference, not a teaching cycle.
-     */
-    private val TUTORABLE_INTENTS = setOf(
-        LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT,
-        LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC
-    )
-
-    /**
-     * The one place this package reads a
-     * [LearningDecisionEngine.CandidateIntervention] — [LearningDecisionEngine] itself
-     * is untouched by this file and stays the sole authority on WHICH concept is worth
-     * working on next; this only decides whether the chosen candidate is a shape this
-     * state machine can run a cycle for, and if so, starts one. Returns null (no
-     * session started, no error) for a candidate outside [TUTORABLE_INTENTS] or with no
-     * `conceptId` — a caller falls back to whatever non-tutor execution path already
-     * exists for that candidate (unchanged; see
-     * [com.checkmate.planner.intervention.LearningInterventionOrchestrator], not
-     * touched by this pass).
-     */
-    fun startFromCandidate(
-        candidate: LearningDecisionEngine.CandidateIntervention,
-        now: Long
-    ): StartResult? {
-        val conceptId = candidate.conceptId ?: return null
-        if (candidate.intent !in TUTORABLE_INTENTS) return null
-        return start(conceptId, now)
+    suspend fun decideAll(
+        context: Context,
+        studentId: String = LearningIds.LOCAL_STUDENT_ID
+    ): Map<String, RetentionDecision> {
+        val db = LearningDatabase.getInstance(context)
+        return db.masteryDao().getAll(studentId).associate { it.conceptId to decide(it.mastery, it.forgettingRisk) }
     }
 }
 
 
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/tutor/TutorStateMachineTest.kt =====
-package com.checkmate.learning.tutor
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/PerformanceAnalyzerTest.kt =====
+package com.checkmate.learning.analytics
 
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.OverallLearningState
 import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class TutorStateMachineTest {
+class PerformanceAnalyzerTest {
 
-    private val conceptId = "concept-1"
-
-    // Same fixture shape as LearningDecisionEngineTest's own `concept()` helper —
-    // reused deliberately so a snapshot built here can only fail this test on
-    // TutorStateMachine's own transition logic, not a fresh fixture-shape question.
-    private fun snapshot(
+    private fun concept(
+        id: String,
+        subject: String?,
+        chapter: String,
+        topic: String,
         mastery: Double,
-        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.MOVE_ON,
-        id: String = conceptId
+        recentAccuracy: Double,
+        lifetimeAccuracy: Double,
+        attemptCount: Int
     ) = ConceptSnapshot(
         conceptId = id,
         exam = "NEET",
-        subject = "Biology",
-        chapter = "Biomolecules",
-        topic = "Proteins",
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
         mastery = mastery,
         masteryConfidence = 0.0,
-        retentionDecision = retentionDecision,
+        retentionDecision = RetentionDecisionSnapshot.MOVE_ON,
         forgettingRisk = 0.0,
-        attemptCount = 10,
-        recentAccuracy = mastery,
-        lifetimeAccuracy = mastery,
+        attemptCount = attemptCount,
+        recentAccuracy = recentAccuracy,
+        lifetimeAccuracy = lifetimeAccuracy,
         errorCount = 0,
         lastSeen = 1_000L,
         prerequisiteIssues = emptyList()
     )
 
-    private val above = MasteryEngine.MASTERY_THRESHOLD + 0.1
-    private val below = MasteryEngine.MASTERY_THRESHOLD - 0.1
-
-    // ── start() ──────────────────────────────────────────────────────────────
+    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
+        studentId = "s1",
+        generatedAt = 1_000L,
+        overall = OverallLearningState(
+            conceptsTracked = concepts.size,
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
+            averageMastery = concepts.map { it.mastery }.average(),
+            totalAttempts = concepts.sumOf { it.attemptCount },
+            unresolvedErrorCount = 0
+        ),
+        concepts = concepts.associateBy { it.conceptId },
+        unresolvedErrors = emptyList(),
+        weakPrerequisites = emptyList()
+    )
 
     @Test
-    fun `start always begins in DIAGNOSE with zero cycles and empty history`() {
-        val session = TutorStateMachine.start(conceptId, now = 1L)
-        assertEquals(TutorState.DIAGNOSE, session.state)
-        assertEquals(0, session.cycleCount)
-        assertTrue(session.history.isEmpty())
+    fun `classifyTrend requires the minimum attempt count before calling a trend`() {
+        val trend = PerformanceAnalyzer.classifyTrend(recentAccuracy = 1.0, lifetimeAccuracy = 0.2, attemptCount = 3)
+        assertEquals(PerformanceAnalyzer.PerformanceTrend.INSUFFICIENT_DATA, trend)
     }
 
     @Test
-    fun `start rejects blank conceptId`() {
-        assertThrows(IllegalArgumentException::class.java) { TutorStateMachine.start("", now = 1L) }
-    }
-
-    // ── DIAGNOSE ─────────────────────────────────────────────────────────────
-
-    @Test
-    fun `DIAGNOSE plus KNOWN skips straight to VERIFY`() {
-        val session = TutorStateMachine.start(conceptId, 1L)
-        val result = TutorStateMachine.transition(session, TutorEvidence.Diagnostic(DiagnosticFinding.KNOWN), 2L)
-        assertAdvancedTo(result, TutorState.VERIFY)
+    fun `classifyTrend flags a real improvement above the noise threshold`() {
+        val trend = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.9, lifetimeAccuracy = 0.6, attemptCount = 10)
+        assertEquals(PerformanceAnalyzer.PerformanceTrend.IMPROVING, trend)
     }
 
     @Test
-    fun `DIAGNOSE plus UNKNOWN MISUNDERSTOOD or FORGOTTEN all route to EXPLAIN`() {
-        listOf(DiagnosticFinding.UNKNOWN, DiagnosticFinding.MISUNDERSTOOD, DiagnosticFinding.FORGOTTEN).forEach { finding ->
-            val session = TutorStateMachine.start(conceptId, 1L)
-            val result = TutorStateMachine.transition(session, TutorEvidence.Diagnostic(finding), 2L)
-            assertAdvancedTo(result, TutorState.EXPLAIN)
-        }
+    fun `classifyTrend flags decline and treats a small delta as stable`() {
+        val declining = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.3, lifetimeAccuracy = 0.7, attemptCount = 10)
+        assertEquals(PerformanceAnalyzer.PerformanceTrend.DECLINING, declining)
+
+        val stable = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.62, lifetimeAccuracy = 0.6, attemptCount = 10)
+        assertEquals(PerformanceAnalyzer.PerformanceTrend.STABLE, stable)
     }
 
     @Test
-    fun `DIAGNOSE rejects non-Diagnostic evidence`() {
-        val session = TutorStateMachine.start(conceptId, 1L)
-        val result = TutorStateMachine.transition(session, TutorEvidence.ExplanationDelivered, 2L)
-        assertInvalid(result)
-    }
-
-    // ── EXPLAIN ──────────────────────────────────────────────────────────────
-
-    @Test
-    fun `EXPLAIN plus ExplanationDelivered advances to PRACTICE`() {
-        val explaining = inState(TutorState.EXPLAIN)
-        val result = TutorStateMachine.transition(explaining, TutorEvidence.ExplanationDelivered, 2L)
-        assertAdvancedTo(result, TutorState.PRACTICE)
-    }
-
-    @Test
-    fun `EXPLAIN rejects non-ExplanationDelivered evidence`() {
-        val explaining = inState(TutorState.EXPLAIN)
-        val result = TutorStateMachine.transition(
-            explaining, TutorEvidence.Diagnostic(DiagnosticFinding.KNOWN), 2L
+    fun `topicImpacts are sorted by marksAtStakeGap descending`() {
+        // High weightage, low mastery -> should rank above low weightage, low mastery.
+        val weak = concept(
+            id = "c-weak-highvalue", subject = "Biology", chapter = "Human Physiology",
+            topic = "Human Physiology", mastery = 0.2, recentAccuracy = 0.2, lifetimeAccuracy = 0.2, attemptCount = 10
         )
-        assertInvalid(result)
-    }
-
-    // ── PRACTICE ─────────────────────────────────────────────────────────────
-
-    @Test
-    fun `PRACTICE with enough attempts advances to VERIFY`() {
-        val practicing = inState(TutorState.PRACTICE)
-        val evidence = TutorEvidence.PracticeAttempts(
-            attemptCount = TutorStateMachine.MIN_PRACTICE_ATTEMPTS, correctCount = 2
+        val lowValue = concept(
+            id = "c-weak-lowvalue", subject = "Biology", chapter = "Biodiversity",
+            topic = "Biodiversity", mastery = 0.2, recentAccuracy = 0.2, lifetimeAccuracy = 0.2, attemptCount = 10
         )
-        val result = TutorStateMachine.transition(practicing, evidence, 2L)
-        assertAdvancedTo(result, TutorState.VERIFY)
-    }
-
-    @Test
-    fun `PRACTICE with insufficient attempts is rejected, never advances to VERIFY`() {
-        val practicing = inState(TutorState.PRACTICE)
-        val evidence = TutorEvidence.PracticeAttempts(
-            attemptCount = TutorStateMachine.MIN_PRACTICE_ATTEMPTS - 1, correctCount = 1
+        val mastered = concept(
+            id = "c-mastered", subject = "Physics", chapter = "Electrostatics",
+            topic = "Electrostatics", mastery = 0.95, recentAccuracy = 0.95, lifetimeAccuracy = 0.95, attemptCount = 10
         )
-        val result = TutorStateMachine.transition(practicing, evidence, 2L)
-        assertInvalid(result)
-        // The core "no evidence, no advance" invariant: state must not have moved.
-        assertEquals(TutorState.PRACTICE, (result as TutorTransitionResult.Invalid).session.state)
+
+        val report = PerformanceAnalyzer.analyze(studentModel(listOf(lowValue, mastered, weak)), examType = "NEET")
+
+        assertEquals("c-weak-highvalue", report.topicImpacts.first().conceptId)
+        assertTrue(report.topicImpacts.first().marksAtStakeGap > report.topicImpacts.last().marksAtStakeGap)
+    }
+
+    /**
+     * Replaces the old "concepts with no subject are excluded from subjectAccuracy"
+     * test — that behavior was the bug (see PerformanceAnalyzer's own doc on the
+     * subject-resolution fix). "Current Electricity" is the same fixture
+     * ConceptWeightageTest uses to prove fuzzy resolution finds Physics for a
+     * real-imported concept (subject == null) — this test proves subjectAccuracy
+     * now benefits from that same resolution, not just topicImpacts.
+     */
+    @Test
+    fun `a real-import concept with no subject is included in subjectAccuracy via fuzzy resolution`() {
+        val realImport = concept(
+            id = "c-real-import", subject = null, chapter = "Current Electricity",
+            topic = "Current Electricity", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
+        )
+
+        val report = PerformanceAnalyzer.analyze(studentModel(listOf(realImport)), examType = "NEET")
+
+        assertEquals(1, report.topicImpacts.size)
+        assertEquals(1, report.subjectAccuracy.size)
+        assertEquals("Physics", report.subjectAccuracy.first().subject)
+        assertEquals(6, report.subjectAccuracy.first().attemptCount)
+    }
+
+    /**
+     * The fix narrows exclusion to "fuzzy resolution genuinely found nothing," not
+     * "raw subject was null" — this fixture (same as
+     * ConceptWeightageTest's "unresolvable topic" case) can't be placed under any
+     * subject at all, so it's still correctly excluded from subjectAccuracy while
+     * remaining visible in topicImpacts (with zero marksAtStake, per
+     * ConceptWeightage's own "unresolved -> 0, not an error" contract).
+     */
+    @Test
+    fun `a concept unresolvable by fuzzy matching stays out of subjectAccuracy but still appears in topicImpacts`() {
+        val unresolvable = concept(
+            id = "c-unresolvable", subject = null, chapter = "Not A Real Chapter",
+            topic = "Not A Real Topic", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
+        )
+
+        val report = PerformanceAnalyzer.analyze(studentModel(listOf(unresolvable)), examType = "NEET")
+
+        assertEquals(1, report.topicImpacts.size)
+        assertTrue(report.subjectAccuracy.isEmpty())
+        assertEquals(0.0, report.topicImpacts.first().marksAtStakeGap, 0.001)
     }
 
     @Test
-    fun `PRACTICE rejects correctCount greater than attemptCount`() {
-        val practicing = inState(TutorState.PRACTICE)
-        assertThrows(IllegalArgumentException::class.java) {
-            TutorStateMachine.transition(
-                practicing, TutorEvidence.PracticeAttempts(attemptCount = 3, correctCount = 5), 2L
+    fun `overall trend is attempt-weighted across concepts, not a plain average`() {
+        // One concept with many attempts and a strong recent improvement should
+        // dominate one concept with few attempts and a mild decline.
+        val dominant = concept(
+            id = "c-dominant", subject = "Physics", chapter = "Kinematics", topic = "Kinematics",
+            mastery = 0.8, recentAccuracy = 0.9, lifetimeAccuracy = 0.5, attemptCount = 50
+        )
+        val minor = concept(
+            id = "c-minor", subject = "Chemistry", chapter = "Solutions", topic = "Solutions",
+            mastery = 0.5, recentAccuracy = 0.4, lifetimeAccuracy = 0.5, attemptCount = 4
+        )
+
+        val report = PerformanceAnalyzer.analyze(studentModel(listOf(dominant, minor)), examType = "NEET")
+
+        assertEquals(PerformanceAnalyzer.PerformanceTrend.IMPROVING, report.overallTrend)
+        assertEquals(54, report.totalAttempts)
+    }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ScoreGainEstimatorTest.kt =====
+package com.checkmate.learning.analytics
+
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.OverallLearningState
+import com.checkmate.learning.model.PrerequisiteRef
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ScoreGainEstimatorTest {
+
+    private fun concept(
+        id: String,
+        subject: String?,
+        chapter: String,
+        topic: String,
+        mastery: Double,
+        attemptCount: Int,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
+        forgettingRisk: Double = 0.0,
+        errorCount: Int = 0,
+        prerequisiteIssues: List<PrerequisiteRef> = emptyList()
+    ) = ConceptSnapshot(
+        conceptId = id,
+        exam = "NEET",
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = forgettingRisk,
+        attemptCount = attemptCount,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = prerequisiteIssues
+    )
+
+    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
+        studentId = "s1",
+        generatedAt = 1_000L,
+        overall = OverallLearningState(
+            conceptsTracked = concepts.size,
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
+            averageMastery = concepts.map { it.mastery }.average(),
+            totalAttempts = concepts.sumOf { it.attemptCount },
+            unresolvedErrorCount = 0
+        ),
+        concepts = concepts.associateBy { it.conceptId },
+        unresolvedErrors = emptyList(),
+        weakPrerequisites = emptyList()
+    )
+
+    // Same fixtures PerformanceAnalyzerTest already proves resolve correctly
+    // (Human Physiology / Biodiversity / Laws of Motion / unresolvable pair) —
+    // reused deliberately so a ranking difference here can only come from
+    // ScoreGainEstimator's own logic, not a fresh weightage-resolution question.
+
+    @Test
+    fun `a higher-weightage weak concept ranks above a lower-weightage equally-weak one`() {
+        val highValue = concept(
+            id = "c-high", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+            mastery = 0.13, attemptCount = 10, errorCount = 3
+        )
+        val lowValue = concept(
+            id = "c-low", subject = "Biology", chapter = "Biodiversity", topic = "Biodiversity",
+            mastery = 0.13, attemptCount = 10, errorCount = 3
+        )
+
+        val ranked = ScoreGainEstimator.rank(studentModel(listOf(lowValue, highValue)), examType = "NEET")
+
+        assertEquals("c-high", ranked.first().conceptId)
+        assertTrue(ranked.first().expectedGain > ranked.last().expectedGain)
+    }
+
+    @Test
+    fun `a concept the resolver could not place has zero expected gain, not a crash`() {
+        val unresolvable = concept(
+            id = "c-unresolvable", subject = null, chapter = "Not A Real Chapter", topic = "Not A Real Topic",
+            mastery = 0.2, attemptCount = 10
+        )
+
+        val ranked = ScoreGainEstimator.rank(studentModel(listOf(unresolvable)), examType = "NEET")
+
+        assertEquals(1, ranked.size)
+        assertEquals(0.0, ranked.first().expectedGain, 0.001)
+        assertEquals(0.0, ranked.first().marksAtStake, 0.001)
+    }
+
+    @Test
+    fun `a thinly-attempted concept is flagged LOW confidence even with a large mastery gap`() {
+        val thin = concept(
+            id = "c-thin", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+            mastery = 0.1, attemptCount = 1
+        )
+
+        val ranked = ScoreGainEstimator.rank(studentModel(listOf(thin)), examType = "NEET")
+
+        assertEquals(ScoreGainEstimator.EstimateConfidence.LOW, ranked.first().confidence)
+    }
+
+    @Test
+    fun `a concept still needing TEACH outranks an equally weak concept already at MOVE_ON`() {
+        val needsTeach = concept(
+            id = "c-teach", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+            mastery = 0.13, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.TEACH
+        )
+        val moveOn = concept(
+            id = "c-moveon", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+            mastery = 0.13, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.MOVE_ON
+        )
+
+        val ranked = ScoreGainEstimator.rank(studentModel(listOf(moveOn, needsTeach)), examType = "NEET")
+
+        assertEquals("c-teach", ranked.first().conceptId)
+    }
+
+    @Test
+    fun `more weak prerequisites raises time cost and lowers expected gain versus an otherwise identical concept`() {
+        val clean = concept(
+            id = "c-clean", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+            mastery = 0.13, attemptCount = 10
+        )
+        val tangled = concept(
+            id = "c-tangled", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+            mastery = 0.13, attemptCount = 10,
+            prerequisiteIssues = listOf(
+                PrerequisiteRef("prereq-1", "Biology", "Cell Structure And Function", "Cell Structure And Function")
             )
+        )
+
+        val ranked = studentModel(listOf(clean, tangled)).let { ScoreGainEstimator.rank(it, examType = "NEET") }
+        val cleanEstimate = ranked.first { it.conceptId == "c-clean" }
+        val tangledEstimate = ranked.first { it.conceptId == "c-tangled" }
+
+        assertTrue(tangledEstimate.timeCostMinutes > cleanEstimate.timeCostMinutes)
+        assertTrue(tangledEstimate.expectedGain < cleanEstimate.expectedGain)
+    }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ScorePredictorTest.kt =====
+package com.checkmate.learning.analytics
+
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.OverallLearningState
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ScorePredictorTest {
+
+    // Same fixture shape as ScoreGainEstimatorTest/PerformanceAnalyzerTest, reused
+    // deliberately so this test can only fail on ScorePredictor's own logic, not a
+    // fresh weightage-resolution question.
+    private fun concept(
+        id: String,
+        subject: String?,
+        chapter: String,
+        topic: String,
+        mastery: Double,
+        attemptCount: Int,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
+        errorCount: Int = 0
+    ) = ConceptSnapshot(
+        conceptId = id,
+        exam = "NEET",
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = 0.0,
+        attemptCount = attemptCount,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = emptyList()
+    )
+
+    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
+        studentId = "s1",
+        generatedAt = 1_000L,
+        overall = OverallLearningState(
+            conceptsTracked = concepts.size,
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
+            averageMastery = concepts.map { it.mastery }.average(),
+            totalAttempts = concepts.sumOf { it.attemptCount },
+            unresolvedErrorCount = 0
+        ),
+        concepts = concepts.associateBy { it.conceptId },
+        unresolvedErrors = emptyList(),
+        weakPrerequisites = emptyList()
+    )
+
+    @Test
+    fun `expected score is bracketed by its own range and never exceeds the exam total`() {
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-physio", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                    mastery = 0.4, attemptCount = 10
+                ),
+                concept(
+                    id = "c-laws", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.13, attemptCount = 8, errorCount = 4
+                )
+            )
+        )
+
+        val score = ScorePredictor.predict(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(score.rangeLow <= score.expected)
+        assertTrue(score.expected <= score.rangeHigh)
+        assertTrue(score.expected in 0.0..720.0)
+        assertTrue(score.rangeLow >= 0.0 && score.rangeHigh <= 720.0)
+    }
+
+    @Test
+    fun `gap floors at zero once the target is already met, and only produces bottlenecks when a real gap exists`() {
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-strong", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.9, attemptCount = 10
+                )
+            )
+        )
+
+        val alreadyThere = ScorePredictor.predict(model, examType = "NEET", targetScore = 1)
+        assertEquals(0.0, alreadyThere.gap, 0.001)
+        assertTrue(alreadyThere.bottlenecks.isEmpty())
+
+        val stillShort = ScorePredictor.predict(model, examType = "NEET", targetScore = 700)
+        assertTrue(stillShort.gap > 0.0)
+        assertEquals(700 - stillShort.expected, stillShort.gap, 0.001)
+    }
+
+    @Test
+    fun `thinner attempt data widens the range versus the same mastery backed by more attempts`() {
+        val thin = studentModel(
+            listOf(
+                concept(
+                    id = "c-thin", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.5, attemptCount = 1
+                )
+            )
+        )
+        val wellEvidenced = studentModel(
+            listOf(
+                concept(
+                    id = "c-evidenced", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.5, attemptCount = 20
+                )
+            )
+        )
+
+        val thinScore = ScorePredictor.predict(thin, examType = "NEET", targetScore = 650)
+        val evidencedScore = ScorePredictor.predict(wellEvidenced, examType = "NEET", targetScore = 650)
+
+        val thinWidth = thinScore.rangeHigh - thinScore.rangeLow
+        val evidencedWidth = evidencedScore.rangeHigh - evidencedScore.rangeLow
+        assertTrue(thinWidth > evidencedWidth)
+    }
+
+    @Test
+    fun `bottleneck contributions always sum to exactly the gap, whether or not a residual line is needed`() {
+        // Small target — concept-level shortfall alone exceeds it, so buckets get
+        // scaled down and there's no "exam strategy" residual line.
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-weak-1", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                    mastery = 0.1, attemptCount = 10, errorCount = 5
+                ),
+                concept(
+                    id = "c-weak-2", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.1, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
+                )
+            )
+        )
+
+        val smallTarget = ScorePredictor.predict(model, examType = "NEET", targetScore = 1)
+        if (smallTarget.gap > 0.0) {
+            assertEquals(smallTarget.gap, smallTarget.bottlenecks.sumOf { it.marks }, 0.01)
         }
+
+        val bigTarget = ScorePredictor.predict(model, examType = "NEET", targetScore = 720)
+        assertTrue(bigTarget.gap > 0.0)
+        assertEquals(bigTarget.gap, bigTarget.bottlenecks.sumOf { it.marks }, 0.01)
+        // A big-enough target should need more recovery than the concept-level
+        // weaknesses alone explain, so the residual "exam strategy" line appears.
+        assertTrue(bigTarget.bottlenecks.any { it.mechanism == ScorePredictor.BottleneckMechanism.OTHER })
     }
 
     @Test
-    fun `PRACTICE rejects non-PracticeAttempts evidence`() {
-        val practicing = inState(TutorState.PRACTICE)
-        val result = TutorStateMachine.transition(practicing, TutorEvidence.CloseOut, 2L)
-        assertInvalid(result)
+    fun `bottleneck mechanism reflects error-heaviness and retention risk, not just raw mastery`() {
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-errors", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                    mastery = 0.1, attemptCount = 10, errorCount = 5
+                ),
+                concept(
+                    id = "c-retention", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                    mastery = 0.1, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
+                ),
+                concept(
+                    id = "c-plain-weak", subject = "Biology", chapter = "Biodiversity", topic = "Biodiversity",
+                    mastery = 0.1, attemptCount = 10
+                )
+            )
+        )
+
+        val score = ScorePredictor.predict(model, examType = "NEET", targetScore = 720)
+        val mechanisms = score.bottlenecks.map { it.mechanism }.toSet()
+
+        assertTrue(ScorePredictor.BottleneckMechanism.ERRORS in mechanisms)
+        assertTrue(ScorePredictor.BottleneckMechanism.RETENTION in mechanisms)
+        assertTrue(ScorePredictor.BottleneckMechanism.WEAK_CONCEPTS in mechanisms)
     }
+}
 
-    // ── VERIFY ───────────────────────────────────────────────────────────────
 
-    @Test
-    fun `VERIFY with mastery above threshold and no retention risk advances to MASTERED`() {
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(above, RetentionDecisionSnapshot.MOVE_ON), null)
-        val result = TutorStateMachine.transition(verifying, evidence, 2L)
-        assertAdvancedTo(result, TutorState.MASTERED)
-    }
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LearningDecisionEngineTest.kt =====
+package com.checkmate.learning.engine
 
-    @Test
-    fun `VERIFY with high mastery but retention REVIEW does not count as mastered`() {
-        // Core invariant check: a task being "done" is never enough — here even a
-        // real, above-threshold mastery number must ALSO clear retention risk.
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(above, RetentionDecisionSnapshot.REVIEW), null)
-        val result = TutorStateMachine.transition(verifying, evidence, 2L)
-        assertAdvancedTo(result, TutorState.PRACTICE) // null error type defaults to PROCEDURAL
-        assertEquals(1, (result as TutorTransitionResult.Advanced).session.cycleCount)
-    }
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.ErrorPatternSnapshot
+import com.checkmate.learning.model.OverallLearningState
+import com.checkmate.learning.model.PrerequisiteIssue
+import com.checkmate.learning.model.PrerequisiteRef
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
-    @Test
-    fun `VERIFY failure with conceptual error routes to EXPLAIN and increments cycle`() {
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(below), "MISCONCEPTION")
-        val result = TutorStateMachine.transition(verifying, evidence, 2L)
-        assertAdvancedTo(result, TutorState.EXPLAIN)
-        assertEquals(1, (result as TutorTransitionResult.Advanced).session.cycleCount)
-    }
+class LearningDecisionEngineTest {
 
-    @Test
-    fun `VERIFY failure with procedural error routes to PRACTICE and increments cycle`() {
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(below), "CARELESS")
-        val result = TutorStateMachine.transition(verifying, evidence, 2L)
-        assertAdvancedTo(result, TutorState.PRACTICE)
-        assertEquals(1, (result as TutorTransitionResult.Advanced).session.cycleCount)
-    }
+    // Same fixture shape as ScorePredictorTest/ScoreGainEstimatorTest, reused
+    // deliberately so this test can only fail on LearningDecisionEngine's own
+    // classification/ranking logic, not a fresh weightage-resolution question.
+    private fun concept(
+        id: String,
+        subject: String?,
+        chapter: String,
+        topic: String,
+        mastery: Double,
+        attemptCount: Int,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
+        errorCount: Int = 0,
+        prerequisiteIssues: List<com.checkmate.learning.model.PrerequisiteRef> = emptyList()
+    ) = ConceptSnapshot(
+        conceptId = id,
+        exam = "NEET",
+        subject = subject,
+        chapter = chapter,
+        topic = topic,
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = 0.0,
+        attemptCount = attemptCount,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = prerequisiteIssues
+    )
 
-    @Test
-    fun `VERIFY failure with null error type defaults to PROCEDURAL`() {
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(below), null)
-        val result = TutorStateMachine.transition(verifying, evidence, 2L)
-        assertAdvancedTo(result, TutorState.PRACTICE)
-    }
+    private fun studentModel(
+        concepts: List<ConceptSnapshot>,
+        unresolvedErrors: List<ErrorPatternSnapshot> = emptyList(),
+        weakPrerequisites: List<PrerequisiteIssue> = emptyList()
+    ) = StudentModel(
+        studentId = "s1",
+        generatedAt = 1_000L,
+        overall = OverallLearningState(
+            conceptsTracked = concepts.size,
+            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
+            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
+            averageMastery = if (concepts.isEmpty()) 0.0 else concepts.map { it.mastery }.average(),
+            totalAttempts = concepts.sumOf { it.attemptCount },
+            unresolvedErrorCount = unresolvedErrors.sumOf { it.occurrences }
+        ),
+        concepts = concepts.associateBy { it.conceptId },
+        unresolvedErrors = unresolvedErrors,
+        weakPrerequisites = weakPrerequisites
+    )
 
-    @Test
-    fun `VERIFY escalates instead of looping once MAX_CYCLES is reached`() {
-        var session = inState(TutorState.VERIFY, cycleCount = TutorStateMachine.MAX_CYCLES)
-        val evidence = TutorEvidence.Verification(snapshot(below), "CARELESS")
-        val result = TutorStateMachine.transition(session, evidence, 2L)
-        assertAdvancedTo(result, TutorState.ESCALATED)
-        // Escalation itself must not be counted as another retry cycle.
-        assertEquals(
-            TutorStateMachine.MAX_CYCLES,
-            (result as TutorTransitionResult.Advanced).session.cycleCount
+    // Padded with well-mastered filler concepts so overall.totalAttempts clears
+    // THIN_DATA_ATTEMPT_THRESHOLD when a test isn't specifically exercising the
+    // thin-data / START_MOCK path — keeps that path's own test the only one
+    // where it's expected to fire.
+    private fun filler(count: Int = 3) = (1..count).map {
+        concept(
+            id = "filler-$it", subject = "Physics", chapter = "Filler $it", topic = "Filler $it",
+            mastery = 0.95, attemptCount = 10
         )
     }
 
     @Test
-    fun `VERIFY below MAX_CYCLES still loops rather than escalating`() {
-        val session = inState(TutorState.VERIFY, cycleCount = TutorStateMachine.MAX_CYCLES - 1)
-        val evidence = TutorEvidence.Verification(snapshot(below), "CARELESS")
-        val result = TutorStateMachine.transition(session, evidence, 2L)
-        assertAdvancedTo(result, TutorState.PRACTICE)
-    }
-
-    @Test
-    fun `VERIFY rejects a snapshot for a different concept`() {
-        val verifying = inState(TutorState.VERIFY)
-        val evidence = TutorEvidence.Verification(snapshot(above, id = "some-other-concept"), null)
-        assertThrows(IllegalArgumentException::class.java) {
-            TutorStateMachine.transition(verifying, evidence, 2L)
-        }
-    }
-
-    @Test
-    fun `VERIFY rejects non-Verification evidence`() {
-        val verifying = inState(TutorState.VERIFY)
-        val result = TutorStateMachine.transition(verifying, TutorEvidence.ExplanationDelivered, 2L)
-        assertInvalid(result)
-    }
-
-    @Test
-    fun `classifyFailure buckets error types into CONCEPTUAL vs PROCEDURAL`() {
-        listOf("UNKNOWN_CONCEPT", "MISCONCEPTION", "FORMULA_RECALL", "FORMULA_SELECTION").forEach {
-            assertEquals(VerifyFailureShape.CONCEPTUAL, TutorStateMachine.classifyFailure(it))
-        }
-        listOf("CALCULATION", "UNIT_ERROR", "SIGN_ERROR", "QUESTION_MISREAD", "CARELESS", "TIME_PRESSURE", "BAD_GUESS", null)
-            .forEach { assertEquals(VerifyFailureShape.PROCEDURAL, TutorStateMachine.classifyFailure(it)) }
-    }
-
-    // ── MASTERED ─────────────────────────────────────────────────────────────
-
-    @Test
-    fun `MASTERED plus CloseOut advances to MOVE_ON`() {
-        val mastered = inState(TutorState.MASTERED)
-        val result = TutorStateMachine.transition(mastered, TutorEvidence.CloseOut, 2L)
-        assertAdvancedTo(result, TutorState.MOVE_ON)
-    }
-
-    @Test
-    fun `MASTERED rejects non-CloseOut evidence`() {
-        val mastered = inState(TutorState.MASTERED)
-        val result = TutorStateMachine.transition(mastered, TutorEvidence.ExplanationDelivered, 2L)
-        assertInvalid(result)
-    }
-
-    // ── Terminal states reject everything ───────────────────────────────────
-
-    @Test
-    fun `MOVE_ON is terminal and rejects every evidence type`() {
-        val done = inState(TutorState.MOVE_ON)
-        allEvidenceSamples().forEach { evidence ->
-            assertInvalid(TutorStateMachine.transition(done, evidence, 2L))
-        }
-    }
-
-    @Test
-    fun `ESCALATED is terminal and rejects every evidence type`() {
-        val escalated = inState(TutorState.ESCALATED)
-        allEvidenceSamples().forEach { evidence ->
-            assertInvalid(TutorStateMachine.transition(escalated, evidence, 2L))
-        }
-    }
-
-    @Test
-    fun `TutorState_isTerminal is true only for MOVE_ON and ESCALATED`() {
-        TutorState.values().forEach { state ->
-            val expected = state == TutorState.MOVE_ON || state == TutorState.ESCALATED
-            assertEquals("isTerminal mismatch for $state", expected, state.isTerminal)
-        }
-    }
-
-    // ── Full happy-path walk ─────────────────────────────────────────────────
-
-    @Test
-    fun `full cycle from DIAGNOSE to MOVE_ON accumulates one history record per transition`() {
-        var session = TutorStateMachine.start(conceptId, 1L)
-        session = advanceOrFail(session, TutorEvidence.Diagnostic(DiagnosticFinding.UNKNOWN), 2L)
-        assertEquals(TutorState.EXPLAIN, session.state)
-
-        session = advanceOrFail(session, TutorEvidence.ExplanationDelivered, 3L)
-        assertEquals(TutorState.PRACTICE, session.state)
-
-        session = advanceOrFail(
-            session, TutorEvidence.PracticeAttempts(TutorStateMachine.MIN_PRACTICE_ATTEMPTS, 3), 4L
+    fun `ranks a clear weak concept as REPAIR_CONCEPT with the estimator's own expectedGain`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-weak", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                mastery = 0.1, attemptCount = 10
+            )
         )
-        assertEquals(TutorState.VERIFY, session.state)
 
-        session = advanceOrFail(session, TutorEvidence.Verification(snapshot(above), null), 5L)
-        assertEquals(TutorState.MASTERED, session.state)
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val top = report.candidates.first()
 
-        session = advanceOrFail(session, TutorEvidence.CloseOut, 6L)
-        assertEquals(TutorState.MOVE_ON, session.state)
-
-        assertEquals(5, session.history.size)
-        assertEquals(0, session.cycleCount) // never failed a VERIFY, so no retry cycle burned
-        assertTrue(session.state.isTerminal)
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, top.intent)
+        assertEquals("c-weak", top.conceptId)
+        assertTrue(top.expectedGain > 0.0)
+        assertEquals(top.expectedGain, top.priorityScore, 0.0001)
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    @Test
+    fun `high mastery plus REVIEW retention becomes a retention test, not a full repair`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-review", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                mastery = 0.85, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
+            )
+        )
 
-    private fun inState(state: TutorState, cycleCount: Int = 0) = TutorSession(
-        conceptId = conceptId,
-        state = state,
-        cycleCount = cycleCount,
-        startedAt = 1L,
-        updatedAt = 1L,
-        history = emptyList()
-    )
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.first { it.conceptId == "c-review" }
 
-    private fun advanceOrFail(session: TutorSession, evidence: TutorEvidence, now: Long): TutorSession {
-        val result = TutorStateMachine.transition(session, evidence, now)
-        assertTrue("expected Advanced, got $result", result is TutorTransitionResult.Advanced)
-        return (result as TutorTransitionResult.Advanced).session
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, candidate.intent)
+        assertEquals(10, candidate.durationMinutes)
     }
 
-    private fun assertAdvancedTo(result: TutorTransitionResult, expected: TutorState) {
-        assertTrue("expected Advanced, got $result", result is TutorTransitionResult.Advanced)
-        assertEquals(expected, (result as TutorTransitionResult.Advanced).session.state)
+    @Test
+    fun `high mastery with careless errors suggests increasing difficulty, not repair`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-careless", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.85, attemptCount = 10, errorCount = 2
+            ),
+            unresolvedErrors = listOf(
+                ErrorPatternSnapshot(
+                    conceptId = "c-careless", errorType = "CARELESS", occurrences = 2,
+                    firstSeen = 100L, lastSeen = 900L
+                )
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.firstOrNull { it.conceptId == "c-careless" }
+
+        assertTrue(candidate != null)
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY, candidate!!.intent)
     }
 
-    private fun assertInvalid(result: TutorTransitionResult) {
-        assertTrue("expected Invalid, got $result", result is TutorTransitionResult.Invalid)
-        assertFalse((result as TutorTransitionResult.Invalid).reason.isBlank())
+    @Test
+    fun `heavy high-rate errors at low mastery suggest reducing difficulty`() {
+        val model = studentModel(
+            filler() + concept(
+                id = "c-mismatch", subject = "Chemistry", chapter = "Chemical Bonding", topic = "Chemical Bonding",
+                mastery = 0.15, attemptCount = 10, errorCount = 7
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+        val candidate = report.candidates.first { it.conceptId == "c-mismatch" }
+
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY, candidate.intent)
     }
 
-    private fun allEvidenceSamples(): List<TutorEvidence> = listOf(
-        TutorEvidence.Diagnostic(DiagnosticFinding.KNOWN),
-        TutorEvidence.ExplanationDelivered,
-        TutorEvidence.PracticeAttempts(TutorStateMachine.MIN_PRACTICE_ATTEMPTS, 1),
-        TutorEvidence.Verification(snapshot(above), null),
-        TutorEvidence.CloseOut
-    )
+    @Test
+    fun `an untested prerequisite becomes a diagnostic, an already-attempted one does not`() {
+        val untested = PrerequisiteRef(
+            conceptId = "prereq-untested", subject = "Physics", chapter = "Kinematics", topic = "Kinematics"
+        )
+        val attempted = PrerequisiteRef(
+            conceptId = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors"
+        )
+        val model = studentModel(
+            filler() + concept(
+                id = "c-downstream", subject = "Physics", chapter = "Rolling Motion", topic = "Rolling Motion",
+                mastery = 0.2, attemptCount = 8
+            ) + concept(
+                id = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors",
+                mastery = 0.3, attemptCount = 5
+            ),
+            weakPrerequisites = listOf(
+                PrerequisiteIssue(conceptId = "c-downstream", weakPrerequisites = listOf(untested, attempted))
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(report.candidates.any {
+            it.conceptId == "prereq-untested" &&
+                it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC
+        })
+        assertTrue(report.candidates.none { it.conceptId == "prereq-attempted" && it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC })
+    }
+
+    @Test
+    fun `thin overall attempt data surfaces START_MOCK among the candidates`() {
+        val model = studentModel(
+            listOf(
+                concept(
+                    id = "c-thin", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
+                    mastery = 0.2, attemptCount = 3
+                )
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(model.overall.totalAttempts < 20)
+        assertTrue(report.candidates.any { it.intent == LearningDecisionEngine.LearningInterventionIntent.START_MOCK })
+    }
+
+    @Test
+    fun `three or more weak topics in one chapter collapse into one targeted set`() {
+        // "Human Physiology" resolves via ConceptWeightage's exact (exam, subject,
+        // chapter) tier since subject is provided directly — same fixture chapter
+        // ScorePredictorTest already relies on for a real, non-zero weightage.
+        val model = studentModel(
+            filler() + listOf(
+                concept(id = "c1", subject = "Biology", chapter = "Human Physiology", topic = "Excretion", mastery = 0.2, attemptCount = 6),
+                concept(id = "c2", subject = "Biology", chapter = "Human Physiology", topic = "Circulation", mastery = 0.25, attemptCount = 6),
+                concept(id = "c3", subject = "Biology", chapter = "Human Physiology", topic = "Neural Control", mastery = 0.15, attemptCount = 6)
+            )
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        val targetedSets = report.candidates.filter {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET && it.chapter == "Human Physiology"
+        }
+        assertEquals(1, targetedSets.size)
+        assertTrue(report.candidates.none { it.chapter == "Human Physiology" && it.intent == LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT })
+    }
+
+    @Test
+    fun `every candidate list is capped and sorted by priority descending`() {
+        // Eight distinct, real, resolvable chapters (none repeated, so nothing
+        // collapses into a targeted set) — enough weak concepts to force the
+        // MAX_CANDIDATES cap to actually bind.
+        val chapters = listOf(
+            "Biology" to "Human Physiology",
+            "Physics" to "Laws of Motion",
+            "Physics" to "Kinematics",
+            "Chemistry" to "Chemical Bonding",
+            "Biology" to "Ecology And Environment",
+            "Physics" to "Vectors and 3D",
+            "Chemistry" to "Coordination Compounds",
+            "Biology" to "Biodiversity"
+        )
+        val model = studentModel(
+            chapters.mapIndexed { i, (subject, chapter) ->
+                concept(
+                    id = "c-many-$i", subject = subject, chapter = chapter, topic = chapter,
+                    mastery = 0.1 + i * 0.02, attemptCount = 8
+                )
+            }
+        )
+
+        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
+
+        assertTrue(report.candidates.isNotEmpty())
+        assertTrue(report.candidates.size <= 5)
+        val scores = report.candidates.map { it.priorityScore }
+        assertEquals(scores.sortedDescending(), scores)
+    }
 }
 
 
