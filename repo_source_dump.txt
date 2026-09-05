@@ -47,6 +47,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── TargetedTestEvidenceImporter.kt
 │   │   │   │   │   │   │   ├── TaskSyncManager.kt
 │   │   │   │   │   │   │   ├── TelegramAlertBot.kt
+│   │   │   │   │   │   │   ├── TutorCycleManager.kt
 │   │   │   │   │   │   │   ├── WorkModeTaskReconciler.kt
 │   │   │   │   │   │   ├── ui
 │   │   │   │   │   │   │   ├── consultation
@@ -200,6 +201,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── TestReportParser.kt
 │   │   │   │   │   │   │   │   │   ├── TestResultNormalizer.kt
 │   │   │   │   │   │   │   │   ├── tutor
+│   │   │   │   │   │   │   │   │   ├── TutorDiagnostics.kt
 │   │   │   │   │   │   │   │   │   ├── TutorEvidence.kt
 │   │   │   │   │   │   │   │   │   ├── TutorSession.kt
 │   │   │   │   │   │   │   │   │   ├── TutorSessionLedger.kt
@@ -223,6 +225,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── testmate
 │   │   │   │   │   │   │   │   │   ├── TestReportParserTest.kt
 │   │   │   │   │   │   │   │   ├── tutor
+│   │   │   │   │   │   │   │   │   ├── TutorDiagnosticsTest.kt
 │   │   │   │   │   │   │   │   │   ├── TutorStateMachineTest.kt
 │   ├── planner
 │   │   ├── build.gradle.kts
@@ -2468,6 +2471,7 @@ import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
@@ -2591,7 +2595,14 @@ object GapTaskManager {
             val decisionReport = LearningDecisionEngine.decideFromReport(
                 report, studentModel, estimates, expectedScore
             )
-            LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            val orchestrationResult =
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
+            // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
+            // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
+            // startFromCandidate's own doc for which intents this actually applies to.
+            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
             createTargetedTestIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
@@ -2999,7 +3010,10 @@ object GapTaskManager {
                 topic = topic,
                 result = result
             )
-            GapTaskLedger.markActiveEvidenceImported()
+            GapTaskLedger.markActiveEvidenceImported(
+                attemptCount = result.attemptedCount,
+                correctCount = result.correctCount
+            )
         } catch (e: Exception) {
             Log.e(TAG, "evidence import failed: ${e.message}", e)
         }
@@ -5058,6 +5072,13 @@ class ReminderService : Service() {
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
                 try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
+                // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
+                // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and
+                // VERIFY consume GapTaskLedger's own already-imported P0b evidence (just
+                // polled/imported by the call directly above, same tick) rather than firing a
+                // second competing Testmate request. See TutorCycleManager's own class doc.
+                try { TutorCycleManager.driveActiveSession(applicationContext) } catch (_: Exception) {}
                 // Retention-check evidence loop (next-session-retention-loop.txt): requests a
                 // Testmate session for any RETENTION CHECK task that doesn't have one yet —
                 // see RetentionCheckManager's own doc for why this is a separate ledger/
@@ -6376,6 +6397,232 @@ object TelegramAlertBot {
         val id = CheckmatePrefs.getString("telegram_chat_id", null)
         return if (id.isNullOrBlank()) null else id.trim()
     }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/TutorCycleManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorDiagnostics
+import com.checkmate.learning.tutor.TutorEvidence
+import com.checkmate.learning.tutor.TutorSession
+import com.checkmate.learning.tutor.TutorSessionLedger
+import com.checkmate.learning.tutor.TutorState
+import com.checkmate.learning.tutor.TutorTransitionResult
+import com.checkmate.planner.intervention.GapTaskLedger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/**
+ * Upgrade Blueprint Phase 3, P3.2 ("make the FSM drive real learning activity") —
+ * the execution bridge between the pure [com.checkmate.learning.tutor.TutorStateMachine]
+ * skeleton and the real intervention pipeline. This is a fourth manager in the same family
+ * as [GapTaskManager]/[RetentionCheckManager]: one object, called from
+ * [ReminderService]'s existing 15-min loop, driving one specific piece of state.
+ *
+ * DELIBERATELY DOES NOT REQUEST ITS OWN TESTMATE TEST. [GapTaskManager]'s own P0b loop
+ * already requests/polls/imports a targeted test for whatever concept
+ * [GapTaskLedger.activeConceptId] currently is — and that concept is, by construction, the
+ * exact same one a tutor session was started for (see [GapTaskManager]'s own
+ * `generateIfNeededLocked`, which calls [TutorSessionLedger.startFromCandidate] with the
+ * same [com.checkmate.learning.engine.LearningDecisionEngine.CandidateIntervention]
+ * [GapTaskLedger.recordServed] already tracked). Firing a SECOND, independent targeted-test
+ * request here would mean two competing Testmate sessions for one concept — this instead
+ * reads [GapTaskLedger]'s own already-imported evidence
+ * ([GapTaskLedger.activeLastImportAttemptCount]/[GapTaskLedger.activeLastImportCorrectCount])
+ * and, once VERIFY resolves without mastery, asks for a fresh round the SAME way
+ * `resolveDoneConcept` already does ([GapTaskLedger.resetForNextRound]) — "extend the
+ * existing intervention pipeline, don't replace it," applied to the tutor bridge itself.
+ *
+ * SHARES [GapTaskLedger]'s MUTEX. Every function here reads or writes [GapTaskLedger]'s own
+ * fields, so [driveActiveSession] runs inside [GapTaskLedger.withLock] — same discipline
+ * [GapTaskManager] itself already applies to every one of its own entry points, for exactly
+ * the race class already fixed once in this codebase (see [GapTaskLedger.withLock]'s own
+ * doc). [TutorSessionLedger] has no mutex of its own; every mutation of it happens to be
+ * serialized through this shared lock today ONLY because every call site that touches it
+ * (this file, and [GapTaskManager]'s `startFromCandidate` call) is reached via
+ * [GapTaskLedger.withLock] — a future caller that mutates [TutorSessionLedger] from outside
+ * that lock would reopen the exact bug class this comment is warning about.
+ *
+ * NO LLM CALL ANYWHERE IN THIS FILE — DIAGNOSE uses [TutorDiagnostics] (deterministic), and
+ * EXPLAIN auto-advances immediately by design (see [driveExplain]'s own doc for why that's
+ * a real, defensible choice for this pass and not a stub being papered over).
+ */
+object TutorCycleManager {
+
+    private const val TAG = "TutorCycleManager"
+
+    /** Safety cap on how many state-to-state auto-advances (DIAGNOSE, EXPLAIN — the two
+     *  states that need no external evidence) this drives in a single tick, so a logic bug
+     *  that made [TutorStateMachine] loop between two states could never hang this call
+     *  forever. Five is comfortably above the three real states (DIAGNOSE/EXPLAIN/one
+     *  PRACTICE-or-VERIFY check) a normal tick ever needs to walk through. */
+    private const val MAX_AUTO_STEPS_PER_TICK = 5
+
+    /** Call from [ReminderService]'s existing 15-min loop, after
+     *  [GapTaskManager.evidencePollIfNeeded] (so a just-imported round's evidence is
+     *  available to consume in the very same tick). No-op if no tutor session is active. */
+    suspend fun driveActiveSession(context: Context) = GapTaskLedger.withLock {
+        driveActiveSessionLocked(context)
+    }
+
+    private suspend fun driveActiveSessionLocked(context: Context) {
+        var steps = 0
+        while (steps++ < MAX_AUTO_STEPS_PER_TICK) {
+            val session = TutorSessionLedger.current() ?: return
+            val advanced = when (session.state) {
+                TutorState.DIAGNOSE -> driveDiagnose(context, session)
+                TutorState.EXPLAIN -> driveExplain(session)
+                TutorState.PRACTICE -> drivePractice(session)
+                TutorState.VERIFY -> driveVerify(context, session)
+                TutorState.MASTERED -> { driveMastered(session); return }
+                TutorState.MOVE_ON, TutorState.ESCALATED -> {
+                    // Defensive only — driveMastered/ESCALATED's own producer already clear
+                    // the slot immediately, so a session should never actually be READ back
+                    // in one of these two states on a later tick. Clearing here anyway costs
+                    // nothing and closes the gap if that assumption is ever wrong.
+                    Log.w(TAG, "found lingering terminal session (${session.state}) for concept=${session.conceptId} — clearing")
+                    TutorSessionLedger.clear()
+                    return
+                }
+            }
+            if (!advanced) return
+        }
+        Log.w(TAG, "hit MAX_AUTO_STEPS_PER_TICK — check for a TutorStateMachine loop")
+    }
+
+    // ── DIAGNOSE ─────────────────────────────────────────────────────────────
+
+    private suspend fun driveDiagnose(context: Context, session: TutorSession): Boolean {
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[session.conceptId]
+        val finding = TutorDiagnostics.diagnose(snapshot)
+        val result = TutorSessionLedger.apply(TutorEvidence.Diagnostic(finding), now())
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── EXPLAIN ──────────────────────────────────────────────────────────────
+
+    /**
+     * Auto-advances immediately — no LLM teaching layer exists yet (deliberate; see
+     * [TutorCycleManager]'s own class doc and [TutorState]'s scope note). The explanation
+     * already shown to the student for this concept is the real gap-repair
+     * [com.checkmate.planner.model.StudyTask]'s own `rationale` text
+     * ([com.checkmate.learning.engine.LearningDecisionEngine]'s `rationaleFor` — genuine
+     * written explanatory content already surfaced in the UI, not a placeholder), created
+     * the moment [GapTaskManager] served this concept. Once a real LLM explanation layer
+     * exists (P3.1-adjacent work), this is the one place it plugs in — replacing this
+     * immediate auto-advance with "wait until the student has actually viewed/requested a
+     * richer explanation" — without [TutorStateMachine]'s own EXPLAIN transition changing
+     * at all.
+     */
+    private fun driveExplain(session: TutorSession): Boolean {
+        val result = TutorSessionLedger.apply(TutorEvidence.ExplanationDelivered, now())
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── PRACTICE ─────────────────────────────────────────────────────────────
+
+    /**
+     * Consumes [GapTaskLedger]'s own already-imported round evidence — see class doc for
+     * why this never requests its own Testmate test. Returns false (nothing to do yet)
+     * until [GapTaskLedger.isActiveEvidenceImported] goes true, which happens on some later
+     * tick once [GapTaskManager.evidencePollIfNeeded] actually imports a submitted result.
+     */
+    private fun drivePractice(session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            // GapTaskLedger has moved on (covered/reassigned) while this tutor session was
+            // still open — there is no P0b evidence stream left for it to ride on. Free the
+            // slot rather than leave an orphaned session sitting in PRACTICE forever.
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            return false
+        }
+        if (!GapTaskLedger.isActiveEvidenceImported()) return false // waiting on the student
+
+        val attemptCount = GapTaskLedger.activeLastImportAttemptCount()
+        val correctCount = GapTaskLedger.activeLastImportCorrectCount()
+        val result = TutorSessionLedger.apply(TutorEvidence.PracticeAttempts(attemptCount, correctCount), now())
+        if (result !is TutorTransitionResult.Advanced) {
+            // Shouldn't happen at TARGETED_TEST_QUESTION_COUNT=15 >> MIN_PRACTICE_ATTEMPTS=3,
+            // but stay defensive rather than get stuck re-reading the same rejected evidence
+            // forever — ask for a fresh round exactly like a genuine VERIFY-fail would.
+            Log.w(TAG, "concept=$conceptId practice evidence rejected ($result) — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+        return true
+    }
+
+    // ── VERIFY ───────────────────────────────────────────────────────────────
+
+    /**
+     * Split out from [drivePractice] rather than inlined at its tail, so a session that
+     * somehow persists mid-VERIFY across a process death/crash (advanced PRACTICE->VERIFY
+     * but didn't reach a further state before the process died) is still recoverable on the
+     * next tick — this re-derives everything it needs (a fresh [com.checkmate.learning.model.ConceptSnapshot],
+     * fresh dominant error) from durable state rather than anything carried over in memory
+     * from [drivePractice]'s own call.
+     */
+    private suspend fun driveVerify(context: Context, session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            return false
+        }
+
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[conceptId]
+        if (snapshot == null) {
+            // Mastery recompute (inside TargetedTestEvidenceImporter.import) should always
+            // leave a snapshot behind once evidence exists — this would mean something
+            // upstream is broken. Don't fabricate one; ask for a fresh round instead of
+            // guessing at VERIFY with no real evidence.
+            Log.w(TAG, "concept=$conceptId has no ConceptSnapshot to verify against — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+
+        val dominantError = studentModel.unresolvedErrors
+            .filter { it.conceptId == conceptId }
+            .maxByOrNull { it.occurrences }
+            ?.errorType
+
+        val result = TutorSessionLedger.apply(TutorEvidence.Verification(snapshot, dominantError), now())
+        val advancedTo = (result as? TutorTransitionResult.Advanced)?.session?.state
+        if (advancedTo != TutorState.MASTERED) {
+            // Looped back to EXPLAIN/PRACTICE, or escalated — either way this round's
+            // Testmate evidence is now spent. Same mechanism GapTaskManager's own
+            // resolveDoneConcept already uses for "student finished the task, still below
+            // threshold" — a fresh round gets requested the next time
+            // GapTaskManager.createTargetedTestIfNeeded runs.
+            GapTaskLedger.resetForNextRound()
+        }
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── MASTERED ─────────────────────────────────────────────────────────────
+
+    private fun driveMastered(session: TutorSession) {
+        TutorSessionLedger.apply(TutorEvidence.CloseOut, now())
+        TutorSessionLedger.clear()
+        Log.d(TAG, "tutor session for concept=${session.conceptId} closed out (MASTERED -> MOVE_ON)")
+        // Deliberately does NOT call GapTaskLedger.markCovered() — that call is reserved for
+        // GapTaskManager.resolveDoneConcept's own independently-verified "task reached DONE
+        // AND mastery recheck cleared threshold" path (see markCovered's own doc). The tutor
+        // reaching MASTERED is a real, evidence-backed confirmation, but letting two
+        // different code paths both decide "this concept is covered" risks exactly the kind
+        // of double-write / inconsistent-state bug class this codebase has already spent a
+        // long stretch fixing once for this same ledger. GapTaskManager's own flow will reach
+        // the same conclusion independently once the student marks the task DONE.
+    }
+
+    private fun now(): Long = System.currentTimeMillis()
 }
 
 
@@ -23073,6 +23320,76 @@ object TestResultNormalizer {
 }
 
 
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnostics.kt =====
+package com.checkmate.learning.tutor
+
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+
+/**
+ * Upgrade Blueprint Phase 3, P3.2 item 1 ("DIAGNOSE -> real explanation... later this is
+ * where the LLM can become useful") — explicitly deliberately NOT that yet. Per this
+ * session's own instruction ("don't add LLM diagnosis yet... let DiagnosticFinding be
+ * produced from the existing deterministic evidence: concept + wrong questions + error
+ * patterns + mastery + difficulty + timing + retention"), this derives a
+ * [DiagnosticFinding] purely from a [ConceptSnapshot] — the exact same read model
+ * [com.checkmate.learning.engine.LearningDecisionEngine] itself already trusts, nothing
+ * new.
+ *
+ * FUTURE SEAM (explicitly not built here): a P3.1 LLM-proposed hypothesis, once it exists,
+ * replaces WHAT calls this / what feeds [TutorEvidence.Diagnostic] — not [TutorStateMachine]
+ * itself, and not this function's signature. An LLM diagnoser would sit in FRONT of this
+ * (or replace it) to produce a richer, sub-concept-scoped finding; [TutorStateMachine]'s own
+ * transition table doesn't change either way — see [TutorState]'s own class doc.
+ */
+object TutorDiagnostics {
+
+    /**
+     * [snapshot] is null for a [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC]
+     * candidate specifically — that intent exists precisely because
+     * [com.checkmate.learning.graph.KnowledgeGraph] flags a prerequisite the student has
+     * never attempted, so no [ConceptSnapshot] row exists for it yet. [DiagnosticFinding.UNKNOWN]
+     * is the only honest answer for "no evidence exists at all" — not a guess dressed up as
+     * one of the other three findings.
+     *
+     * For a real snapshot (the
+     * [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT]
+     * case — already attempted, mastery known), the heuristic:
+     * - mastery cleared [MasteryEngine.MASTERY_THRESHOLD] but
+     *   [RetentionDecisionSnapshot.REVIEW] means [com.checkmate.learning.engine.RetentionEngine]
+     *   already independently flagged forgetting risk on this concept -> [DiagnosticFinding.FORGOTTEN]
+     *   (learned it once, not retrievable now — re-teaching should be brief, not from scratch).
+     * - real recorded errors ([ConceptSnapshot.errorCount] > 0) at still-below-threshold mastery
+     *   -> [DiagnosticFinding.MISUNDERSTOOD] (they tried, and got a wrong pattern instilled —
+     *   different from never having tried at all).
+     * - mastery already at/above threshold with no retention flag -> [DiagnosticFinding.KNOWN]
+     *   (skip re-teaching, confirm directly).
+     * - anything else (below threshold, no errors recorded yet — e.g. only skipped/unattempted
+     *   questions counted toward this concept so far) -> [DiagnosticFinding.UNKNOWN], the same
+     *   "don't assume a specific gap without positive evidence of one" caution
+     *   [com.checkmate.learning.engine.ErrorEngine.classify] already applies to its own
+     *   unclassifiable case.
+     */
+    fun diagnose(snapshot: ConceptSnapshot?): DiagnosticFinding {
+        if (snapshot == null) return DiagnosticFinding.UNKNOWN
+
+        val known = snapshot.mastery >= MasteryEngine.MASTERY_THRESHOLD
+
+        return when {
+            known && snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW ->
+                DiagnosticFinding.FORGOTTEN
+            !known && snapshot.errorCount > 0 ->
+                DiagnosticFinding.MISUNDERSTOOD
+            known ->
+                DiagnosticFinding.KNOWN
+            else ->
+                DiagnosticFinding.UNKNOWN
+        }
+    }
+}
+
+
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorEvidence.kt =====
 package com.checkmate.learning.tutor
 
@@ -25134,6 +25451,82 @@ class TestReportParserTest {
         val report = TestReportParser.parse("not a report at all")
         assertEquals(0, report.questions.size)
         assertNull(report.scoreObtained)
+    }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/tutor/TutorDiagnosticsTest.kt =====
+package com.checkmate.learning.tutor
+
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class TutorDiagnosticsTest {
+
+    private fun snapshot(
+        mastery: Double,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.MOVE_ON,
+        errorCount: Int = 0
+    ) = ConceptSnapshot(
+        conceptId = "concept-1",
+        exam = "NEET",
+        subject = "Biology",
+        chapter = "Biomolecules",
+        topic = "Proteins",
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = 0.0,
+        attemptCount = 10,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = emptyList()
+    )
+
+    private val above = MasteryEngine.MASTERY_THRESHOLD + 0.1
+    private val below = MasteryEngine.MASTERY_THRESHOLD - 0.1
+
+    @Test
+    fun `null snapshot is always UNKNOWN`() {
+        assertEquals(DiagnosticFinding.UNKNOWN, TutorDiagnostics.diagnose(null))
+    }
+
+    @Test
+    fun `mastered with no retention risk is KNOWN`() {
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.MOVE_ON, errorCount = 0)
+        assertEquals(DiagnosticFinding.KNOWN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `mastered but flagged for retention review is FORGOTTEN`() {
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.REVIEW, errorCount = 0)
+        assertEquals(DiagnosticFinding.FORGOTTEN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `below threshold with recorded errors is MISUNDERSTOOD`() {
+        val s = snapshot(mastery = below, errorCount = 3)
+        assertEquals(DiagnosticFinding.MISUNDERSTOOD, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `below threshold with zero errors is UNKNOWN, not assumed MISUNDERSTOOD`() {
+        val s = snapshot(mastery = below, errorCount = 0)
+        assertEquals(DiagnosticFinding.UNKNOWN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `mastered takes priority over a stray error count`() {
+        // Above threshold with old errorCount>0 but no retention flag: still KNOWN, not
+        // MISUNDERSTOOD — the MISUNDERSTOOD branch only applies to still-below-threshold
+        // mastery, per the class doc's own ordering.
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.MOVE_ON, errorCount = 5)
+        assertEquals(DiagnosticFinding.KNOWN, TutorDiagnostics.diagnose(s))
     }
 }
 
@@ -27298,6 +27691,20 @@ object GapTaskLedger {
     private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
     private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
     private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    // Phase 3 (adaptive tutor state machine) execution bridge: the tutor FSM's
+    // PRACTICE -> VERIFY transition needs real attempt counts for THIS round specifically
+    // (see com.checkmate.learning.tutor.TutorEvidence.PracticeAttempts's own doc — it must
+    // be "this practice pass," not lifetime). This P0b loop already runs the exact Testmate
+    // targeted-test request/import for the same active concept the tutor session tracks
+    // (see TutorSessionLedger.startFromCandidate, called from the same
+    // GapTaskManager.generateIfNeeded call site that serves this ledger's active concept in
+    // the first place) — rather than have TutorCycleManager fire a SECOND, competing
+    // targeted-test request for the same concept, it reads these two fields, written
+    // alongside [markActiveEvidenceImported] from the SAME TestmateResult
+    // GapTaskManager.evidencePollIfNeeded already has in hand. "Extend the existing
+    // intervention pipeline, don't replace it" applied to the tutor bridge specifically.
+    private const val KEY_ACTIVE_LAST_IMPORT_ATTEMPTS = "gap_task_active_last_import_attempts"
+    private const val KEY_ACTIVE_LAST_IMPORT_CORRECT  = "gap_task_active_last_import_correct"
     // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
     // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
     // id never changed between rounds, so a round-2 request for the SAME concept got the
@@ -27513,11 +27920,27 @@ object GapTaskLedger {
     /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
      *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
      *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
-     *  session every 15 minutes for the rest of the day. */
-    fun markActiveEvidenceImported() {
+     *  session every 15 minutes for the rest of the day.
+     *
+     *  [attemptCount]/[correctCount] are this round's own counts (straight from the same
+     *  `TestmateResult` GapTaskManager.evidencePollIfNeeded already has in hand when it calls
+     *  this) — see [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc for why these exist. Optional,
+     *  defaulting to 0/0, so this stays source-compatible with any other caller that only
+     *  cares about the imported flag itself. */
+    fun markActiveEvidenceImported(attemptCount: Int = 0, correctCount: Int = 0) {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, attemptCount)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, correctCount)
         bumpVersion()
     }
+
+    /** This round's attempt count from the last [markActiveEvidenceImported] call — see
+     *  [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc. 0 if nothing has been imported yet. */
+    fun activeLastImportAttemptCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+
+    /** This round's correct count from the last [markActiveEvidenceImported] call — see
+     *  [activeLastImportAttemptCount]'s own doc. */
+    fun activeLastImportCorrectCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
 
     /**
      * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
@@ -27537,6 +27960,8 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
@@ -27571,6 +27996,8 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
         CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
     }
 
