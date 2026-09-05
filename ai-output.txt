@@ -1,1502 +1,887 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/MasteryEngine.kt =====
-package com.checkmate.learning.engine
+//===== TERMUXFILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnostics.kt =====
+package com.checkmate.learning.tutor
+
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.ConceptSnapshot
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+
+/**
+ * Upgrade Blueprint Phase 3, P3.2 item 1 ("DIAGNOSE -> real explanation... later this is
+ * where the LLM can become useful") — explicitly deliberately NOT that yet. Per this
+ * session's own instruction ("don't add LLM diagnosis yet... let DiagnosticFinding be
+ * produced from the existing deterministic evidence: concept + wrong questions + error
+ * patterns + mastery + difficulty + timing + retention"), this derives a
+ * [DiagnosticFinding] purely from a [ConceptSnapshot] — the exact same read model
+ * [com.checkmate.learning.engine.LearningDecisionEngine] itself already trusts, nothing
+ * new.
+ *
+ * FUTURE SEAM (explicitly not built here): a P3.1 LLM-proposed hypothesis, once it exists,
+ * replaces WHAT calls this / what feeds [TutorEvidence.Diagnostic] — not [TutorStateMachine]
+ * itself, and not this function's signature. An LLM diagnoser would sit in FRONT of this
+ * (or replace it) to produce a richer, sub-concept-scoped finding; [TutorStateMachine]'s own
+ * transition table doesn't change either way — see [TutorState]'s own class doc.
+ */
+object TutorDiagnostics {
+
+    /**
+     * [snapshot] is null for a [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC]
+     * candidate specifically — that intent exists precisely because
+     * [com.checkmate.learning.graph.KnowledgeGraph] flags a prerequisite the student has
+     * never attempted, so no [ConceptSnapshot] row exists for it yet. [DiagnosticFinding.UNKNOWN]
+     * is the only honest answer for "no evidence exists at all" — not a guess dressed up as
+     * one of the other three findings.
+     *
+     * For a real snapshot (the
+     * [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT]
+     * case — already attempted, mastery known), the heuristic:
+     * - mastery cleared [MasteryEngine.MASTERY_THRESHOLD] but
+     *   [RetentionDecisionSnapshot.REVIEW] means [com.checkmate.learning.engine.RetentionEngine]
+     *   already independently flagged forgetting risk on this concept -> [DiagnosticFinding.FORGOTTEN]
+     *   (learned it once, not retrievable now — re-teaching should be brief, not from scratch).
+     * - real recorded errors ([ConceptSnapshot.errorCount] > 0) at still-below-threshold mastery
+     *   -> [DiagnosticFinding.MISUNDERSTOOD] (they tried, and got a wrong pattern instilled —
+     *   different from never having tried at all).
+     * - mastery already at/above threshold with no retention flag -> [DiagnosticFinding.KNOWN]
+     *   (skip re-teaching, confirm directly).
+     * - anything else (below threshold, no errors recorded yet — e.g. only skipped/unattempted
+     *   questions counted toward this concept so far) -> [DiagnosticFinding.UNKNOWN], the same
+     *   "don't assume a specific gap without positive evidence of one" caution
+     *   [com.checkmate.learning.engine.ErrorEngine.classify] already applies to its own
+     *   unclassifiable case.
+     */
+    fun diagnose(snapshot: ConceptSnapshot?): DiagnosticFinding {
+        if (snapshot == null) return DiagnosticFinding.UNKNOWN
+
+        val known = snapshot.mastery >= MasteryEngine.MASTERY_THRESHOLD
+
+        return when {
+            known && snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW ->
+                DiagnosticFinding.FORGOTTEN
+            !known && snapshot.errorCount > 0 ->
+                DiagnosticFinding.MISUNDERSTOOD
+            known ->
+                DiagnosticFinding.KNOWN
+            else ->
+                DiagnosticFinding.UNKNOWN
+        }
+    }
+}
+
+
+//===== TERMUXFILE: app/src/main/kotlin/com/checkmate/service/TutorCycleManager.kt =====
+package com.checkmate.service
 
 import android.content.Context
 import android.util.Log
-import com.checkmate.learning.graph.KnowledgeGraph
-import com.checkmate.learning.model.Concept
-import com.checkmate.learning.model.ConceptMastery
-import com.checkmate.learning.model.LearningEventType
-import com.checkmate.learning.model.LearningIds
-import com.checkmate.learning.model.QuestionAttempt
-import com.checkmate.learning.repository.LearningDatabase
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorDiagnostics
+import com.checkmate.learning.tutor.TutorEvidence
+import com.checkmate.learning.tutor.TutorSession
+import com.checkmate.learning.tutor.TutorSessionLedger
+import com.checkmate.learning.tutor.TutorState
+import com.checkmate.learning.tutor.TutorTransitionResult
+import com.checkmate.planner.intervention.GapTaskLedger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
- * Upgrade Blueprint Phase 1.5 ("MasteryEngine — deterministic first, no LLM-guessed
- * scores").
+ * Upgrade Blueprint Phase 3, P3.2 ("make the FSM drive real learning activity") —
+ * the execution bridge between the pure [com.checkmate.learning.tutor.TutorStateMachine]
+ * skeleton and the real intervention pipeline. This is a fourth manager in the same family
+ * as [GapTaskManager]/[RetentionCheckManager]: one object, called from
+ * [ReminderService]'s existing 15-min loop, driving one specific piece of state.
  *
- * mastery = 0.35·recentAccuracy + 0.20·lifetimeAccuracy + 0.15·difficultyPerformance
- *         + 0.15·retention + 0.10·speed + 0.05·confidenceCalibration
+ * DELIBERATELY DOES NOT REQUEST ITS OWN TESTMATE TEST. [GapTaskManager]'s own P0b loop
+ * already requests/polls/imports a targeted test for whatever concept
+ * [GapTaskLedger.activeConceptId] currently is — and that concept is, by construction, the
+ * exact same one a tutor session was started for (see [GapTaskManager]'s own
+ * `generateIfNeededLocked`, which calls [TutorSessionLedger.startFromCandidate] with the
+ * same [com.checkmate.learning.engine.LearningDecisionEngine.CandidateIntervention]
+ * [GapTaskLedger.recordServed] already tracked). Firing a SECOND, independent targeted-test
+ * request here would mean two competing Testmate sessions for one concept — this instead
+ * reads [GapTaskLedger]'s own already-imported evidence
+ * ([GapTaskLedger.activeLastImportAttemptCount]/[GapTaskLedger.activeLastImportCorrectCount])
+ * and, once VERIFY resolves without mastery, asks for a fresh round the SAME way
+ * `resolveDoneConcept` already does ([GapTaskLedger.resetForNextRound]) — "extend the
+ * existing intervention pipeline, don't replace it," applied to the tutor bridge itself.
  *
- * HONEST GAP: two of the six blueprint components have no real data source yet in
- * this codebase — Question.difficulty is always null (TestResultNormalizer never
- * sets it; Testmate's report.md carries no difficulty field) and
- * QuestionAttempt.confidence is always null (nothing captures a stated-confidence
- * input anywhere). Treating a missing input as 0 would drag every mastery score
- * down by exactly its weight regardless of actual performance, so missing
- * components are dropped from the weighted sum and the remaining weights are
- * renormalized to sum to 1.0 (see [renormalizedMastery]). Wire
- * Question.difficulty / a real confidence input in here the moment either exists —
- * nothing else needs to change.
+ * SHARES [GapTaskLedger]'s MUTEX. Every function here reads or writes [GapTaskLedger]'s own
+ * fields, so [driveActiveSession] runs inside [GapTaskLedger.withLock] — same discipline
+ * [GapTaskManager] itself already applies to every one of its own entry points, for exactly
+ * the race class already fixed once in this codebase (see [GapTaskLedger.withLock]'s own
+ * doc). [TutorSessionLedger] has no mutex of its own; every mutation of it happens to be
+ * serialized through this shared lock today ONLY because every call site that touches it
+ * (this file, and [GapTaskManager]'s `startFromCandidate` call) is reached via
+ * [GapTaskLedger.withLock] — a future caller that mutates [TutorSessionLedger] from outside
+ * that lock would reopen the exact bug class this comment is warning about.
  *
- * Concept identity: [KnowledgeGraph.conceptId] keys on (exam, chapter, topic) only —
- * NOT subject — because TestResultNormalizer-imported Questions never carry a
- * subject. This means a mastery row can exist for a concept before/without ever
- * running [KnowledgeGraph.seedExamSyllabus] for that exam — [recomputeAll] below
- * upserts a minimal [Concept] row itself from whatever Question data it has, so
- * ConceptMastery always has a matching, queryable Concept row even with zero
- * syllabus seeding done.
+ * NO LLM CALL ANYWHERE IN THIS FILE — DIAGNOSE uses [TutorDiagnostics] (deterministic), and
+ * EXPLAIN auto-advances immediately by design (see [driveExplain]'s own doc for why that's
+ * a real, defensible choice for this pass and not a stub being papered over).
  */
-object MasteryEngine {
+object TutorCycleManager {
 
-    private const val TAG = "MasteryEngine"
+    private const val TAG = "TutorCycleManager"
 
-    const val MASTERY_THRESHOLD = 0.83
-    private const val RECENT_WINDOW = 10
+    /** Safety cap on how many state-to-state auto-advances (DIAGNOSE, EXPLAIN — the two
+     *  states that need no external evidence) this drives in a single tick, so a logic bug
+     *  that made [TutorStateMachine] loop between two states could never hang this call
+     *  forever. Five is comfortably above the three real states (DIAGNOSE/EXPLAIN/one
+     *  PRACTICE-or-VERIFY check) a normal tick ever needs to walk through. */
+    private const val MAX_AUTO_STEPS_PER_TICK = 5
 
-    private const val W_RECENT = 0.35
-    private const val W_LIFETIME = 0.20
-    private const val W_DIFFICULTY = 0.15
-    private const val W_RETENTION = 0.15
-    private const val W_SPEED = 0.10
-    private const val W_CONFIDENCE = 0.05
-    /**
-     * Weight for the skip-coverage component. Null when no skipped events exist
-     * for the concept so concepts with zero skip data are not penalised.
-     */
-    private const val W_COVERAGE = 0.10
-
-    suspend fun recomputeAll(
-        context: Context,
-        studentId: String = LearningIds.LOCAL_STUDENT_ID
-    ): List<ConceptMastery> {
-        val db = LearningDatabase.getInstance(context)
-        val questions = db.questionDao().getAll()
-        val attempts = db.questionAttemptDao().getAll(studentId)
-        if (attempts.isEmpty()) return emptyList()
-
-        val questionById = questions.associateBy { it.id }
-
-        val grouped = attempts.groupBy { attempt ->
-            val q = questionById[attempt.questionId]
-            KnowledgeGraph.conceptId(
-                exam = q?.exam ?: "unknown",
-                chapter = q?.chapter ?: "unknown",
-                topic = q?.topic
-            )
-        }
-
-        // Count skipped questions per concept so computeMastery can apply a
-        // coverage penalty without conflating skips with wrong answers in accuracy.
-        val allEvents = db.learningEventDao().getAll(studentId)
-        val skippedByConceptId: Map<String, Int> = allEvents
-            .filter { it.eventType == LearningEventType.QUESTION_SKIPPED && it.questionId != null }
-            .groupBy { event ->
-                val q = questionById[event.questionId!!]
-                KnowledgeGraph.conceptId(
-                    exam = q?.exam ?: "unknown",
-                    chapter = q?.chapter ?: "unknown",
-                    topic = q?.topic
-                )
-            }
-            .mapValues { it.value.size }
-
-        val results = mutableListOf<ConceptMastery>()
-        val concepts = mutableListOf<Concept>()
-
-        for ((conceptId, conceptAttempts) in grouped) {
-            val sorted = conceptAttempts.sortedBy { it.timestamp }
-            val skippedCount = skippedByConceptId[conceptId] ?: 0
-            results.add(computeMastery(studentId, conceptId, sorted, skippedCount))
-
-            val sampleQuestion = questionById[sorted.last().questionId]
-            concepts.add(
-                Concept(
-                    id = conceptId,
-                    exam = sampleQuestion?.exam ?: "unknown",
-                    subject = sampleQuestion?.subject,
-                    chapter = sampleQuestion?.chapter ?: "unknown",
-                    topic = sampleQuestion?.topic ?: sampleQuestion?.chapter ?: "unknown"
-                )
-            )
-        }
-
-        db.conceptDao().upsertAll(concepts)
-        db.masteryDao().upsertAll(results)
-        Log.d(TAG, "Recomputed mastery for ${results.size} concept(s), student=$studentId")
-        return results
+    /** Call from [ReminderService]'s existing 15-min loop, after
+     *  [GapTaskManager.evidencePollIfNeeded] (so a just-imported round's evidence is
+     *  available to consume in the very same tick). No-op if no tutor session is active. */
+    suspend fun driveActiveSession(context: Context) = GapTaskLedger.withLock {
+        driveActiveSessionLocked(context)
     }
 
-    /** Pure, testable — no DB/context. Exposed for MasteryEngineTest. */
-    fun computeMastery(
-        studentId: String,
-        conceptId: String,
-        attemptsSortedAscending: List<QuestionAttempt>,
-        skippedCount: Int = 0
-    ): ConceptMastery {
-        require(attemptsSortedAscending.isNotEmpty()) { "computeMastery requires at least one attempt" }
-
-        val attemptCount = attemptsSortedAscending.size
-        val lifetimeAccuracy = attemptsSortedAscending.count { it.correct }.toDouble() / attemptCount
-        val recentSlice = attemptsSortedAscending.takeLast(RECENT_WINDOW)
-        val recentAccuracy = recentSlice.count { it.correct }.toDouble() / recentSlice.size
-        val lastSeen = attemptsSortedAscending.last().timestamp
-        val medianTime = median(attemptsSortedAscending.mapNotNull { it.timeTakenSeconds })
-        val speed = speedScore(medianTime)
-        val retention = RetentionEngine.retentionScore(lastSeen, recentAccuracy)
-
-        // difficulty / confidence: see the HONEST GAP note on the class doc. Both null today.
-        val difficultyPerformance: Double? = null
-        val confidenceCalibration: Double? = null
-
-        // Coverage: what fraction of all questions seen by the student were actually
-        // attempted (not skipped). Null when no skip data exists — keeps the component
-        // out of renormalizedMastery entirely so zero-skip concepts are unaffected.
-        val totalSeen = attemptCount + skippedCount
-        val coverageScore: Double? = if (skippedCount > 0) attemptCount.toDouble() / totalSeen else null
-
-        val mastery = renormalizedMastery(
-            recentAccuracy = recentAccuracy,
-            lifetimeAccuracy = lifetimeAccuracy,
-            difficultyPerformance = difficultyPerformance,
-            retention = retention,
-            speed = speed,
-            confidenceCalibration = confidenceCalibration,
-            coverageScore = coverageScore
-        )
-
-        return ConceptMastery(
-            studentId = studentId,
-            conceptId = conceptId,
-            mastery = mastery,
-            confidence = 0.0,
-            recentAccuracy = recentAccuracy,
-            lifetimeAccuracy = lifetimeAccuracy,
-            difficultyAdjustedAccuracy = difficultyPerformance,
-            medianTimeSeconds = medianTime,
-            attemptCount = attemptCount,
-            lastSeen = lastSeen,
-            lastMastered = if (mastery >= MASTERY_THRESHOLD) lastSeen else null,
-            forgettingRisk = RetentionEngine.forgettingRisk(lastSeen, mastery),
-            errorRate = 1.0 - lifetimeAccuracy,
-            learnedAt = attemptsSortedAscending.first().timestamp,
-            successfulRecallCount = attemptsSortedAscending.count { it.correct },
-            failedRecallCount = attemptsSortedAscending.count { !it.correct },
-            lastUpdated = System.currentTimeMillis()
-        )
-    }
-
-    private fun renormalizedMastery(
-        recentAccuracy: Double,
-        lifetimeAccuracy: Double,
-        difficultyPerformance: Double?,
-        retention: Double,
-        speed: Double,
-        confidenceCalibration: Double?,
-        coverageScore: Double?
-    ): Double {
-        val components = mutableListOf(
-            W_RECENT to recentAccuracy,
-            W_LIFETIME to lifetimeAccuracy,
-            W_RETENTION to retention,
-            W_SPEED to speed
-        )
-        difficultyPerformance?.let { components.add(W_DIFFICULTY to it) }
-        confidenceCalibration?.let { components.add(W_CONFIDENCE to it) }
-        coverageScore?.let { components.add(W_COVERAGE to it) }
-
-        val weightSum = components.sumOf { it.first }
-        return components.sumOf { it.first * it.second } / weightSum
-    }
-
-    /**
-     * No external timing baseline exists anywhere in this codebase (no per-question
-     * expected-time field, no exam-wide pacing constant), so this is a flat heuristic
-     * tuned for single-best-answer NEET/JEE-style MCQs, not a blueprint-specified
-     * formula. Validate against real score correlation before trusting it — same
-     * caveat the blueprint gives for the mastery formula as a whole.
-     */
-    private fun speedScore(medianTimeSeconds: Double?): Double = when {
-        medianTimeSeconds == null -> 0.5 // no timing data — neutral, not penalized
-        medianTimeSeconds <= 60.0 -> 1.0
-        medianTimeSeconds <= 120.0 -> 0.7
-        medianTimeSeconds <= 180.0 -> 0.4
-        else -> 0.2
-    }
-
-    private fun median(values: List<Int>): Double? {
-        if (values.isEmpty()) return null
-        val sorted = values.sorted()
-        val mid = sorted.size / 2
-        return if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2.0 else sorted[mid].toDouble()
-    }
-}
-
-
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/RetentionEngine.kt =====
-package com.checkmate.learning.engine
-
-import android.content.Context
-import com.checkmate.learning.model.LearningIds
-import com.checkmate.learning.repository.LearningDatabase
-import kotlin.math.exp
-
-/**
- * Upgrade Blueprint Phase 1.7 ("RetentionEngine — answers 'does the student *still*
- * know it,' not 'did they study it'").
- *
- * HONEST GAP: the blueprint's retention fields (learned_at, successful_recall_n,
- * failed_recall, last_review) are stored on
- * [com.checkmate.learning.model.ConceptMastery] itself (learnedAt /
- * successfulRecallCount / failedRecallCount / lastSeen) rather than a separate
- * retention table — the blueprint's own model/ listing for Phase 1.4-1.7 names
- * Concept.kt, ConceptMastery.kt, ErrorRecord.kt only, no separate retention entity,
- * so this reuses the mastery row rather than inventing an unlisted file.
- *
- * There is no spaced-repetition review scheduler anywhere in this codebase yet (no
- * SM-2/Leitner implementation) — [retentionScore]/[forgettingRisk] below are a
- * deliberately simple exponential-decay-by-days-since-last-seen model, explicitly
- * NOT the "successful_recall_n vs failed_recall" Ebbinghaus-curve fit the blueprint
- * gestures at. Good enough to feed [decide]'s three-way REVIEW/TEACH/MOVE_ON split;
- * revisit if/when real forgetting-curve data (repeated recall attempts spaced over
- * weeks) exists to fit against.
- */
-object RetentionEngine {
-
-    enum class RetentionDecision { REVIEW, TEACH, MOVE_ON }
-
-    // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
-    // imported directly — RetentionEngine has no dependency on MasteryEngine today
-    // and this avoids introducing one for a single constant.
-    const val HIGH_MASTERY_THRESHOLD = 0.83   // kept in sync with MasteryEngine.MASTERY_THRESHOLD
-    const val HIGH_RISK_THRESHOLD = 0.5
-
-    /** Days after which, with no further attempts, forgetting risk saturates near 1.0. */
-    private const val DECAY_HALFLIFE_DAYS = 14.0
-    private const val MS_PER_DAY = 86_400_000.0
-
-    /**
-     * 0..1, higher = better retained. Decays from [recentAccuracy] toward 0 as days
-     * since [lastSeen] grow, so a concept nailed once three months ago scores lower
-     * than one nailed yesterday, even with identical accuracy.
-     */
-    fun retentionScore(lastSeen: Long?, recentAccuracy: Double, now: Long = System.currentTimeMillis()): Double {
-        if (lastSeen == null) return 0.0
-        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
-        val decay = exp(-daysSince / DECAY_HALFLIFE_DAYS)
-        return (recentAccuracy * decay).coerceIn(0.0, 1.0)
-    }
-
-    /** Inverse-shaped: rises with time since [lastSeen], damped by how well the concept was known. */
-    fun forgettingRisk(lastSeen: Long?, mastery: Double, now: Long = System.currentTimeMillis()): Double {
-        if (lastSeen == null) return 1.0
-        val daysSince = (now - lastSeen).coerceAtLeast(0) / MS_PER_DAY
-        val rawRisk = 1.0 - exp(-daysSince / DECAY_HALFLIFE_DAYS)
-        // Well-mastered concepts decay slower than shakily-known ones — scale by
-        // (1 - mastery/2) so a 0.9-mastery concept's risk rises at ~55% the rate of a 0.0-mastery one.
-        return (rawRisk * (1.0 - mastery / 2.0)).coerceIn(0.0, 1.0)
-    }
-
-    /**
-     * Blueprint §1.7 truth table:
-     * HIGH mastery + HIGH forgetting risk -> REVIEW
-     * LOW mastery                        -> TEACH
-     * HIGH mastery + LOW risk            -> MOVE ON
-     */
-    fun decide(mastery: Double, forgettingRisk: Double): RetentionDecision = when {
-        mastery < HIGH_MASTERY_THRESHOLD -> RetentionDecision.TEACH
-        forgettingRisk >= HIGH_RISK_THRESHOLD -> RetentionDecision.REVIEW
-        else -> RetentionDecision.MOVE_ON
-    }
-
-    suspend fun decideAll(
-        context: Context,
-        studentId: String = LearningIds.LOCAL_STUDENT_ID
-    ): Map<String, RetentionDecision> {
-        val db = LearningDatabase.getInstance(context)
-        return db.masteryDao().getAll(studentId).associate { it.conceptId to decide(it.mastery, it.forgettingRisk) }
-    }
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/analytics/ScorePredictor.kt =====
-package com.checkmate.learning.analytics
-
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-
-/**
- * Upgrade Blueprint Phase 2.3 ("ExpectedScore model").
- *
- * "Surface uncertainty honestly: Expected: 638, Range: 617–659, Target: 680,
- * Gap: 42, broken into bottleneck contributions (Biology retention +16, Physics
- * errors +13, Chemistry weak concepts +9, exam strategy +4). Label as 'estimated
- * performance' until validated against real results — no false precision."
- *
- * SCOPE: composes entirely on top of [PerformanceAnalyzer.TopicImpact] (evidence)
- * and [StudentModel] (already-derived intelligence) — same "reuse, don't
- * re-derive" discipline [ScoreGainEstimator] follows, and the exact composition
- * [PerformanceAnalyzer]'s own class doc anticipated when it named `ScorePredictor`
- * as a downstream consumer still to be built. Fully deterministic, no LLM call.
- *
- * BOTTOM-UP EXPECTED-SCORE MODEL: for each subject in the exam,
- * `subjectTotalMarks` (from [ConceptWeightage.totalMarks]/[ConceptWeightage.subjectSharePercent])
- * splits into `securedMarks` (mastery × marksAtStakeTotal, summed over every
- * tracked topic in that subject — marks the student's own attempt history
- * supports) plus an `estimatedUnaccountedMarks` share for the portion of the
- * subject's PYQ-weighted syllabus with no tracked concept at all, valued at that
- * subject's own attempt-weighted average mastery (or the whole-student
- * [com.checkmate.learning.model.OverallLearningState.averageMastery] when the
- * subject has no tracked topics whatsoever) — the best available signal, not
- * invented. `expected` is the sum across subjects.
- *
- * HONEST GAP: the unaccounted-portion estimate is explicitly the weakest part of
- * this model — a subject the student has barely touched contributes almost
- * entirely from this fallback, not from real evidence. `rangeLow`/`rangeHigh`
- * widen proportionally to how much of `expected` rests on that fallback versus how
- * thin the attempt data backing `securedMarks` is (mirrors [ScoreGainEstimator]'s
- * own `dataConfidence` saturation-at-10-attempts convention, kept as a local
- * constant here for the same "not worth a cross-file import for one number"
- * reason [ScoreGainEstimator] itself gives for not importing
- * `MasteryEngine.RECENT_WINDOW`). None of this has been validated against real
- * mock-result outcomes yet — that validation, not intuition, is the bar for
- * retuning [UNACCOUNTED_UNCERTAINTY]/[SECURED_UNCERTAINTY], same discipline the
- * blueprint already applies to every heuristic in this codebase.
- *
- * BOTTLENECK DECOMPOSITION: every weak topic (mastery below [WEAK_MASTERY_THRESHOLD])
- * with a positive [PerformanceAnalyzer.TopicImpact.marksAtStakeGap] is bucketed
- * into exactly one mechanism — [BottleneckMechanism.ERRORS] when its
- * [com.checkmate.learning.model.ConceptSnapshot.errorCount] is heavy,
- * [BottleneckMechanism.RETENTION] when [RetentionDecisionSnapshot.REVIEW] applies
- * (something once learned is now at risk), else [BottleneckMechanism.WEAK_CONCEPTS]
- * (never secured to begin with) — grouped by (subject, mechanism), summed, and
- * the top few shown ranked by size, matching the blueprint's own worked example
- * shape ("Biology retention +16, Physics errors +13, ..."). Whatever concept-level
- * shortfall isn't covered by the top buckets is folded into one final
- * [BottleneckMechanism.OTHER] "exam strategy & uncovered syllabus" line — this
- * codebase has no per-question guess-quality or pacing signal to decompose that
- * further (see [SubjectScoreCalculator] — it tallies real marks per test, not
- * per-attempt reasoning quality), so it stays an explicit, undecomposed residual
- * rather than a guess dressed up as a mechanism. Bottlenecks always sum to exactly
- * [ExpectedScore.gap] — scaled down proportionally (see [predictFromReport]) if
- * concept-level shortfalls alone would exceed the target gap, so the breakdown
- * never overstates what's actually blocking the target.
- */
-object ScorePredictor {
-
-    /** Kept numerically in sync with [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD]
-     *  by hand, not imported — same reasoning [com.checkmate.learning.engine.RetentionEngine]
-     *  gives for its own `HIGH_MASTERY_THRESHOLD` copy. "Weak enough to be worth
-     *  naming in a bottleneck breakdown," not a different definition of mastery. */
-    private const val WEAK_MASTERY_THRESHOLD = 0.83
-
-    /** Attempt count at which per-topic data confidence saturates to 1.0 — mirrors
-     *  [ScoreGainEstimator.FULL_CONFIDENCE_ATTEMPTS] / `MasteryEngine.RECENT_WINDOW`,
-     *  kept local for the same "not worth a cross-file import for one constant"
-     *  call [ScoreGainEstimator] itself already makes. */
-    private const val FULL_CONFIDENCE_ATTEMPTS = 10.0
-
-    /** Below this many errors on a single concept, treat the wrongness as "not yet
-     *  secured" rather than "a specific, repeated failure mode" — mirrors
-     *  [com.checkmate.learning.engine.ErrorEngine]'s own "repeated errors become
-     *  first-class ErrorPattern objects" framing (blueprint §1.6): a handful of
-     *  isolated misses is just low mastery, a cluster is a distinct error pattern
-     *  worth naming as its own bottleneck mechanism. */
-    private const val ERROR_HEAVY_THRESHOLD = 3
-
-    /** Uncertainty weight applied to the portion of a subject's expected marks
-     *  resting entirely on the fallback-mastery estimate (no tracked concept at
-     *  all) — the least-evidenced part of this model, so it swings the range the
-     *  most. First-pass heuristic, not calibrated against real outcomes yet. */
-    private const val UNACCOUNTED_UNCERTAINTY = 0.5
-
-    /** Uncertainty weight applied to securely-tracked marks, scaled further by
-     *  each subject's own data thinness (`1 - dataConfidence`) — real attempt
-     *  history is trusted far more than the unaccounted fallback, hence the much
-     *  smaller weight than [UNACCOUNTED_UNCERTAINTY]. */
-    private const val SECURED_UNCERTAINTY = 0.15
-
-    /** Blueprint's own worked example shows 3 concept-driven lines plus one
-     *  residual ("exam strategy") — kept as the display cap here rather than
-     *  showing every bucket, so the breakdown stays a "here's what's actually
-     *  moving the needle" list, not a full topic dump (that's what "Biggest
-     *  opportunities" / [ScoreGainEstimator] already is). */
-    private const val MAX_RANKED_BOTTLENECKS = 3
-
-    enum class BottleneckMechanism { RETENTION, ERRORS, WEAK_CONCEPTS, OTHER }
-
-    /**
-     * One line of the "why the gap is what it is" breakdown. `subject` is null
-     * only for the [BottleneckMechanism.OTHER] residual line, which isn't
-     * attributable to any single subject. `marks` is this line's share of
-     * [ExpectedScore.gap] — every [ExpectedScore.bottlenecks] list's `marks`
-     * values sum to `gap` exactly (see class doc's scaling note).
-     */
-    data class BottleneckContribution(
-        val subject: String?,
-        val mechanism: BottleneckMechanism,
-        val label: String,
-        val marks: Double
-    )
-
-    /**
-     * Blueprint §2.3's own shape: `expected`/`rangeLow`/`rangeHigh` are this
-     * model's honest estimate of total marks on the real exam pattern (see class
-     * doc), `target` is passed in by the caller (from
-     * [com.checkmate.core.ConsultationProfile.targetScore] in practice — this
-     * object stays DB-free and testable, same as [ScoreGainEstimator]), and `gap`
-     * is `target - expected` floored at zero (already-exceeding-target has no
-     * gap to explain, not a negative one). LABEL EVERYWHERE THIS IS SHOWN AS
-     * "estimated performance," per the blueprint's own explicit caution — this
-     * is a first-pass heuristic model, not a validated predictor.
-     */
-    data class ExpectedScore(
-        val examType: String,
-        val generatedAt: Long,
-        val expected: Double,
-        val rangeLow: Double,
-        val rangeHigh: Double,
-        val target: Int,
-        val gap: Double,
-        val bottlenecks: List<BottleneckContribution>
-    )
-
-    /** Runs [PerformanceAnalyzer.analyze] itself — see [ScoreGainEstimator.rank]'s
-     *  own doc for why this convenience overload exists alongside [predictFromReport]. */
-    fun predict(studentModel: StudentModel, examType: String, targetScore: Int): ExpectedScore {
-        val report = PerformanceAnalyzer.analyze(studentModel, examType)
-        return predictFromReport(report, studentModel, targetScore)
-    }
-
-    /** Same as [predict] but against an already-built report — for a caller (e.g.
-     *  `TestResultsViewModel`) that already has one from the same Room snapshot,
-     *  so `expected`/`scoreGainEstimates` can never silently diverge. */
-    fun predictFromReport(
-        report: PerformanceAnalyzer.PerformanceReport,
-        studentModel: StudentModel,
-        targetScore: Int
-    ): ExpectedScore {
-        val examType = report.examType
-        val subjects = ConceptWeightage.subjectsForExam(examType)
-        val totalMarks = ConceptWeightage.totalMarks(examType).toDouble()
-
-        var expected = 0.0
-        var halfWidth = 0.0
-
-        for (subject in subjects) {
-            val (subjExpected, subjUncertainty) = subjectExpectedAndUncertainty(
-                subject, examType, report, studentModel
-            )
-            expected += subjExpected
-            halfWidth += subjUncertainty
-        }
-
-        val rangeLow = (expected - halfWidth).coerceIn(0.0, totalMarks)
-        val rangeHigh = (expected + halfWidth).coerceIn(0.0, totalMarks)
-        val gap = (targetScore - expected).coerceAtLeast(0.0)
-
-        val bottlenecks = if (gap > 0.0) bottlenecks(report, studentModel, gap) else emptyList()
-
-        return ExpectedScore(
-            examType = examType,
-            generatedAt = System.currentTimeMillis(),
-            expected = expected,
-            rangeLow = rangeLow,
-            rangeHigh = rangeHigh,
-            target = targetScore,
-            gap = gap,
-            bottlenecks = bottlenecks
-        )
-    }
-
-    /**
-     * `subjectTotalMarks` splits into secured (real evidence) + estimated-unaccounted
-     * (fallback mastery on the syllabus share nothing has been attempted for yet)
-     * — see class doc. Returns 0.0/0.0 uncertainty contribution only in the
-     * degenerate case of an exam with no configured share for this subject
-     * ([ConceptWeightage.subjectSharePercent] returning 0f — shouldn't happen for
-     * a subject [ConceptWeightage.subjectsForExam] itself returned, kept as a
-     * defensive floor rather than a crash).
-     */
-    private fun subjectExpectedAndUncertainty(
-        subject: String,
-        examType: String,
-        report: PerformanceAnalyzer.PerformanceReport,
-        studentModel: StudentModel
-    ): Pair<Double, Double> {
-        val subjectTotalMarks = ConceptWeightage.totalMarks(examType) *
-            (ConceptWeightage.subjectSharePercent(examType, subject) / 100.0)
-        if (subjectTotalMarks <= 0.0) return 0.0 to 0.0
-
-        val topicsInSubject = report.topicImpacts.filter { it.subject == subject }
-
-        val securedMarks = topicsInSubject.sumOf { it.mastery * it.marksAtStakeTotal }
-        val accountedMarks = topicsInSubject.sumOf { it.marksAtStakeTotal }
-        val unaccountedMarks = (subjectTotalMarks - accountedMarks).coerceAtLeast(0.0)
-
-        val fallbackMastery = if (topicsInSubject.isNotEmpty()) {
-            val totalAttempts = topicsInSubject.sumOf { it.attemptCount }
-            if (totalAttempts > 0) {
-                topicsInSubject.sumOf { it.mastery * it.attemptCount } / totalAttempts
-            } else {
-                topicsInSubject.map { it.mastery }.average()
-            }
-        } else {
-            studentModel.overall.averageMastery
-        }
-
-        val estimatedUnaccountedMarks = unaccountedMarks * fallbackMastery
-        val subjectExpected = securedMarks + estimatedUnaccountedMarks
-
-        val dataConfidence = if (topicsInSubject.isNotEmpty()) {
-            val totalAttempts = topicsInSubject.sumOf { it.attemptCount }
-            if (totalAttempts > 0) {
-                (totalAttempts.toDouble() / FULL_CONFIDENCE_ATTEMPTS).coerceIn(0.0, 1.0)
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
-
-        val uncertainty = unaccountedMarks * UNACCOUNTED_UNCERTAINTY +
-            securedMarks * (1.0 - dataConfidence) * SECURED_UNCERTAINTY
-
-        return subjectExpected to uncertainty
-    }
-
-    /**
-     * Ranked (subject, mechanism) buckets summed from every weak topic's
-     * [PerformanceAnalyzer.TopicImpact.marksAtStakeGap], top [MAX_RANKED_BOTTLENECKS]
-     * shown plus one [BottleneckMechanism.OTHER] residual — see class doc.
-     * Scales every bucket (including the residual) down proportionally when the
-     * raw concept-level shortfall total exceeds `gap`, so the breakdown always
-     * sums to exactly `gap` rather than double-counting marks the target doesn't
-     * actually need recovered (e.g. a modest target that sits well inside the
-     * full syllabus's total shortfall).
-     */
-    private fun bottlenecks(
-        report: PerformanceAnalyzer.PerformanceReport,
-        studentModel: StudentModel,
-        gap: Double
-    ): List<BottleneckContribution> {
-        data class Bucket(val subject: String?, val mechanism: BottleneckMechanism, val marks: Double)
-
-        val raw = report.topicImpacts
-            .filter { it.mastery < WEAK_MASTERY_THRESHOLD && it.marksAtStakeGap > 0.0 }
-            .mapNotNull { impact ->
-                val snapshot = studentModel.concepts[impact.conceptId] ?: return@mapNotNull null
-                val mechanism = when {
-                    snapshot.errorCount >= ERROR_HEAVY_THRESHOLD -> BottleneckMechanism.ERRORS
-                    snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW -> BottleneckMechanism.RETENTION
-                    else -> BottleneckMechanism.WEAK_CONCEPTS
+    private suspend fun driveActiveSessionLocked(context: Context) {
+        var steps = 0
+        while (steps++ < MAX_AUTO_STEPS_PER_TICK) {
+            val session = TutorSessionLedger.current() ?: return
+            val advanced = when (session.state) {
+                TutorState.DIAGNOSE -> driveDiagnose(context, session)
+                TutorState.EXPLAIN -> driveExplain(session)
+                TutorState.PRACTICE -> drivePractice(session)
+                TutorState.VERIFY -> driveVerify(context, session)
+                TutorState.MASTERED -> { driveMastered(session); return }
+                TutorState.MOVE_ON, TutorState.ESCALATED -> {
+                    // Defensive only — driveMastered/ESCALATED's own producer already clear
+                    // the slot immediately, so a session should never actually be READ back
+                    // in one of these two states on a later tick. Clearing here anyway costs
+                    // nothing and closes the gap if that assumption is ever wrong.
+                    Log.w(TAG, "found lingering terminal session (${session.state}) for concept=${session.conceptId} — clearing")
+                    TutorSessionLedger.clear()
+                    return
                 }
-                Bucket(impact.subject, mechanism, impact.marksAtStakeGap)
             }
-
-        val grouped = raw
-            .groupBy { it.subject to it.mechanism }
-            .map { (key, group) -> Bucket(key.first, key.second, group.sumOf { it.marks }) }
-            .sortedByDescending { it.marks }
-
-        val topBuckets = grouped.take(MAX_RANKED_BOTTLENECKS)
-        val topSum = topBuckets.sumOf { it.marks }
-
-        fun Bucket.toContribution(marks: Double) = BottleneckContribution(
-            subject = subject,
-            mechanism = mechanism,
-            label = if (subject != null) "$subject ${mechanismLabel(mechanism)}" else mechanismLabel(mechanism),
-            marks = marks
-        )
-
-        return if (topSum >= gap) {
-            // Concept-level shortfall alone already covers (or exceeds) the target
-            // gap — scale down proportionally so the shown lines sum to exactly
-            // `gap`, not a bigger number the target doesn't call for. No residual
-            // line: there's nothing left over to attribute to it.
-            val scale = if (topSum > 0.0) gap / topSum else 0.0
-            topBuckets.map { it.toContribution(it.marks * scale) }
-        } else {
-            val residual = gap - topSum
-            topBuckets.map { it.toContribution(it.marks) } +
-                BottleneckContribution(
-                    subject = null,
-                    mechanism = BottleneckMechanism.OTHER,
-                    label = "Exam strategy & uncovered syllabus",
-                    marks = residual
-                )
+            if (!advanced) return
         }
+        Log.w(TAG, "hit MAX_AUTO_STEPS_PER_TICK — check for a TutorStateMachine loop")
     }
 
-    /** Display label for a [BottleneckMechanism] — "Biology retention" / "Physics
-     *  errors" / "Chemistry weak concepts" per the blueprint's own worked example. */
-    private fun mechanismLabel(mechanism: BottleneckMechanism): String = when (mechanism) {
-        BottleneckMechanism.RETENTION -> "retention"
-        BottleneckMechanism.ERRORS -> "errors"
-        BottleneckMechanism.WEAK_CONCEPTS -> "weak concepts"
-        BottleneckMechanism.OTHER -> "exam strategy & uncovered syllabus"
+    // ── DIAGNOSE ─────────────────────────────────────────────────────────────
+
+    private suspend fun driveDiagnose(context: Context, session: TutorSession): Boolean {
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[session.conceptId]
+        val finding = TutorDiagnostics.diagnose(snapshot)
+        val result = TutorSessionLedger.apply(TutorEvidence.Diagnostic(finding), now())
+        return result is TutorTransitionResult.Advanced
     }
+
+    // ── EXPLAIN ──────────────────────────────────────────────────────────────
+
+    /**
+     * Auto-advances immediately — no LLM teaching layer exists yet (deliberate; see
+     * [TutorCycleManager]'s own class doc and [TutorState]'s scope note). The explanation
+     * already shown to the student for this concept is the real gap-repair
+     * [com.checkmate.planner.model.StudyTask]'s own `rationale` text
+     * ([com.checkmate.learning.engine.LearningDecisionEngine]'s `rationaleFor` — genuine
+     * written explanatory content already surfaced in the UI, not a placeholder), created
+     * the moment [GapTaskManager] served this concept. Once a real LLM explanation layer
+     * exists (P3.1-adjacent work), this is the one place it plugs in — replacing this
+     * immediate auto-advance with "wait until the student has actually viewed/requested a
+     * richer explanation" — without [TutorStateMachine]'s own EXPLAIN transition changing
+     * at all.
+     */
+    private fun driveExplain(session: TutorSession): Boolean {
+        val result = TutorSessionLedger.apply(TutorEvidence.ExplanationDelivered, now())
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── PRACTICE ─────────────────────────────────────────────────────────────
+
+    /**
+     * Consumes [GapTaskLedger]'s own already-imported round evidence — see class doc for
+     * why this never requests its own Testmate test. Returns false (nothing to do yet)
+     * until [GapTaskLedger.isActiveEvidenceImported] goes true, which happens on some later
+     * tick once [GapTaskManager.evidencePollIfNeeded] actually imports a submitted result.
+     */
+    private fun drivePractice(session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            // GapTaskLedger has moved on (covered/reassigned) while this tutor session was
+            // still open — there is no P0b evidence stream left for it to ride on. Free the
+            // slot rather than leave an orphaned session sitting in PRACTICE forever.
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            return false
+        }
+        if (!GapTaskLedger.isActiveEvidenceImported()) return false // waiting on the student
+
+        val attemptCount = GapTaskLedger.activeLastImportAttemptCount()
+        val correctCount = GapTaskLedger.activeLastImportCorrectCount()
+        val result = TutorSessionLedger.apply(TutorEvidence.PracticeAttempts(attemptCount, correctCount), now())
+        if (result !is TutorTransitionResult.Advanced) {
+            // Shouldn't happen at TARGETED_TEST_QUESTION_COUNT=15 >> MIN_PRACTICE_ATTEMPTS=3,
+            // but stay defensive rather than get stuck re-reading the same rejected evidence
+            // forever — ask for a fresh round exactly like a genuine VERIFY-fail would.
+            Log.w(TAG, "concept=$conceptId practice evidence rejected ($result) — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+        return true
+    }
+
+    // ── VERIFY ───────────────────────────────────────────────────────────────
+
+    /**
+     * Split out from [drivePractice] rather than inlined at its tail, so a session that
+     * somehow persists mid-VERIFY across a process death/crash (advanced PRACTICE->VERIFY
+     * but didn't reach a further state before the process died) is still recoverable on the
+     * next tick — this re-derives everything it needs (a fresh [com.checkmate.learning.model.ConceptSnapshot],
+     * fresh dominant error) from durable state rather than anything carried over in memory
+     * from [drivePractice]'s own call.
+     */
+    private suspend fun driveVerify(context: Context, session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            return false
+        }
+
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[conceptId]
+        if (snapshot == null) {
+            // Mastery recompute (inside TargetedTestEvidenceImporter.import) should always
+            // leave a snapshot behind once evidence exists — this would mean something
+            // upstream is broken. Don't fabricate one; ask for a fresh round instead of
+            // guessing at VERIFY with no real evidence.
+            Log.w(TAG, "concept=$conceptId has no ConceptSnapshot to verify against — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+
+        val dominantError = studentModel.unresolvedErrors
+            .filter { it.conceptId == conceptId }
+            .maxByOrNull { it.occurrences }
+            ?.errorType
+
+        val result = TutorSessionLedger.apply(TutorEvidence.Verification(snapshot, dominantError), now())
+        val advancedTo = (result as? TutorTransitionResult.Advanced)?.session?.state
+        if (advancedTo != TutorState.MASTERED) {
+            // Looped back to EXPLAIN/PRACTICE, or escalated — either way this round's
+            // Testmate evidence is now spent. Same mechanism GapTaskManager's own
+            // resolveDoneConcept already uses for "student finished the task, still below
+            // threshold" — a fresh round gets requested the next time
+            // GapTaskManager.createTargetedTestIfNeeded runs.
+            GapTaskLedger.resetForNextRound()
+        }
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── MASTERED ─────────────────────────────────────────────────────────────
+
+    private fun driveMastered(session: TutorSession) {
+        TutorSessionLedger.apply(TutorEvidence.CloseOut, now())
+        TutorSessionLedger.clear()
+        Log.d(TAG, "tutor session for concept=${session.conceptId} closed out (MASTERED -> MOVE_ON)")
+        // Deliberately does NOT call GapTaskLedger.markCovered() — that call is reserved for
+        // GapTaskManager.resolveDoneConcept's own independently-verified "task reached DONE
+        // AND mastery recheck cleared threshold" path (see markCovered's own doc). The tutor
+        // reaching MASTERED is a real, evidence-backed confirmation, but letting two
+        // different code paths both decide "this concept is covered" risks exactly the kind
+        // of double-write / inconsistent-state bug class this codebase has already spent a
+        // long stretch fixing once for this same ledger. GapTaskManager's own flow will reach
+        // the same conclusion independently once the student marks the task DONE.
+    }
+
+    private fun now(): Long = System.currentTimeMillis()
 }
 
 
+//===== TERMUXFILE: modules/learning/src/test/kotlin/com/checkmate/learning/tutor/TutorDiagnosticsTest.kt =====
+package com.checkmate.learning.tutor
 
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/LearningDecisionEngine.kt =====
-package com.checkmate.learning.engine
-
-import com.checkmate.learning.analytics.PerformanceAnalyzer
-import com.checkmate.learning.analytics.ScoreGainEstimator
-import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.ConceptSnapshot
 import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class TutorDiagnosticsTest {
+
+    private fun snapshot(
+        mastery: Double,
+        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.MOVE_ON,
+        errorCount: Int = 0
+    ) = ConceptSnapshot(
+        conceptId = "concept-1",
+        exam = "NEET",
+        subject = "Biology",
+        chapter = "Biomolecules",
+        topic = "Proteins",
+        mastery = mastery,
+        masteryConfidence = 0.0,
+        retentionDecision = retentionDecision,
+        forgettingRisk = 0.0,
+        attemptCount = 10,
+        recentAccuracy = mastery,
+        lifetimeAccuracy = mastery,
+        errorCount = errorCount,
+        lastSeen = 1_000L,
+        prerequisiteIssues = emptyList()
+    )
+
+    private val above = MasteryEngine.MASTERY_THRESHOLD + 0.1
+    private val below = MasteryEngine.MASTERY_THRESHOLD - 0.1
+
+    @Test
+    fun `null snapshot is always UNKNOWN`() {
+        assertEquals(DiagnosticFinding.UNKNOWN, TutorDiagnostics.diagnose(null))
+    }
+
+    @Test
+    fun `mastered with no retention risk is KNOWN`() {
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.MOVE_ON, errorCount = 0)
+        assertEquals(DiagnosticFinding.KNOWN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `mastered but flagged for retention review is FORGOTTEN`() {
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.REVIEW, errorCount = 0)
+        assertEquals(DiagnosticFinding.FORGOTTEN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `below threshold with recorded errors is MISUNDERSTOOD`() {
+        val s = snapshot(mastery = below, errorCount = 3)
+        assertEquals(DiagnosticFinding.MISUNDERSTOOD, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `below threshold with zero errors is UNKNOWN, not assumed MISUNDERSTOOD`() {
+        val s = snapshot(mastery = below, errorCount = 0)
+        assertEquals(DiagnosticFinding.UNKNOWN, TutorDiagnostics.diagnose(s))
+    }
+
+    @Test
+    fun `mastered takes priority over a stray error count`() {
+        // Above threshold with old errorCount>0 but no retention flag: still KNOWN, not
+        // MISUNDERSTOOD — the MISUNDERSTOOD branch only applies to still-below-threshold
+        // mastery, per the class doc's own ordering.
+        val s = snapshot(mastery = above, retentionDecision = RetentionDecisionSnapshot.MOVE_ON, errorCount = 5)
+        assertEquals(DiagnosticFinding.KNOWN, TutorDiagnostics.diagnose(s))
+    }
+}
+
+
+//===== TERMUXFILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
+package com.checkmate.planner.intervention
+
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.learning.engine.LearningDecisionEngine
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
 /**
- * Upgrade Blueprint Phase 2.4 ("Extend the existing intervention pipeline, don't
- * replace it") — the actual decision layer everything upstream of this file has
- * been building evidence for.
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done" needs state that neither [LearningInterventionOrchestrator] nor
+ * [com.checkmate.planner.PlanStore] carry on their own:
  *
- * The question this file answers is deliberately narrow, per the blueprint's own
- * framing: "What should this student do NEXT?" — not "what's weak" (already
- * answered by [PerformanceAnalyzer]) and not "what's worth marks" (already
- * answered by [ScoreGainEstimator]/[ScorePredictor]). Those stay upstream,
- * EVIDENCE-shaped; this is the first (and, deliberately, only) file allowed to
- * turn that evidence into a ranked, typed action — same "don't let this layer
- * decide what the next layer should decide" boundary [PerformanceAnalyzer]'s own
- * class doc already draws for itself.
+ * - [PlanStore.todayTasks] only ever holds the CURRENT day's list — there's nowhere to ask
+ *   "did the concept I served three days ago ever get finished."
+ * - [LearningInterventionOrchestrator.executeTopCandidate] re-ranks from scratch every run.
+ *   Without something outside it remembering what's already been served, re-running the
+ *   SAME [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport] output
+ *   tomorrow (mastery hasn't moved without the P0b evidence loop) would just re-pick
+ *   today's exact candidate forever — the backlog would never advance.
  *
- * DETERMINISTIC BY DESIGN — no LLM call anywhere in this file, and none should
- * ever be added. Per the blueprint's own architecture:
- * ```
- * deterministic engines -> CandidateInterventions -> LearningDecisionEngine
- *     -> ranked action -> LLM -> explanation / tutoring / wording
- * ```
- * The LLM becomes the teacher, not the decision-maker — it explains and delivers
- * whatever [CandidateIntervention] this engine already ranked first; it never
- * proposes or reorders candidates itself. If a future pass wants an LLM-proposed
- * adjustment to any ranking term below, that goes through the same "LLM proposes,
- * deterministic layer validates" discipline the blueprint applies everywhere else
- * (Phase 0 item 2), not a blind hand-off of the ranking itself.
+ * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
+ * covering four things:
+ * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
+ *    `TaskState.DONE` *and* a mastery recheck against real P0b evidence confirms it actually
+ *    cleared [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — never merely
+ *    once a task was created for it, and never merely because the task was checked off with
+ *    mastery still weak (see [markCovered] and [resetForNextRound] docs for why task-DONE
+ *    alone isn't the right signal — that conflation is what silently broke the P0b
+ *    retest-until-mastered loop). [LearningInterventionOrchestrator] skips covered concepts
+ *    when walking the ranked candidate list.
+ * 2. **The active concept's streak** — how many consecutive days the current gap concept
+ *    has been re-served without reaching DONE, which is exactly the escalation-depth input
+ *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
+ *    persuasion — see [com.checkmate.service.GapTaskManager]).
+ * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
+ *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ * 4. **P0b: the active concept's linked Testmate targeted-test session** — which
+ *    `test_sessions.id`/`tests.id` Testmate created for the CURRENT active concept (see
+ *    [recordTestmateSession]), and whether that session's result has already been turned
+ *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
+ *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
+ *    creates the targeted test at most once per concept PER ROUND and imports its result at
+ *    most once per round. [resetForNextRound] clears just this slot when a round's evidence
+ *    came back still below mastery, so the SAME concept can start a fresh round.
+ *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
+ *    map, since there is only ever one active gap concept at a time in this single-user app.
  *
- * SCOPE OF THIS PASS: produces the ranked [CandidateIntervention] list only — the
- * "ranked action" box in the diagram above. Wiring these into the existing
- * behavior-intervention pipeline (`InterventionIntent -> ActionExecutor ->
- * PolicyValidator -> TaskEscrow -> TaskMutator -> TriggerEvaluator ->
- * InterventionTransaction -> Reconciliation`) as first-class, executable
- * `StudyTask`-mutating actions is Blueprint §2.5 ("make plan changes
- * transactional") — a separate, larger integration into `:modules:planner`'s
- * escrow/commit/rollback machinery, deliberately not started here. That pipeline
- * today only knows how to execute five narrow, already-audited behavior actions
- * (see [com.checkmate.planner.intervention.PermittedAction]); teaching it to
- * safely mutate a `StudyTask` into a `REPAIR_CONCEPT` session (create a task?
- * retarget an existing one? at what priority relative to what's already
- * scheduled?) is its own design pass with its own PolicyValidator rules, not an
- * incidental addition to this one. What's built here is the missing input that
- * pass will eventually consume — surfaced to the student directly in the
- * meantime (see `TestResultsViewModel`/`TestResultsScreen` wiring).
- *
- * INTENT TAXONOMY: exactly the eight intents Blueprint §2.4 names —
- * [LearningInterventionIntent.REPAIR_CONCEPT], [LearningInterventionIntent.START_DIAGNOSTIC],
- * [LearningInterventionIntent.ASSIGN_TARGETED_SET], [LearningInterventionIntent.SCHEDULE_RETENTION_TEST],
- * [LearningInterventionIntent.START_MOCK], [LearningInterventionIntent.REPLAN_DAY],
- * [LearningInterventionIntent.REDUCE_DIFFICULTY], [LearningInterventionIntent.INCREASE_DIFFICULTY].
- * No new intent invented here, none dropped.
- *
- * HONEST GAP: every classification rule below (which intent fits which signal
- * shape) is a first-pass heuristic, same as every other engine in this codebase —
- * flagged the same way [ScoreGainEstimator]/[ScorePredictor] flag their own
- * weights. Priority scores mix two genuinely different units on one axis: concept-
- * level candidates rank by [ScoreGainEstimator.ScoreGainEstimate.expectedGain]
- * (marks per [SESSION_MINUTES]-minute block — a real, if uncalibrated, rate), while
- * whole-student candidates ([LearningInterventionIntent.START_MOCK],
- * [LearningInterventionIntent.REPLAN_DAY]) have no natural per-session mark rate at
- * all and are scaled onto the same axis relative to the strongest concept-level
- * candidate in the same report (see [macroCandidates]) purely so ranking has
- * something to sort against — not because the two numbers mean the same thing.
- * Not validated against real outcomes; that validation, not intuition, is the bar
- * for retuning any constant here.
+ * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
+ * per-student keying needed.
  */
-object LearningDecisionEngine {
+object GapTaskLedger {
 
-    /** How many ranked candidates a caller sees — enough for a "here's what's next
-     *  and what's after that" view without dumping every weak topic as a
-     *  duplicate-shaped action. */
-    private const val MAX_CANDIDATES = 5
+    private const val TAG = "GapTaskLedger"
 
-    /** How many of [ScoreGainEstimator]'s top-ranked estimates get turned into
-     *  candidates at all, before targeted-set collapsing and final ranking trim
-     *  this down further — wider than [MAX_CANDIDATES] so a chapter with several
-     *  weak topics still has enough raw material to collapse into one
-     *  [LearningInterventionIntent.ASSIGN_TARGETED_SET] instead of losing topics
-     *  to the pool cutoff before grouping even runs. */
-    private const val CONCEPT_CANDIDATE_POOL = 10
+    private val json = Json { ignoreUnknownKeys = true }
 
-    /** Kept numerically in sync with [RetentionEngine.HIGH_MASTERY_THRESHOLD] /
-     *  [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] by hand, not
-     *  imported — same "not worth a cross-file dependency for one constant"
-     *  convention [ScorePredictor.WEAK_MASTERY_THRESHOLD] already establishes. */
-    private const val HIGH_MASTERY_THRESHOLD = 0.83
+    private const val KEY_COVERED_CONCEPT_IDS       = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID         = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID            = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY       = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED        = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT            = "gap_task_active_subject"
+    private const val KEY_ACTIVE_CHAPTER            = "gap_task_active_chapter"
+    private const val KEY_ACTIVE_TOPIC              = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN       = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE          = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN      = "gap_task_active_expected_gain"
+    private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
+    private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
+    private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    // Phase 3 (adaptive tutor state machine) execution bridge: the tutor FSM's
+    // PRACTICE -> VERIFY transition needs real attempt counts for THIS round specifically
+    // (see com.checkmate.learning.tutor.TutorEvidence.PracticeAttempts's own doc — it must
+    // be "this practice pass," not lifetime). This P0b loop already runs the exact Testmate
+    // targeted-test request/import for the same active concept the tutor session tracks
+    // (see TutorSessionLedger.startFromCandidate, called from the same
+    // GapTaskManager.generateIfNeeded call site that serves this ledger's active concept in
+    // the first place) — rather than have TutorCycleManager fire a SECOND, competing
+    // targeted-test request for the same concept, it reads these two fields, written
+    // alongside [markActiveEvidenceImported] from the SAME TestmateResult
+    // GapTaskManager.evidencePollIfNeeded already has in hand. "Extend the existing
+    // intervention pipeline, don't replace it" applied to the tutor bridge specifically.
+    private const val KEY_ACTIVE_LAST_IMPORT_ATTEMPTS = "gap_task_active_last_import_attempts"
+    private const val KEY_ACTIVE_LAST_IMPORT_CORRECT  = "gap_task_active_last_import_correct"
+    // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
+    // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
+    // id never changed between rounds, so a round-2 request for the SAME concept got the
+    // SAME (already-completed) session back instead of a fresh one — resetForNextRound
+    // correctly asked for another round, but Testmate had no way to tell it apart from a
+    // retried round-1 call. This counter gives each round a distinct suffix (see
+    // GapTaskManager.createTargetedTestIfNeeded) so intervention_id actually changes when
+    // the round does. Round 1 stays a bare conceptId (no suffix) for backward
+    // compatibility with sessions already in flight before this fix.
+    private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
+    // literal 4-character string "null" (not a real null reference) whenever they were
+    // ultimately derived from a Question row whose topic column was corrupted by the
+    // now-fixed TestmateApi.parseResult bare-optString bug — a JSON null surviving as
+    // the text "null", written to Room, then re-surfaced by MasteryEngine.recomputeAll
+    // every time it rebuilds a Concept from that same poisoned row. `candidate.topic ?:
+    // candidate.chapter ?: ""` never catches this because the value ISN'T null — the
+    // Elvis operator only fires on a real null reference. Filtering it out here, at the
+    // single place every active-topic/active-chapter read and write funnels through,
+    // means neither a fresh instance of this bug nor a not-yet-repaired historical one
+    // can reach GapTaskManager's Testmate request payload or any UI string.
+    private fun sanitizeTopicOrChapter(value: String?): String? =
+        value?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
 
-    /** Kept in sync with [ScorePredictor.ERROR_HEAVY_THRESHOLD] by hand, same
-     *  "repeated errors become a distinct signal, not just low mastery" framing. */
-    private const val ERROR_HEAVY_THRESHOLD = 3
+    private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG               = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES       = 50
 
-    /** Fraction of attempts on a concept that must have produced an error before
-     *  the failure mode looks like "the difficulty tier itself is miscalibrated"
-     *  rather than ordinary not-yet-mastered weakness — the extra bar
-     *  [LearningInterventionIntent.REDUCE_DIFFICULTY] needs beyond plain
-     *  [ERROR_HEAVY_THRESHOLD], since most weak concepts should stay
-     *  [LearningInterventionIntent.REPAIR_CONCEPT] rather than being read as a
-     *  difficulty problem. */
-    private const val REDUCE_DIFFICULTY_ERROR_RATE = 0.6
+    // ── Reactive change signal (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
+    //
+    // Every field this object exposes is CheckmatePrefs-backed — plain SharedPreferences,
+    // with no Flow/observable of its own. [com.checkmate.ui.home.HomeScreen] used to call
+    // activeTaskId()/activeTestmateSessionId() straight from inside its @Composable body,
+    // which only re-runs when something IT collects via collectAsState (i.e.
+    // HomeViewModel.state, itself driven only by [com.checkmate.planner.PlanStore
+    // .todayTasks]) actually emits. That's fine for the round-desync case where a PlanStore
+    // write happens alongside the ledger write (e.g. resolveDoneConcept's evidence-not-
+    // imported-yet branch, which does revert the task via PlanStore.markTaskInDay) — but
+    // resolveDoneConcept's OTHER branch (evidence imported, mastery still below threshold)
+    // calls [resetForNextRound] then [com.checkmate.service.GapTaskManager
+    // .createTargetedTestIfNeeded] records the new round's session via
+    // [recordTestmateSession] — neither of those touches PlanStore at all. Both run from
+    // ReminderService's 15-minute background loop, entirely outside Compose. Confirmed
+    // live: with HomeScreen open and idle across that loop's tick, the round-2 session got
+    // created correctly, but the screen never recomposed to see it — repairSessionFor's
+    // activeSessionId stayed pinned to whatever it read at the LAST unrelated recompose,
+    // which (right after round 1's task went DONE) was round 1's own already-submitted
+    // session id. Tapping "Take repair test" then opened THAT session, and Testmate
+    // correctly redirected to its already-completed result page — this was never a
+    // session-creation or WebView-caching bug, the UI simply never learned a new session
+    // existed.
+    //
+    // A monotonic counter, not the state itself: every mutating function below that
+    // changes anything HomeScreen reads bumps this after writing (recordServed,
+    // recordTestmateSession, markActiveEvidenceImported, resetForNextRound, markCovered).
+    // [com.checkmate.ui.home.HomeViewModel] collects it and re-reads the ledger's live
+    // accessors into HomeState on every emission, the same "some background loop wrote
+    // through prefs, now push a fresh snapshot into Compose state" shape
+    // [com.checkmate.planner.PlanStore]'s own StateFlow already establishes for tasks —
+    // this just extends that same reactivity to the P0b session fields instead of leaving
+    // them as an unobserved side channel.
+    private val _version = MutableStateFlow(0L)
+    val version: StateFlow<Long> = _version.asStateFlow()
+    private fun bumpVersion() { _version.update { it + 1 } }
 
-    /** Below this many total attempts across the whole student model, every
-     *  ranked estimate above is running on evidence too thin to trust — a fresh
-     *  mock generates more real signal per hour than another repair guess.
-     *  First-pass threshold, not calibrated against real outcomes. */
-    private const val THIN_DATA_ATTEMPT_THRESHOLD = 20
+    // ── Covered concepts ────────────────────────────────────────────────────
 
-    /** Minimum weak topics sharing a (subject, chapter) before they're collapsed
-     *  into one [LearningInterventionIntent.ASSIGN_TARGETED_SET] candidate instead
-     *  of appearing as that many separate [LearningInterventionIntent.REPAIR_CONCEPT]
-     *  candidates — three near-duplicate "repair X" rows for the same chapter is
-     *  noise, not three distinct decisions. */
-    private const val MIN_TOPICS_FOR_TARGETED_SET = 3
-
-    private const val DIAGNOSTIC_MINUTES = 15
-    private const val RETENTION_TEST_MINUTES = 10
-    private const val MOCK_MINUTES = 60
-    private const val MAX_TARGETED_SET_MINUTES = 90
-
-    /** What share of the strongest concept-level candidate's priority a macro
-     *  (whole-student) candidate is scaled to when its own trigger condition is
-     *  only barely met — see [macroCandidates] and this class's own HONEST GAP
-     *  note on mixing units. */
-    private const val MIN_MACRO_PRIORITY_SHARE = 0.3
-
-    enum class LearningInterventionIntent {
-        REPAIR_CONCEPT,
-        START_DIAGNOSTIC,
-        ASSIGN_TARGETED_SET,
-        SCHEDULE_RETENTION_TEST,
-        START_MOCK,
-        REPLAN_DAY,
-        REDUCE_DIFFICULTY,
-        INCREASE_DIFFICULTY
-    }
-
-    /**
-     * One ranked, typed thing the student could do next. `conceptId` is null for
-     * candidates that aren't about one specific concept ([ASSIGN_TARGETED_SET]
-     * names a chapter instead; [START_MOCK]/[REPLAN_DAY] are whole-student).
-     * `expectedGain` is the real marks-per-session number for concept-level
-     * candidates and `0.0` for ones that don't have a comparable per-session mark
-     * rate (see class doc) — `priorityScore` is what [decideFromReport] actually
-     * sorts on, kept separate from `expectedGain` so a caller can always show the
-     * real evidence-backed number alongside the rank, never a synthetic one
-     * dressed up as marks.
-     */
-    data class CandidateIntervention(
-        val intent: LearningInterventionIntent,
-        val conceptId: String?,
-        val subject: String?,
-        val chapter: String?,
-        val topic: String?,
-        val durationMinutes: Int,
-        val expectedGain: Double,
-        val priorityScore: Double,
-        val rationale: String
-    )
-
-    data class DecisionReport(
-        val studentId: String,
-        val examType: String,
-        val generatedAt: Long,
-        /** Ranked highest-[CandidateIntervention.priorityScore] first, capped at
-         *  [MAX_CANDIDATES]. */
-        val candidates: List<CandidateIntervention>
-    )
-
-    /** Runs [PerformanceAnalyzer.analyze]/[ScoreGainEstimator.rank]/[ScorePredictor.predict]
-     *  itself — see [ScoreGainEstimator.rank]'s own doc for why this convenience
-     *  overload exists alongside [decideFromReport]. */
-    fun decide(studentModel: StudentModel, examType: String, targetScore: Int): DecisionReport {
-        val report = PerformanceAnalyzer.analyze(studentModel, examType)
-        val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
-        val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
-        return decideFromReport(report, studentModel, estimates, expectedScore)
-    }
+    fun isCovered(conceptId: String): Boolean =
+        coveredIds().contains(conceptId)
 
     /**
-     * Same as [decide] but against an already-built [PerformanceAnalyzer.PerformanceReport]/
-     * [ScoreGainEstimator.ScoreGainEstimate] list/[ScorePredictor.ExpectedScore] —
-     * for a caller (e.g. `TestResultsViewModel`) that already built all three off
-     * one Room read, so this can never silently diverge from what's already on
-     * screen. Same "one Room read, N derived views" discipline
-     * [ScorePredictor.predictFromReport] itself follows.
+     * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
+     * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
+     * DONE, AND (once P0b evidence exists) a mastery recheck actually cleared
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — see
+     * [com.checkmate.service.GapTaskManager]'s `resolveDoneConcept`. Never call this merely
+     * because a task once existed for the concept, and never merely because the task reached
+     * DONE while mastery is still known to be weak (use [resetForNextRound] for that case
+     * instead) — either would mean an unfinished gap silently "counts" as covered and the
+     * orchestrator moves on, permanently abandoning the one the student hasn't actually
+     * closed — the opposite of "till every gap is covered." Clears the active-concept pointer
+     * if [conceptId] was it, so the next [recordServed] call for a different concept starts a
+     * fresh streak instead of inheriting this one's day count.
      */
-    fun decideFromReport(
-        report: PerformanceAnalyzer.PerformanceReport,
-        studentModel: StudentModel,
-        estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
-        expectedScore: ScorePredictor.ExpectedScore
-    ): DecisionReport {
-        val diagnostics = diagnosticCandidates(studentModel, report)
-        val concepts = collapseIntoTargetedSets(conceptCandidates(studentModel, estimates))
-        val conceptLevel = diagnostics + concepts
-        val ceiling = conceptLevel.maxOfOrNull { it.priorityScore } ?: 0.0
-        val macro = macroCandidates(studentModel, report, ceiling)
+    fun markCovered(conceptId: String) {
+        val updated = coveredIds() + conceptId
+        CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
+        recordWarningOutcome(conceptId)
+        if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
+            clearActive()
+        }
+        bumpVersion()
+    }
 
-        val ranked = (conceptLevel + macro)
-            .sortedByDescending { it.priorityScore }
-            .take(MAX_CANDIDATES)
+    private fun coveredIds(): Set<String> =
+        CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
+            ?.split(",")
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
 
-        return DecisionReport(
-            studentId = studentModel.studentId,
-            examType = report.examType,
-            generatedAt = System.currentTimeMillis(),
-            candidates = ranked
+    // ── Active concept + streak ─────────────────────────────────────────────
+
+    /**
+     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
+     * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
+     * SAME concept already active (re-served because it wasn't finished, or because it's
+     * starting a new P0b round after [resetForNextRound]); starts a fresh streak at 1 for a
+     * new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     *
+     * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
+     * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
+     * day while its current round's session is still outstanding must leave that session
+     * alone, since the whole point of re-serving it is that the student hasn't taken that
+     * session yet. Once a round's evidence comes back still below mastery, those fields get
+     * reset separately by [resetForNextRound], not here.
+     */
+    fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
+        val conceptId = candidate.conceptId ?: return
+        val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+        val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        val isNewConcept = previousConceptId != conceptId
+        val daysServed = if (isNewConcept) 1 else previousDays + 1
+
+        // DIAGNOSTIC (round-never-increments investigation): this is the ONLY place that can
+        // silently undo a resetForNextRound() bump that just happened earlier in the SAME
+        // generateIfNeeded call — if executeTopCandidate's fresh re-rank picks a different
+        // concept than the one resolveDoneConcept just reset for retry, isNewConcept is true
+        // here and the round/session fields get wiped back to round 1 before
+        // createTargetedTestIfNeeded ever runs. Logging the before-state makes that collision
+        // visible in the same logcat window instead of two separate-looking "round=1" reads.
+        Log.d(TAG, "recordServed: previousConceptId=$previousConceptId conceptId=$conceptId " +
+            "isNewConcept=$isNewConcept currentRound=${CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1)}")
+
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
+        // BUGFIX (topic-"null" 422 loop): see sanitizeTopicOrChapter's own doc — candidate.topic
+        // can hold the literal string "null" from a still-poisoned Question row, which would
+        // otherwise sail straight past the `?:` fallback below since it isn't a real null.
+        CheckmatePrefs.putString(
+            KEY_ACTIVE_TOPIC,
+            sanitizeTopicOrChapter(candidate.topic) ?: sanitizeTopicOrChapter(candidate.chapter) ?: ""
         )
-    }
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
 
-    /**
-     * [LearningInterventionIntent.START_DIAGNOSTIC] candidates — one per weak
-     * prerequisite the student has never independently attempted (no entry in
-     * [StudentModel.concepts] at all). A prerequisite the student HAS attempted
-     * already has its own [ScoreGainEstimator] ranking and belongs to
-     * [conceptCandidates] as an ordinary [LearningInterventionIntent.REPAIR_CONCEPT]
-     * — diagnosing something already directly evidenced would just repeat work
-     * [ScoreGainEstimator] already did. `priorityScore` sums the
-     * [PerformanceAnalyzer.TopicImpact.marksAtStakeGap] of every downstream weak
-     * concept that traces back to this prerequisite (Blueprint §1.4's own
-     * "Rolling Motion failure traced back to a weak Laws of Motion prerequisite"
-     * example) — same unit as concept-level `expectedGain` in spirit (marks at
-     * stake), but NOT the same calculation (no time-cost division, no
-     * probability-of-improvement term — there's no attempt data yet to derive
-     * either from). Flagged per class doc as a first-pass approximation, not a
-     * true apples-to-apples comparison.
-     */
-    private fun diagnosticCandidates(
-        studentModel: StudentModel,
-        report: PerformanceAnalyzer.PerformanceReport
-    ): List<CandidateIntervention> {
-        val gapByConceptId = report.topicImpacts.associate { it.conceptId to it.marksAtStakeGap }
-        val downstreamGaps = mutableMapOf<String, MutableList<Double>>()
-        val refByPrereqId = mutableMapOf<String, com.checkmate.learning.model.PrerequisiteRef>()
-
-        for (issue in studentModel.weakPrerequisites) {
-            val downstreamGap = gapByConceptId[issue.conceptId] ?: 0.0
-            for (ref in issue.weakPrerequisites) {
-                if (studentModel.concepts.containsKey(ref.conceptId)) continue
-                downstreamGaps.getOrPut(ref.conceptId) { mutableListOf() }.add(downstreamGap)
-                refByPrereqId.putIfAbsent(ref.conceptId, ref)
-            }
+        if (isNewConcept) {
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+            CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+            CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
         }
-
-        return downstreamGaps.map { (prereqConceptId, gaps) ->
-            val ref = refByPrereqId.getValue(prereqConceptId)
-            val totalDownstreamValue = gaps.sum()
-            val label = ref.topic ?: ref.chapter ?: "this prerequisite"
-            CandidateIntervention(
-                intent = LearningInterventionIntent.START_DIAGNOSTIC,
-                conceptId = prereqConceptId,
-                subject = ref.subject,
-                chapter = ref.chapter,
-                topic = ref.topic,
-                durationMinutes = DIAGNOSTIC_MINUTES,
-                expectedGain = 0.0,
-                priorityScore = totalDownstreamValue,
-                rationale = "Untested prerequisite ($label) behind ${gaps.size} weak concept(s) worth " +
-                    "~%.1f marks — diagnose it before repairing those directly.".format(totalDownstreamValue)
-            )
-        }
+        bumpVersion()
     }
 
-    /**
-     * One candidate per top-[CONCEPT_CANDIDATE_POOL] [ScoreGainEstimator] estimate
-     * with positive `expectedGain` — [classifyIntent] picks which of the six
-     * concept-scoped intents fits each concept's own mastery/retention/error
-     * signal shape (see that function's own doc), everything else about the
-     * candidate (`expectedGain`, `priorityScore`) is the estimate's own number,
-     * unmodified — this function decides WHICH action, [ScoreGainEstimator]
-     * already decided HOW MUCH it's worth.
-     */
-    private fun conceptCandidates(
-        studentModel: StudentModel,
-        estimates: List<ScoreGainEstimator.ScoreGainEstimate>
-    ): List<CandidateIntervention> {
-        val dominantErrorByConceptId = studentModel.unresolvedErrors
-            .groupBy { it.conceptId }
-            .mapValues { (_, patterns) -> patterns.maxByOrNull { it.occurrences }?.errorType }
+    // BUGFIX: this was the one accessor in this object missing the blank-filter every
+    // sibling below it has (activeSubject/activeChapter/activeTopic/etc.). clearActive()
+    // writes "" (not null) to KEY_ACTIVE_CONCEPT_ID same as every other key — without the
+    // filter, a cleared ledger reported a truthy-but-empty concept id instead of null,
+    // which made createTargetedTestIfNeeded() (see GapTaskManager) treat "nothing active"
+    // as "an active concept with a missing chapter" and log a misleading warning every
+    // cycle instead of correctly no-op'ing.
+    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)?.takeIf { it.isNotBlank() }
+    fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
+    fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
+    fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+    fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
+    // BUGFIX (topic-"null" 422 loop): defense-in-depth alongside the write-side sanitize in
+    // recordServed — filters out a literal "null" written before this fix shipped, on any
+    // existing install that hasn't re-served a concept (and so hasn't re-run recordServed)
+    // since updating.
+    fun activeTopic(): String? = sanitizeTopicOrChapter(CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null))
+    fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
+    fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
+    fun activeExpectedGain(): Double =
+        CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
 
-        return estimates
-            .filter { it.expectedGain > 0.0 }
-            .take(CONCEPT_CANDIDATE_POOL)
-            .mapNotNull { estimate ->
-                val snapshot = studentModel.concepts[estimate.conceptId] ?: return@mapNotNull null
-                val dominantError = dominantErrorByConceptId[estimate.conceptId]
-                val intent = classifyIntent(snapshot, dominantError)
-                CandidateIntervention(
-                    intent = intent,
-                    conceptId = estimate.conceptId,
-                    subject = estimate.subject,
-                    chapter = estimate.chapter,
-                    topic = estimate.topic,
-                    durationMinutes = durationFor(intent, estimate),
-                    expectedGain = estimate.expectedGain,
-                    priorityScore = estimate.expectedGain,
-                    rationale = rationaleFor(intent, estimate, snapshot, dominantError)
-                )
-            }
+    // ── P0b: active concept's Testmate targeted-test link ───────────────────
+
+    fun activeTestmateTestId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_TEST_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun activeTestmateSessionId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun isActiveEvidenceImported(): Boolean =
+        CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+
+    /** Which P0b retest round the active concept is on — 1 for a fresh concept or one
+     *  that's never had [resetForNextRound] called, incrementing each time evidence comes
+     *  back still below mastery. See the key's own doc for why this exists: it's what lets
+     *  [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded] send Testmate a
+     *  genuinely different `intervention_id` per round instead of replaying round 1's. */
+    fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
+
+    /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
+     *  a targeted test was created (or already existed — see the endpoint's own idempotency
+     *  by intervention_id) for the currently active concept. */
+    fun recordTestmateSession(testId: String, sessionId: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
+        bumpVersion()
     }
 
-    /**
-     * Six-way split over a concept's own already-derived signals — no new
-     * heuristic invented, every branch reuses a decision another engine already
-     * made:
-     * - [RetentionDecisionSnapshot.REVIEW] at high mastery (something once known,
-     *   now at risk — [com.checkmate.learning.engine.RetentionEngine]'s own
-     *   truth table) -> [LearningInterventionIntent.SCHEDULE_RETENTION_TEST], not
-     *   a full repair — it doesn't need re-teaching, it needs a recall check.
-     * - High mastery with a dominant CARELESS/TIME_PRESSURE error (the two error
-     *   types [com.checkmate.learning.engine.ErrorEngine]'s current heuristic can
-     *   actually distinguish) -> [LearningInterventionIntent.INCREASE_DIFFICULTY]:
-     *   the knowledge is there, the failure mode is pace/attention under the
-     *   current difficulty tier, not the concept itself.
-     * - Heavy, high-rate errors (see [REDUCE_DIFFICULTY_ERROR_RATE]) at low
-     *   mastery -> [LearningInterventionIntent.REDUCE_DIFFICULTY]: nearly every
-     *   attempt is failing, which reads as "this tier is currently miscalibrated
-     *   for this student," not just "needs more repair time at the same level."
-     * - Everything else weak -> [LearningInterventionIntent.REPAIR_CONCEPT], the
-     *   default and by far the most common outcome.
-     */
-    private fun classifyIntent(
-        snapshot: ConceptSnapshot,
-        dominantError: String?
-    ): LearningInterventionIntent {
-        val errorRate = if (snapshot.attemptCount > 0) {
-            snapshot.errorCount.toDouble() / snapshot.attemptCount
-        } else {
-            0.0
-        }
-        return when {
-            snapshot.retentionDecision == RetentionDecisionSnapshot.REVIEW &&
-                snapshot.mastery >= HIGH_MASTERY_THRESHOLD ->
-                LearningInterventionIntent.SCHEDULE_RETENTION_TEST
-
-            snapshot.mastery >= HIGH_MASTERY_THRESHOLD &&
-                (dominantError == "CARELESS" || dominantError == "TIME_PRESSURE") ->
-                LearningInterventionIntent.INCREASE_DIFFICULTY
-
-            snapshot.errorCount >= ERROR_HEAVY_THRESHOLD &&
-                errorRate >= REDUCE_DIFFICULTY_ERROR_RATE &&
-                snapshot.mastery < HIGH_MASTERY_THRESHOLD ->
-                LearningInterventionIntent.REDUCE_DIFFICULTY
-
-            else -> LearningInterventionIntent.REPAIR_CONCEPT
-        }
-    }
-
-    private fun durationFor(
-        intent: LearningInterventionIntent,
-        estimate: ScoreGainEstimator.ScoreGainEstimate
-    ): Int = when (intent) {
-        LearningInterventionIntent.SCHEDULE_RETENTION_TEST -> RETENTION_TEST_MINUTES
-        else -> estimate.timeCostMinutes.toInt()
-    }
-
-    private fun rationaleFor(
-        intent: LearningInterventionIntent,
-        estimate: ScoreGainEstimator.ScoreGainEstimate,
-        snapshot: ConceptSnapshot,
-        dominantError: String?
-    ): String {
-        val label = estimate.topic ?: estimate.chapter ?: "this concept"
-        return when (intent) {
-            LearningInterventionIntent.SCHEDULE_RETENTION_TEST ->
-                "$label is well-mastered (%.0f%%) but at forgetting risk — a short recall check, not a re-teach."
-                    .format(snapshot.mastery * 100)
-            LearningInterventionIntent.INCREASE_DIFFICULTY ->
-                "$label is well-mastered (%.0f%%) but errors skew $dominantError — push harder practice to convert accuracy under pressure."
-                    .format(snapshot.mastery * 100)
-            LearningInterventionIntent.REDUCE_DIFFICULTY ->
-                "$label: ${snapshot.errorCount} errors across ${snapshot.attemptCount} attempts at %.0f%% mastery — current difficulty tier looks miscalibrated; step down before more repair time."
-                    .format(snapshot.mastery * 100)
-            else ->
-                "$label at %.0f%% mastery, ~%.1f marks still at stake.".format(snapshot.mastery * 100, estimate.marksAtStake)
-        }
-    }
-
-    /**
-     * Collapses [LearningInterventionIntent.REPAIR_CONCEPT] candidates sharing a
-     * (subject, chapter) into one [LearningInterventionIntent.ASSIGN_TARGETED_SET]
-     * once there are at least [MIN_TOPICS_FOR_TARGETED_SET] of them — every other
-     * intent passes through untouched, since collapsing a
-     * [LearningInterventionIntent.SCHEDULE_RETENTION_TEST] or
-     * [LearningInterventionIntent.REDUCE_DIFFICULTY] into a generic practice set
-     * would lose exactly the distinction [classifyIntent] just made. The
-     * collapsed candidate's `expectedGain`/`priorityScore` sum the group's own
-     * (already-real) numbers — not re-estimated — and `durationMinutes` sums the
-     * group's own time costs, capped at [MAX_TARGETED_SET_MINUTES] so one chapter
-     * with many weak topics doesn't imply an unrealistically long single session.
-     */
-    private fun collapseIntoTargetedSets(candidates: List<CandidateIntervention>): List<CandidateIntervention> {
-        val repairable = candidates.filter { it.intent == LearningInterventionIntent.REPAIR_CONCEPT }
-        val rest = candidates.filter { it.intent != LearningInterventionIntent.REPAIR_CONCEPT }
-        val groups = repairable.groupBy { it.subject to it.chapter }
-
-        val kept = mutableListOf<CandidateIntervention>()
-        val collapsed = mutableListOf<CandidateIntervention>()
-
-        for ((key, group) in groups) {
-            if (group.size >= MIN_TOPICS_FOR_TARGETED_SET) {
-                val totalGain = group.sumOf { it.expectedGain }
-                val totalMinutes = group.sumOf { it.durationMinutes }.coerceAtMost(MAX_TARGETED_SET_MINUTES)
-                val label = key.second ?: key.first ?: "this chapter"
-                collapsed += CandidateIntervention(
-                    intent = LearningInterventionIntent.ASSIGN_TARGETED_SET,
-                    conceptId = null,
-                    subject = key.first,
-                    chapter = key.second,
-                    topic = null,
-                    durationMinutes = totalMinutes,
-                    expectedGain = totalGain,
-                    priorityScore = totalGain,
-                    rationale = "${group.size} weak topics in $label — one mixed practice set covers them " +
-                        "together instead of ${group.size} separate repair sessions."
-                )
-            } else {
-                kept += group
-            }
-        }
-
-        return kept + collapsed + rest
-    }
-
-    /**
-     * Whole-student candidates that aren't about any single concept —
-     * [LearningInterventionIntent.START_MOCK] when the entire report is running on
-     * too few attempts to trust ([THIN_DATA_ATTEMPT_THRESHOLD]), and
-     * [LearningInterventionIntent.REPLAN_DAY] when recent accuracy is genuinely
-     * declining ([PerformanceAnalyzer.PerformanceTrend.DECLINING] — not merely
-     * stable-but-imperfect). Both conditions can fire in the same report. Neither
-     * has a natural per-session mark rate the way concept-level candidates do
-     * (see class doc's HONEST GAP note), so `priorityScore` is scaled relative to
-     * `conceptCeiling` — the strongest concept-level candidate's own priority in
-     * this same report — floored at [MIN_MACRO_PRIORITY_SHARE] of it so a macro
-     * candidate can never be silently sorted to the bottom by being on the wrong
-     * numeric scale, but also never guaranteed to outrank a genuinely strong
-     * concept-level opportunity just for existing.
-     */
-    private fun macroCandidates(
-        studentModel: StudentModel,
-        report: PerformanceAnalyzer.PerformanceReport,
-        conceptCeiling: Double
-    ): List<CandidateIntervention> {
-        val floor = (conceptCeiling * MIN_MACRO_PRIORITY_SHARE).coerceAtLeast(1.0)
-        val out = mutableListOf<CandidateIntervention>()
-
-        if (studentModel.overall.totalAttempts < THIN_DATA_ATTEMPT_THRESHOLD) {
-            out += CandidateIntervention(
-                intent = LearningInterventionIntent.START_MOCK,
-                conceptId = null,
-                subject = null,
-                chapter = null,
-                topic = null,
-                durationMinutes = MOCK_MINUTES,
-                expectedGain = 0.0,
-                priorityScore = floor,
-                rationale = "Only ${studentModel.overall.totalAttempts} attempts tracked so far — every " +
-                    "estimate above is running on thin evidence. A fresh mock generates more real signal " +
-                    "than another guess at what to repair."
-            )
-        }
-
-        if (report.overallTrend == PerformanceAnalyzer.PerformanceTrend.DECLINING) {
-            val severity = (-report.overallTrendDelta).coerceIn(0.0, 1.0)
-            out += CandidateIntervention(
-                intent = LearningInterventionIntent.REPLAN_DAY,
-                conceptId = null,
-                subject = null,
-                chapter = null,
-                topic = null,
-                durationMinutes = 0,
-                expectedGain = 0.0,
-                priorityScore = (conceptCeiling * severity).coerceAtLeast(floor),
-                rationale = "Recent accuracy is trending down (%.0f%% below your overall average) — the " +
-                    "current plan itself may need restructuring, not just more of the same sessions."
-                    .format(severity * 100)
-            )
-        }
-
-        return out
-    }
-}
-
-
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/KnowledgeGraph.kt =====
-package com.checkmate.learning.graph
-
-import android.content.Context
-import com.checkmate.core.ExamSyllabus
-import com.checkmate.learning.model.Concept
-import com.checkmate.learning.repository.LearningDatabase
-import java.security.MessageDigest
-
-/**
- * Upgrade Blueprint Phase 1.4 ("Concept-level knowledge graph, not chapter-level
- * weakness"). See [Concept]'s class doc for the honest limitation on granularity —
- * one Concept here = one [ExamSyllabus] topic, not a true sub-topic concept, since
- * nothing in this codebase defines concepts finer than that.
- */
-object KnowledgeGraph {
-
-    // BUG CAUGHT AGAINST REAL DATA: Testmate's own report.md carries exam strings
-    // like "NEET-2027" (title-embedded year — see the sample
-    // ft-01b-full-test-neet-2027--report.md), but ExamSyllabus's top-level keys are
-    // bare exam names ("NEET", "JEE", ...). Without normalizing, every real import
-    // would key concepts under "neet-2027-..." while seedExamSyllabus("NEET") keys
-    // them under "neet-...", and the two would never join — mastery computed from
-    // real attempts would sit in a completely different set of rows than the
-    // syllabus-seeded prerequisite graph. Stripping a trailing "-YYYY" fixes the
-    // common case. An exam string that doesn't end in a year, or an ExamSyllabus
-    // key that later grows its own year suffix, would need this revisited.
-    private val YEAR_SUFFIX = Regex("""-(19|20)\d{2}$""")
-    // Was private — widened to internal so the one real call site for
-    // seedExamSyllabus (TestResultNormalizer, wiring it in for the first time) can
-    // normalize a report's raw exam string ("NEET-2027") to an ExamSyllabus key
-    // ("NEET") before calling it, without duplicating this regex there.
-    internal fun normalizeExam(exam: String): String = YEAR_SUFFIX.replace(exam.trim(), "")
-
-    /**
-     * Deterministic id from (exam, chapter, topic) — deliberately NOT subject. See
-     * [com.checkmate.learning.engine.MasteryEngine]'s class doc: real
-     * TestResultNormalizer-imported Questions never carry a subject (report.md has
-     * no subject field), so keying on subject would split a seeded syllabus concept
-     * and its real-import attempts into two rows that never join. `topic` falls
-     * back to `chapter` when null, matching TestReportParser's own dash-to-null
-     * normalization (chapter-level granularity when Testmate reports no topic).
-     */
-    fun conceptId(exam: String, chapter: String, topic: String?): String {
-        val key = "${normalizeExam(exam).lowercase()}|${chapter.trim().lowercase()}|" +
-            "${(topic ?: chapter).trim().lowercase()}"
-        return slugify(key)
-    }
-
-    private fun slugify(raw: String): String {
-        val slug = raw.replace(Regex("[^a-z0-9]+"), "-").trim('-')
-        // Hash suffix guards against two different raw keys slugifying to the same
-        // truncated prefix — cheap insurance, not expected to matter at this data scale.
-        val hash = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray())
-            .joinToString("") { "%02x".format(it) }.take(8)
-        return "${slug.take(60)}-$hash"
-    }
-
-    /**
-     * Topic-level prerequisite graph for NEET and JEE — every (chapter, topic) pair
-     * here is checked at generation time to match an actual leaf in
-     * [ExamSyllabus.data] (no free-floating/typo'd concept names), and the combined
-     * graph is verified acyclic (no topic can trace back to itself through its own
-     * prerequisite chain) before being committed here.
+    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
+     *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
+     *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
+     *  session every 15 minutes for the rest of the day.
      *
-     * GRANULARITY MISMATCH BETWEEN NEET AND JEE, BY NECESSITY: NEET chapters now
-     * match [ExamSyllabus]'s real per-unit granularity (rebuilt off the actual
-     * NTA/NMC NEET(UG)-2026 notified syllabus — see that file's doc comment), so
-     * NEET edges here are correspondingly fine-grained but NOT exhaustive: they
-     * cover the between-unit dependency chain (roughly NTA's own unit ordering,
-     * e.g. Kinematics -> Laws Of Motion -> Work Energy And Power) plus a few
-     * additional real cross-links (e.g. Optics also needs Oscillations And Waves,
-     * not just the linear chain), rather than every possible topic-to-topic edge
-     * within 400+ NEET topics — that density wouldn't add real diagnostic signal
-     * over the same unit-level chain. JEE chapters are still the earlier coarser
-     * grouping (e.g. "Mechanics" as one chapter covering many NTA-JEE units) and
-     * haven't had the same real-syllabus rebuild yet — same treatment applies to
-     * JEE if/when needed, matching how [ExamSyllabus]'s own doc comment flags it.
-     *
-     * SCOPE CALL, not an oversight: CUET and SSC CGL are deliberately NOT covered.
-     * CUET's Biology/Chemistry/Physics blocks are the same NEET/JEE content
-     * re-labelled "Class 11 X / Class 12 X" — a real prerequisite tree for it would
-     * just be this same NEET/JEE graph reprojected onto renamed chapters, which
-     * isn't worth a second maintained copy. SSC CGL's chapters (verbal/non-verbal
-     * reasoning, vocabulary, current affairs, static GK) don't have a genuine
-     * prerequisite structure the way STEM concepts do — "Idioms and Phrases" isn't
-     * downstream of "Synonyms and Antonyms" in any real pedagogical sense — so
-     * inventing edges there would be fabricated structure, not curriculum accuracy.
-     * Revisit if CUET/SSC CGL ever need real diagnostic depth of their own.
-     *
-     * [seedExamSyllabus] applies whatever's here; edges for an exam this list
-     * doesn't cover simply produce no ConceptDependency rows for that exam (existing
-     * fail-open behavior, unchanged).
-     */
-    private data class PrerequisiteSeed(
-        val exam: String, val chapter: String, val topic: String,
-        val prerequisiteChapter: String, val prerequisiteTopic: String
-    )
+     *  [attemptCount]/[correctCount] are this round's own counts (straight from the same
+     *  `TestmateResult` GapTaskManager.evidencePollIfNeeded already has in hand when it calls
+     *  this) — see [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc for why these exist. Optional,
+     *  defaulting to 0/0, so this stays source-compatible with any other caller that only
+     *  cares about the imported flag itself. */
+    fun markActiveEvidenceImported(attemptCount: Int = 0, correctCount: Int = 0) {
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, attemptCount)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, correctCount)
+        bumpVersion()
+    }
 
-    private val SEED_PREREQUISITES = listOf(
-        // JEE Mathematics — Algebra
-        PrerequisiteSeed("JEE", "Algebra", "Quadratic Equations", "Algebra", "Complex Numbers"),
-        PrerequisiteSeed("JEE", "Algebra", "Sequences and Series", "Algebra", "Quadratic Equations"),
-        PrerequisiteSeed("JEE", "Algebra", "Permutations and Combinations", "Algebra", "Sequences and Series"),
-        PrerequisiteSeed("JEE", "Algebra", "Binomial Theorem", "Algebra", "Permutations and Combinations"),
-        PrerequisiteSeed("JEE", "Algebra", "Matrices and Determinants", "Algebra", "Quadratic Equations"),
-        PrerequisiteSeed("JEE", "Algebra", "Mathematical Induction", "Algebra", "Sequences and Series"),
-        // JEE Mathematics — Trigonometry
-        PrerequisiteSeed("JEE", "Trigonometry", "Trigonometric Equations", "Trigonometry", "Trigonometric Ratios"),
-        PrerequisiteSeed("JEE", "Trigonometry", "Inverse Trigonometry", "Trigonometry", "Trigonometric Ratios"),
-        PrerequisiteSeed("JEE", "Trigonometry", "Properties of Triangles", "Trigonometry", "Trigonometric Ratios"),
-        PrerequisiteSeed("JEE", "Trigonometry", "Properties of Triangles", "Trigonometry", "Inverse Trigonometry"),
-        // JEE Mathematics — Calculus
-        PrerequisiteSeed("JEE", "Calculus", "Differentiation", "Calculus", "Limits and Continuity"),
-        PrerequisiteSeed("JEE", "Calculus", "Applications of Derivatives", "Calculus", "Differentiation"),
-        PrerequisiteSeed("JEE", "Calculus", "Integration", "Calculus", "Differentiation"),
-        PrerequisiteSeed("JEE", "Calculus", "Definite Integrals", "Calculus", "Integration"),
-        PrerequisiteSeed("JEE", "Calculus", "Area Under Curves", "Calculus", "Definite Integrals"),
-        PrerequisiteSeed("JEE", "Calculus", "Differential Equations", "Calculus", "Integration"),
-        // JEE Mathematics — Coordinate Geometry
-        PrerequisiteSeed("JEE", "Coordinate Geometry", "Circles", "Coordinate Geometry", "Straight Lines"),
-        PrerequisiteSeed("JEE", "Coordinate Geometry", "Parabola", "Coordinate Geometry", "Straight Lines"),
-        PrerequisiteSeed("JEE", "Coordinate Geometry", "Ellipse", "Coordinate Geometry", "Parabola"),
-        PrerequisiteSeed("JEE", "Coordinate Geometry", "Hyperbola", "Coordinate Geometry", "Ellipse"),
-        // JEE Mathematics — Vectors and 3D
-        PrerequisiteSeed("JEE", "Vectors and 3D", "3D Geometry", "Vectors and 3D", "Vectors"),
-        PrerequisiteSeed("JEE", "Vectors and 3D", "Planes and Lines in 3D", "Vectors and 3D", "3D Geometry"),
-        // JEE Mathematics — Probability and Statistics
-        PrerequisiteSeed("JEE", "Probability and Statistics", "Bayes Theorem", "Probability and Statistics", "Probability"),
-        PrerequisiteSeed("JEE", "Probability and Statistics", "Random Variables", "Probability and Statistics", "Probability"),
-        PrerequisiteSeed("JEE", "Probability and Statistics", "Statistics", "Probability and Statistics", "Random Variables"),
-        // JEE Physics — Mechanics
-        PrerequisiteSeed("JEE", "Mechanics", "Newton's Laws", "Mechanics", "Kinematics"),
-        PrerequisiteSeed("JEE", "Mechanics", "Work Energy Theorem", "Mechanics", "Newton's Laws"),
-        PrerequisiteSeed("JEE", "Mechanics", "Rotational Dynamics", "Mechanics", "Newton's Laws"),
-        PrerequisiteSeed("JEE", "Mechanics", "Rotational Dynamics", "Mechanics", "Work Energy Theorem"),
-        PrerequisiteSeed("JEE", "Mechanics", "Gravitation", "Mechanics", "Newton's Laws"),
-        PrerequisiteSeed("JEE", "Mechanics", "Gravitation", "Mechanics", "Work Energy Theorem"),
-        PrerequisiteSeed("JEE", "Mechanics", "Fluid Mechanics", "Mechanics", "Work Energy Theorem"),
-        PrerequisiteSeed("JEE", "Mechanics", "Simple Harmonic Motion", "Mechanics", "Newton's Laws"),
-        PrerequisiteSeed("JEE", "Mechanics", "Waves and Sound", "Mechanics", "Simple Harmonic Motion"),
-        // JEE Physics — Thermodynamics
-        PrerequisiteSeed("JEE", "Thermodynamics", "Kinetic Theory", "Mechanics", "Newton's Laws"),
-        PrerequisiteSeed("JEE", "Thermodynamics", "Laws of Thermodynamics", "Thermodynamics", "Kinetic Theory"),
-        PrerequisiteSeed("JEE", "Thermodynamics", "Calorimetry", "Thermodynamics", "Laws of Thermodynamics"),
-        // JEE Physics — Electromagnetism
-        PrerequisiteSeed("JEE", "Electromagnetism", "Current Electricity", "Electromagnetism", "Electrostatics"),
-        PrerequisiteSeed("JEE", "Electromagnetism", "Magnetism", "Electromagnetism", "Current Electricity"),
-        PrerequisiteSeed("JEE", "Electromagnetism", "Electromagnetic Induction", "Electromagnetism", "Magnetism"),
-        PrerequisiteSeed("JEE", "Electromagnetism", "AC Circuits", "Electromagnetism", "Electromagnetic Induction"),
-        PrerequisiteSeed("JEE", "Electromagnetism", "EM Waves", "Electromagnetism", "AC Circuits"),
-        // JEE Physics — Optics and Modern Physics
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Wave Optics", "Optics and Modern Physics", "Ray Optics"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Photoelectric Effect", "Optics and Modern Physics", "Wave Optics"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Photoelectric Effect", "Electromagnetism", "EM Waves"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Atomic Models", "Optics and Modern Physics", "Photoelectric Effect"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Nuclear Physics", "Optics and Modern Physics", "Atomic Models"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Semiconductors", "Electromagnetism", "Current Electricity"),
-        PrerequisiteSeed("JEE", "Optics and Modern Physics", "Semiconductors", "Optics and Modern Physics", "Atomic Models"),
-        // JEE Chemistry — Physical Chemistry
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Bonding", "Physical Chemistry", "Atomic Structure"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Equilibrium", "Physical Chemistry", "Thermodynamics"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Thermodynamics", "Physical Chemistry", "Chemical Bonding"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Electrochemistry", "Physical Chemistry", "Chemical Equilibrium"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Chemical Kinetics", "Physical Chemistry", "Chemical Equilibrium"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Solutions", "Physical Chemistry", "Chemical Equilibrium"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Solid State", "Physical Chemistry", "Chemical Bonding"),
-        PrerequisiteSeed("JEE", "Physical Chemistry", "Surface Chemistry", "Physical Chemistry", "Chemical Kinetics"),
-        // JEE Chemistry — Organic Chemistry
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Reaction Mechanisms", "Organic Chemistry", "IUPAC Nomenclature"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Hydrocarbons", "Organic Chemistry", "IUPAC Nomenclature"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Functional Group Chemistry", "Organic Chemistry", "Hydrocarbons"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Functional Group Chemistry", "Organic Chemistry", "Reaction Mechanisms"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Biomolecules", "Organic Chemistry", "Functional Group Chemistry"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Polymers", "Organic Chemistry", "Functional Group Chemistry"),
-        PrerequisiteSeed("JEE", "Organic Chemistry", "Practical Organic Chemistry", "Organic Chemistry", "Functional Group Chemistry"),
-        // JEE Chemistry — Inorganic Chemistry
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Chemical Bonding Advanced", "Inorganic Chemistry", "Periodic Table Trends"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Chemical Bonding Advanced", "Physical Chemistry", "Chemical Bonding"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "s p d f Block Elements", "Inorganic Chemistry", "Periodic Table Trends"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Coordination Chemistry", "Inorganic Chemistry", "s p d f Block Elements"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Coordination Chemistry", "Inorganic Chemistry", "Chemical Bonding Advanced"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Analytical Chemistry", "Inorganic Chemistry", "Coordination Chemistry"),
-        PrerequisiteSeed("JEE", "Inorganic Chemistry", "Metallurgy", "Inorganic Chemistry", "s p d f Block Elements"),
-        // NEET — Kinematics
-        PrerequisiteSeed("NEET", "Kinematics", "Frame of Reference", "Physics And Measurement", "Dimensional Analysis and Applications"),
-        // NEET — Laws Of Motion
-        PrerequisiteSeed("NEET", "Laws Of Motion", "Force and Inertia", "Kinematics", "Uniformly Accelerated Motion"),
-        // NEET — Work Energy And Power
-        PrerequisiteSeed("NEET", "Work Energy And Power", "Work Done by Constant and Variable Force", "Laws Of Motion", "Newton's Second Law of Motion"),
-        // NEET — Rotational Motion
-        PrerequisiteSeed("NEET", "Rotational Motion", "Centre of Mass", "Work Energy And Power", "Work-Energy Theorem"),
-        // NEET — Gravitation
-        PrerequisiteSeed("NEET", "Gravitation", "Universal Law of Gravitation", "Rotational Motion", "Moment of Inertia"),
-        // NEET — Properties Of Solids And Liquids
-        PrerequisiteSeed("NEET", "Properties Of Solids And Liquids", "Elastic Behaviour", "Gravitation", "Universal Law of Gravitation"),
-        // NEET — Thermodynamics
-        PrerequisiteSeed("NEET", "Thermodynamics", "Thermal Equilibrium", "Properties Of Solids And Liquids", "Bernoulli's Principle"),
-        // NEET — Kinetic Theory Of Gases
-        PrerequisiteSeed("NEET", "Kinetic Theory Of Gases", "Equation of State of a Perfect Gas", "Thermodynamics", "First Law of Thermodynamics"),
-        // NEET — Oscillations And Waves
-        PrerequisiteSeed("NEET", "Oscillations And Waves", "Periodic Motion", "Kinetic Theory Of Gases", "Kinetic Interpretation of Temperature"),
-        // NEET — Electrostatics
-        PrerequisiteSeed("NEET", "Electrostatics", "Electric Charges and Conservation of Charge", "Oscillations And Waves", "Simple Harmonic Motion"),
-        // NEET — Current Electricity
-        PrerequisiteSeed("NEET", "Current Electricity", "Electric Current", "Electrostatics", "Gauss's Law and Applications"),
-        // NEET — Magnetic Effects Of Current And Magnetism
-        PrerequisiteSeed("NEET", "Magnetic Effects Of Current And Magnetism", "Biot-Savart Law", "Current Electricity", "Ohm's Law"),
-        // NEET — Electromagnetic Induction And Alternating Currents
-        PrerequisiteSeed("NEET", "Electromagnetic Induction And Alternating Currents", "Faraday's Law", "Magnetic Effects Of Current And Magnetism", "Biot-Savart Law"),
-        // NEET — Electromagnetic Waves
-        PrerequisiteSeed("NEET", "Electromagnetic Waves", "Displacement Current", "Electromagnetic Induction And Alternating Currents", "Faraday's Law"),
-        // NEET — Optics
-        PrerequisiteSeed("NEET", "Optics", "Reflection of Light", "Electromagnetic Waves", "Characteristics of Electromagnetic Waves"),
-        // NEET — Dual Nature Of Matter And Radiation
-        PrerequisiteSeed("NEET", "Dual Nature Of Matter And Radiation", "Photoelectric Effect", "Optics", "Refraction of Light"),
-        // NEET — Atoms And Nuclei
-        PrerequisiteSeed("NEET", "Atoms And Nuclei", "Alpha-Particle Scattering Experiment", "Dual Nature Of Matter And Radiation", "Photoelectric Effect"),
-        // NEET — Electronic Devices
-        PrerequisiteSeed("NEET", "Electronic Devices", "Semiconductors", "Atoms And Nuclei", "Bohr Model and Energy Levels"),
-        // NEET — Optics
-        PrerequisiteSeed("NEET", "Optics", "Wavefront and Huygens' Principle", "Oscillations And Waves", "Wave Motion"),
-        // NEET — Electronic Devices
-        PrerequisiteSeed("NEET", "Electronic Devices", "Semiconductors", "Current Electricity", "Ohm's Law"),
-        // NEET — Atomic Structure
-        PrerequisiteSeed("NEET", "Atomic Structure", "Electromagnetic Radiation and Photoelectric Effect", "Some Basic Concepts In Chemistry", "Mole Concept and Molar Mass"),
-        // NEET — Chemical Bonding And Molecular Structure
-        PrerequisiteSeed("NEET", "Chemical Bonding And Molecular Structure", "Kossel-Lewis Approach", "Atomic Structure", "Quantum Mechanical Model of Atom"),
-        // NEET — Chemical Thermodynamics
-        PrerequisiteSeed("NEET", "Chemical Thermodynamics", "System and Surroundings", "Chemical Bonding And Molecular Structure", "Valence Bond Theory"),
-        // NEET — Equilibrium
-        PrerequisiteSeed("NEET", "Equilibrium", "Dynamic Equilibrium", "Chemical Thermodynamics", "First Law of Thermodynamics"),
-        // NEET — Solutions
-        PrerequisiteSeed("NEET", "Solutions", "Methods of Expressing Concentration", "Equilibrium", "Law of Chemical Equilibrium"),
-        // NEET — Redox Reactions And Electrochemistry
-        PrerequisiteSeed("NEET", "Redox Reactions And Electrochemistry", "Oxidation and Reduction", "Solutions", "Colligative Properties"),
-        // NEET — Chemical Kinetics
-        PrerequisiteSeed("NEET", "Chemical Kinetics", "Rate of a Chemical Reaction", "Redox Reactions And Electrochemistry", "Oxidation Number"),
-        // NEET — Classification Of Elements And Periodicity In Properties
-        PrerequisiteSeed("NEET", "Classification Of Elements And Periodicity In Properties", "Modern Periodic Law", "Chemical Kinetics", "Rate Law and Rate Constant"),
-        // NEET — P-Block Elements
-        PrerequisiteSeed("NEET", "P-Block Elements", "Group 13 to Group 18 Elements", "Classification Of Elements And Periodicity In Properties", "Periodic Trends — Atomic and Ionic Radii"),
-        // NEET — d And f Block Elements
-        PrerequisiteSeed("NEET", "d And f Block Elements", "Transition Elements — Electronic Configuration and Occurrence", "P-Block Elements", "Electronic Configuration Trends"),
-        // NEET — Co-Ordination Compounds
-        PrerequisiteSeed("NEET", "Co-Ordination Compounds", "Werner's Theory", "d And f Block Elements", "Transition Elements — Electronic Configuration and Occurrence"),
-        // NEET — Solutions
-        PrerequisiteSeed("NEET", "Solutions", "Colligative Properties", "Equilibrium", "Law of Chemical Equilibrium"),
-        // NEET — Some Basic Principles Of Organic Chemistry
-        PrerequisiteSeed("NEET", "Some Basic Principles Of Organic Chemistry", "Hybridization and Shapes of Molecules", "Chemical Bonding And Molecular Structure", "Hybridization"),
-        PrerequisiteSeed("NEET", "Some Basic Principles Of Organic Chemistry", "Tetravalency of Carbon", "Purification And Characterisation Of Organic Compounds", "Qualitative Analysis — Detection of N S P Halogens"),
-        // NEET — Hydrocarbons
-        PrerequisiteSeed("NEET", "Hydrocarbons", "Classification Isomerism and Nomenclature of Hydrocarbons", "Some Basic Principles Of Organic Chemistry", "Inductive Effect"),
-        // NEET — Organic Compounds Containing Halogens
-        PrerequisiteSeed("NEET", "Organic Compounds Containing Halogens", "Preparation Properties and Reactions of Haloalkanes and Haloarenes", "Hydrocarbons", "Electrophilic Addition Mechanism"),
-        // NEET — Organic Compounds Containing Oxygen
-        PrerequisiteSeed("NEET", "Organic Compounds Containing Oxygen", "Alcohols — Primary Secondary Tertiary and Dehydration Mechanism", "Organic Compounds Containing Halogens", "Mechanisms of Substitution Reactions"),
-        // NEET — Organic Compounds Containing Nitrogen
-        PrerequisiteSeed("NEET", "Organic Compounds Containing Nitrogen", "Amines — Nomenclature Classification and Basic Character", "Organic Compounds Containing Oxygen", "Aldehydes and Ketones — Nucleophilic Addition"),
-        // NEET — Biomolecules
-        PrerequisiteSeed("NEET", "Biomolecules", "Carbohydrates — Classification Aldoses and Ketoses", "Organic Compounds Containing Nitrogen", "Amines — Nomenclature Classification and Basic Character"),
-        // NEET — Purification And Characterisation Of Organic Compounds
-        PrerequisiteSeed("NEET", "Purification And Characterisation Of Organic Compounds", "Crystallization Sublimation Distillation", "Some Basic Principles Of Organic Chemistry", "Classification by Functional Groups"),
-        // NEET — Co-Ordination Compounds
-        PrerequisiteSeed("NEET", "Co-Ordination Compounds", "IUPAC Nomenclature of Coordination Compounds", "Chemical Bonding And Molecular Structure", "Valence Bond Theory"),
-        // NEET — Structural Organisation In Animals And Plants
-        PrerequisiteSeed("NEET", "Structural Organisation In Animals And Plants", "Morphology and Modifications of Flowering Plants", "Diversity In Living World", "Five Kingdom Classification"),
-        // NEET — Cell Structure And Function
-        PrerequisiteSeed("NEET", "Cell Structure And Function", "Cell Theory", "Structural Organisation In Animals And Plants", "Plant Tissues"),
-        // NEET — Plant Physiology
-        PrerequisiteSeed("NEET", "Plant Physiology", "Photosynthesis as Autotrophic Nutrition", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
-        // NEET — Human Physiology
-        PrerequisiteSeed("NEET", "Human Physiology", "Respiratory System and Mechanism of Breathing", "Plant Physiology", "Photosynthesis as Autotrophic Nutrition"),
-        // NEET — Reproduction
-        PrerequisiteSeed("NEET", "Reproduction", "Flower Structure and Gametophyte Development", "Human Physiology", "Human Heart and Blood Vessels"),
-        // NEET — Genetics And Evolution
-        PrerequisiteSeed("NEET", "Genetics And Evolution", "Mendelian Inheritance", "Reproduction", "Fertilisation and Embryo Development to Blastocyst"),
-        // NEET — Biology And Human Welfare
-        PrerequisiteSeed("NEET", "Biology And Human Welfare", "Pathogens and Parasites Causing Human Diseases", "Genetics And Evolution", "Structure of DNA and RNA"),
-        // NEET — Biotechnology And Its Applications
-        PrerequisiteSeed("NEET", "Biotechnology And Its Applications", "Principles of Biotechnology", "Biology And Human Welfare", "Basic Concepts of Immunology and Vaccines"),
-        PrerequisiteSeed("NEET", "Biotechnology And Its Applications", "Genetic Engineering — Recombinant DNA Technology", "Genetics And Evolution", "Structure of DNA and RNA"),
-        // NEET — Reproduction
-        PrerequisiteSeed("NEET", "Reproduction", "Gametogenesis — Spermatogenesis and Oogenesis", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
-        // NEET — Genetics And Evolution
-        PrerequisiteSeed("NEET", "Genetics And Evolution", "Chromosome Theory of Inheritance", "Cell Structure And Function", "Cell Cycle Mitosis and Meiosis"),
-        // NEET — Ecology And Environment
-        PrerequisiteSeed("NEET", "Ecology And Environment", "Ecosystem Patterns and Components", "Structural Organisation In Animals And Plants", "Plant Tissues")
+    /** This round's attempt count from the last [markActiveEvidenceImported] call — see
+     *  [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc. 0 if nothing has been imported yet. */
+    fun activeLastImportAttemptCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+
+    /** This round's correct count from the last [markActiveEvidenceImported] call — see
+     *  [activeLastImportAttemptCount]'s own doc. */
+    fun activeLastImportCorrectCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+
+    /**
+     * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
+     * when the active concept's task reached DONE but a mastery recheck against real Testmate
+     * retest evidence showed it's still below
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — the student finished
+     * the *review task*, but the concept itself isn't mastered yet. Clears only the P0b
+     * session fields (test id, session id, evidence-imported flag) — deliberately NEVER
+     * touches [markCovered]'s covered-set, and NEVER touches the active concept/day-streak
+     * fields, since this concept is still active and its streak should keep counting. With
+     * these three fields blank again, [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     * reads "no session yet" and requests a fresh Testmate retest for the SAME concept on the
+     * next run, closing the loop that used to stop dead here.
+     */
+    fun resetForNextRound() {
+        val roundBefore = activeTestmateRound()
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
+        // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
+        // replaying this same concept's round-1 id and getting the already-completed
+        // session handed straight back.
+        val roundAfter = roundBefore + 1
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, roundAfter)
+        // DIAGNOSTIC (round-never-increments investigation): every write to
+        // KEY_ACTIVE_TESTMATE_ROUND should now self-announce (see the matching log in
+        // recordServed) so a later overwrite is traceable to whichever call did it, instead
+        // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
+        Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
+        // BUGFIX (r1-result-on-r2-screen, background-loop case): this is the write that
+        // used to leave HomeScreen stranded — see the [version] field's own doc. Bumping
+        // here means HomeViewModel is notified the moment the session/round fields go
+        // blank (so the repair-test button correctly disappears while round 2's request
+        // is in flight), and again when recordTestmateSession populates the fresh one —
+        // instead of the whole transition being invisible until some unrelated recompose.
+        bumpVersion()
+    }
+
+    private fun clearActive() {
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+    }
+
+    // ── Once-a-day guards ────────────────────────────────────────────────────
+
+    fun hasGeneratedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_GENERATED_DAY, null) == todayKey
+
+    fun markGeneratedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_GENERATED_DAY, todayKey)
+
+    fun hasEscalatedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_ESCALATED_DAY, null) == todayKey
+
+    fun markEscalatedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_ESCALATED_DAY, todayKey)
+
+    // ── Warning outcome log (data collection only — no style-selection logic yet) ──────
+
+    @Serializable
+    data class WarningLogEntry(
+        val conceptId: String,
+        val sentDayKey: String,
+        val daysServedAtEscalation: Int,
+        val tier: Int,
+        var completedAfterward: Boolean = false
     )
 
     /**
-     * Inserts one [Concept] row per (subject, chapter, topic) leaf of
-     * ExamSyllabus.data[exam], plus whatever [SEED_PREREQUISITES] edges apply to
-     * that exam. `exam` here must be an ExamSyllabus key ("NEET"), not a
-     * Testmate-report exam string ("NEET-2027") — [conceptId] normalizes both to
-     * the same slug internally, so this still joins correctly with real imported
-     * attempts either way.
-     *
-     * WIRING: called from [com.checkmate.learning.testmate.TestResultNormalizer.normalizeAndPersist]
-     * on every import, using `report.exam` (normalized via [normalizeExam]) as the
-     * exam key — no separate onboarding flow exists to declare a student's exam
-     * ahead of time, but every real import already carries its own exam string, so
-     * seeding opportunistically off that is the actual first real signal available,
-     * not a guess. Safe to call repeatedly for the same exam: [Concept] upsertAll
-     * overwrites identically and [ConceptDependencyDao.insertAll] is
-     * `OnConflictStrategy.IGNORE`, so a re-imported report re-seeding the same exam
-     * is a no-op past the first time, not a duplicate/corruption risk.
+     * Appends one record every time [com.checkmate.service.GapTaskManager] actually sends
+     * an escalation message. Deliberately just data collection for now — once there's
+     * enough history to mean anything, which [tier] (escalation depth) correlates with a
+     * concept actually reaching DONE afterward becomes a real, evidence-backed question
+     * instead of a guess. Capped at [MAX_WARNING_LOG_ENTRIES], oldest dropped first.
      */
-    suspend fun seedExamSyllabus(context: Context, exam: String) {
-        val subjects = ExamSyllabus.data[exam] ?: return
-        val db = LearningDatabase.getInstance(context)
-
-        val concepts = subjects.flatMap { (subject, chapters) ->
-            chapters.flatMap { (chapter, topics) ->
-                topics.map { topic ->
-                    Concept(
-                        id = conceptId(exam, chapter, topic),
-                        exam = exam,
-                        subject = subject,
-                        chapter = chapter,
-                        topic = topic
-                    )
-                }
-            }
-        }
-        db.conceptDao().upsertAll(concepts)
-
-        val edges = SEED_PREREQUISITES
-            .filter { it.exam == exam }
-            .map {
-                ConceptDependency(
-                    conceptId = conceptId(exam, it.chapter, it.topic),
-                    prerequisiteConceptId = conceptId(exam, it.prerequisiteChapter, it.prerequisiteTopic)
-                )
-            }
-        db.conceptDependencyDao().insertAll(edges)
+    fun logWarningSent(conceptId: String, dayKey: String, daysServedAtEscalation: Int, tier: Int) {
+        val updated = (warningLog() + WarningLogEntry(conceptId, dayKey, daysServedAtEscalation, tier))
+            .takeLast(MAX_WARNING_LOG_ENTRIES)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
     }
 
-    /**
-     * Diagnoses a weak concept as a prerequisite failure where possible, per the
-     * blueprint's "rolling motion failure diagnosed as prerequisite failure"
-     * example. Returns the prerequisite [Concept]s whose mastery is below
-     * [masteryThreshold] — empty if [conceptId] has no seeded prerequisite edges
-     * (e.g. [seedExamSyllabus] was never run for its exam) or none are actually weak.
-     */
-    suspend fun diagnosePrerequisiteFailure(
-        context: Context,
-        studentId: String,
-        conceptId: String,
-        // Kept numerically in sync with MasteryEngine.MASTERY_THRESHOLD by hand, not
-        // imported directly — avoids a graph<->engine circular reference for one constant.
-        masteryThreshold: Double = 0.83
-    ): List<Concept> {
-        val db = LearningDatabase.getInstance(context)
-        val prerequisiteIds = db.conceptDependencyDao().getPrerequisites(conceptId)
-        if (prerequisiteIds.isEmpty()) return emptyList()
+    /** Called from [markCovered] — flips the most recent unresolved warning for
+     *  [conceptId], if any, so the log can later answer "did warning X actually work." */
+    private fun recordWarningOutcome(conceptId: String) {
+        val log = warningLog()
+        val lastUnresolvedIndex = log.indexOfLast { it.conceptId == conceptId && !it.completedAfterward }
+        if (lastUnresolvedIndex == -1) return
+        val updated = log.toMutableList()
+        updated[lastUnresolvedIndex] = updated[lastUnresolvedIndex].copy(completedAfterward = true)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
 
-        return prerequisiteIds.mapNotNull { prereqId ->
-            val mastery = db.masteryDao().getByConcept(studentId, prereqId)
-            val isWeak = mastery == null || mastery.mastery < masteryThreshold
-            if (isWeak) db.conceptDao().getById(prereqId) else null
+    fun warningLog(): List<WarningLogEntry> =
+        CheckmatePrefs.getString(KEY_WARNING_LOG, null)?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+
+    // ── Shared day-key helper — same "YYYY_dayOfYear" format PlanStore uses ────────────
+
+    fun todayKey(): String {
+        val cal = Calendar.getInstance()
+        return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+
+    // ── Mutual exclusion ────────────────────────────────────────────────────
+
+    /**
+     * Serializes every read-then-write sequence against this ledger's active-concept /
+     * P0b-round / session state. Same shape as [TaskEscrow]'s own per-key `Mutex` +
+     * `withLock` (see its class doc: "the actual correctness boundary is in-process
+     * mutual exclusion, not a DB transaction") — this ledger is the single-active-concept
+     * singleton the whole gap-task subsystem assumes is only ever touched one call at a
+     * time, which stopped being guaranteed once THREE independent, unsynchronized call
+     * chains started reading/writing it:
+     *  1. ReminderService's 15-min loop -> GapTaskManager.generateIfNeeded /
+     *     escalationCheckIfNeeded / evidencePollIfNeeded
+     *  2. TestResultsViewModel.executeTopIntervention -> LearningInterventionOrchestrator
+     *     .executeTopCandidate directly, bypassing GapTaskManager, on Dispatchers.IO
+     *  3. HomeViewModel.confirmCompletion -> GapTaskManager.generateIfNeeded, on
+     *     viewModelScope
+     * Two of these landing close enough in time can both read the same round before
+     * either writes, independently bump it, and produce two different Testmate
+     * intervention_ids for what should be one round — see this class's own doc and
+     * [resetForNextRound]'s doc for the round-counter mechanism this races against.
+     *
+     * A single object-level [Mutex] (not per-key like [TaskEscrow]'s) is correct here
+     * specifically because this ledger only ever tracks ONE active concept at a time
+     * (see class doc) — there's no second key to key a lock off of.
+     *
+     * Reentrant by coroutine: [GapTaskManager.generateIfNeeded] and
+     * [GapTaskManager.escalationCheckIfNeeded] each call into
+     * [LearningInterventionOrchestrator.executeTopCandidate] from WITHIN their own
+     * already-locked section. Without reentrancy, that nested call would try to
+     * re-acquire a [Mutex] its own caller is still holding and deadlock the first time
+     * this path actually runs. [LockOwnerElement] in the coroutine's context is how a
+     * nested call recognizes "this call chain already holds the lock" and runs its block
+     * inline instead of re-acquiring. This only protects a single already-serialized call
+     * chain against itself — two genuinely different callers (e.g. the ReminderService
+     * loop and a HomeViewModel tap) still serialize through [mutex] exactly as intended.
+     */
+    private val mutex = Mutex()
+
+    private object LockOwnerKey : CoroutineContext.Key<LockOwnerElement>
+    private class LockOwnerElement : CoroutineContext.Element {
+        override val key: CoroutineContext.Key<*> get() = LockOwnerKey
+    }
+
+    suspend fun <T> withLock(block: suspend () -> T): T {
+        if (coroutineContext[LockOwnerKey] != null) {
+            // Already inside this lock on this call chain (e.g. GapTaskManager's own
+            // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
+            return block()
+        }
+        return mutex.withLock {
+            withContext(LockOwnerElement()) { block() }
         }
     }
 }
 
 
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+//===== TERMUXFILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
 package com.checkmate.service
 
 import android.content.Context
@@ -1513,6 +898,7 @@ import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
@@ -1636,7 +1022,14 @@ object GapTaskManager {
             val decisionReport = LearningDecisionEngine.decideFromReport(
                 report, studentModel, estimates, expectedScore
             )
-            LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            val orchestrationResult =
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
+            // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
+            // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
+            // startFromCandidate's own doc for which intents this actually applies to.
+            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
             createTargetedTestIfNeeded()
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
@@ -2044,7 +1437,10 @@ object GapTaskManager {
                 topic = topic,
                 result = result
             )
-            GapTaskLedger.markActiveEvidenceImported()
+            GapTaskLedger.markActiveEvidenceImported(
+                attemptCount = result.attemptedCount,
+                correctCount = result.correctCount
+            )
         } catch (e: Exception) {
             Log.e(TAG, "evidence import failed: ${e.message}", e)
         }
@@ -2182,760 +1578,172 @@ days running — this is the escalated warning, not the first nudge. Rules:
 }
 
 
+//===== TERMUXFILE: app/src/main/kotlin/com/checkmate/service/ReminderService.kt =====
+package com.checkmate.service
 
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import com.checkmate.workmode.UninstallGuard
+import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/PerformanceAnalyzerTest.kt =====
-package com.checkmate.learning.analytics
+class ReminderService : Service() {
+    companion object {
+        private const val CHANNEL_ID = "reminder_channel"
+        private const val NOTIF_ID   = 55
+        // Mentor v2 (spec 3.5): same Cloudflare Worker StatusReporter already pushes to.
+        // NOTE: the worker-side route that lets a guardian issue an "unlock"/"override"
+        // command via Telegram and have it show up here isn't part of this Android repo —
+        // this only polls a /override-status endpoint and expects {"override": true|false}
+        // back. Add the matching route to worker.js to make this live end-to-end; until then
+        // this poll just always sees false and grantRemoteOverride() is never called, so it's
+        // a safe no-op rather than a broken dependency.
+        private const val OVERRIDE_URL = "https://steep-band-1bd0.amirshamse8.workers.dev/override-status"
 
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.OverallLearningState
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class PerformanceAnalyzerTest {
-
-    private fun concept(
-        id: String,
-        subject: String?,
-        chapter: String,
-        topic: String,
-        mastery: Double,
-        recentAccuracy: Double,
-        lifetimeAccuracy: Double,
-        attemptCount: Int
-    ) = ConceptSnapshot(
-        conceptId = id,
-        exam = "NEET",
-        subject = subject,
-        chapter = chapter,
-        topic = topic,
-        mastery = mastery,
-        masteryConfidence = 0.0,
-        retentionDecision = RetentionDecisionSnapshot.MOVE_ON,
-        forgettingRisk = 0.0,
-        attemptCount = attemptCount,
-        recentAccuracy = recentAccuracy,
-        lifetimeAccuracy = lifetimeAccuracy,
-        errorCount = 0,
-        lastSeen = 1_000L,
-        prerequisiteIssues = emptyList()
-    )
-
-    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
-        studentId = "s1",
-        generatedAt = 1_000L,
-        overall = OverallLearningState(
-            conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
-            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
-            averageMastery = concepts.map { it.mastery }.average(),
-            totalAttempts = concepts.sumOf { it.attemptCount },
-            unresolvedErrorCount = 0
-        ),
-        concepts = concepts.associateBy { it.conceptId },
-        unresolvedErrors = emptyList(),
-        weakPrerequisites = emptyList()
-    )
-
-    @Test
-    fun `classifyTrend requires the minimum attempt count before calling a trend`() {
-        val trend = PerformanceAnalyzer.classifyTrend(recentAccuracy = 1.0, lifetimeAccuracy = 0.2, attemptCount = 3)
-        assertEquals(PerformanceAnalyzer.PerformanceTrend.INSUFFICIENT_DATA, trend)
-    }
-
-    @Test
-    fun `classifyTrend flags a real improvement above the noise threshold`() {
-        val trend = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.9, lifetimeAccuracy = 0.6, attemptCount = 10)
-        assertEquals(PerformanceAnalyzer.PerformanceTrend.IMPROVING, trend)
-    }
-
-    @Test
-    fun `classifyTrend flags decline and treats a small delta as stable`() {
-        val declining = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.3, lifetimeAccuracy = 0.7, attemptCount = 10)
-        assertEquals(PerformanceAnalyzer.PerformanceTrend.DECLINING, declining)
-
-        val stable = PerformanceAnalyzer.classifyTrend(recentAccuracy = 0.62, lifetimeAccuracy = 0.6, attemptCount = 10)
-        assertEquals(PerformanceAnalyzer.PerformanceTrend.STABLE, stable)
-    }
-
-    @Test
-    fun `topicImpacts are sorted by marksAtStakeGap descending`() {
-        // High weightage, low mastery -> should rank above low weightage, low mastery.
-        val weak = concept(
-            id = "c-weak-highvalue", subject = "Biology", chapter = "Human Physiology",
-            topic = "Human Physiology", mastery = 0.2, recentAccuracy = 0.2, lifetimeAccuracy = 0.2, attemptCount = 10
-        )
-        val lowValue = concept(
-            id = "c-weak-lowvalue", subject = "Biology", chapter = "Biodiversity",
-            topic = "Biodiversity", mastery = 0.2, recentAccuracy = 0.2, lifetimeAccuracy = 0.2, attemptCount = 10
-        )
-        val mastered = concept(
-            id = "c-mastered", subject = "Physics", chapter = "Electrostatics",
-            topic = "Electrostatics", mastery = 0.95, recentAccuracy = 0.95, lifetimeAccuracy = 0.95, attemptCount = 10
-        )
-
-        val report = PerformanceAnalyzer.analyze(studentModel(listOf(lowValue, mastered, weak)), examType = "NEET")
-
-        assertEquals("c-weak-highvalue", report.topicImpacts.first().conceptId)
-        assertTrue(report.topicImpacts.first().marksAtStakeGap > report.topicImpacts.last().marksAtStakeGap)
-    }
-
-    /**
-     * Replaces the old "concepts with no subject are excluded from subjectAccuracy"
-     * test — that behavior was the bug (see PerformanceAnalyzer's own doc on the
-     * subject-resolution fix). "Current Electricity" is the same fixture
-     * ConceptWeightageTest uses to prove fuzzy resolution finds Physics for a
-     * real-imported concept (subject == null) — this test proves subjectAccuracy
-     * now benefits from that same resolution, not just topicImpacts.
-     */
-    @Test
-    fun `a real-import concept with no subject is included in subjectAccuracy via fuzzy resolution`() {
-        val realImport = concept(
-            id = "c-real-import", subject = null, chapter = "Current Electricity",
-            topic = "Current Electricity", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
-        )
-
-        val report = PerformanceAnalyzer.analyze(studentModel(listOf(realImport)), examType = "NEET")
-
-        assertEquals(1, report.topicImpacts.size)
-        assertEquals(1, report.subjectAccuracy.size)
-        assertEquals("Physics", report.subjectAccuracy.first().subject)
-        assertEquals(6, report.subjectAccuracy.first().attemptCount)
-    }
-
-    /**
-     * The fix narrows exclusion to "fuzzy resolution genuinely found nothing," not
-     * "raw subject was null" — this fixture (same as
-     * ConceptWeightageTest's "unresolvable topic" case) can't be placed under any
-     * subject at all, so it's still correctly excluded from subjectAccuracy while
-     * remaining visible in topicImpacts (with zero marksAtStake, per
-     * ConceptWeightage's own "unresolved -> 0, not an error" contract).
-     */
-    @Test
-    fun `a concept unresolvable by fuzzy matching stays out of subjectAccuracy but still appears in topicImpacts`() {
-        val unresolvable = concept(
-            id = "c-unresolvable", subject = null, chapter = "Not A Real Chapter",
-            topic = "Not A Real Topic", mastery = 0.5, recentAccuracy = 0.5, lifetimeAccuracy = 0.5, attemptCount = 6
-        )
-
-        val report = PerformanceAnalyzer.analyze(studentModel(listOf(unresolvable)), examType = "NEET")
-
-        assertEquals(1, report.topicImpacts.size)
-        assertTrue(report.subjectAccuracy.isEmpty())
-        assertEquals(0.0, report.topicImpacts.first().marksAtStakeGap, 0.001)
-    }
-
-    @Test
-    fun `overall trend is attempt-weighted across concepts, not a plain average`() {
-        // One concept with many attempts and a strong recent improvement should
-        // dominate one concept with few attempts and a mild decline.
-        val dominant = concept(
-            id = "c-dominant", subject = "Physics", chapter = "Kinematics", topic = "Kinematics",
-            mastery = 0.8, recentAccuracy = 0.9, lifetimeAccuracy = 0.5, attemptCount = 50
-        )
-        val minor = concept(
-            id = "c-minor", subject = "Chemistry", chapter = "Solutions", topic = "Solutions",
-            mastery = 0.5, recentAccuracy = 0.4, lifetimeAccuracy = 0.5, attemptCount = 4
-        )
-
-        val report = PerformanceAnalyzer.analyze(studentModel(listOf(dominant, minor)), examType = "NEET")
-
-        assertEquals(PerformanceAnalyzer.PerformanceTrend.IMPROVING, report.overallTrend)
-        assertEquals(54, report.totalAttempts)
-    }
-}
-
-
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ScoreGainEstimatorTest.kt =====
-package com.checkmate.learning.analytics
-
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.OverallLearningState
-import com.checkmate.learning.model.PrerequisiteRef
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class ScoreGainEstimatorTest {
-
-    private fun concept(
-        id: String,
-        subject: String?,
-        chapter: String,
-        topic: String,
-        mastery: Double,
-        attemptCount: Int,
-        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
-        forgettingRisk: Double = 0.0,
-        errorCount: Int = 0,
-        prerequisiteIssues: List<PrerequisiteRef> = emptyList()
-    ) = ConceptSnapshot(
-        conceptId = id,
-        exam = "NEET",
-        subject = subject,
-        chapter = chapter,
-        topic = topic,
-        mastery = mastery,
-        masteryConfidence = 0.0,
-        retentionDecision = retentionDecision,
-        forgettingRisk = forgettingRisk,
-        attemptCount = attemptCount,
-        recentAccuracy = mastery,
-        lifetimeAccuracy = mastery,
-        errorCount = errorCount,
-        lastSeen = 1_000L,
-        prerequisiteIssues = prerequisiteIssues
-    )
-
-    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
-        studentId = "s1",
-        generatedAt = 1_000L,
-        overall = OverallLearningState(
-            conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
-            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
-            averageMastery = concepts.map { it.mastery }.average(),
-            totalAttempts = concepts.sumOf { it.attemptCount },
-            unresolvedErrorCount = 0
-        ),
-        concepts = concepts.associateBy { it.conceptId },
-        unresolvedErrors = emptyList(),
-        weakPrerequisites = emptyList()
-    )
-
-    // Same fixtures PerformanceAnalyzerTest already proves resolve correctly
-    // (Human Physiology / Biodiversity / Laws of Motion / unresolvable pair) —
-    // reused deliberately so a ranking difference here can only come from
-    // ScoreGainEstimator's own logic, not a fresh weightage-resolution question.
-
-    @Test
-    fun `a higher-weightage weak concept ranks above a lower-weightage equally-weak one`() {
-        val highValue = concept(
-            id = "c-high", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-            mastery = 0.13, attemptCount = 10, errorCount = 3
-        )
-        val lowValue = concept(
-            id = "c-low", subject = "Biology", chapter = "Biodiversity", topic = "Biodiversity",
-            mastery = 0.13, attemptCount = 10, errorCount = 3
-        )
-
-        val ranked = ScoreGainEstimator.rank(studentModel(listOf(lowValue, highValue)), examType = "NEET")
-
-        assertEquals("c-high", ranked.first().conceptId)
-        assertTrue(ranked.first().expectedGain > ranked.last().expectedGain)
-    }
-
-    @Test
-    fun `a concept the resolver could not place has zero expected gain, not a crash`() {
-        val unresolvable = concept(
-            id = "c-unresolvable", subject = null, chapter = "Not A Real Chapter", topic = "Not A Real Topic",
-            mastery = 0.2, attemptCount = 10
-        )
-
-        val ranked = ScoreGainEstimator.rank(studentModel(listOf(unresolvable)), examType = "NEET")
-
-        assertEquals(1, ranked.size)
-        assertEquals(0.0, ranked.first().expectedGain, 0.001)
-        assertEquals(0.0, ranked.first().marksAtStake, 0.001)
-    }
-
-    @Test
-    fun `a thinly-attempted concept is flagged LOW confidence even with a large mastery gap`() {
-        val thin = concept(
-            id = "c-thin", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-            mastery = 0.1, attemptCount = 1
-        )
-
-        val ranked = ScoreGainEstimator.rank(studentModel(listOf(thin)), examType = "NEET")
-
-        assertEquals(ScoreGainEstimator.EstimateConfidence.LOW, ranked.first().confidence)
-    }
-
-    @Test
-    fun `a concept still needing TEACH outranks an equally weak concept already at MOVE_ON`() {
-        val needsTeach = concept(
-            id = "c-teach", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-            mastery = 0.13, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.TEACH
-        )
-        val moveOn = concept(
-            id = "c-moveon", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-            mastery = 0.13, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.MOVE_ON
-        )
-
-        val ranked = ScoreGainEstimator.rank(studentModel(listOf(moveOn, needsTeach)), examType = "NEET")
-
-        assertEquals("c-teach", ranked.first().conceptId)
-    }
-
-    @Test
-    fun `more weak prerequisites raises time cost and lowers expected gain versus an otherwise identical concept`() {
-        val clean = concept(
-            id = "c-clean", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-            mastery = 0.13, attemptCount = 10
-        )
-        val tangled = concept(
-            id = "c-tangled", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-            mastery = 0.13, attemptCount = 10,
-            prerequisiteIssues = listOf(
-                PrerequisiteRef("prereq-1", "Biology", "Cell Structure And Function", "Cell Structure And Function")
-            )
-        )
-
-        val ranked = studentModel(listOf(clean, tangled)).let { ScoreGainEstimator.rank(it, examType = "NEET") }
-        val cleanEstimate = ranked.first { it.conceptId == "c-clean" }
-        val tangledEstimate = ranked.first { it.conceptId == "c-tangled" }
-
-        assertTrue(tangledEstimate.timeCostMinutes > cleanEstimate.timeCostMinutes)
-        assertTrue(tangledEstimate.expectedGain < cleanEstimate.expectedGain)
-    }
-}
-
-
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/ScorePredictorTest.kt =====
-package com.checkmate.learning.analytics
-
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.OverallLearningState
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class ScorePredictorTest {
-
-    // Same fixture shape as ScoreGainEstimatorTest/PerformanceAnalyzerTest, reused
-    // deliberately so this test can only fail on ScorePredictor's own logic, not a
-    // fresh weightage-resolution question.
-    private fun concept(
-        id: String,
-        subject: String?,
-        chapter: String,
-        topic: String,
-        mastery: Double,
-        attemptCount: Int,
-        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
-        errorCount: Int = 0
-    ) = ConceptSnapshot(
-        conceptId = id,
-        exam = "NEET",
-        subject = subject,
-        chapter = chapter,
-        topic = topic,
-        mastery = mastery,
-        masteryConfidence = 0.0,
-        retentionDecision = retentionDecision,
-        forgettingRisk = 0.0,
-        attemptCount = attemptCount,
-        recentAccuracy = mastery,
-        lifetimeAccuracy = mastery,
-        errorCount = errorCount,
-        lastSeen = 1_000L,
-        prerequisiteIssues = emptyList()
-    )
-
-    private fun studentModel(concepts: List<ConceptSnapshot>) = StudentModel(
-        studentId = "s1",
-        generatedAt = 1_000L,
-        overall = OverallLearningState(
-            conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
-            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
-            averageMastery = concepts.map { it.mastery }.average(),
-            totalAttempts = concepts.sumOf { it.attemptCount },
-            unresolvedErrorCount = 0
-        ),
-        concepts = concepts.associateBy { it.conceptId },
-        unresolvedErrors = emptyList(),
-        weakPrerequisites = emptyList()
-    )
-
-    @Test
-    fun `expected score is bracketed by its own range and never exceeds the exam total`() {
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-physio", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                    mastery = 0.4, attemptCount = 10
-                ),
-                concept(
-                    id = "c-laws", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.13, attemptCount = 8, errorCount = 4
-                )
-            )
-        )
-
-        val score = ScorePredictor.predict(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(score.rangeLow <= score.expected)
-        assertTrue(score.expected <= score.rangeHigh)
-        assertTrue(score.expected in 0.0..720.0)
-        assertTrue(score.rangeLow >= 0.0 && score.rangeHigh <= 720.0)
-    }
-
-    @Test
-    fun `gap floors at zero once the target is already met, and only produces bottlenecks when a real gap exists`() {
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-strong", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.9, attemptCount = 10
-                )
-            )
-        )
-
-        val alreadyThere = ScorePredictor.predict(model, examType = "NEET", targetScore = 1)
-        assertEquals(0.0, alreadyThere.gap, 0.001)
-        assertTrue(alreadyThere.bottlenecks.isEmpty())
-
-        val stillShort = ScorePredictor.predict(model, examType = "NEET", targetScore = 700)
-        assertTrue(stillShort.gap > 0.0)
-        assertEquals(700 - stillShort.expected, stillShort.gap, 0.001)
-    }
-
-    @Test
-    fun `thinner attempt data widens the range versus the same mastery backed by more attempts`() {
-        val thin = studentModel(
-            listOf(
-                concept(
-                    id = "c-thin", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.5, attemptCount = 1
-                )
-            )
-        )
-        val wellEvidenced = studentModel(
-            listOf(
-                concept(
-                    id = "c-evidenced", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.5, attemptCount = 20
-                )
-            )
-        )
-
-        val thinScore = ScorePredictor.predict(thin, examType = "NEET", targetScore = 650)
-        val evidencedScore = ScorePredictor.predict(wellEvidenced, examType = "NEET", targetScore = 650)
-
-        val thinWidth = thinScore.rangeHigh - thinScore.rangeLow
-        val evidencedWidth = evidencedScore.rangeHigh - evidencedScore.rangeLow
-        assertTrue(thinWidth > evidencedWidth)
-    }
-
-    @Test
-    fun `bottleneck contributions always sum to exactly the gap, whether or not a residual line is needed`() {
-        // Small target — concept-level shortfall alone exceeds it, so buckets get
-        // scaled down and there's no "exam strategy" residual line.
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-weak-1", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                    mastery = 0.1, attemptCount = 10, errorCount = 5
-                ),
-                concept(
-                    id = "c-weak-2", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.1, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
-                )
-            )
-        )
-
-        val smallTarget = ScorePredictor.predict(model, examType = "NEET", targetScore = 1)
-        if (smallTarget.gap > 0.0) {
-            assertEquals(smallTarget.gap, smallTarget.bottlenecks.sumOf { it.marks }, 0.01)
+        fun start(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(Intent(context, ReminderService::class.java))
+            else
+                context.startService(Intent(context, ReminderService::class.java))
         }
-
-        val bigTarget = ScorePredictor.predict(model, examType = "NEET", targetScore = 720)
-        assertTrue(bigTarget.gap > 0.0)
-        assertEquals(bigTarget.gap, bigTarget.bottlenecks.sumOf { it.marks }, 0.01)
-        // A big-enough target should need more recovery than the concept-level
-        // weaknesses alone explain, so the residual "exam strategy" line appears.
-        assertTrue(bigTarget.bottlenecks.any { it.mechanism == ScorePredictor.BottleneckMechanism.OTHER })
     }
 
-    @Test
-    fun `bottleneck mechanism reflects error-heaviness and retention risk, not just raw mastery`() {
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-errors", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                    mastery = 0.1, attemptCount = 10, errorCount = 5
-                ),
-                concept(
-                    id = "c-retention", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                    mastery = 0.1, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
-                ),
-                concept(
-                    id = "c-plain-weak", subject = "Biology", chapter = "Biodiversity", topic = "Biodiversity",
-                    mastery = 0.1, attemptCount = 10
-                )
-            )
-        )
-
-        val score = ScorePredictor.predict(model, examType = "NEET", targetScore = 720)
-        val mechanisms = score.bottlenecks.map { it.mechanism }.toSet()
-
-        assertTrue(ScorePredictor.BottleneckMechanism.ERRORS in mechanisms)
-        assertTrue(ScorePredictor.BottleneckMechanism.RETENTION in mechanisms)
-        assertTrue(ScorePredictor.BottleneckMechanism.WEAK_CONCEPTS in mechanisms)
-    }
-}
-
-
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LearningDecisionEngineTest.kt =====
-package com.checkmate.learning.engine
-
-import com.checkmate.learning.model.ConceptSnapshot
-import com.checkmate.learning.model.ErrorPatternSnapshot
-import com.checkmate.learning.model.OverallLearningState
-import com.checkmate.learning.model.PrerequisiteIssue
-import com.checkmate.learning.model.PrerequisiteRef
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import com.checkmate.learning.model.StudentModel
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class LearningDecisionEngineTest {
-
-    // Same fixture shape as ScorePredictorTest/ScoreGainEstimatorTest, reused
-    // deliberately so this test can only fail on LearningDecisionEngine's own
-    // classification/ranking logic, not a fresh weightage-resolution question.
-    private fun concept(
-        id: String,
-        subject: String?,
-        chapter: String,
-        topic: String,
-        mastery: Double,
-        attemptCount: Int,
-        retentionDecision: RetentionDecisionSnapshot = RetentionDecisionSnapshot.TEACH,
-        errorCount: Int = 0,
-        prerequisiteIssues: List<com.checkmate.learning.model.PrerequisiteRef> = emptyList()
-    ) = ConceptSnapshot(
-        conceptId = id,
-        exam = "NEET",
-        subject = subject,
-        chapter = chapter,
-        topic = topic,
-        mastery = mastery,
-        masteryConfidence = 0.0,
-        retentionDecision = retentionDecision,
-        forgettingRisk = 0.0,
-        attemptCount = attemptCount,
-        recentAccuracy = mastery,
-        lifetimeAccuracy = mastery,
-        errorCount = errorCount,
-        lastSeen = 1_000L,
-        prerequisiteIssues = prerequisiteIssues
-    )
-
-    private fun studentModel(
-        concepts: List<ConceptSnapshot>,
-        unresolvedErrors: List<ErrorPatternSnapshot> = emptyList(),
-        weakPrerequisites: List<PrerequisiteIssue> = emptyList()
-    ) = StudentModel(
-        studentId = "s1",
-        generatedAt = 1_000L,
-        overall = OverallLearningState(
-            conceptsTracked = concepts.size,
-            conceptsMastered = concepts.count { it.mastery >= MasteryEngine.MASTERY_THRESHOLD },
-            conceptsWeak = concepts.count { it.mastery < MasteryEngine.MASTERY_THRESHOLD },
-            averageMastery = if (concepts.isEmpty()) 0.0 else concepts.map { it.mastery }.average(),
-            totalAttempts = concepts.sumOf { it.attemptCount },
-            unresolvedErrorCount = unresolvedErrors.sumOf { it.occurrences }
-        ),
-        concepts = concepts.associateBy { it.conceptId },
-        unresolvedErrors = unresolvedErrors,
-        weakPrerequisites = weakPrerequisites
-    )
-
-    // Padded with well-mastered filler concepts so overall.totalAttempts clears
-    // THIN_DATA_ATTEMPT_THRESHOLD when a test isn't specifically exercising the
-    // thin-data / START_MOCK path — keeps that path's own test the only one
-    // where it's expected to fire.
-    private fun filler(count: Int = 3) = (1..count).map {
-        concept(
-            id = "filler-$it", subject = "Physics", chapter = "Filler $it", topic = "Filler $it",
-            mastery = 0.95, attemptCount = 10
-        )
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .build()
     }
 
-    @Test
-    fun `ranks a clear weak concept as REPAIR_CONCEPT with the estimator's own expectedGain`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-weak", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                mastery = 0.1, attemptCount = 10
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val top = report.candidates.first()
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT, top.intent)
-        assertEquals("c-weak", top.conceptId)
-        assertTrue(top.expectedGain > 0.0)
-        assertEquals(top.expectedGain, top.priorityScore, 0.0001)
-    }
-
-    @Test
-    fun `high mastery plus REVIEW retention becomes a retention test, not a full repair`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-review", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                mastery = 0.85, attemptCount = 10, retentionDecision = RetentionDecisionSnapshot.REVIEW
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.first { it.conceptId == "c-review" }
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, candidate.intent)
-        assertEquals(10, candidate.durationMinutes)
-    }
-
-    @Test
-    fun `high mastery with careless errors suggests increasing difficulty, not repair`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-careless", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
-                mastery = 0.85, attemptCount = 10, errorCount = 2
-            ),
-            unresolvedErrors = listOf(
-                ErrorPatternSnapshot(
-                    conceptId = "c-careless", errorType = "CARELESS", occurrences = 2,
-                    firstSeen = 100L, lastSeen = 900L
-                )
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.firstOrNull { it.conceptId == "c-careless" }
-
-        assertTrue(candidate != null)
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.INCREASE_DIFFICULTY, candidate!!.intent)
-    }
-
-    @Test
-    fun `heavy high-rate errors at low mastery suggest reducing difficulty`() {
-        val model = studentModel(
-            filler() + concept(
-                id = "c-mismatch", subject = "Chemistry", chapter = "Chemical Bonding", topic = "Chemical Bonding",
-                mastery = 0.15, attemptCount = 10, errorCount = 7
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-        val candidate = report.candidates.first { it.conceptId == "c-mismatch" }
-
-        assertEquals(LearningDecisionEngine.LearningInterventionIntent.REDUCE_DIFFICULTY, candidate.intent)
-    }
-
-    @Test
-    fun `an untested prerequisite becomes a diagnostic, an already-attempted one does not`() {
-        val untested = PrerequisiteRef(
-            conceptId = "prereq-untested", subject = "Physics", chapter = "Kinematics", topic = "Kinematics"
-        )
-        val attempted = PrerequisiteRef(
-            conceptId = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors"
-        )
-        val model = studentModel(
-            filler() + concept(
-                id = "c-downstream", subject = "Physics", chapter = "Rolling Motion", topic = "Rolling Motion",
-                mastery = 0.2, attemptCount = 8
-            ) + concept(
-                id = "prereq-attempted", subject = "Physics", chapter = "Vectors", topic = "Vectors",
-                mastery = 0.3, attemptCount = 5
-            ),
-            weakPrerequisites = listOf(
-                PrerequisiteIssue(conceptId = "c-downstream", weakPrerequisites = listOf(untested, attempted))
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(report.candidates.any {
-            it.conceptId == "prereq-untested" &&
-                it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC
-        })
-        assertTrue(report.candidates.none { it.conceptId == "prereq-attempted" && it.intent == LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC })
-    }
-
-    @Test
-    fun `thin overall attempt data surfaces START_MOCK among the candidates`() {
-        val model = studentModel(
-            listOf(
-                concept(
-                    id = "c-thin", subject = "Biology", chapter = "Human Physiology", topic = "Human Physiology",
-                    mastery = 0.2, attemptCount = 3
-                )
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(model.overall.totalAttempts < 20)
-        assertTrue(report.candidates.any { it.intent == LearningDecisionEngine.LearningInterventionIntent.START_MOCK })
-    }
-
-    @Test
-    fun `three or more weak topics in one chapter collapse into one targeted set`() {
-        // "Human Physiology" resolves via ConceptWeightage's exact (exam, subject,
-        // chapter) tier since subject is provided directly — same fixture chapter
-        // ScorePredictorTest already relies on for a real, non-zero weightage.
-        val model = studentModel(
-            filler() + listOf(
-                concept(id = "c1", subject = "Biology", chapter = "Human Physiology", topic = "Excretion", mastery = 0.2, attemptCount = 6),
-                concept(id = "c2", subject = "Biology", chapter = "Human Physiology", topic = "Circulation", mastery = 0.25, attemptCount = 6),
-                concept(id = "c3", subject = "Biology", chapter = "Human Physiology", topic = "Neural Control", mastery = 0.15, attemptCount = 6)
-            )
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        val targetedSets = report.candidates.filter {
-            it.intent == LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET && it.chapter == "Human Physiology"
-        }
-        assertEquals(1, targetedSets.size)
-        assertTrue(report.candidates.none { it.chapter == "Human Physiology" && it.intent == LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT })
-    }
-
-    @Test
-    fun `every candidate list is capped and sorted by priority descending`() {
-        // Eight distinct, real, resolvable chapters (none repeated, so nothing
-        // collapses into a targeted set) — enough weak concepts to force the
-        // MAX_CANDIDATES cap to actually bind.
-        val chapters = listOf(
-            "Biology" to "Human Physiology",
-            "Physics" to "Laws of Motion",
-            "Physics" to "Kinematics",
-            "Chemistry" to "Chemical Bonding",
-            "Biology" to "Ecology And Environment",
-            "Physics" to "Vectors and 3D",
-            "Chemistry" to "Coordination Compounds",
-            "Biology" to "Biodiversity"
-        )
-        val model = studentModel(
-            chapters.mapIndexed { i, (subject, chapter) ->
-                concept(
-                    id = "c-many-$i", subject = subject, chapter = chapter, topic = chapter,
-                    mastery = 0.1 + i * 0.02, attemptCount = 8
-                )
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
+        scope.launch {
+            while (isActive) {
+                // Bugfix ("old tasks not clearing at end of day"): PlanStore.todayTasks is
+                // only ever populated at process start or by a local write, so a DONE/SKIPPED
+                // task just sat there until the app restarted. Runs first each cycle so every
+                // check below it (checkPendingTasks, ProactiveMentor, GapTaskManager) sees the
+                // cleaned-up list. See PlanStore.cleanupCompletedIfDue's own doc for the 9 PM
+                // guard and the tomorrow-carry-forward for still-unresolved tasks. When it
+                // returns non-null, tasks were carried onto tomorrow's plan — push that day's
+                // list to TaskSyncManager right away instead of leaving it stranded locally
+                // until some unrelated future edit happens to touch tomorrow's plan and
+                // trigger a push (PlanStore itself stays sync-unaware; this is the one place
+                // that bridges the two, same as HomeViewModel already does for today's list).
+                try {
+                    val carried = PlanStore.cleanupCompletedIfDue()
+                    if (carried != null) {
+                        withContext(Dispatchers.IO) {
+                            TaskSyncManager.pushTasks(carried.tasks, carried.dayKey, carried.updatedAt)
+                        }
+                    }
+                } catch (_: Exception) {}
+                checkPendingTasks()
+                // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
+                // nothing's been started by the configured hour. No-ops after the first fire
+                // each day (see ProactiveMentor.idleCheckIfNeeded's day-key guard).
+                try { ProactiveMentor.idleCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // "No tasks in plan == no study": once-daily check for a multi-day gap with
+                // no plan/completion, nudges the student and alerts the guardian. Same
+                // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
+                try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
+                // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
+                try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
+                // own class doc always said was still missing — runs the analysis pipeline once
+                // a day and lets the orchestrator pick up wherever GapTaskLedger left off. Also
+                // requests the P0b Testmate targeted test for whatever concept ends up active.
+                // See GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
+                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Gap-task escalation: warns the student, with escalating persuasion, when the
+                // currently-active gap concept has gone unaddressed for more than a day — see
+                // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
+                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                // P0b: the actual evidence-loop return arrow — polls the active concept's
+                // Testmate targeted-test session and, once it's submitted, imports real
+                // QuestionAttempt/LearningEvent evidence instead of leaving mastery to move
+                // only off the task's DONE flag. Deliberately every cycle, not once/day — see
+                // GapTaskManager.evidencePollIfNeeded's own doc.
+                try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
+                // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
+                // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and
+                // VERIFY consume GapTaskLedger's own already-imported P0b evidence (just
+                // polled/imported by the call directly above, same tick) rather than firing a
+                // second competing Testmate request. See TutorCycleManager's own class doc.
+                try { TutorCycleManager.driveActiveSession(applicationContext) } catch (_: Exception) {}
+                // Retention-check evidence loop (next-session-retention-loop.txt): requests a
+                // Testmate session for any RETENTION CHECK task that doesn't have one yet —
+                // see RetentionCheckManager's own doc for why this is a separate ledger/
+                // manager from the gap-repair pair above rather than folded into it.
+                try { RetentionCheckManager.createRetentionTestsIfNeeded() } catch (_: Exception) {}
+                // Retention-check evidence loop, return arrow: polls any outstanding retention
+                // session and, once submitted, imports real QuestionAttempt/LearningEvent
+                // evidence — same every-cycle (not once/day) cadence as the gap-repair poll
+                // above, for the same reason (the student can submit at any time).
+                try { RetentionCheckManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
+                try { pollRemoteOverride() } catch (_: Exception) {}
+                delay(15 * 60 * 1000L) // check every 15 min
             }
-        )
-
-        val report = LearningDecisionEngine.decide(model, examType = "NEET", targetScore = 650)
-
-        assertTrue(report.candidates.isNotEmpty())
-        assertTrue(report.candidates.size <= 5)
-        val scores = report.candidates.map { it.priorityScore }
-        assertEquals(scores.sortedDescending(), scores)
+        }
     }
+
+    private suspend fun checkPendingTasks() {
+        val tasks = PlanStore.getTodayTasksSnapshot()
+        val pending = tasks.filter { it.state == TaskState.PENDING }
+        if (pending.isNotEmpty()) {
+            val next = pending.first()
+            CheckmateTTS.speak(this, "Reminder: ${next.subject} — ${next.topic} is pending.")
+        }
+    }
+
+    /** See OVERRIDE_URL note above — safe no-op until the worker-side route exists. */
+    private suspend fun pollRemoteOverride() = withContext(Dispatchers.IO) {
+        val chatId = TelegramAlertBot.getChatId() ?: return@withContext
+        val request = Request.Builder()
+            .url("$OVERRIDE_URL?chatId=$chatId")
+            .get()
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext
+            val body = response.body?.string() ?: return@withContext
+            val overridden = JSONObject(body).optBoolean("override", false)
+            if (overridden) UninstallGuard.grantRemoteOverride()
+        }
+    }
+
+    private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("Checkmate")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setOngoing(true)
+        .setPriority(NotificationCompat.PRIORITY_LOW)
+        .build()
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Reminders", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() { scope.cancel(); super.onDestroy() }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
 
 
