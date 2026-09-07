@@ -1,5 +1,6 @@
 package com.checkmate.learning.tutor
 
+import kotlinx.serialization.Serializable
 import java.util.UUID
 
 /**
@@ -11,17 +12,19 @@ import java.util.UUID
  * NAMED DELIBERATELY DIFFERENT FROM [DiagnosticFinding]: that enum (KNOWN/UNKNOWN/
  * MISUNDERSTOOD/FORGOTTEN) is the coarse, already-load-bearing evidence type
  * [TutorEvidence.Diagnostic] carries into [TutorStateMachine] — reusing its name for this
- * much richer shape would either collide or silently shadow it. This type does not feed
- * [TutorStateMachine] in P3.1 — wiring a [TutorDiagnosticFinding] into
- * [TutorEvidence.Diagnostic] (via some [hypothesisType] -> [DiagnosticFinding] mapping) is
- * the P3.2 follow-up the roadmap describes as "swap TutorDiagnostics's deterministic path
- * for the validated LLM path," not part of this pass.
+ * much richer shape would either collide or silently shadow it. [TutorCycleManager]'s P3.2
+ * wiring (see that file) keeps this deliberate: the LLM-produced [hypothesisType] here
+ * enriches what EXPLAIN has to work with, but the coarse [DiagnosticFinding] driving
+ * [TutorStateMachine]'s own transition stays [TutorDiagnostics]'s deterministic heuristic,
+ * unchanged — matching that state machine's own "an LLM may PRODUCE the evidence this file
+ * consumes... but never decides the transition itself" invariant.
  *
- * Not yet Room-persisted or CheckmatePrefs-backed — P3.1 defines the shape and the
- * validation boundary; a durable store (mirroring [TutorSessionLedger]'s
- * CheckmatePrefs-blob pattern, or a proper Room table once more than one finding per
- * session needs to coexist) is follow-up work, not invented here.
+ * [Serializable]: P3.2's [TutorDiagnosticFindingLedger] persists this directly as one JSON
+ * blob via CheckmatePrefs — same pattern [TutorSession] itself already establishes via
+ * [TutorSessionLedger], for the same reason (a plain-data snapshot that needs to survive
+ * one background-loop tick to the next, not a Room-modeled entity in its own right yet).
  */
+@Serializable
 data class TutorDiagnosticFinding(
     val findingId: String = UUID.randomUUID().toString(),
     val conceptId: String,
