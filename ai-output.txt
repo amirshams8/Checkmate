@@ -295,6 +295,7 @@ data class LlmExplanationResponse(
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticFinding.kt =====
 package com.checkmate.learning.tutor
 
+import kotlinx.serialization.Serializable
 import java.util.UUID
 
 /**
@@ -306,17 +307,19 @@ import java.util.UUID
  * NAMED DELIBERATELY DIFFERENT FROM [DiagnosticFinding]: that enum (KNOWN/UNKNOWN/
  * MISUNDERSTOOD/FORGOTTEN) is the coarse, already-load-bearing evidence type
  * [TutorEvidence.Diagnostic] carries into [TutorStateMachine] — reusing its name for this
- * much richer shape would either collide or silently shadow it. This type does not feed
- * [TutorStateMachine] in P3.1 — wiring a [TutorDiagnosticFinding] into
- * [TutorEvidence.Diagnostic] (via some [hypothesisType] -> [DiagnosticFinding] mapping) is
- * the P3.2 follow-up the roadmap describes as "swap TutorDiagnostics's deterministic path
- * for the validated LLM path," not part of this pass.
+ * much richer shape would either collide or silently shadow it. [TutorCycleManager]'s P3.2
+ * wiring (see that file) keeps this deliberate: the LLM-produced [hypothesisType] here
+ * enriches what EXPLAIN has to work with, but the coarse [DiagnosticFinding] driving
+ * [TutorStateMachine]'s own transition stays [TutorDiagnostics]'s deterministic heuristic,
+ * unchanged — matching that state machine's own "an LLM may PRODUCE the evidence this file
+ * consumes... but never decides the transition itself" invariant.
  *
- * Not yet Room-persisted or CheckmatePrefs-backed — P3.1 defines the shape and the
- * validation boundary; a durable store (mirroring [TutorSessionLedger]'s
- * CheckmatePrefs-blob pattern, or a proper Room table once more than one finding per
- * session needs to coexist) is follow-up work, not invented here.
+ * [Serializable]: P3.2's [TutorDiagnosticFindingLedger] persists this directly as one JSON
+ * blob via CheckmatePrefs — same pattern [TutorSession] itself already establishes via
+ * [TutorSessionLedger], for the same reason (a plain-data snapshot that needs to survive
+ * one background-loop tick to the next, not a Room-modeled entity in its own right yet).
  */
+@Serializable
 data class TutorDiagnosticFinding(
     val findingId: String = UUID.randomUUID().toString(),
     val conceptId: String,
@@ -874,6 +877,395 @@ class TutorDiagnosticValidatorTest {
         assertEquals(0.0, finding.confidence, 0.0001)
         assertEquals(42L, finding.createdAt)
     }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticFindingLedger.kt =====
+package com.checkmate.learning.tutor
+
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+/**
+ * Upgrade Blueprint Phase 3, P3.2 — durable handoff for the [TutorDiagnosticFinding]
+ * [com.checkmate.service.TutorCycleManager]'s DIAGNOSE step enriches, so its EXPLAIN step
+ * (a separate [com.checkmate.service.ReminderService] 15-min-loop tick — possibly minutes,
+ * or a process restart, apart) can read it back without re-running an LLM diagnosis.
+ *
+ * Same CheckmatePrefs-blob, single-slot pattern [TutorSessionLedger] itself already
+ * establishes, and tied to the exact same "one tutor session in flight at a time"
+ * invariant that file's own class doc justifies — so a single unkeyed slot (not a
+ * per-conceptId map) is correct here too. [current]'s caller is responsible for checking
+ * `finding.conceptId` still matches the active session before trusting it (see
+ * [com.checkmate.service.TutorCycleManager]'s own EXPLAIN step) — this object doesn't
+ * enforce that itself, same "ledger is a thin read/write wrapper, not a decision-maker"
+ * split [TutorSessionLedger] models between itself and [TutorStateMachine].
+ *
+ * NOT unit-tested at the JVM level, same convention [TutorSessionLedger]'s own class doc
+ * documents (`CheckmatePrefs.ready()` needs `CheckmatePrefs.init(context)`, which plain JVM
+ * tests don't run) — the pure logic that PRODUCES what gets stored here
+ * ([TutorDiagnosticValidator]) is exhaustively tested instead (see
+ * `TutorDiagnosticValidatorTest`).
+ */
+object TutorDiagnosticFindingLedger {
+
+    private const val TAG = "TutorDiagnosticFindingLedger"
+    private val json = Json { ignoreUnknownKeys = true }
+    private const val KEY_ACTIVE_FINDING = "tutor_active_diagnostic_finding"
+
+    /** Current stored finding, if any — null once [clear]ed, or if none was ever stored
+     *  (e.g. [TutorDiagnosticContextBuilder.build] returned null for this session's
+     *  concept, so DIAGNOSE had no evidence to enrich in the first place). */
+    fun current(): TutorDiagnosticFinding? =
+        CheckmatePrefs.getString(KEY_ACTIVE_FINDING, null)?.let {
+            runCatching { json.decodeFromString<TutorDiagnosticFinding>(it) }
+                .onFailure { e -> Log.w(TAG, "failed to decode active diagnostic finding, discarding", e) }
+                .getOrNull()
+        }
+
+    fun store(finding: TutorDiagnosticFinding) {
+        CheckmatePrefs.putString(KEY_ACTIVE_FINDING, json.encodeToString(finding))
+    }
+
+    /** Call once the finding has been consumed (or the session it belonged to ends) —
+     *  explicit clear, not automatic on read, same discipline [TutorSessionLedger.clear]'s
+     *  own doc documents: a caller may still want to re-read it (e.g. EXPLAIN running
+     *  again after a VERIFY failure loops back, per [TutorStateMachine]'s own routing)
+     *  before it's gone. */
+    fun clear() {
+        CheckmatePrefs.remove(KEY_ACTIVE_FINDING)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/TutorCycleManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.DiagnosticFinding
+import com.checkmate.learning.tutor.DirectLlmGateway
+import com.checkmate.learning.tutor.TutorDiagnosticContextBuilder
+import com.checkmate.learning.tutor.TutorDiagnosticFindingLedger
+import com.checkmate.learning.tutor.TutorDiagnosticValidator
+import com.checkmate.learning.tutor.TutorDiagnostics
+import com.checkmate.learning.tutor.TutorEvidence
+import com.checkmate.learning.tutor.TutorExplanationContext
+import com.checkmate.learning.tutor.TutorSession
+import com.checkmate.learning.tutor.TutorSessionLedger
+import com.checkmate.learning.tutor.TutorState
+import com.checkmate.learning.tutor.TutorTransitionResult
+import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.ui.mentor.MentorViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/**
+ * Upgrade Blueprint Phase 3, P3.2 ("make the FSM drive real learning activity") —
+ * the execution bridge between the pure [com.checkmate.learning.tutor.TutorStateMachine]
+ * skeleton and the real intervention pipeline. This is a fourth manager in the same family
+ * as [GapTaskManager]/[RetentionCheckManager]: one object, called from
+ * [ReminderService]'s existing 15-min loop, driving one specific piece of state.
+ *
+ * DELIBERATELY DOES NOT REQUEST ITS OWN TESTMATE TEST. [GapTaskManager]'s own P0b loop
+ * already requests/polls/imports a targeted test for whatever concept
+ * [GapTaskLedger.activeConceptId] currently is — and that concept is, by construction, the
+ * exact same one a tutor session was started for (see [GapTaskManager]'s own
+ * `generateIfNeededLocked`, which calls [TutorSessionLedger.startFromCandidate] with the
+ * same [com.checkmate.learning.engine.LearningDecisionEngine.CandidateIntervention]
+ * [GapTaskLedger.recordServed] already tracked). Firing a SECOND, independent targeted-test
+ * request here would mean two competing Testmate sessions for one concept — this instead
+ * reads [GapTaskLedger]'s own already-imported evidence
+ * ([GapTaskLedger.activeLastImportAttemptCount]/[GapTaskLedger.activeLastImportCorrectCount])
+ * and, once VERIFY resolves without mastery, asks for a fresh round the SAME way
+ * `resolveDoneConcept` already does ([GapTaskLedger.resetForNextRound]) — "extend the
+ * existing intervention pipeline, don't replace it," applied to the tutor bridge itself.
+ *
+ * SHARES [GapTaskLedger]'s MUTEX. Every function here reads or writes [GapTaskLedger]'s own
+ * fields, so [driveActiveSession] runs inside [GapTaskLedger.withLock] — same discipline
+ * [GapTaskManager] itself already applies to every one of its own entry points, for exactly
+ * the race class already fixed once in this codebase (see [GapTaskLedger.withLock]'s own
+ * doc). [TutorSessionLedger] has no mutex of its own; every mutation of it happens to be
+ * serialized through this shared lock today ONLY because every call site that touches it
+ * (this file, and [GapTaskManager]'s `startFromCandidate` call) is reached via
+ * [GapTaskLedger.withLock] — a future caller that mutates [TutorSessionLedger] from outside
+ * that lock would reopen the exact bug class this comment is warning about.
+ *
+ * P3.2 UPDATE — DIAGNOSE/EXPLAIN now DO reach an LLM (see [driveDiagnose]/[driveExplain]),
+ * but the FSM TRANSITION itself never does — [DiagnosticFinding] (the coarse KNOWN/UNKNOWN/
+ * MISUNDERSTOOD/FORGOTTEN evidence [TutorEvidence.Diagnostic] carries into
+ * [com.checkmate.learning.tutor.TutorStateMachine]) still comes exclusively from
+ * [TutorDiagnostics]'s deterministic heuristic, unchanged. What the LLM path adds is a
+ * richer [com.checkmate.learning.tutor.TutorDiagnosticFinding] (sub-concept hypothesis,
+ * structured explanation content) layered ON TOP, best-effort, never blocking or altering
+ * the deterministic transition below it — matching
+ * [com.checkmate.learning.tutor.TutorStateMachine]'s own "DETERMINISTIC BY DESIGN" doc: "An
+ * LLM may PRODUCE the [TutorEvidence] this file consumes... but never decides the
+ * transition itself."
+ */
+object TutorCycleManager {
+
+    private const val TAG = "TutorCycleManager"
+
+    /** Safety cap on how many state-to-state auto-advances (DIAGNOSE, EXPLAIN — the two
+     *  states that need no external evidence) this drives in a single tick, so a logic bug
+     *  that made [TutorStateMachine][com.checkmate.learning.tutor.TutorStateMachine] loop
+     *  between two states could never hang this call forever. Five is comfortably above the
+     *  three real states (DIAGNOSE/EXPLAIN/one PRACTICE-or-VERIFY check) a normal tick ever
+     *  needs to walk through. */
+    private const val MAX_AUTO_STEPS_PER_TICK = 5
+
+    /** Call from [ReminderService]'s existing 15-min loop, after
+     *  [GapTaskManager.evidencePollIfNeeded] (so a just-imported round's evidence is
+     *  available to consume in the very same tick). No-op if no tutor session is active. */
+    suspend fun driveActiveSession(context: Context) = GapTaskLedger.withLock {
+        driveActiveSessionLocked(context)
+    }
+
+    private suspend fun driveActiveSessionLocked(context: Context) {
+        var steps = 0
+        while (steps++ < MAX_AUTO_STEPS_PER_TICK) {
+            val session = TutorSessionLedger.current() ?: return
+            val advanced = when (session.state) {
+                TutorState.DIAGNOSE -> driveDiagnose(context, session)
+                TutorState.EXPLAIN -> driveExplain(context, session)
+                TutorState.PRACTICE -> drivePractice(session)
+                TutorState.VERIFY -> driveVerify(context, session)
+                TutorState.MASTERED -> { driveMastered(session); return }
+                TutorState.MOVE_ON, TutorState.ESCALATED -> {
+                    // Defensive only — driveMastered/ESCALATED's own producer already clear
+                    // the slot immediately, so a session should never actually be READ back
+                    // in one of these two states on a later tick. Clearing here anyway costs
+                    // nothing and closes the gap if that assumption is ever wrong.
+                    Log.w(TAG, "found lingering terminal session (${session.state}) for concept=${session.conceptId} — clearing")
+                    TutorSessionLedger.clear()
+                    TutorDiagnosticFindingLedger.clear()
+                    return
+                }
+            }
+            if (!advanced) return
+        }
+        Log.w(TAG, "hit MAX_AUTO_STEPS_PER_TICK — check for a TutorStateMachine loop")
+    }
+
+    // ── DIAGNOSE ─────────────────────────────────────────────────────────────
+
+    private suspend fun driveDiagnose(context: Context, session: TutorSession): Boolean {
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[session.conceptId]
+        val finding = TutorDiagnostics.diagnose(snapshot)
+
+        // P3.2: best-effort enrichment only — see class doc's P3.2 UPDATE note. `finding`
+        // above (deterministic) is what actually decides this transition, below,
+        // regardless of whether enrichment runs, succeeds, or is skipped entirely. Only
+        // attempted when there's real evidence to reason over (snapshot != null) and
+        // teaching is actually needed (not KNOWN) — an LLM asked to hypothesize about a
+        // concept the student already knows, or one with zero evidence at all, has nothing
+        // useful to add.
+        if (snapshot != null && finding != DiagnosticFinding.KNOWN) {
+            enrichDiagnosisIfPossible(context, session)
+        }
+
+        val result = TutorSessionLedger.apply(TutorEvidence.Diagnostic(finding), now())
+        return result is TutorTransitionResult.Advanced
+    }
+
+    /**
+     * Attempts an LLM-enriched diagnosis and stores it via [TutorDiagnosticFindingLedger]
+     * for [driveExplain] to pick up on a later tick. Never throws, never blocks
+     * [driveDiagnose]'s own deterministic transition — [TutorDiagnosticContextBuilder.build]
+     * returning null, an LLM timeout/blank response, or a
+     * [TutorDiagnosticValidator.ValidationResult.Rejected] all fall through to
+     * [TutorDiagnosticValidator.deterministicFallback] rather than leaving nothing stored,
+     * same "no silent failure, always land on a usable value" discipline the offline-first
+     * LLM paths elsewhere in this codebase (e.g.
+     * [com.checkmate.planner.intervention.InterventionFallback]) already follow.
+     */
+    private suspend fun enrichDiagnosisIfPossible(context: Context, session: TutorSession) {
+        val diagCtx = TutorDiagnosticContextBuilder.build(
+            context = context,
+            conceptId = session.conceptId,
+            tutorState = session.state,
+            cycleCount = session.cycleCount
+        ) ?: return
+
+        val raw = runCatching { DirectLlmGateway.diagnose(diagCtx) }.getOrNull()
+        val enriched = if (raw != null) {
+            when (val result = TutorDiagnosticValidator.validate(raw, diagCtx, now())) {
+                is TutorDiagnosticValidator.ValidationResult.Valid -> result.finding
+                is TutorDiagnosticValidator.ValidationResult.Rejected -> {
+                    Log.w(TAG, "concept=${session.conceptId} LLM diagnosis rejected (${result.reason}) — using deterministic fallback")
+                    TutorDiagnosticValidator.deterministicFallback(diagCtx, now())
+                }
+            }
+        } else {
+            TutorDiagnosticValidator.deterministicFallback(diagCtx, now())
+        }
+        TutorDiagnosticFindingLedger.store(enriched)
+    }
+
+    // ── EXPLAIN ──────────────────────────────────────────────────────────────
+
+    /**
+     * P3.2: reads back the [com.checkmate.learning.tutor.TutorDiagnosticFinding]
+     * [driveDiagnose] enriched (if any), requests a structured explanation via
+     * [DirectLlmGateway.explain], and posts it to the student through the same channel
+     * [ProactiveMentor] already uses ([MentorViewModel.appendProactiveMessage] +
+     * [MentorNotifier.notify]) — not a new delivery channel.
+     *
+     * Still auto-advances EXPLAIN -> PRACTICE regardless of whether delivery succeeded —
+     * [TutorEvidence.ExplanationDelivered]'s own doc is explicit that "which type of
+     * explanation was chosen is a teaching-layer concern this state machine deliberately
+     * has no opinion on — it only needs to know teaching happened before practice can
+     * start." A richer LLM explanation and the original gap-repair
+     * [com.checkmate.planner.model.StudyTask]'s own rationale text (already shown in the
+     * UI regardless) are equally "an explanation was delivered" as far as the FSM is
+     * concerned — this only changes WHAT the student additionally sees in Mentor chat, not
+     * whether the transition is allowed.
+     */
+    private suspend fun driveExplain(context: Context, session: TutorSession): Boolean {
+        deliverExplanationIfPossible(context, session)
+        val result = TutorSessionLedger.apply(TutorEvidence.ExplanationDelivered, now())
+        return result is TutorTransitionResult.Advanced
+    }
+
+    /**
+     * No-op (falls through to the pre-existing StudyTask-rationale-only behavior) when
+     * there's no enriched finding for THIS concept — including a finding left over from a
+     * different, already-superseded session, guarded by the conceptId check below, since
+     * [TutorDiagnosticFindingLedger] is a single unkeyed slot (see that object's own doc).
+     */
+    private suspend fun deliverExplanationIfPossible(context: Context, session: TutorSession) {
+        val finding = TutorDiagnosticFindingLedger.current() ?: return
+        if (finding.conceptId != session.conceptId) return
+
+        val diagCtx = TutorDiagnosticContextBuilder.build(
+            context = context,
+            conceptId = session.conceptId,
+            tutorState = session.state,
+            cycleCount = session.cycleCount
+        ) ?: return
+
+        val explanation = runCatching {
+            DirectLlmGateway.explain(TutorExplanationContext(diagCtx, finding))
+        }.getOrNull() ?: return
+
+        val message = buildString {
+            append(explanation.explanation)
+            explanation.workedExample?.let { append("\n\nExample: $it") }
+            explanation.commonTrap?.let { append("\n\nWatch out: $it") }
+            explanation.checkQuestion?.let { append("\n\n$it") }
+        }
+        MentorViewModel.appendProactiveMessage(message)
+        MentorNotifier.notify(context, explanation.explanation)
+    }
+
+    // ── PRACTICE ─────────────────────────────────────────────────────────────
+
+    /**
+     * Consumes [GapTaskLedger]'s own already-imported round evidence — see class doc for
+     * why this never requests its own Testmate test. Returns false (nothing to do yet)
+     * until [GapTaskLedger.isActiveEvidenceImported] goes true, which happens on some later
+     * tick once [GapTaskManager.evidencePollIfNeeded] actually imports a submitted result.
+     */
+    private fun drivePractice(session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            // GapTaskLedger has moved on (covered/reassigned) while this tutor session was
+            // still open — there is no P0b evidence stream left for it to ride on. Free the
+            // slot rather than leave an orphaned session sitting in PRACTICE forever.
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            TutorDiagnosticFindingLedger.clear()
+            return false
+        }
+        if (!GapTaskLedger.isActiveEvidenceImported()) return false // waiting on the student
+
+        val attemptCount = GapTaskLedger.activeLastImportAttemptCount()
+        val correctCount = GapTaskLedger.activeLastImportCorrectCount()
+        val result = TutorSessionLedger.apply(TutorEvidence.PracticeAttempts(attemptCount, correctCount), now())
+        if (result !is TutorTransitionResult.Advanced) {
+            // Shouldn't happen at TARGETED_TEST_QUESTION_COUNT=15 >> MIN_PRACTICE_ATTEMPTS=3,
+            // but stay defensive rather than get stuck re-reading the same rejected evidence
+            // forever — ask for a fresh round exactly like a genuine VERIFY-fail would.
+            Log.w(TAG, "concept=$conceptId practice evidence rejected ($result) — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+        return true
+    }
+
+    // ── VERIFY ───────────────────────────────────────────────────────────────
+
+    /**
+     * Split out from [drivePractice] rather than inlined at its tail, so a session that
+     * somehow persists mid-VERIFY across a process death/crash (advanced PRACTICE->VERIFY
+     * but didn't reach a further state before the process died) is still recoverable on the
+     * next tick — this re-derives everything it needs (a fresh [com.checkmate.learning.model.ConceptSnapshot],
+     * fresh dominant error) from durable state rather than anything carried over in memory
+     * from [drivePractice]'s own call.
+     */
+    private suspend fun driveVerify(context: Context, session: TutorSession): Boolean {
+        val conceptId = session.conceptId
+        if (GapTaskLedger.activeConceptId() != conceptId) {
+            Log.w(TAG, "concept=$conceptId is no longer GapTaskLedger's active concept — clearing stale tutor session")
+            TutorSessionLedger.clear()
+            TutorDiagnosticFindingLedger.clear()
+            return false
+        }
+
+        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+        val snapshot = studentModel.concepts[conceptId]
+        if (snapshot == null) {
+            // Mastery recompute (inside TargetedTestEvidenceImporter.import) should always
+            // leave a snapshot behind once evidence exists — this would mean something
+            // upstream is broken. Don't fabricate one; ask for a fresh round instead of
+            // guessing at VERIFY with no real evidence.
+            Log.w(TAG, "concept=$conceptId has no ConceptSnapshot to verify against — requesting a fresh round")
+            GapTaskLedger.resetForNextRound()
+            return false
+        }
+
+        val dominantError = studentModel.unresolvedErrors
+            .filter { it.conceptId == conceptId }
+            .maxByOrNull { it.occurrences }
+            ?.errorType
+
+        val result = TutorSessionLedger.apply(TutorEvidence.Verification(snapshot, dominantError), now())
+        val advancedTo = (result as? TutorTransitionResult.Advanced)?.session?.state
+        if (advancedTo != TutorState.MASTERED) {
+            // Looped back to EXPLAIN/PRACTICE, or escalated — either way this round's
+            // Testmate evidence is now spent. Same mechanism GapTaskManager's own
+            // resolveDoneConcept already uses for "student finished the task, still below
+            // threshold" — a fresh round gets requested the next time
+            // GapTaskManager.createTargetedTestIfNeeded runs.
+            GapTaskLedger.resetForNextRound()
+        }
+        return result is TutorTransitionResult.Advanced
+    }
+
+    // ── MASTERED ─────────────────────────────────────────────────────────────
+
+    private fun driveMastered(session: TutorSession) {
+        TutorSessionLedger.apply(TutorEvidence.CloseOut, now())
+        TutorSessionLedger.clear()
+        TutorDiagnosticFindingLedger.clear()
+        Log.d(TAG, "tutor session for concept=${session.conceptId} closed out (MASTERED -> MOVE_ON)")
+        // Deliberately does NOT call GapTaskLedger.markCovered() — that call is reserved for
+        // GapTaskManager.resolveDoneConcept's own independently-verified "task reached DONE
+        // AND mastery recheck cleared threshold" path (see markCovered's own doc). The tutor
+        // reaching MASTERED is a real, evidence-backed confirmation, but letting two
+        // different code paths both decide "this concept is covered" risks exactly the kind
+        // of double-write / inconsistent-state bug class this codebase has already spent a
+        // long stretch fixing once for this same ledger. GapTaskManager's own flow will reach
+        // the same conclusion independently once the student marks the task DONE.
+    }
+
+    private fun now(): Long = System.currentTimeMillis()
 }
 
 
