@@ -15,6 +15,26 @@ val localProps = Properties().apply {
 android {
     namespace = "com.checkmate"
     compileSdk = 35
+    signingConfigs {
+    create("checkmateCi") {
+        val keystorePath = System.getenv("CHECKMATE_KEYSTORE")
+        val keystorePassword = System.getenv("CHECKMATE_KEYSTORE_PASSWORD")
+        val keyAlias = System.getenv("CHECKMATE_KEY_ALIAS")
+        val keyPassword = System.getenv("CHECKMATE_KEY_PASSWORD")
+
+        if (
+            !keystorePath.isNullOrBlank() &&
+            !keystorePassword.isNullOrBlank() &&
+            !keyAlias.isNullOrBlank() &&
+            !keyPassword.isNullOrBlank()
+        ) {
+            storeFile = file(keystorePath)
+            storePassword = keystorePassword
+            this.keyAlias = keyAlias
+            this.keyPassword = keyPassword
+        }
+    }
+}
 
     defaultConfig {
         applicationId = "com.checkmate"
@@ -23,11 +43,13 @@ android {
         versionCode = 1
         versionName = "1.0"
 
+        signingConfig = signingConfigs.getByName("checkmateCi")
         // Telegram bot token — set in local.properties, never commit that file
         buildConfigField(
             "String",
             "TELEGRAM_BOT_TOKEN",
             "\"${localProps.getProperty("telegram_bot_token", "")}\""
+            
         )
     }
 
