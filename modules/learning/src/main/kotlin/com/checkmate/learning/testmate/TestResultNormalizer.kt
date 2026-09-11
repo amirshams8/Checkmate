@@ -131,13 +131,26 @@ object TestResultNormalizer {
 
         val db = LearningDatabase.getInstance(context)
         val testId = deterministicTestId(report)
+        // testId scheme changed from title+exam to title+exam+score+count (see the
+        // doc comment on deterministicTestId). Rows written before that change are
+        // still sitting in Room keyed on the OLD scheme, so a bare new-scheme check
+        // would miss them and re-write a report that's already imported. Checking the
+        // legacy id too, one time, keeps existing data from getting duplicated; this
+        // fallback can be deleted once you're confident no pre-migration data remains.
+        val legacyTestId = legacyDeterministicTestId(report)
 
         // Idempotency guard: the same report re-imported (e.g. user re-shares the same
         // file) must not double-count attempts/events. Question ids are deterministic
         // from (testId, question number), so checking the first one tells us whether
         // this exact test was already normalized.
         val firstQuestionId = report.questions.firstOrNull()?.let { deterministicQuestionId(testId, it.number) }
-        if (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) {
+        val legacyFirstQuestionId = if (legacyTestId != testId) {
+            report.questions.firstOrNull()?.let { deterministicQuestionId(legacyTestId, it.number) }
+        } else null
+        val alreadyImportedRow =
+            (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) ||
+                (legacyFirstQuestionId != null && db.questionDao().getById(legacyFirstQuestionId) != null)
+        if (alreadyImportedRow) {
             Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
             return NormalizeResult(
                 alreadyImported = true,
@@ -276,11 +289,27 @@ object TestResultNormalizer {
     )
 
     /**
-     * Stable id derived from the report's own content (exam + title), not a random
-     * UUID — the same report re-imported must resolve to the same testId so the
-     * idempotency guard above actually works.
+     * Stable id derived from the report's own content, not a random UUID — the same
+     * report re-imported must resolve to the same testId so the idempotency guard
+     * above actually works.
+     *
+     * Deliberately NOT title+exam alone: two genuinely different test attempts can
+     * share a title (an AI-recreated report reusing a prior title, or a student
+     * retaking a mock under its original name), and title+exam collapsed those into
+     * one, silently dropping the second import (alreadyImported=true) without
+     * surfacing anything beyond a Log.w. Folding in score + question count ties the
+     * id to the report's actual content instead of just its name, while staying
+     * resilient to whitespace/line-ending drift a full-text hash would choke on.
      */
     private fun deterministicTestId(report: ParsedTestReport): String =
+        sha256Hex(
+            "${report.exam ?: ""}|${report.title}|${report.scoreObtained}|" +
+                "${report.scoreTotal}|${report.questions.size}"
+        ).take(16)
+
+    /** Old testId scheme (title+exam only) — kept only for the one-time migration
+     *  fallback in [normalize]. Safe to delete once no pre-migration rows remain. */
+    private fun legacyDeterministicTestId(report: ParsedTestReport): String =
         sha256Hex("${report.exam ?: ""}|${report.title}").take(16)
 
     private fun deterministicQuestionId(testId: String, questionNumber: Int): String =
