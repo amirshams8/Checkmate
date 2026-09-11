@@ -52,6 +52,19 @@ data class SubjectScore(
  */
 object SubjectScoreCalculator {
 
+    /**
+     * Bucket for any chapter [ConceptWeightage.resolveWeightage] can't map to a
+     * subject (ResolutionMethod.UNRESOLVED, subjectResolved == null) — e.g. a
+     * Testmate chapter tag with no PYQWeightage/ExamSyllabus match and no
+     * ALIASES entry yet. BUG THIS REPLACES: `.filterKeys { it != null }` used
+     * to drop these questions (and their marks) from the output entirely with
+     * no trace — a real report import (FT-01D) lost 3 of 6 chapters' worth of
+     * marks this way, silently, before this was caught. Surfacing them under
+     * an explicit "Unmapped" subject means a coverage gap shows up as a
+     * visible bucket the person can investigate, not marks that vanish.
+     */
+    const val UNMAPPED_SUBJECT = "Unmapped"
+
     fun compute(examType: String, questions: List<ScoredQuestionFact>): List<SubjectScore> {
         val marksPerQuestion = ConceptWeightage.marksPerQuestion(examType)
         val negativeMarks = ConceptWeightage.negativeMarksPerWrong(examType)
@@ -60,14 +73,14 @@ object SubjectScoreCalculator {
             .groupBy { q ->
                 val topicKey = q.topic ?: q.chapter
                 ConceptWeightage.resolveWeightage(examType, null, q.chapter, topicKey).subjectResolved
+                    ?: UNMAPPED_SUBJECT
             }
-            .filterKeys { it != null }
             .map { (subject, group) ->
                 val correct = group.count { it.correct }
                 val wrong = group.count { it.attempted && !it.correct }
                 val skipped = group.count { !it.attempted }
                 SubjectScore(
-                    subject = subject!!,
+                    subject = subject,
                     questionsCount = group.size,
                     correct = correct,
                     wrong = wrong,

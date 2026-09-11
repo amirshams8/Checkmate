@@ -88,6 +88,16 @@ object ConceptWeightage {
             normalize("The Living World") to "Diversity In Living World",
             normalize("Structural Organisation") to "Structural Organisation In Animals And Plants",
             normalize("Cell Cycle & Cell Division") to "Cell Structure And Function",
+            // Real Testmate chapter tags (verified against ft01b-questions.json /
+            // FT-01D report) that were never covered by an ALIASES entry, causing
+            // ConceptWeightage.resolveWeightage to return UNRESOLVED for them and
+            // SubjectScoreCalculator to silently drop the whole chapter from the
+            // subject rollup. "Units & Measurements" and "Cell: The Unit of Life"
+            // are genuine 1:1 renames of their canonical chapter — see PYQWeightage
+            // topic lists — so they inherit the matched entry's own confidence,
+            // same as the Group 1 entries above.
+            normalize("Units & Measurements") to "Physics And Measurement",
+            normalize("Cell: The Unit of Life") to "Cell Structure And Function",
 
             // --- Group 2: real topic reported as its own chapter ----------------
             // Motion in a Plane / Projectile Motion / Relative Velocity are real
@@ -110,6 +120,16 @@ object ConceptWeightage {
             // figure. Revisit if/when PYQWeightage ever gets topic-level (not just
             // chapter-level) granularity.
             normalize("Breathing & Exchange of Gases") to "Human Physiology",
+            // "Structural Organisation in Animals: Animal Tissues" is a real topic
+            // WITHIN the canonical "Structural Organisation In Animals And Plants"
+            // chapter (see ExamSyllabus — that chapter also covers plant
+            // morphology, anatomy, and plant families, 5 other topics besides
+            // Animal Tissues). Same coarse-bucket shape as Breathing above — the
+            // ":"-suffixed report tag also carries extra tokens ("animal",
+            // "tissues") that pushed it below FUZZY_MIN_JACCARD against the bare
+            // "Structural Organisation" alias, which is why it needs its own
+            // explicit entry rather than resolving via tier 5.
+            normalize("Structural Organisation in Animals: Animal Tissues") to "Structural Organisation In Animals And Plants",
             // Extra trailing content beyond what normalize()'s parenthetical/suffix
             // stripping handles alone — see Biomolecules-I vs -II note lower down.
             // MISCLASSIFIED AS GROUP 1 UNTIL THIS PASS: "Cell Structure And Function"
@@ -165,7 +185,8 @@ object ConceptWeightage {
      */
     private val COARSE_BUCKET_ALIASES: Set<String> = setOf(
         normalize("Breathing & Exchange of Gases"),
-        normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors")
+        normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"),
+        normalize("Structural Organisation in Animals: Animal Tissues")
     )
 
     /** Generic connective words stripped before token-overlap comparison — NOT
