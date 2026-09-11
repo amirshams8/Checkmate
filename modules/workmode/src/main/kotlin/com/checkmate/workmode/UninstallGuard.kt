@@ -63,7 +63,14 @@ object UninstallGuard {
 
     // Minimum time between PIN (re)generations — stops a student from
     // spamming "generate" to flood the guardian's Telegram.
-    private const val REGEN_COOLDOWN_MS = 5 * 60 * 1000L
+    //
+    // 2026-09: bumped from 5 minutes to ~7 months (210 days) as a hard
+    // commitment lock — the "Generate PIN" button stays visible and tappable,
+    // but generateAndSendGuardianPin() below refuses every call until this
+    // window has fully elapsed since the last generation. This is a rolling
+    // duration off KEY_LAST_GENERATED, not a fixed calendar date — if that's
+    // ever needed instead, compare against a stored target timestamp here.
+    private const val REGEN_COOLDOWN_MS = 210L * 24 * 60 * 60 * 1000L
 
     // Brute-force protection on the unlock field itself.
     private const val MAX_FAILED_ATTEMPTS = 5
@@ -210,6 +217,24 @@ object UninstallGuard {
         val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
         val remaining = REGEN_COOLDOWN_MS - (System.currentTimeMillis() - last)
         return if (remaining > 0) remaining / 1000 else 0
+    }
+
+    /**
+     * Human-readable form of [regenCooldownRemainingSeconds] — now that
+     * REGEN_COOLDOWN_MS spans months rather than minutes, a raw second count
+     * (e.g. "18143987s") is useless in the UI. Picks the coarsest unit that
+     * still reads naturally: days once over an hour, otherwise minutes/seconds.
+     */
+    fun regenCooldownRemainingLabel(): String {
+        val totalSeconds = regenCooldownRemainingSeconds()
+        if (totalSeconds <= 0) return "0s"
+        val days = totalSeconds / 86_400
+        val hours = (totalSeconds % 86_400) / 3_600
+        return when {
+            days > 0  -> "${days}d ${hours}h"
+            hours > 0 -> "${hours}h ${(totalSeconds % 3_600) / 60}m"
+            else      -> "${totalSeconds / 60}m ${totalSeconds % 60}s"
+        }
     }
 
     private fun hashPin(pin: String): String {
