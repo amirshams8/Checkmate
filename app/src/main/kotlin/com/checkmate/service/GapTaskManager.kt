@@ -59,7 +59,15 @@ import kotlinx.coroutines.withContext
 object GapTaskManager {
 
     private const val TAG = "GapTaskManager"
-    private const val TARGETED_TEST_QUESTION_COUNT = 15
+
+    // FIX (repair-test hard limit): a repair test must cover every wrong/skipped question
+    // the student has for the concept's chapter/topic, not a fixed slice of them. 0 is the
+    // sentinel Testmate's POST /api/tests/targeted route.ts reads as "no cap" for the
+    // WRONG_SKIPPED pool (see that route's own doc) — it was 15 before, which silently
+    // truncated any repair set bigger than that. Retention checks are a different, smaller
+    // probe and intentionally keep their own fixed count — see
+    // RetentionCheckManager.RETENTION_QUESTION_COUNT, untouched by this.
+    private const val TARGETED_TEST_QUESTION_COUNT = 0
 
     // Persisted (not just logged) so a create-test failure is visible in Settings → Test
     // Platform without needing adb logcat — Log.w/Log.e alone rotate out of the buffer
@@ -472,7 +480,7 @@ object GapTaskManager {
                 interventionId = interventionId,
                 chapter = chapter,
                 topic = topicForApi,
-                questionCount = TARGETED_TEST_QUESTION_COUNT,
+                questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
                 pool = TestmateQuestionPool.WRONG_SKIPPED
             )
         } catch (e: Exception) {

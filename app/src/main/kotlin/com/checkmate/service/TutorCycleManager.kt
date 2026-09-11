@@ -245,7 +245,9 @@ object TutorCycleManager {
         val correctCount = GapTaskLedger.activeLastImportCorrectCount()
         val result = TutorSessionLedger.apply(TutorEvidence.PracticeAttempts(attemptCount, correctCount), now())
         if (result !is TutorTransitionResult.Advanced) {
-            // Shouldn't happen at TARGETED_TEST_QUESTION_COUNT=15 >> MIN_PRACTICE_ATTEMPTS=3,
+            // Shouldn't happen — GapTaskManager's repair test is now uncapped (every
+            // wrong/skipped question for the concept, previously capped at 15), so
+            // attemptCount only ever grows further past MIN_PRACTICE_ATTEMPTS=3,
             // but stay defensive rather than get stuck re-reading the same rejected evidence
             // forever — ask for a fresh round exactly like a genuine VERIFY-fail would.
             Log.w(TAG, "concept=$conceptId practice evidence rejected ($result) — requesting a fresh round")
