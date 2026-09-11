@@ -1,944 +1,1096 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/HypothesisType.kt =====
-package com.checkmate.learning.tutor
+//===== TERMUXFILE: Testmate/app/api/tests/targeted/route.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getServiceClient } from '@/lib/supabase';
+import { getCurrentUserFromRequest } from '@/lib/auth';
 
-/**
- * Upgrade Blueprint Phase 3, P3.1 — closed vocabulary for
- * [LlmDiagnosticResponse.hypothesisType]. The LLM classifies into one of these; it never
- * invents a new label (see [parse]'s own fallback for what happens when it tries).
- *
- * Deliberately separate from the existing coarse [DiagnosticFinding]
- * (KNOWN/UNKNOWN/MISUNDERSTOOD/FORGOTTEN) — that enum is unchanged by this file and still
- * drives [TutorStateMachine]'s transition table (see that file's own "DELIBERATE SCOPE
- * NOTE" — P3.1 richens what PRODUCES a [DiagnosticFinding], not the finding shape itself).
- * [HypothesisType] is a finer-grained, sub-concept-scoped hypothesis about *why* a student
- * is stuck — carried on [TutorDiagnosticFinding], not fed to [TutorStateMachine] directly.
- */
-enum class HypothesisType {
-    PROCEDURAL_ERROR,
-    CONCEPTUAL_MISUNDERSTANDING,
-    PREREQUISITE_GAP,
-    FORMULA_SELECTION_ERROR,
-    REPRESENTATION_ERROR,
-    UNIT_ERROR,
-    SIGN_DIRECTION_ERROR,
-    READING_INTERPRETATION_ERROR,
-    CARELESS_EXECUTION,
-    UNKNOWN;
+// POST /api/tests/targeted
+// Body: {
+//   intervention_id: string,       // Checkmate's GapTaskLedger concept id
+//   chapter: string,
+//   topic?: string,
+//   question_count?: number,       // default 15 for pool 'NEW'; omitted/0/negative means
+//                                   // "no cap" for WRONG / SKIPPED / WRONG_SKIPPED — returns
+//                                   // every matching question instead of truncating at 15
+//   pool?: 'WRONG' | 'SKIPPED' | 'WRONG_SKIPPED' | 'NEW',  // default 'WRONG_SKIPPED'
+//   duration_seconds?: number      // default question_count * 90
+// }
+//
+// P0b — the "Testmate owns question selection, Checkmate owns why" endpoint. Builds a
+// student-specific test out of THIS student's own wrong/skipped history for one
+// chapter/topic (falling back to never-attempted questions from the same chapter/topic
+// if there aren't enough), then immediately creates and joins a solo session against it —
+// so Checkmate never has to also call POST /api/sessions or implement question selection
+// itself. Auth via getCurrentUserFromRequest (device-token compatible), unlike
+// POST /api/sessions, which currently only accepts the cookie session — Checkmate has no
+// browser session, so that route was never callable from the app for this.
+//
+// Idempotent on intervention_id (see db/migrations/009_targeted_tests.sql, refined by
+// 010_targeted_tests_reusable_intervention.sql): calling this again with the same
+// intervention_id for the same user, while a LIVE session for it still exists, returns
+// that SAME test/session rather than generating a new test every retry.
+//
+// KNOWN LIMITATION: "SKIPPED" only catches a question the student visited and left
+// unanswered (a `responses` row with a null selected_answer) — a question in a past test
+// the student never even navigated to (no `responses` row at all) can't be detected this
+// way without diffing every past test's full question list against responses, which this
+// endpoint doesn't do. Good enough for v1; revisit if that gap turns out to matter.
+//
+// BUGFIX (Aug 2026): the WRONG/SKIPPED lookup used to pull the student's ENTIRE response
+// history (every chapter, every subject, since day one) via `.eq('user_id', ...)`, then
+// filter it down to this chapter in memory. supabase-js sends `.in()` filters as URL query
+// params, and that unbounded history was stuffed into a single GET request's `.in('id', ...)`
+// filter — fine while history was small, but it grows without bound as the student keeps
+// using the app, and eventually exceeds the HTTP gateway's URL-length limit. That produces
+// a raw, non-JSON 400 from the gateway itself (not a normal PostgREST error), which
+// supabase-js surfaces as a generic `"Bad Request"` message — indistinguishable from a real
+// query error, and unrelated to which chapter/concept was being requested (hence "fails on
+// every chapter, even a brand new one" once history crossed the threshold).
+//
+// Fixed by flipping the query order: first fetch THIS CHAPTER's (optionally topic's)
+// question-id pool from `questions` — bounded by how many questions exist for one
+// chapter, not by the student's lifetime history — then filter `responses` down to only
+// those ids. That pool is batched defensively (CHUNK_SIZE) in case a single chapter's
+// question bank is ever large enough to risk the same URL-length problem on its own.
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUserFromRequest(req);
+  if (!user) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  }
 
-    companion object {
-        /**
-         * Parses a raw, untrusted LLM string into a closed [HypothesisType], defaulting to
-         * [UNKNOWN] for anything that doesn't match a member name exactly (including null/
-         * blank). Same "don't assume a specific gap without positive evidence" caution
-         * [com.checkmate.learning.engine.ErrorEngine.classify] and
-         * [TutorDiagnostics.diagnose] already apply to their own unclassifiable cases.
-         *
-         * This is a soft fallback, not a schema-validation failure —
-         * [TutorDiagnosticValidator] does NOT reject an otherwise-valid response solely for
-         * an unparseable hypothesisType string; it just gets classified as [UNKNOWN] rather
-         * than losing the rest of the diagnosis (hypothesis text, evidence, confidence).
-         */
-        fun parse(raw: String?): HypothesisType =
-            entries.firstOrNull { it.name == raw } ?: UNKNOWN
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  const interventionId = body.intervention_id;
+  const chapter = body.chapter;
+  const topic = typeof body.topic === 'string' && body.topic.trim() ? body.topic.trim() : null;
+  const pool = (typeof body.pool === 'string' ? body.pool.toUpperCase() : 'WRONG_SKIPPED') as
+    | 'WRONG'
+    | 'SKIPPED'
+    | 'WRONG_SKIPPED'
+    | 'NEW';
+
+  // FIX (repair-test hard limit): question_count as a positive number is still a hard cap,
+  // same as always — this is what a retention check (Checkmate's RetentionCheckManager)
+  // keeps using to stay a short probe. But omitted/0/negative now means "no cap" for
+  // WRONG / SKIPPED / WRONG_SKIPPED — a repair test should pull in EVERY wrong/skipped
+  // question this student has for the chapter/topic, not just the first 15 the old default
+  // silently truncated to. 'NEW' still needs a real ceiling here since its candidate pool is
+  // the chapter's ENTIRE question bank, not bounded by the student's own history — an
+  // uncapped request for 'NEW' falls back to the same default of 15 it always had.
+  const rawQuestionCount = typeof body.question_count === 'number' ? Math.floor(body.question_count) : null;
+  const uncapped = pool !== 'NEW' && (rawQuestionCount === null || rawQuestionCount <= 0);
+  const questionCap = uncapped
+    ? Number.POSITIVE_INFINITY
+    : rawQuestionCount !== null && rawQuestionCount > 0
+      ? rawQuestionCount
+      : 15;
+
+  if (typeof interventionId !== 'string' || !interventionId.trim()) {
+    return NextResponse.json({ error: 'intervention_id is required' }, { status: 400 });
+  }
+  if (typeof chapter !== 'string' || !chapter.trim()) {
+    return NextResponse.json({ error: 'chapter is required' }, { status: 400 });
+  }
+  if (!['WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'].includes(pool)) {
+    return NextResponse.json(
+      { error: "pool must be one of 'WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'" },
+      { status: 400 }
+    );
+  }
+
+  const supabase = getServiceClient();
+
+  // Batches any `.in('id', [...])` filter so a single request's URL can't grow unbounded —
+  // see the BUGFIX note above. 150 ids/request comfortably stays under gateway URL limits
+  // even with 36-char UUIDs.
+  const CHUNK_SIZE = 150;
+  function chunk<T>(arr: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  // ── Idempotency: same student + same intervention_id => same LIVE test/session ──────
+  // BUGFIX (Aug 2026, reintroduced by 010's re-migration): this query used to have no
+  // status filter, which was only safe under 009's original unique index (one row per
+  // intervention_id, ever). 010_targeted_tests_reusable_intervention.sql rescoped that
+  // index to `status = 'live'` so a later, genuinely new occurrence of the same concept
+  // could get a fresh session once the earlier one ended — but this route wasn't updated
+  // to match, so once an old (ended) session and a new (live) session both existed for the
+  // same intervention_id, `.maybeSingle()` found more than one row and threw "JSON object
+  // requested, multiple (or no) rows returned" (HTTP 500). When only the old ended session
+  // existed, this also silently handed it back as "existing" instead of creating a new
+  // one — the cause of a fresh round's "Take Test" landing on a previous round's result
+  // page. Filtering to status = 'live' here matches the DB index and fixes both.
+  const { data: existingSession, error: idempotencyError } = await supabase
+    .from('test_sessions')
+    .select('id, test_id, intervention_id')
+    .eq('intervention_id', interventionId)
+    .eq('created_by', user.id)
+    .eq('status', 'live')
+    .maybeSingle();
+
+  if (idempotencyError) {
+    console.error('[targeted] idempotency check failed:', idempotencyError.message);
+    return NextResponse.json({ error: idempotencyError.message }, { status: 500 });
+  }
+
+  if (existingSession) {
+    const { data: existingTest, error: existingTestError } = await supabase
+      .from('tests')
+      .select('id, title, status, duration_seconds')
+      .eq('id', existingSession.test_id)
+      .single();
+    if (existingTestError) {
+      console.error('[targeted] existing-test lookup failed:', existingTestError.message);
+      return NextResponse.json({ error: existingTestError.message }, { status: 500 });
     }
+    return NextResponse.json({
+      test: existingTest,
+      session: existingSession,
+      question_count: uncapped ? null : questionCap,
+      reused: true
+    });
+  }
+
+  // ── Build the candidate question pool from this student's own history ──────────────
+  type CandidateRow = {
+    id: string;
+    question_text: string;
+    question_image_url: string | null;
+    question_data: unknown;
+    options: unknown;
+    option_images: unknown;
+    correct_answer: string | null;
+    marks: number | null;
+    negative_marks: number | null;
+    chapter: string | null;
+    topic: string | null;
+    difficulty: string | null;
+    question_type: string | null;
+    explanation: string | null;
+    answered_at?: string | null;
+  };
+
+  const QUESTION_SELECT =
+    'id, question_text, question_image_url, question_data, options, option_images, correct_answer, marks, negative_marks, chapter, topic, difficulty, question_type, explanation';
+
+  const chosen: CandidateRow[] = [];
+  const chosenIds = new Set<string>();
+
+  if (pool === 'WRONG' || pool === 'SKIPPED' || pool === 'WRONG_SKIPPED') {
+    // Scope by CHAPTER first — bounded by this chapter's question bank, not by the
+    // student's entire lifetime response history (see BUGFIX note above).
+    let chapterQuestionsQuery = supabase.from('questions').select('id').eq('chapter', chapter);
+    if (topic) chapterQuestionsQuery = chapterQuestionsQuery.eq('topic', topic);
+    const { data: chapterQuestions, error: chapterQError } = await chapterQuestionsQuery;
+    if (chapterQError) {
+      console.error('[targeted] chapter question-pool lookup failed:', chapterQError.message);
+      return NextResponse.json({ error: chapterQError.message }, { status: 500 });
+    }
+    const chapterQuestionIds = (chapterQuestions ?? []).map((q) => q.id);
+
+    if (chapterQuestionIds.length > 0) {
+      // Fetch this student's responses restricted to THIS chapter's question ids only,
+      // batched defensively in case one chapter's bank is itself very large.
+      const responseRows: { question_id: string; selected_answer: string | null; is_correct: boolean | null; answered_at: string | null }[] = [];
+      for (const idsBatch of chunk(chapterQuestionIds, CHUNK_SIZE)) {
+        const { data: batch, error: rError } = await supabase
+          .from('responses')
+          .select('question_id, selected_answer, is_correct, answered_at')
+          .eq('user_id', user.id)
+          .in('question_id', idsBatch);
+        if (rError) {
+          console.error('[targeted] responses lookup failed:', rError.message);
+          return NextResponse.json({ error: rError.message }, { status: 500 });
+        }
+        if (batch) responseRows.push(...batch);
+      }
+
+      if (responseRows.length > 0) {
+        const uniqueAnsweredIds = Array.from(new Set(responseRows.map((r) => r.question_id)));
+        const questionById = new Map<string, CandidateRow>();
+        for (const idsBatch of chunk(uniqueAnsweredIds, CHUNK_SIZE)) {
+          const { data: qBatch, error: qError } = await supabase
+            .from('questions')
+            .select(QUESTION_SELECT)
+            .in('id', idsBatch);
+          if (qError) {
+            console.error('[targeted] candidate-question lookup failed:', qError.message);
+            return NextResponse.json({ error: qError.message }, { status: 500 });
+          }
+          for (const q of qBatch ?? []) questionById.set(q.id, q as CandidateRow);
+        }
+
+        const wantWrong = pool === 'WRONG' || pool === 'WRONG_SKIPPED';
+        const wantSkipped = pool === 'SKIPPED' || pool === 'WRONG_SKIPPED';
+
+        // Most-recent-first, and de-duped by question_id (a question can have been
+        // attempted in more than one past test session) — keep only the latest attempt
+        // at each one.
+        const sorted = [...responseRows].sort(
+          (a, b) => new Date(b.answered_at ?? 0).getTime() - new Date(a.answered_at ?? 0).getTime()
+        );
+
+        for (const r of sorted) {
+          if (chosen.length >= questionCap) break;
+          if (chosenIds.has(r.question_id)) continue;
+          const q = questionById.get(r.question_id);
+          if (!q) continue;
+
+          const isWrong = r.is_correct === false;
+          const isSkipped = r.selected_answer === null || r.selected_answer === undefined;
+          if ((wantWrong && isWrong) || (wantSkipped && isSkipped)) {
+            chosen.push(q);
+            chosenIds.add(r.question_id);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Backfill (or serve entirely, for pool === 'NEW') from never-attempted questions ──
+  // Skipped entirely when `uncapped`: an uncapped WRONG/SKIPPED/WRONG_SKIPPED request wants
+  // exactly this student's actual wrong/skipped set, not padded up to some target size with
+  // questions they've never even seen.
+  if (!uncapped && chosen.length < questionCap) {
+    // Only needs to know WHICH of this chapter's questions the student has already
+    // attempted, so scope this the same bounded way — not the student's full history.
+    let backfillQuery = supabase.from('questions').select(QUESTION_SELECT).eq('chapter', chapter).limit(questionCap * 3); // overfetch — some will be filtered out below
+    if (topic) backfillQuery = backfillQuery.eq('topic', topic);
+
+    const { data: backfillCandidates, error: bError } = await backfillQuery;
+    if (bError) {
+      console.error('[targeted] backfill lookup failed:', bError.message);
+      return NextResponse.json({ error: bError.message }, { status: 500 });
+    }
+
+    const backfillIds = (backfillCandidates ?? []).map((q) => q.id);
+    const attemptedIds = new Set<string>();
+    for (const idsBatch of chunk(backfillIds, CHUNK_SIZE)) {
+      const { data: attempted, error: aError } = await supabase
+        .from('responses')
+        .select('question_id')
+        .eq('user_id', user.id)
+        .in('question_id', idsBatch);
+      if (aError) {
+        console.error('[targeted] attempted-ids lookup failed:', aError.message);
+        return NextResponse.json({ error: aError.message }, { status: 500 });
+      }
+      for (const r of attempted ?? []) attemptedIds.add(r.question_id);
+    }
+
+    for (const q of backfillCandidates ?? []) {
+      if (chosen.length >= questionCap) break;
+      if (chosenIds.has(q.id)) continue;
+      if (attemptedIds.has(q.id)) continue; // "NEW" means genuinely never attempted
+      chosen.push(q as CandidateRow);
+      chosenIds.add(q.id);
+    }
+  }
+
+  if (chosen.length === 0) {
+    return NextResponse.json(
+      { error: `No questions available for chapter "${chapter}"${topic ? ` / topic "${topic}"` : ''} yet.` },
+      { status: 422 }
+    );
+  }
+
+  // Computed from the actual selected set (chosen.length), not the nominal cap — matters
+  // once `pool` is uncapped, since there is no fixed target question_count left to multiply
+  // by 90 in that case.
+  const durationSeconds =
+    typeof body.duration_seconds === 'number' && body.duration_seconds > 0
+      ? body.duration_seconds
+      : chosen.length * 90;
+
+  // ── Create the test, copy the chosen questions into it, start a solo session ────────
+  const { data: newTest, error: testError } = await supabase
+    .from('tests')
+    .insert({
+      title: `Repair: ${chapter}${topic ? ` — ${topic}` : ''}`,
+      status: 'published', // system-generated from already-tagged questions — skip draft/review
+      owner_user_id: user.id,
+      generated_from: { intervention_id: interventionId, chapter, topic, pool, question_count: chosen.length },
+      duration_seconds: durationSeconds
+    })
+    .select()
+    .single();
+  if (testError) {
+    console.error('[targeted] test insert failed:', testError.message);
+    return NextResponse.json({ error: testError.message }, { status: 500 });
+  }
+
+  const questionRows = chosen.map((q, i) => ({
+    test_id: newTest.id,
+    question_number: i + 1,
+    question_text: q.question_text,
+    question_image_url: q.question_image_url,
+    question_data: q.question_data,
+    options: q.options,
+    option_images: q.option_images,
+    correct_answer: q.correct_answer,
+    marks: q.marks ?? 4,
+    negative_marks: q.negative_marks ?? 1,
+    chapter: q.chapter,
+    topic: q.topic,
+    difficulty: q.difficulty,
+    question_type: q.question_type,
+    explanation: q.explanation,
+    origin_question_id: q.id,
+    tag_source: 'targeted_copy'
+  }));
+
+  const { error: qInsertError } = await supabase.from('questions').insert(questionRows);
+  if (qInsertError) {
+    console.error('[targeted] question copy insert failed:', qInsertError.message);
+    return NextResponse.json({ error: qInsertError.message }, { status: 500 });
+  }
+
+  const { data: session, error: sessionError } = await supabase
+    .from('test_sessions')
+    .insert({
+      test_id: newTest.id,
+      mode: 'solo',
+      server_start_time: new Date().toISOString(),
+      duration_seconds: durationSeconds,
+      status: 'live',
+      created_by: user.id,
+      intervention_id: interventionId
+    })
+    .select()
+    .single();
+  if (sessionError) {
+    console.error('[targeted] session insert failed:', sessionError.message);
+    return NextResponse.json({ error: sessionError.message }, { status: 500 });
+  }
+
+  const { error: joinError } = await supabase
+    .from('session_participants')
+    .insert({ session_id: session.id, user_id: user.id });
+  if (joinError) {
+    console.error('[targeted] session join failed:', joinError.message);
+    return NextResponse.json({ error: joinError.message }, { status: 500 });
+  }
+
+  return NextResponse.json(
+    { test: newTest, session, question_count: questionRows.length, reused: false },
+    { status: 201 }
+  );
 }
 
 
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticContext.kt =====
-package com.checkmate.learning.tutor
-
-import com.checkmate.learning.model.PrerequisiteRef
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — the context schema fed to [TutorLlmGateway.diagnose].
- * Assembled by [TutorDiagnosticContextBuilder] from already-derived intelligence
- * ([com.checkmate.learning.model.StudentModel] + [com.checkmate.learning.model.ErrorRecord]
- * history) — this type itself carries no I/O and derives nothing new, same "aggregates,
- * doesn't re-derive" discipline
- * [com.checkmate.learning.student.StudentModelBuilder]'s own class doc establishes for the
- * layer beneath it.
- *
- * [knownEvidenceQuestionIds] is the ONLY set of question ids
- * [TutorDiagnosticValidator.validate] will accept in a response's `evidenceQuestionIds` —
- * an id the LLM names that isn't in this set gets silently dropped, not trusted just
- * because the LLM said so (see that validator's own "evidence actually belongs to this
- * concept" check).
- */
-data class TutorDiagnosticContext(
-    val conceptId: String,
-    val exam: String?,
-    val subject: String?,
-    val chapter: String?,
-    val topic: String?,
-    val mastery: Double,
-    val retentionDecision: RetentionDecisionSnapshot,
-    val forgettingRisk: Double,
-    val attemptCount: Int,
-    val recentAccuracy: Double,
-    val lifetimeAccuracy: Double,
-    val errorCount: Int,
-    /** Most-recent-first, capped at [TutorDiagnosticContextBuilder.MAX_RECENT_ERRORS] —
-     *  enough for an LLM prompt to reason over without unbounded growth for a concept with
-     *  a long error history. */
-    val recentErrors: List<EvidenceErrorRef>,
-    val weakPrerequisites: List<PrerequisiteRef>,
-    /** The tutor session's own state/cycleCount at the moment DIAGNOSE ran — lets the LLM
-     *  (and a human reading a stored [TutorDiagnosticFinding] later) tell a first-pass
-     *  diagnosis apart from one produced after EXPLAIN/PRACTICE already looped once. */
-    val tutorState: TutorState,
-    val cycleCount: Int
-) {
-    val knownEvidenceQuestionIds: Set<String> get() = recentErrors.map { it.questionId }.toSet()
-}
-
-/**
- * One [com.checkmate.learning.model.ErrorRecord], trimmed to what a diagnosis prompt (or
- * [TutorDiagnosticValidator]'s evidence check) actually needs — not the full Room entity.
- */
-data class EvidenceErrorRef(
-    val questionId: String,
-    /** [com.checkmate.learning.model.ErrorType.name] — same "plain string, not the
-     *  engine-internal enum" choice [com.checkmate.learning.model.ErrorPatternSnapshot]
-     *  already makes for the same reason. */
-    val errorType: String,
-    val timestamp: Long
-)
-
-/**
- * Context for [TutorLlmGateway.explain] — the accepted diagnosis plus everything
- * [TutorDiagnosticContext] already carries about the concept, so the explain prompt never
- * needs to re-derive or re-fetch anything [diagnostic] already has. Composition over
- * duplicating fields, same reasoning [TutorExplanationContext]'s sibling types in this
- * package already follow.
- */
-data class TutorExplanationContext(
-    val diagnostic: TutorDiagnosticContext,
-    val finding: TutorDiagnosticFinding
-)
 
 
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/LlmDiagnosticResponse.kt =====
-package com.checkmate.learning.tutor
-
-import org.json.JSONException
-import org.json.JSONObject
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — exactly what the model says, untrusted. Never
- * persisted, never handed to [TutorStateMachine] directly — [TutorDiagnosticValidator]
- * is the only path from this type to a durable [TutorDiagnosticFinding]. Same "LLM output
- * is untrusted input, never a decision" boundary
- * [com.checkmate.planner.intervention.LlmIntentParser]'s own class doc already establishes
- * for the negotiation-screen intent schema — this is that same discipline applied to
- * diagnosis.
- */
-data class LlmDiagnosticResponse(
-    val hypothesis: String,
-    /** Raw, unparsed — [HypothesisType.parse] resolves it downstream in
-     *  [TutorDiagnosticValidator]. Kept as a raw string here rather than [HypothesisType]
-     *  itself so an LLM inventing a label outside the closed vocabulary is a soft
-     *  UNKNOWN-fallback, not a parse failure that discards the whole response. */
-    val hypothesisType: String?,
-    val suspectedSubConcept: String?,
-    val reasoningSummary: String?,
-    val evidenceQuestionIds: List<String>,
-    val confidence: Double,
-    val recommendedProbe: String?
-) {
-    companion object {
-        /**
-         * @param raw the LLM's raw text response. Tolerates a markdown code fence around
-         *   the JSON — same [stripCodeFence] tolerance
-         *   [com.checkmate.planner.intervention.LlmIntentParser.parse] already applies, for
-         *   the same reason (some providers wrap JSON output in ```json fences regardless
-         *   of system-prompt instructions).
-         *
-         * Expected shape:
-         *   {
-         *     "hypothesis": "...",
-         *     "hypothesisType": "CONCEPTUAL_MISUNDERSTANDING",
-         *     "suspectedSubConcept": "...",
-         *     "reasoningSummary": "...",
-         *     "evidenceQuestionIds": ["q1", "q2"],
-         *     "confidence": 0.7,
-         *     "recommendedProbe": "..."
-         *   }
-         *
-         * Returns null — never throws — for unparseable JSON or a missing/blank
-         * `hypothesis` (the one field with no honest default). Null is load-bearing, same
-         * as [com.checkmate.planner.intervention.LlmIntentParser.parse]'s own null: every
-         * caller treats a failed parse identically to a timed-out/blank LLM call and falls
-         * back to [TutorDiagnosticValidator.deterministicFallback].
-         */
-        fun parse(raw: String): LlmDiagnosticResponse? {
-            val obj = try {
-                JSONObject(stripCodeFence(raw))
-            } catch (e: JSONException) {
-                return null
-            }
-
-            val hypothesis = obj.optString("hypothesis", "").takeIf { it.isNotBlank() } ?: return null
-            val confidence = obj.optDouble("confidence", Double.NaN)
-            if (confidence.isNaN()) return null
-
-            val evidenceIds = obj.optJSONArray("evidenceQuestionIds")?.let { arr ->
-                (0 until arr.length()).mapNotNull { i -> arr.optString(i, null)?.takeIf { it.isNotBlank() } }
-            } ?: emptyList()
-
-            return LlmDiagnosticResponse(
-                hypothesis = hypothesis,
-                hypothesisType = obj.optStringOrNull("hypothesisType"),
-                suspectedSubConcept = obj.optStringOrNull("suspectedSubConcept"),
-                reasoningSummary = obj.optStringOrNull("reasoningSummary"),
-                evidenceQuestionIds = evidenceIds,
-                confidence = confidence,
-                recommendedProbe = obj.optStringOrNull("recommendedProbe")
-            )
-        }
-    }
-}
-
-/** org.json's [JSONObject.optString] returns the literal string "null" for a missing key
- *  in some call forms — same footgun [com.checkmate.planner.intervention.LlmIntentParser]
- *  already guards against with an identical helper; duplicated here rather than shared
- *  since :modules:learning has no dependency on :modules:planner (only the reverse). */
-internal fun JSONObject.optStringOrNull(key: String): String? =
-    if (has(key) && !isNull(key)) optString(key, null) else null
-
-internal fun stripCodeFence(raw: String): String {
-    val trimmed = raw.trim()
-    if (!trimmed.startsWith("```")) return trimmed
-    return trimmed
-        .removePrefix("```json").removePrefix("```JSON").removePrefix("```")
-        .removeSuffix("```")
-        .trim()
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/LlmExplanationResponse.kt =====
-package com.checkmate.learning.tutor
-
-import org.json.JSONException
-import org.json.JSONObject
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — structured, not prose. Per the Upgrade Blueprint's own
- * framing ("the mentor never free-lectures... first check known/unknown/misunderstood/
- * forgotten, then pick the *type* of response — not a fixed-length essay"), this carries
- * the separate structured pieces a teaching layer can compose from (a short explanation, a
- * worked example, a common trap, a check question, a hint ladder) rather than one long
- * generated paragraph. Same untrusted status as [LlmDiagnosticResponse] — this is
- * generated content, not a decision, and P3.1 does not build the "Checkmate pedagogical/
- * policy validation" step this feeds into (flagged as a later pass, not invented here).
- */
-data class LlmExplanationResponse(
-    val explanation: String,
-    val keyIdea: String?,
-    val workedExample: String?,
-    val commonTrap: String?,
-    val checkQuestion: String?,
-    val hintLadder: List<String>,
-    /** What the explanation is grounded in — e.g. concept ids, a specific
-     *  [com.checkmate.learning.model.Question] id, a syllabus reference. Free-form strings
-     *  rather than a typed reference on purpose: P3.1 doesn't define what a "grounding ref"
-     *  resolves to yet (no single canonical id space covers concept/question/syllabus
-     *  references today) — kept as opaque strings so this contract doesn't have to be
-     *  revisited the moment that's decided. */
-    val groundingRefs: List<String>
-) {
-    companion object {
-        /**
-         * Same tolerance/failure discipline as [LlmDiagnosticResponse.parse] — strips a
-         * markdown code fence, returns null (never throws) for unparseable JSON or a
-         * missing/blank `explanation` (the one field with no honest default).
-         *
-         * Expected shape:
-         *   {
-         *     "explanation": "...",
-         *     "keyIdea": "...",
-         *     "workedExample": "...",
-         *     "commonTrap": "...",
-         *     "checkQuestion": "...",
-         *     "hintLadder": ["...", "..."],
-         *     "groundingRefs": ["..."]
-         *   }
-         */
-        fun parse(raw: String): LlmExplanationResponse? {
-            val obj = try {
-                JSONObject(stripCodeFence(raw))
-            } catch (e: JSONException) {
-                return null
-            }
-
-            val explanation = obj.optString("explanation", "").takeIf { it.isNotBlank() } ?: return null
-
-            fun stringList(key: String): List<String> =
-                obj.optJSONArray(key)?.let { arr ->
-                    (0 until arr.length()).mapNotNull { i -> arr.optString(i, null)?.takeIf { it.isNotBlank() } }
-                } ?: emptyList()
-
-            return LlmExplanationResponse(
-                explanation = explanation,
-                keyIdea = obj.optStringOrNull("keyIdea"),
-                workedExample = obj.optStringOrNull("workedExample"),
-                commonTrap = obj.optStringOrNull("commonTrap"),
-                checkQuestion = obj.optStringOrNull("checkQuestion"),
-                hintLadder = stringList("hintLadder"),
-                groundingRefs = stringList("groundingRefs")
-            )
-        }
-    }
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticFinding.kt =====
-package com.checkmate.learning.tutor
-
-import kotlinx.serialization.Serializable
-import java.util.UUID
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — the validated, durable Checkmate representation of a
- * diagnosis. The ONLY way to construct one is [TutorDiagnosticValidator.validate] (an LLM
- * hypothesis that clears validation) or [TutorDiagnosticValidator.deterministicFallback]
- * (no LLM involved) — never built directly from an untrusted [LlmDiagnosticResponse].
- *
- * NAMED DELIBERATELY DIFFERENT FROM [DiagnosticFinding]: that enum (KNOWN/UNKNOWN/
- * MISUNDERSTOOD/FORGOTTEN) is the coarse, already-load-bearing evidence type
- * [TutorEvidence.Diagnostic] carries into [TutorStateMachine] — reusing its name for this
- * much richer shape would either collide or silently shadow it. [TutorCycleManager]'s P3.2
- * wiring (see that file) keeps this deliberate: the LLM-produced [hypothesisType] here
- * enriches what EXPLAIN has to work with, but the coarse [DiagnosticFinding] driving
- * [TutorStateMachine]'s own transition stays [TutorDiagnostics]'s deterministic heuristic,
- * unchanged — matching that state machine's own "an LLM may PRODUCE the evidence this file
- * consumes... but never decides the transition itself" invariant.
- *
- * [Serializable]: P3.2's [TutorDiagnosticFindingLedger] persists this directly as one JSON
- * blob via CheckmatePrefs — same pattern [TutorSession] itself already establishes via
- * [TutorSessionLedger], for the same reason (a plain-data snapshot that needs to survive
- * one background-loop tick to the next, not a Room-modeled entity in its own right yet).
- */
-@Serializable
-data class TutorDiagnosticFinding(
-    val findingId: String = UUID.randomUUID().toString(),
-    val conceptId: String,
-    val hypothesisType: HypothesisType,
-    val hypothesis: String,
-    val suspectedSubConcept: String?,
-    /** Only the subset of the LLM's claimed evidence that
-     *  [TutorDiagnosticValidator.validate] actually confirmed belongs to this concept — see
-     *  that function's own doc for why a partially-hallucinated evidence list is filtered,
-     *  not rejected outright. */
-    val validatedEvidenceQuestionIds: List<String>,
-    val confidence: Double,
-    val createdAt: Long,
-    val source: FindingSource,
-    val status: FindingStatus = FindingStatus.ACTIVE
-)
-
-enum class FindingSource { LLM, DETERMINISTIC }
-
-/** [ACTIVE] until something acts on it. [VERIFIED]/[REJECTED]/[SUPERSEDED] are declared
- *  per the P3.1 spec's own contract but nothing in this pass transitions a finding into
- *  them yet — that belongs to whatever P3.2 follow-up consumes [TutorDiagnosticFinding]
- *  (e.g. VERIFY resolving it, or a fresh DIAGNOSE superseding a stale one). */
-enum class FindingStatus { ACTIVE, VERIFIED, REJECTED, SUPERSEDED }
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticValidator.kt =====
-package com.checkmate.learning.tutor
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — "substantive validation lives in Checkmate Kotlin
- * only, never duplicated into a gateway/Worker layer." This is that validation, and the
- * ONLY path from an untrusted [LlmDiagnosticResponse] to a durable [TutorDiagnosticFinding].
- * Pure and synchronous — no I/O, no Android dependency — same "engine tested pure" split
- * [TutorStateMachine] itself already models, so this is exercisable from a plain JVM test
- * with zero Context/Room/network involved.
- *
- * Pipeline this implements:
- * ```
- * TutorDiagnosticContext -> LLM Gateway -> LlmDiagnosticResponse (untrusted)
- *   -> TutorDiagnosticValidator:
- *        - concept exists?           (context.conceptId non-blank)
- *        - hypothesis non-empty?     (the one field with no honest default)
- *        - confidence in bounds?     ([0.0, 1.0])
- *        - evidence belongs here?    (filtered against context.knownEvidenceQuestionIds)
- *        - schema valid?             (LlmDiagnosticResponse.parse already enforced this
- *                                      before this function ever sees a response)
- *   -> TutorDiagnosticFinding (durable)
- * ```
- */
-object TutorDiagnosticValidator {
-
-    sealed class ValidationResult {
-        data class Valid(val finding: TutorDiagnosticFinding) : ValidationResult()
-        /** Never thrown, always returned — same "caller decides what happens next, this
-         *  function never has side effects" discipline as [TutorTransitionResult.Invalid]. */
-        data class Rejected(val reason: String) : ValidationResult()
-    }
-
-    /**
-     * Validates [response] against [context] and produces a [TutorDiagnosticFinding] on
-     * success. `evidenceQuestionIds` the LLM named that AREN'T in
-     * [TutorDiagnosticContext.knownEvidenceQuestionIds] are silently dropped rather than
-     * causing outright rejection — a hypothesis citing one hallucinated id alongside three
-     * real ones is still a usable diagnosis; only the unbacked claim is discarded, not the
-     * whole finding. An `hypothesisType` string that doesn't match [HypothesisType]'s
-     * closed vocabulary is likewise soft-mapped to [HypothesisType.UNKNOWN] by
-     * [HypothesisType.parse], not a rejection reason — see that function's own doc.
-     *
-     * Genuine rejections are reserved for the response being unusable as a diagnosis at
-     * all: no hypothesis text, or a confidence value outside the range a caller could
-     * sanely act on.
-     */
-    fun validate(
-        response: LlmDiagnosticResponse,
-        context: TutorDiagnosticContext,
-        now: Long
-    ): ValidationResult {
-        if (context.conceptId.isBlank()) {
-            return ValidationResult.Rejected("context has no concept to diagnose")
-        }
-        if (response.hypothesis.isBlank()) {
-            return ValidationResult.Rejected("empty hypothesis")
-        }
-        if (response.confidence < 0.0 || response.confidence > 1.0) {
-            return ValidationResult.Rejected("confidence ${response.confidence} out of [0.0, 1.0] range")
-        }
-
-        val validatedEvidence = response.evidenceQuestionIds.filter { it in context.knownEvidenceQuestionIds }
-
-        return ValidationResult.Valid(
-            TutorDiagnosticFinding(
-                conceptId = context.conceptId,
-                hypothesisType = HypothesisType.parse(response.hypothesisType),
-                hypothesis = response.hypothesis.trim(),
-                suspectedSubConcept = response.suspectedSubConcept?.takeIf { it.isNotBlank() },
-                validatedEvidenceQuestionIds = validatedEvidence,
-                confidence = response.confidence,
-                createdAt = now,
-                source = FindingSource.LLM
-            )
-        )
-    }
-
-    /**
-     * Deterministic fallback finding — same [TutorDiagnosticFinding] shape an LLM diagnosis
-     * would produce, so a downstream caller never has to special-case "no LLM was
-     * involved." Mirrors
-     * [com.checkmate.planner.intervention.InterventionFallback]'s own "the deterministic
-     * path produces the same shape a real negotiation would" discipline.
-     *
-     * Used specifically for "an LLM diagnosis was attempted and didn't come back usable"
-     * (blank/timeout/unparseable/[ValidationResult.Rejected]) — this does NOT replace
-     * [TutorDiagnostics.diagnose], which is the existing four-way heuristic still governing
-     * DIAGNOSE when no LLM is configured at all (see [TutorCycleManager]'s own class doc:
-     * "NO LLM CALL ANYWHERE IN THIS FILE" — wiring this in is the P3.2 follow-up, not part
-     * of P3.1).
-     */
-    fun deterministicFallback(context: TutorDiagnosticContext, now: Long): TutorDiagnosticFinding =
-        TutorDiagnosticFinding(
-            conceptId = context.conceptId,
-            hypothesisType = HypothesisType.UNKNOWN,
-            hypothesis = "No LLM diagnosis available — falling back to deterministic evidence only.",
-            suspectedSubConcept = null,
-            validatedEvidenceQuestionIds = emptyList(),
-            confidence = 0.0,
-            createdAt = now,
-            source = FindingSource.DETERMINISTIC
-        )
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorLlmGateway.kt =====
-package com.checkmate.learning.tutor
-
-/**
- * Upgrade Blueprint Phase 3, P3.1 — the gateway seam, introduced now even with only one
- * implementation ([DirectLlmGateway]), so a future `RemoteLlmGateway` (Worker-fronted,
- * personal-convenience only per the roadmap's own "deferred, not blocking" note) can slot
- * in later without touching [TutorDiagnosticContext]/[LlmDiagnosticResponse]/
- * [LlmExplanationResponse] or any caller of this interface.
- *
- * NAMED DELIBERATELY DIFFERENT FROM [com.checkmate.core.llm.LlmGateway]: that `object`
- * already exists as the concrete multi-provider transport (Groq/OpenRouter/Claude/Gemini/
- * VibeBuild, chosen via CheckmatePrefs). This interface does not replace or wrap over it at
- * the transport level — [DirectLlmGateway] is a NEW consumer of the existing
- * `com.checkmate.core.llm.LlmGateway.complete()` call, one layer up:
- * ```
- * TutorLlmGateway (this file)
- *        |
- *        v
- * DirectLlmGateway  ── prompt building + response parsing (tutor-specific)
- *        |
- *        v
- * com.checkmate.core.llm.LlmGateway.complete()  ── unchanged, provider transport only
- *        |
- *        v
- * Groq / OpenRouter / Claude / Gemini / VibeBuild
- * ```
- * Both `diagnose`/`explain` return null (never throw) on a blank/unparseable LLM response —
- * same "no API key configured -> empty string -> caller falls back" contract
- * `com.checkmate.core.llm.LlmGateway.complete`'s own doc already establishes; a caller here
- * feeds a null straight into [TutorDiagnosticValidator.deterministicFallback] the same way
- * a null [LlmIntentParser][com.checkmate.planner.intervention.LlmIntentParser] result
- * already triggers `InterventionFallback` elsewhere in this codebase.
- */
-interface TutorLlmGateway {
-    suspend fun diagnose(context: TutorDiagnosticContext): LlmDiagnosticResponse?
-    suspend fun explain(context: TutorExplanationContext): LlmExplanationResponse?
-}
-
-object DirectLlmGateway : TutorLlmGateway {
-
-    override suspend fun diagnose(context: TutorDiagnosticContext): LlmDiagnosticResponse? {
-        val raw = com.checkmate.core.llm.LlmGateway.complete(
-            prompt = buildDiagnosePrompt(context),
-            systemPrompt = DIAGNOSE_SYSTEM_PROMPT
-        )
-        if (raw.isBlank()) return null
-        return LlmDiagnosticResponse.parse(raw)
-    }
-
-    override suspend fun explain(context: TutorExplanationContext): LlmExplanationResponse? {
-        val raw = com.checkmate.core.llm.LlmGateway.complete(
-            prompt = buildExplainPrompt(context),
-            systemPrompt = EXPLAIN_SYSTEM_PROMPT
-        )
-        if (raw.isBlank()) return null
-        return LlmExplanationResponse.parse(raw)
-    }
-
-    // ── DIAGNOSE prompt ──────────────────────────────────────────────────────
-
-    /** Lists the closed [HypothesisType] vocabulary verbatim so the model classifies into
-     *  it rather than inventing labels — same "closed schema, LLM doesn't invent" framing
-     *  [com.checkmate.planner.intervention.LlmIntentParser]'s own expected-shape doc uses
-     *  for `intentType`. */
-    private val DIAGNOSE_SYSTEM_PROMPT = """
-        You are Checkmate's diagnostic reasoning step for one exam-prep concept. You do not
-        decide anything — a separate deterministic validator decides what happens next. Your
-        only job is to propose a hypothesis for why the student is stuck, grounded in the
-        evidence given.
-
-        Respond with ONLY a single JSON object, no markdown, no commentary:
-        {
-          "hypothesis": "<one or two sentences, specific to the evidence>",
-          "hypothesisType": "<one of: ${HypothesisType.entries.filter { it != HypothesisType.UNKNOWN }.joinToString(", ") { it.name }}>",
-          "suspectedSubConcept": "<a narrower sub-topic than the given concept, or null>",
-          "reasoningSummary": "<why this hypothesis, one sentence>",
-          "evidenceQuestionIds": ["<question ids from the given error history that support this>"],
-          "confidence": <0.0 to 1.0>,
-          "recommendedProbe": "<a short diagnostic question to confirm/refute this, or null>"
-        }
-
-        Only cite question ids that appear in the evidence you were given — never invent one.
-        If the evidence doesn't clearly support one hypothesis, say so honestly with a lower
-        confidence rather than guessing.
-    """.trimIndent()
-
-    private fun buildDiagnosePrompt(context: TutorDiagnosticContext): String = buildString {
-        appendLine("Concept: ${context.subject ?: "?"} / ${context.chapter ?: "?"} / ${context.topic ?: context.conceptId}")
-        appendLine("Mastery: ${context.mastery} (attempts=${context.attemptCount}, recentAccuracy=${context.recentAccuracy}, lifetimeAccuracy=${context.lifetimeAccuracy})")
-        appendLine("Retention: ${context.retentionDecision}, forgettingRisk=${context.forgettingRisk}")
-        appendLine("Tutor state: ${context.tutorState}, cycleCount=${context.cycleCount}")
-        if (context.weakPrerequisites.isNotEmpty()) {
-            appendLine("Weak prerequisites: " + context.weakPrerequisites.joinToString { it.topic ?: it.chapter ?: it.conceptId })
-        }
-        appendLine("Recent wrong-answer evidence (id: errorType @ timestamp):")
-        if (context.recentErrors.isEmpty()) {
-            appendLine("  (none)")
-        } else {
-            context.recentErrors.forEach { appendLine("  ${it.questionId}: ${it.errorType} @ ${it.timestamp}") }
-        }
-    }
-
-    // ── EXPLAIN prompt ───────────────────────────────────────────────────────
-
-    private val EXPLAIN_SYSTEM_PROMPT = """
-        You are Checkmate's explanation-generation step for one exam-prep concept, following
-        a diagnosis that already identified why the student is stuck. Do not free-lecture —
-        produce short, targeted pieces the app can compose from, not one long essay.
-
-        Respond with ONLY a single JSON object, no markdown, no commentary:
-        {
-          "explanation": "<short, targeted micro-explanation, 2-4 sentences>",
-          "keyIdea": "<the single core idea in one sentence, or null>",
-          "workedExample": "<one worked example, or null>",
-          "commonTrap": "<the specific mistake this student is making, or null>",
-          "checkQuestion": "<a quick question to check understanding, or null>",
-          "hintLadder": ["<hint 1, smallest nudge>", "<hint 2>", "<hint 3, most direct>"],
-          "groundingRefs": ["<what this is grounded in — concept/question ids, syllabus refs>"]
-        }
-    """.trimIndent()
-
-    private fun buildExplainPrompt(context: TutorExplanationContext): String = buildString {
-        val d = context.diagnostic
-        val f = context.finding
-        appendLine("Concept: ${d.subject ?: "?"} / ${d.chapter ?: "?"} / ${d.topic ?: d.conceptId}")
-        appendLine("Diagnosis: ${f.hypothesisType} (confidence=${f.confidence}, source=${f.source})")
-        appendLine("Hypothesis: ${f.hypothesis}")
-        f.suspectedSubConcept?.let { appendLine("Suspected sub-concept: $it") }
-        appendLine("Student mastery: ${d.mastery}, recentAccuracy=${d.recentAccuracy}")
-    }
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticContextBuilder.kt =====
-package com.checkmate.learning.tutor
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+package com.checkmate.service
 
 import android.content.Context
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.ConceptWeightage
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.tutor.TutorSessionLedger
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateQuestionPool
+import com.checkmate.testmate.TestmateResultOutcome
+import com.checkmate.testmate.TestmateTargetedTestOutcome
+import com.checkmate.ui.mentor.MentorViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Upgrade Blueprint Phase 3, P3.1 — assembles [TutorDiagnosticContext] from already-derived
- * intelligence ([com.checkmate.learning.model.StudentModel] +
- * [com.checkmate.learning.model.ErrorRecord] history), same "aggregates, doesn't
- * re-derive" discipline [com.checkmate.learning.student.StudentModelBuilder] itself
- * follows one layer down. The only place in this package that touches Room/Context for
- * P3.1 — [TutorDiagnosticValidator] stays pure, matching the "engine tested pure, builder
- * wraps it with I/O" split [TutorStateMachine]/[TutorSessionLedger] already model.
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done — and warn the student, with escalating persuasion, when one is being
+ * ignored." Three entry points now, all called from [ReminderService]'s existing 15-min
+ * loop (same wiring pattern as every [ProactiveMentor] check already there):
+ *
+ * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
+ *   doc always said was still missing, now filled by a genuine day-level schedule instead
+ *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
+ *   still owns that import-time trigger; this is the *ongoing* one). Also now requests the
+ *   P0b Testmate targeted test for whichever concept ends up active (see
+ *   [createTargetedTestIfNeeded]).
+ * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
+ *   currently being served and, once it's gone unaddressed for more than a day, sends an
+ *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
+ *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ * - [evidencePollIfNeeded] — P0b: the actual return arrow. Every 15-min cycle (NOT
+ *   once-a-day gated, unlike the two above — the student could submit the Testmate test at
+ *   any time), checks whether the active concept's targeted-test result is in yet and, if
+ *   so, hands it to [TargetedTestEvidenceImporter] so mastery moves off REAL evidence
+ *   instead of only the task's DONE flag.
+ *
+ * Neither [generateIfNeeded] nor [escalationCheckIfNeeded] needs its own "is there anything
+ * to analyze" gate beyond checking `studentModel.concepts.isEmpty()` — an empty StudentModel
+ * (no test ever imported) just means [LearningDecisionEngine.decideFromReport] returns no
+ * candidates and nothing happens, same as the import-time trigger's own behavior.
  */
-object TutorDiagnosticContextBuilder {
+object GapTaskManager {
 
-    /** Caps how many recent [com.checkmate.learning.model.ErrorRecord] rows go into a
-     *  diagnosis prompt — enough for an LLM to spot a pattern without unbounded growth for
-     *  a concept with a long error history. Not calibrated against real prompt-quality
-     *  outcomes — first-pass constant, flagged rather than pretended-derived, same honesty
-     *  [TutorStateMachine.MAX_CYCLES] and [TutorStateMachine.MIN_PRACTICE_ATTEMPTS] apply
-     *  to their own first-pass constants. */
-    private const val MAX_RECENT_ERRORS = 10
+    private const val TAG = "GapTaskManager"
+
+    // FIX (repair-test hard limit): a repair test must cover every wrong/skipped question
+    // the student has for the concept's chapter/topic, not a fixed slice of them. 0 is the
+    // sentinel Testmate's POST /api/tests/targeted route.ts reads as "no cap" for the
+    // WRONG_SKIPPED pool (see that route's own doc) — it was 15 before, which silently
+    // truncated any repair set bigger than that. Retention checks are a different, smaller
+    // probe and intentionally keep their own fixed count — see
+    // RetentionCheckManager.RETENTION_QUESTION_COUNT, untouched by this.
+    private const val TARGETED_TEST_QUESTION_COUNT = 0
+
+    // Persisted (not just logged) so a create-test failure is visible in Settings → Test
+    // Platform without needing adb logcat — Log.w/Log.e alone rotate out of the buffer
+    // within hours, which is exactly what made a 2-day-old missing token invisible on
+    // device. Cleared on the next successful attempt, or manually from Settings.
+    const val PREF_TESTMATE_LAST_ERROR = "gap_task_testmate_last_error"
+    const val PREF_TESTMATE_LAST_ERROR_AT = "gap_task_testmate_last_error_at"
+
+    // BUGFIX (topic-"null" 422 loop, one-time data repair): once-ever guard for
+    // repairLegacyNullTopicsIfNeeded — the repair itself is a cheap single UPDATE per
+    // table, but there's no reason to run it on every generateIfNeeded call for the rest
+    // of this install's life once it's confirmed done.
+    private const val PREF_REPAIRED_LEGACY_NULL_TOPICS = "gap_task_repaired_legacy_null_topics_v1"
+
+    // ── Daily generation ─────────────────────────────────────────────────────
 
     /**
-     * Returns null when [conceptId] has no [com.checkmate.learning.model.ConceptSnapshot]
-     * at all — i.e. genuinely never attempted (the same
-     * [com.checkmate.learning.engine.LearningDecisionEngine.LearningInterventionIntent.START_DIAGNOSTIC]
-     * case [TutorDiagnostics.diagnose] itself treats as "no evidence exists, [UNKNOWN] is
-     * the only honest answer"). Deliberately NOT building a context with zeroed-out fields
-     * for that case — asking an LLM to hypothesize about a concept with literally zero
-     * evidence would produce a confident-sounding guess dressed up as a diagnosis, exactly
-     * what [TutorDiagnostics]'s own doc already warns against. A caller getting null here
-     * should fall back to [TutorDiagnostics.diagnose] with a null snapshot, same as today.
+     * Once per calendar day (guarded by [GapTaskLedger.hasGeneratedToday]): resolves whether
+     * yesterday's gap-task actually got finished (see [resolveActiveConceptState]), then runs
+     * the exact same StudentModel -> PerformanceReport -> ScoreGainEstimator -> ExpectedScore
+     * -> DecisionReport pipeline [com.checkmate.ui.testresults.TestResultsViewModel] runs
+     * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
+     * instead of a just-parsed report since there may be no fresh import today at all.
+     * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
+     * and picking up where yesterday left off. Once that's done, also requests (or confirms)
+     * the P0b Testmate targeted test for whichever concept is now active — see
+     * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
+     * analysis run shouldn't retry every 15 minutes for the rest of the day).
      */
-    suspend fun build(
-        context: Context,
-        conceptId: String,
-        tutorState: TutorState,
-        cycleCount: Int
-    ): TutorDiagnosticContext? {
-        val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
-        val snapshot = studentModel.concepts[conceptId] ?: return null
+    /**
+     * BUGFIX (unsynchronized ledger race): this whole body used to run un-serialized
+     * against the two other call chains that also read-then-write [GapTaskLedger]'s
+     * active-round/session state ([LearningInterventionOrchestrator.executeTopCandidate]
+     * called directly from [com.checkmate.ui.testresults.TestResultsViewModel], and this
+     * same function called from [com.checkmate.ui.home.HomeViewModel.confirmCompletion]).
+     * See [GapTaskLedger.withLock]'s own doc for the concrete failure this closes.
+     */
+    suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
+        generateIfNeededLocked(context)
+    }
 
-        val recentErrors = withContext(Dispatchers.IO) {
-            LearningDatabase.getInstance(context).errorRecordDao().getByConcept(conceptId)
+    private suspend fun generateIfNeededLocked(context: Context) {
+        // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
+        // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
+        // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
+        // 15-min cycle, same cadence as evidencePollIfNeeded, NOT only once per calendar
+        // day. The active concept's task can legitimately go DONE-with-evidence-imported
+        // more than once in a single day (a fast student, or a same-day repro/test cycle),
+        // and each time it does, the loop needs to advance the round and request the next
+        // Testmate retest THE SAME DAY — not sit inert until hasGeneratedToday resets
+        // tomorrow. Confirmed live: with this gated, marking the round-2 task Done and
+        // re-importing its evidence same-day did nothing at all until
+        // gap_task_last_generated_day was manually deleted from prefs to force a fresh
+        // generateIfNeeded run — the ONLY code path that ever calls
+        // resolveActiveConceptState/createTargetedTestIfNeeded. Both are cheap, ledger-
+        // driven, and safely no-op with nothing active, so running them unconditionally
+        // here is safe — unlike the StudentModel/PerformanceAnalyzer pipeline below, which
+        // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
+        // part.
+        resolveActiveConceptState(context)
+        createTargetedTestIfNeeded()
+
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+
+        repairLegacyNullTopicsIfNeeded(context)
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+            val decisionReport = LearningDecisionEngine.decideFromReport(
+                report, studentModel, estimates, expectedScore
+            )
+            val orchestrationResult =
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
+            // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
+            // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
+            // startFromCandidate's own doc for which intents this actually applies to.
+            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
+            createTargetedTestIfNeeded()
+        } catch (e: Exception) {
+            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+        } finally {
+            GapTaskLedger.markGeneratedToday(todayKey)
         }
-            .sortedByDescending { it.timestamp }
-            .take(MAX_RECENT_ERRORS)
-            .map { EvidenceErrorRef(questionId = it.questionId, errorType = it.errorType.name, timestamp = it.timestamp) }
-
-        val weakPrerequisites = studentModel.weakPrerequisites
-            .firstOrNull { it.conceptId == conceptId }
-            ?.weakPrerequisites
-            ?: emptyList()
-
-        return TutorDiagnosticContext(
-            conceptId = conceptId,
-            exam = snapshot.exam,
-            subject = snapshot.subject,
-            chapter = snapshot.chapter,
-            topic = snapshot.topic,
-            mastery = snapshot.mastery,
-            retentionDecision = snapshot.retentionDecision,
-            forgettingRisk = snapshot.forgettingRisk,
-            attemptCount = snapshot.attemptCount,
-            recentAccuracy = snapshot.recentAccuracy,
-            lifetimeAccuracy = snapshot.lifetimeAccuracy,
-            errorCount = snapshot.errorCount,
-            recentErrors = recentErrors,
-            weakPrerequisites = weakPrerequisites,
-            tutorState = tutorState,
-            cycleCount = cycleCount
-        )
-    }
-}
-
-
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/tutor/TutorDiagnosticValidatorTest.kt =====
-package com.checkmate.learning.tutor
-
-import com.checkmate.learning.model.RetentionDecisionSnapshot
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class HypothesisTypeTest {
-
-    @Test
-    fun `parses an exact member name`() {
-        assertEquals(HypothesisType.CONCEPTUAL_MISUNDERSTANDING, HypothesisType.parse("CONCEPTUAL_MISUNDERSTANDING"))
     }
 
-    @Test
-    fun `unknown label falls back to UNKNOWN, not a crash`() {
-        assertEquals(HypothesisType.UNKNOWN, HypothesisType.parse("SOMETHING_THE_LLM_MADE_UP"))
-    }
-
-    @Test
-    fun `null falls back to UNKNOWN`() {
-        assertEquals(HypothesisType.UNKNOWN, HypothesisType.parse(null))
-    }
-}
-
-class LlmDiagnosticResponseParseTest {
-
-    private val validJson = """
-        {
-          "hypothesis": "Sign error when substituting into the formula.",
-          "hypothesisType": "SIGN_DIRECTION_ERROR",
-          "suspectedSubConcept": "Vector subtraction",
-          "reasoningSummary": "Three of four wrong answers flipped a sign.",
-          "evidenceQuestionIds": ["q1", "q2"],
-          "confidence": 0.75,
-          "recommendedProbe": "Ask them to redo q1 narrating each sign choice."
+    /**
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, resolves whether
+     * the concept is truly finished (see [resolveDoneConcept]) BEFORE re-ranking — otherwise
+     * today's run would still see it as active (streak intact) for the few seconds between
+     * "the student finished it" and "the ledger found out," and [LearningInterventionOrchestrator]
+     * would have no way to know without this being called first. Safe to call with nothing
+     * active (both lookups return null and this no-ops).
+     */
+    private suspend fun resolveActiveConceptState(context: Context) {
+        // DIAGNOSTIC (round-2 redirect-to-old-result investigation): every early return
+        // below used to be silent — logcat showed createTargetedTestIfNeeded either firing
+        // or not, with no way to tell WHY resolveDoneConcept never ran when it should have.
+        // Logging each branch so the next repro run pinpoints the actual break instead of
+        // requiring another guess-and-rebuild cycle.
+        val conceptId = GapTaskLedger.activeConceptId() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: no active concept — no-op")
+            return
         }
-    """.trimIndent()
-
-    @Test
-    fun `parses a well-formed response`() {
-        val response = LlmDiagnosticResponse.parse(validJson)
-        assertEquals("Sign error when substituting into the formula.", response?.hypothesis)
-        assertEquals("SIGN_DIRECTION_ERROR", response?.hypothesisType)
-        assertEquals(listOf("q1", "q2"), response?.evidenceQuestionIds)
-        assertEquals(0.75, response?.confidence ?: -1.0, 0.0001)
+        val taskId = GapTaskLedger.activeTaskId() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId has no active taskId — no-op")
+            return
+        }
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId has no dayKey — no-op")
+            return
+        }
+        val task = findTask(taskId, dayKey) ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId dayKey=$dayKey — " +
+                "task not found in PlanStore.todayTasks or loadDay($dayKey) — no-op")
+            return
+        }
+        Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
+        if (task.state == TaskState.DONE) {
+            resolveDoneConcept(context, conceptId, dayKey)
+        }
     }
 
-    @Test
-    fun `tolerates a markdown code fence`() {
-        val fenced = "```json\n$validJson\n```"
-        assertEquals("Sign error when substituting into the formula.", LlmDiagnosticResponse.parse(fenced)?.hypothesis)
+    /**
+     * BUGFIX (topic-"null" 422 loop, one-time data repair): a JSON `null` topic used to
+     * survive TestmateApi.parseResult's bare optString() calls as the literal string
+     * "null" instead of a real Kotlin null — see that class's parseResult doc and
+     * GapTaskLedger.sanitizeTopicOrChapter's doc for the full chain. That fix stops NEW
+     * corruption, but does nothing for Question/Concept rows already written to Room
+     * before this build — MasteryEngine.recomputeAll re-derives Concept.topic from a
+     * sample Question row on every single recompute, so an already-poisoned row keeps
+     * re-poisoning GapTaskLedger's active topic (and therefore the Testmate request
+     * payload) forever, purely patching the client never fixes it. Runs once ever per
+     * install (see [PREF_REPAIRED_LEGACY_NULL_TOPICS]) since it's a permanent repair, not
+     * an ongoing condition — every future write already goes through the parseResult fix
+     * plus the GapTaskLedger/TestmateApi sanitize guards.
+     */
+    private suspend fun repairLegacyNullTopicsIfNeeded(context: Context) {
+        if (CheckmatePrefs.getBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, false)) return
+        try {
+            val db = LearningDatabase.getInstance(context)
+            val questionsFixed = withContext(Dispatchers.IO) { db.questionDao().repairLiteralNullTopics() }
+            val conceptsFixed = withContext(Dispatchers.IO) { db.conceptDao().repairLiteralNullTopics() }
+            Log.d(TAG, "repairLegacyNullTopicsIfNeeded: fixed $questionsFixed question row(s), " +
+                "$conceptsFixed concept row(s) with literal topic=\"null\"")
+            CheckmatePrefs.putBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, true)
+        } catch (e: Exception) {
+            // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
+            // runs again on the next generateIfNeeded call instead of silently giving up.
+            Log.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
+        }
     }
 
-    @Test
-    fun `malformed JSON returns null, never throws`() {
-        assertNull(LlmDiagnosticResponse.parse("not json at all"))
-    }
+    /**
+     * BUGFIX (P0b re-intervention loop): a task reaching DONE only means the student finished
+     * the *review task* — it says nothing about whether the concept itself is actually
+     * mastered. The previous behavior called [GapTaskLedger.markCovered] unconditionally as
+     * soon as the task hit DONE, which permanently retired the concept even when the Testmate
+     * retest evidence for that exact concept came back still below
+     * [MasteryEngine.MASTERY_THRESHOLD]. Once covered, [LearningInterventionOrchestrator]
+     * never re-ranks that concept again no matter how weak it stays — this is what silently
+     * broke the "retest -> still weak -> another targeted retest" cycle the whole P0b loop
+     * exists for (confirmed live: report -> targeted test -> retest submitted -> evidence
+     * imported -> mastery recomputed still below threshold -> no next retest was ever
+     * requested, because the concept had already been marked covered the moment its task
+     * card was checked off).
+     *
+     * Now: only mark covered once P0b evidence has actually been imported for this concept
+     * AND mastery has genuinely cleared the bar.
+     * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
+     *   as before this fix.
+     * - Evidence imported and mastery >= threshold -> genuinely done, cover it.
+     * - Evidence imported and mastery still < threshold, OR no mastery row found at all ->
+     *   concept stays active; only its P0b session fields reset (see
+     *   [GapTaskLedger.resetForNextRound]) so [createTargetedTestIfNeeded] requests a
+     *   brand-new Testmate retest for the SAME concept on the next run instead of the loop
+     *   silently stopping.
+     *
+     * BUGFIX (false-covered on conceptId drift): "no mastery row at all" used to be folded
+     * into the same branch as "mastery cleared the bar" — markCovered either way. That's
+     * only safe if a missing row genuinely means "nothing to check," but by the time this
+     * runs [GapTaskLedger.isActiveEvidenceImported] is already true, meaning REAL P0b
+     * evidence WAS imported for this exact round. [MasteryEngine.recomputeAll] re-derives
+     * its grouping key ([com.checkmate.learning.graph.KnowledgeGraph.conceptId]) from each
+     * [com.checkmate.learning.model.Question]'s own chapter/topic tag on every single run —
+     * see that class's own doc — so a retest's Testmate-tagged questions whose chapter/topic
+     * string isn't byte-for-byte identical to the original import's produces a brand-new
+     * hash bucket instead of updating this one, leaving a lookup for the OLD active
+     * conceptId returning null even though the real concept is nowhere near mastered.
+     * Confirmed live: this exact path fired while real mastery was still 0.744 (well under
+     * [MasteryEngine.MASTERY_THRESHOLD]), [GapTaskLedger.markCovered] wiped the still-
+     * unresolved concept, and the identical real gap resurfaced minutes later under a fresh
+     * conceptId — eventually exhausting Testmate's wrong/skipped question pool for that
+     * chapter (repeated fresh-round requests instead of one continuing round). Missing
+     * mastery data with evidence already imported is now treated the same as "still below
+     * threshold" — one extra retest round is far cheaper than silently abandoning a real gap.
+     *
+     * BUGFIX (revert-to-PENDING silent no-op via day-key mismatch): [dayKey] is now required
+     * from the caller (both already have it in scope) instead of this function reaching for
+     * [PlanStore]'s today-only [PlanStore.markTask] — see [PlanStore.markTaskInDay]'s own doc
+     * for the full mechanism. Without the correct day, the "evidence not imported, revert to
+     * PENDING" branch below silently failed to revert anything whenever the active task
+     * wasn't from strictly today, leaving [LearningInterventionOrchestrator.executeTopCandidate]'s
+     * AlreadyActive guard blind to the true PENDING intent and creating a duplicate task for
+     * the same still-unresolved concept — confirmed live via the round-stuck-at-1 /
+     * redirect-to-old-result repro.
+     */
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String, dayKey: String) {
+        if (!GapTaskLedger.isActiveEvidenceImported()) {
+            val round = GapTaskLedger.activeTestmateRound()
+            val sessionId = GapTaskLedger.activeTestmateSessionId()
 
-    @Test
-    fun `missing hypothesis returns null`() {
-        val noHypothesis = """{"confidence": 0.5, "evidenceQuestionIds": []}"""
-        assertNull(LlmDiagnosticResponse.parse(noHypothesis))
-    }
-
-    @Test
-    fun `missing confidence returns null`() {
-        val noConfidence = """{"hypothesis": "x", "evidenceQuestionIds": []}"""
-        assertNull(LlmDiagnosticResponse.parse(noConfidence))
-    }
-
-    @Test
-    fun `optional fields default sensibly when absent`() {
-        val minimal = """{"hypothesis": "x", "confidence": 0.2}"""
-        val response = LlmDiagnosticResponse.parse(minimal)
-        assertEquals(emptyList<String>(), response?.evidenceQuestionIds)
-        assertNull(response?.hypothesisType)
-        assertNull(response?.suspectedSubConcept)
-    }
-}
-
-class LlmExplanationResponseParseTest {
-
-    @Test
-    fun `parses a well-formed response`() {
-        val json = """
-            {
-              "explanation": "Vectors subtract tip-to-tail in the opposite direction.",
-              "keyIdea": "Subtraction is addition of the negative vector.",
-              "hintLadder": ["Try drawing it.", "Flip the second vector.", "Add tip-to-tail."],
-              "groundingRefs": ["q1"]
+            if (sessionId == null) {
+                // Genuinely nothing to check yet — no targeted test was ever requested for
+                // this concept (round 1, no session on file). Covering is correct here.
+                Log.d(TAG, "resolveDoneConcept: concept=$conceptId no session ever created " +
+                    "(round=$round) — nothing to check, covering")
+                GapTaskLedger.markCovered(conceptId)
+                return
             }
-        """.trimIndent()
-        val response = LlmExplanationResponse.parse(json)
-        assertEquals("Vectors subtract tip-to-tail in the opposite direction.", response?.explanation)
-        assertEquals(3, response?.hintLadder?.size)
-    }
 
-    @Test
-    fun `missing explanation returns null`() {
-        assertNull(LlmExplanationResponse.parse("""{"keyIdea": "x"}"""))
-    }
-
-    @Test
-    fun `malformed JSON returns null`() {
-        assertNull(LlmExplanationResponse.parse("{{{"))
-    }
-}
-
-class TutorDiagnosticValidatorTest {
-
-    private fun context(
-        conceptId: String = "concept-1",
-        knownIds: List<String> = listOf("q1", "q2")
-    ) = TutorDiagnosticContext(
-        conceptId = conceptId,
-        exam = "NEET",
-        subject = "Physics",
-        chapter = "Vectors",
-        topic = "Vector subtraction",
-        mastery = 0.4,
-        retentionDecision = RetentionDecisionSnapshot.TEACH,
-        forgettingRisk = 0.0,
-        attemptCount = 8,
-        recentAccuracy = 0.4,
-        lifetimeAccuracy = 0.4,
-        errorCount = 4,
-        recentErrors = knownIds.map { EvidenceErrorRef(questionId = it, errorType = "SIGN_ERROR", timestamp = 1_000L) },
-        weakPrerequisites = emptyList(),
-        tutorState = TutorState.DIAGNOSE,
-        cycleCount = 0
-    )
-
-    private fun response(
-        confidence: Double = 0.7,
-        hypothesis: String = "Sign error on subtraction.",
-        evidenceQuestionIds: List<String> = listOf("q1")
-    ) = LlmDiagnosticResponse(
-        hypothesis = hypothesis,
-        hypothesisType = "SIGN_DIRECTION_ERROR",
-        suspectedSubConcept = "Vector subtraction",
-        reasoningSummary = "reasons",
-        evidenceQuestionIds = evidenceQuestionIds,
-        confidence = confidence,
-        recommendedProbe = null
-    )
-
-    @Test
-    fun `valid response produces an LLM-sourced finding`() {
-        val result = TutorDiagnosticValidator.validate(response(), context(), now = 5_000L)
-        val valid = result as TutorDiagnosticValidator.ValidationResult.Valid
-        assertEquals(FindingSource.LLM, valid.finding.source)
-        assertEquals(HypothesisType.SIGN_DIRECTION_ERROR, valid.finding.hypothesisType)
-        assertEquals("concept-1", valid.finding.conceptId)
-        assertEquals(5_000L, valid.finding.createdAt)
-    }
-
-    @Test
-    fun `evidence ids not in context are dropped, not rejected`() {
-        val result = TutorDiagnosticValidator.validate(
-            response(evidenceQuestionIds = listOf("q1", "q999-hallucinated")),
-            context(),
-            now = 1L
-        )
-        val valid = result as TutorDiagnosticValidator.ValidationResult.Valid
-        assertEquals(listOf("q1"), valid.finding.validatedEvidenceQuestionIds)
-    }
-
-    @Test
-    fun `blank hypothesis is rejected`() {
-        val result = TutorDiagnosticValidator.validate(response(hypothesis = "   "), context(), now = 1L)
-        assertTrue(result is TutorDiagnosticValidator.ValidationResult.Rejected)
-    }
-
-    @Test
-    fun `confidence above 1 is rejected`() {
-        val result = TutorDiagnosticValidator.validate(response(confidence = 1.5), context(), now = 1L)
-        assertTrue(result is TutorDiagnosticValidator.ValidationResult.Rejected)
-    }
-
-    @Test
-    fun `confidence below 0 is rejected`() {
-        val result = TutorDiagnosticValidator.validate(response(confidence = -0.1), context(), now = 1L)
-        assertTrue(result is TutorDiagnosticValidator.ValidationResult.Rejected)
-    }
-
-    @Test
-    fun `blank concept id is rejected`() {
-        val result = TutorDiagnosticValidator.validate(response(), context(conceptId = ""), now = 1L)
-        assertTrue(result is TutorDiagnosticValidator.ValidationResult.Rejected)
-    }
-
-    @Test
-    fun `unparseable hypothesisType soft-falls-back to UNKNOWN, does not reject`() {
-        val weirdResponse = response().copy(hypothesisType = "NOT_A_REAL_TYPE")
-        val result = TutorDiagnosticValidator.validate(weirdResponse, context(), now = 1L)
-        val valid = result as TutorDiagnosticValidator.ValidationResult.Valid
-        assertEquals(HypothesisType.UNKNOWN, valid.finding.hypothesisType)
-    }
-
-    @Test
-    fun `deterministic fallback carries DETERMINISTIC source and zero confidence`() {
-        val finding = TutorDiagnosticValidator.deterministicFallback(context(), now = 42L)
-        assertEquals(FindingSource.DETERMINISTIC, finding.source)
-        assertEquals(0.0, finding.confidence, 0.0001)
-        assertEquals(42L, finding.createdAt)
-    }
-}
-
-
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/tutor/TutorDiagnosticFindingLedger.kt =====
-package com.checkmate.learning.tutor
-
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-
-/**
- * Upgrade Blueprint Phase 3, P3.2 — durable handoff for the [TutorDiagnosticFinding]
- * [com.checkmate.service.TutorCycleManager]'s DIAGNOSE step enriches, so its EXPLAIN step
- * (a separate [com.checkmate.service.ReminderService] 15-min-loop tick — possibly minutes,
- * or a process restart, apart) can read it back without re-running an LLM diagnosis.
- *
- * Same CheckmatePrefs-blob, single-slot pattern [TutorSessionLedger] itself already
- * establishes, and tied to the exact same "one tutor session in flight at a time"
- * invariant that file's own class doc justifies — so a single unkeyed slot (not a
- * per-conceptId map) is correct here too. [current]'s caller is responsible for checking
- * `finding.conceptId` still matches the active session before trusting it (see
- * [com.checkmate.service.TutorCycleManager]'s own EXPLAIN step) — this object doesn't
- * enforce that itself, same "ledger is a thin read/write wrapper, not a decision-maker"
- * split [TutorSessionLedger] models between itself and [TutorStateMachine].
- *
- * NOT unit-tested at the JVM level, same convention [TutorSessionLedger]'s own class doc
- * documents (`CheckmatePrefs.ready()` needs `CheckmatePrefs.init(context)`, which plain JVM
- * tests don't run) — the pure logic that PRODUCES what gets stored here
- * ([TutorDiagnosticValidator]) is exhaustively tested instead (see
- * `TutorDiagnosticValidatorTest`).
- */
-object TutorDiagnosticFindingLedger {
-
-    private const val TAG = "TutorDiagnosticFindingLedger"
-    private val json = Json { ignoreUnknownKeys = true }
-    private const val KEY_ACTIVE_FINDING = "tutor_active_diagnostic_finding"
-
-    /** Current stored finding, if any — null once [clear]ed, or if none was ever stored
-     *  (e.g. [TutorDiagnosticContextBuilder.build] returned null for this session's
-     *  concept, so DIAGNOSE had no evidence to enrich in the first place). */
-    fun current(): TutorDiagnosticFinding? =
-        CheckmatePrefs.getString(KEY_ACTIVE_FINDING, null)?.let {
-            runCatching { json.decodeFromString<TutorDiagnosticFinding>(it) }
-                .onFailure { e -> Log.w(TAG, "failed to decode active diagnostic finding, discarding", e) }
-                .getOrNull()
+            // BUGFIX (P0b premature-cover): a session exists (round=$round) but its evidence
+            // hasn't been imported yet — the review task was marked DONE before
+            // evidencePollIfNeeded's 15-min cycle caught up. Confirmed live (see repro log
+            // 08-30 22:26:16): covering unconditionally here closed round 2 of concept
+            // neet-biomolecules-ii-...-56718eb2 with no evidence check at all, right after
+            // round 1 correctly found mastery still below threshold — exactly the silent-
+            // abandon path this diagnostic was added to catch. Defer instead: put the task
+            // back to PENDING so the next evidencePollIfNeeded/generateIfNeeded pass
+            // re-resolves it once real evidence has actually landed, rather than guessing
+            // blind. escalationCheckIfNeeded and resolveActiveConceptState both call this
+            // function again on their own next pass, so this concept won't get stuck.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId == null) {
+                Log.w(TAG, "resolveDoneConcept: concept=$conceptId evidence not imported and " +
+                    "no activeTaskId to revert — leaving as-is for next pass")
+                return
+            }
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId evidence NOT imported yet " +
+                "(round=$round, sessionId=$sessionId) — deferring resolution instead of " +
+                "covering (see BUGFIX note), reverting taskId=$taskId (dayKey=$dayKey) to PENDING")
+            // BUGFIX: was PlanStore.markTask(taskId, PENDING) — today-list-only, silently
+            // no-op'd for a task whose dayKey wasn't today's (see PlanStore.markTaskInDay doc
+            // and this function's own class doc). Logging the outcome so a future miss (task
+            // genuinely missing from both today's list AND plan_$dayKey) is visible instead
+            // of silently trusted.
+            val reverted = PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            if (!reverted) {
+                Log.w(TAG, "resolveDoneConcept: concept=$conceptId taskId=$taskId dayKey=$dayKey " +
+                    "— revert-to-PENDING found no matching task in plan_$dayKey either; " +
+                    "AlreadyActive guard may still see this as DONE next run")
+            }
+            return
         }
 
-    fun store(finding: TutorDiagnosticFinding) {
-        CheckmatePrefs.putString(KEY_ACTIVE_FINDING, json.encodeToString(finding))
+        val mastery = try {
+            withContext(Dispatchers.IO) {
+                LearningDatabase.getInstance(context).masteryDao()
+                    .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            return // retry this check on the next generateIfNeeded run rather than guessing
+        }
+
+        if (mastery == null) {
+            // BUGFIX (false-covered on conceptId drift): see doc above — evidence was
+            // already confirmed imported for this round, so a missing row here means the
+            // recomputed mastery likely landed under a different conceptId, not that
+            // there's nothing left to check. Treat as unresolved, not done.
+            Log.w(TAG, "resolveDoneConcept: concept=$conceptId has evidence imported but NO " +
+                "mastery row — likely conceptId drift (see BUGFIX doc). Treating as unresolved " +
+                "instead of covering.")
+            GapTaskLedger.resetForNextRound()
+            // BUGFIX (Branch B never reverted DONE task): resetForNextRound() alone doesn't
+            // move the task's own state — only the evidence-not-imported branch above did
+            // that. Without this, a task marked DONE stays DONE while the ledger considers
+            // the concept unresolved, so the AlreadyActive guard sees "already active" AND
+            // "already done" at once and the retest loop stalls with the task stuck on the
+            // plan as complete. Mirror Branch A's revert-to-PENDING here.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId != null) {
+                PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            }
+        } else if (mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+            GapTaskLedger.markCovered(conceptId)
+        } else {
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+                "(${mastery.mastery}) after evidence — requesting another targeted retest round")
+            GapTaskLedger.resetForNextRound()
+            // BUGFIX (Branch B never reverted DONE task): same gap as above — mastery below
+            // threshold means the concept isn't actually resolved, but without reverting the
+            // task itself, it stays DONE on the plan even as the ledger starts a new round.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId != null) {
+                PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            }
+        }
     }
 
-    /** Call once the finding has been consumed (or the session it belonged to ends) —
-     *  explicit clear, not automatic on read, same discipline [TutorSessionLedger.clear]'s
-     *  own doc documents: a caller may still want to re-read it (e.g. EXPLAIN running
-     *  again after a VERIFY failure loops back, per [TutorStateMachine]'s own routing)
-     *  before it's gone. */
-    fun clear() {
-        CheckmatePrefs.remove(KEY_ACTIVE_FINDING)
+    /** Checks today's live list first (cheap, common case), falls back to [PlanStore.loadDay]
+     *  for a task created on an earlier day that hasn't rolled into today's plan. */
+    private fun findTask(taskId: String, dayKey: String): StudyTask? =
+        PlanStore.todayTasks.value.find { it.id == taskId }
+            ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── P0b: Testmate targeted-test creation ────────────────────────────────
+
+    /**
+     * Requests a Testmate targeted-repair test for the currently active gap concept, but
+     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
+     * means either this call already succeeded for this concept, or the concept is being
+     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
+     * across days (see its own doc). No-ops with nothing active, or with no
+     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
+     * crashing the whole generation pass over it). A failed request is NOT retried until the
+     * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
+     * session that was actually recorded, so a create failure just means one day's targeted
+     * test is missing, not a retry storm.
+     */
+    private suspend fun createTargetedTestIfNeeded() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val existingSession = GapTaskLedger.activeTestmateSessionId()
+        // DIAGNOSTIC: makes the guard's decision visible — was there already a session on
+        // file (and if so which round), or did this genuinely start from a clean slate.
+        Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
+            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()}")
+        if (existingSession != null) return
+        val chapter = GapTaskLedger.activeChapter() ?: run {
+            Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
+            return
+        }
+        val topic = GapTaskLedger.activeTopic()
+
+        // Same verbose-chapter-name problem already diagnosed for subject resolution
+        // (see ConceptWeightage's ALIASES doc): GapTaskLedger.activeChapter() is whatever
+        // free-text chapter label Testmate's own report exported (e.g. "Biomolecules-II
+        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors").
+        // This resolver was originally routed into the Testmate API call on the assumption
+        // that Testmate's question bank used Checkmate's own canonical chapter names —
+        // that assumption turned out to be wrong (see BUGFIX below) — but it's kept computed
+        // here purely for the diagnostic log line, since knowing what Checkmate's own
+        // weightage system considers this chapter is still useful context when debugging.
+        val exam = ConsultationProfile.load().examTarget
+        val subject = GapTaskLedger.activeSubject()
+        val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
+        val canonicalChapter = resolution.matchedKey ?: chapter
+        if (canonicalChapter != chapter) {
+            Log.d(TAG, "createTargetedTestIfNeeded: chapter '$chapter' resolves internally to " +
+                "'$canonicalChapter' (method=${resolution.method}) — sending raw label to Testmate, see BUGFIX")
+        }
+
+        // BUGFIX: this used to send canonicalChapter (above) to Testmate instead of the raw
+        // chapter string, on the assumption that Testmate's questions.chapter column used the
+        // same canonical names Checkmate's own ConceptWeightage resolver produces. Live data
+        // disproved that: Testmate stores the exact raw, unedited chapter label from each
+        // source PDF at import time (e.g. "The Living World" — 18 questions in Testmate;
+        // Checkmate's canonicalized "Diversity In Living World" — zero. Same story for
+        // "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes,
+        // Cofactors" — 33 questions raw; canonicalized to "Cell Structure And Function" — zero).
+        // route.ts does an exact .eq('chapter', chapter) match, so sending the canonicalized
+        // name was silently routing every one of these lookups at a chapter Testmate has never
+        // heard of. Sending the raw, uncanonicalized chapter is what actually matches Testmate's
+        // own tags.
+
+        // BUGFIX: GapTaskLedger.recordServed sets activeTopic() to the RAW (pre-canonicalization)
+        // chapter string as its "no real topic" sentinel (candidate.topic ?: candidate.chapter —
+        // see that function's own doc, matching Concept.kt's "topic then equals chapter" convention).
+        // Only forward topic when it's a genuinely distinct value from the raw chapter; otherwise
+        // sending chapter alone is correct, same as if no topic had ever been recorded.
+        //
+        // BUGFIX (topic-"null" 422 loop): GapTaskLedger.activeTopic() now sanitizes the literal
+        // string "null" itself, so this filter is redundant for anything served from here on.
+        // Kept anyway as defense-in-depth for [topic] values that reach this function some other
+        // way, and because "it != chapter" alone was never a substitute for a blank/literal-null
+        // check to begin with.
+        val topicForApi = topic?.takeIf { it != chapter && !it.equals("null", ignoreCase = true) }
+
+        // BUGFIX (P0b re-intervention loop, part 2): TestmateApi.createTargetedTest is
+        // idempotent BY intervention_id — Testmate returns the same test/session on a
+        // repeated call with the same id rather than creating a new one (see that
+        // function's own doc). conceptId never changes between rounds, so round 2's
+        // request here was sending the EXACT SAME intervention_id as round 1's, and
+        // Testmate correctly handed back round 1's session — already completed by the
+        // student. That's what made "Take Test" land on an old result page: it wasn't a
+        // stale UI/WebView issue, Testmate genuinely never created a new session. Round
+        // 1 keeps the bare conceptId (no behavior change for sessions already in flight);
+        // round 2+ gets a distinct suffix from GapTaskLedger's round counter (bumped in
+        // resetForNextRound) so each round is a genuinely separate intervention as far as
+        // Testmate's idempotency check is concerned.
+        val round = GapTaskLedger.activeTestmateRound()
+        val interventionId = if (round <= 1) conceptId else "$conceptId-r$round"
+        if (round > 1) {
+            Log.d(TAG, "createTargetedTestIfNeeded: round=$round for concept=$conceptId — " +
+                "using intervention_id=$interventionId so Testmate issues a fresh session " +
+                "instead of replaying round 1's completed one")
+        }
+
+        val outcome = try {
+            TestmateApi.createTargetedTest(
+                interventionId = interventionId,
+                chapter = chapter,
+                topic = topicForApi,
+                questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
+                pool = TestmateQuestionPool.WRONG_SKIPPED
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
+            return
+        }
+
+        when (outcome) {
+            is TestmateTargetedTestOutcome.Success -> {
+                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                clearTestmateError()
+            }
+            is TestmateTargetedTestOutcome.Error -> {
+                Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+                recordTestmateError(outcome.message)
+            }
+        }
+    }
+
+    /** Persists the failure so it survives past logcat's buffer — see [PREF_TESTMATE_LAST_ERROR]. */
+    private fun recordTestmateError(message: String) {
+        CheckmatePrefs.putString(PREF_TESTMATE_LAST_ERROR, message)
+        CheckmatePrefs.putLong(PREF_TESTMATE_LAST_ERROR_AT, System.currentTimeMillis())
+    }
+
+    private fun clearTestmateError() {
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR)
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR_AT)
+    }
+
+    // ── P0b: evidence import ─────────────────────────────────────────────────
+
+    /**
+     * Every 15-min cycle: if the active concept has a Testmate session ([createTargetedTestIfNeeded]
+     * already ran) whose evidence hasn't been imported yet, fetches the result and, once it's
+     * actually there (the student has submitted — an [TestmateResultOutcome.Error], including
+     * Testmate's "no result yet" 404, just means try again next cycle), hands the per-question
+     * breakdown to [TargetedTestEvidenceImporter]. This is deliberately NOT gated to once/day
+     * like [generateIfNeeded]/[escalationCheckIfNeeded] — the student can submit the test at any
+     * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
+     * up to 24 hours later.
+     */
+    /** BUGFIX (unsynchronized ledger race): see [GapTaskLedger.withLock]'s doc — this
+     *  reads then, once the student's submitted result lands, writes
+     *  [GapTaskLedger.markActiveEvidenceImported], the exact read-then-write shape the
+     *  other two entry points also race against. */
+    suspend fun evidencePollIfNeeded(context: Context) = GapTaskLedger.withLock {
+        evidencePollIfNeededLocked(context)
+    }
+
+    private suspend fun evidencePollIfNeededLocked(context: Context) {
+        if (GapTaskLedger.isActiveEvidenceImported()) return
+        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
+
+        val outcome = try {
+            TestmateApi.fetchResult(sessionId)
+        } catch (e: Exception) {
+            Log.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
+            return
+        }
+        val result = when (outcome) {
+            is TestmateResultOutcome.Success -> outcome.result
+            is TestmateResultOutcome.Error -> return // not submitted yet (or a real failure either way) — retry next cycle
+        }
+        if (result.breakdown.isEmpty()) return // submitted but no per-question data yet — treat like not-ready
+
+        try {
+            val exam = ConsultationProfile.load().examTarget
+            val chapter = GapTaskLedger.activeChapter()
+            val topic = GapTaskLedger.activeTopic()
+            TargetedTestEvidenceImporter.import(
+                context = context,
+                sessionId = sessionId,
+                exam = exam,
+                chapter = chapter,
+                topic = topic,
+                result = result
+            )
+            GapTaskLedger.markActiveEvidenceImported(
+                attemptCount = result.attemptedCount,
+                correctCount = result.correctCount
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "evidence import failed: ${e.message}", e)
+        }
+    }
+
+    // ── Escalating skip/stall warning ───────────────────────────────────────
+
+    private val TIER_1_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach warning a student about ONE specific unfinished
+task, not their whole day. Rules:
+- 1-3 sentences, direct and consequence-based, no generic praise or "you can do it"
+- Name the specific concept and why it matters (marks at stake), not vague encouragement
+- Tone: firm reminder, not yet an ultimatum
+""".trimIndent()
+
+    private val TIER_2_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach. This specific gap has been ignored for several
+days running — this is the escalated warning, not the first nudge. Rules:
+- 3-5 sentences, still no fluff, but now make the full case
+- State plainly how many days this has been unaddressed
+- Connect this ONE concept to the real exam-day consequence (marks lost, gap to target score)
+- Reference the student's own skip pattern if given one, as evidence this is a pattern, not a one-off
+- End with a direct, specific ask — not "you should study" but "do this today"
+""".trimIndent()
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasEscalatedToday]). Depth scales with
+     * [GapTaskLedger.activeDaysServed]: day 1 gets no escalation at all (the task just showed
+     * up today — that's the normal experience, not a warning), day 2-3 names the concrete
+     * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
+     * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
+     * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
+     * interrupting with a warning would be counterproductive) and resolves it (see
+     * [resolveDoneConcept]) instead of warning if it turns out to already be DONE
+     * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
+     * first).
+     */
+    /** BUGFIX (unsynchronized ledger race): can call [resolveDoneConcept] ->
+     *  [GapTaskLedger.resetForNextRound] and [createTargetedTestIfNeeded] on the same
+     *  active-concept state the other two entry points touch — see
+     *  [GapTaskLedger.withLock]'s doc. */
+    suspend fun escalationCheckIfNeeded(context: Context) = GapTaskLedger.withLock {
+        escalationCheckIfNeededLocked(context)
+    }
+
+    private suspend fun escalationCheckIfNeededLocked(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasEscalatedToday(todayKey)) return
+
+        val daysServed = GapTaskLedger.activeDaysServed()
+        if (daysServed < 2) return // day 1: normal experience, no warning
+
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey)
+
+        if (task == null || task.state == TaskState.DONE) {
+            if (task?.state == TaskState.DONE) {
+                resolveDoneConcept(context, conceptId, dayKey)
+                // BUGFIX (r1-result-on-r2-screen): resolveDoneConcept can call
+                // GapTaskLedger.resetForNextRound() (still-below-mastery / conceptId-drift
+                // branches), which clears the active session so a new round can be
+                // requested — but it doesn't request one itself. generateIfNeeded() always
+                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded() right
+                // after (see that function's own BUGFIX note); this path didn't, so a round
+                // reset discovered here sat un-actioned until the next generateIfNeeded
+                // cycle, by which point a fresh re-rank can pick a different top concept and
+                // recordServed's isNewConcept branch silently abandons this round's request —
+                // leaving the old round-1 Testmate session as the only one on file even
+                // though the ledger had already moved to round 2 (confirmed via repro log:
+                // resetForNextRound round 1->2 for biomolecules-ii, immediately followed by
+                // recordServed picking up an unrelated concept with no
+                // createTargetedTestIfNeeded ever firing for biomolecules' round 2). Calling
+                // it here too closes that gap the same way generateIfNeeded already does;
+                // it's a no-op whenever resolveDoneConcept covered the concept outright or
+                // deferred it back to PENDING, since both leave no active concept id.
+                createTargetedTestIfNeeded()
+            }
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+        if (task.state != TaskState.PENDING && task.state != TaskState.SKIPPED) {
+            return // ACTIVE/PAUSED right now — don't interrupt an in-progress session
+        }
+
+        val tier = if (daysServed >= 4) 2 else 1
+        val message = try {
+            buildEscalationMessage(tier, daysServed)
+        } catch (e: Exception) {
+            Log.e(TAG, "escalation message build failed: ${e.message}", e)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+
+        MentorViewModel.appendProactiveMessage(message)
+        MentorNotifier.notify(context, message)
+        GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
+        GapTaskLedger.markEscalatedToday(todayKey)
+        Log.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+    }
+
+    private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {
+        val subject = GapTaskLedger.activeSubject()?.takeIf { it.isNotBlank() } ?: "this subject"
+        val topic = GapTaskLedger.activeTopic()?.takeIf { it.isNotBlank() } ?: subject
+        val rationale = GapTaskLedger.activeRationale()?.takeIf { it.isNotBlank() }
+            ?: "$topic still needs work."
+        val marksAtStake = GapTaskLedger.activeExpectedGain()
+
+        val patternLine = BehaviorLedger.getSnapshot().subjectPatterns
+            .filter { it.subject.equals(subject, ignoreCase = true) }
+            .maxByOrNull { it.occurrences }
+            ?.let { "You've skipped $subject ${it.taskType} tasks ${it.occurrences} times recently — this fits the pattern." }
+            ?: ""
+
+        val ruleMsg = when (tier) {
+            2 -> "Day $daysServed unaddressed: $topic. $rationale $patternLine " +
+                "This gap alone is worth roughly ${"%.1f".format(marksAtStake)} marks — " +
+                "left alone, it stays a hole on exam day. Do it today."
+            else -> "$topic has gone $daysServed days without being done. $rationale Do it today."
+        }
+
+        val systemPrompt = if (tier == 2) TIER_2_SYSTEM_PROMPT else TIER_1_SYSTEM_PROMPT
+        val userPrompt = "Concept: $topic ($subject). Days unaddressed: $daysServed. " +
+            "Why it matters: $rationale Approx marks at stake: ${"%.1f".format(marksAtStake)}. " +
+            "$patternLine Write the warning message now."
+
+        return try {
+            val llmMsg = LlmGateway.complete(userPrompt, systemPrompt)
+            if (llmMsg.isBlank()) ruleMsg else llmMsg
+        } catch (_: Exception) {
+            ruleMsg
+        }
     }
 }
+
+
 
 
 //===== FILE: app/src/main/kotlin/com/checkmate/service/TutorCycleManager.kt =====
@@ -1189,7 +1341,9 @@ object TutorCycleManager {
         val correctCount = GapTaskLedger.activeLastImportCorrectCount()
         val result = TutorSessionLedger.apply(TutorEvidence.PracticeAttempts(attemptCount, correctCount), now())
         if (result !is TutorTransitionResult.Advanced) {
-            // Shouldn't happen at TARGETED_TEST_QUESTION_COUNT=15 >> MIN_PRACTICE_ATTEMPTS=3,
+            // Shouldn't happen — GapTaskManager's repair test is now uncapped (every
+            // wrong/skipped question for the concept, previously capped at 15), so
+            // attemptCount only ever grows further past MIN_PRACTICE_ATTEMPTS=3,
             // but stay defensive rather than get stuck re-reading the same rejected evidence
             // forever — ask for a fresh round exactly like a genuine VERIFY-fail would.
             Log.w(TAG, "concept=$conceptId practice evidence rejected ($result) — requesting a fresh round")
