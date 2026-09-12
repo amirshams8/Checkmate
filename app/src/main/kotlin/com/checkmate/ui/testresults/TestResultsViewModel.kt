@@ -219,6 +219,10 @@ class TestResultsViewModel : ViewModel() {
      */
     private fun buildPerformanceReport(context: Context, examType: String?, alreadyImported: Boolean) {
         if (examType == null) {
+            // DIAGNOSTIC (surgical trace for "import succeeds but no task appears"):
+            // this branch alone means orchestration never even had a decisionReport to
+            // work with — remove once the no-task-created cause is confirmed.
+            Log.w(TAG, "DIAGNOSTIC: buildPerformanceReport bailing — examType is null, analysis skipped entirely")
             _state.update {
                 it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
             }
@@ -281,11 +285,22 @@ class TestResultsViewModel : ViewModel() {
         decisionReport: LearningDecisionEngine.DecisionReport,
         alreadyImported: Boolean
     ) {
-        if (alreadyImported) return
+        if (alreadyImported) {
+            // DIAGNOSTIC: this is the OTHER silent no-op — replay path never reaches
+            // the orchestrator at all. Remove once confirmed which gate is firing.
+            Log.w(TAG, "DIAGNOSTIC: executeTopIntervention skipped — alreadyImported=true, orchestrator never called")
+            return
+        }
         try {
             val result = withContext(Dispatchers.IO) {
                 LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
             }
+            // DIAGNOSTIC: executeTopCandidateLocked can reject every candidate (already-
+            // active task, already-covered concept, not-mappable, policy rejection) and
+            // return normally — none of that logs anywhere on its own. This line is the
+            // only way to see outcome/rejections without reading in-memory state.
+            // Remove alongside the two DIAGNOSTIC lines above once resolved.
+            Log.d(TAG, "DIAGNOSTIC: orchestration outcome=${result.outcome} rejections=${result.rejections}")
             _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
         } catch (e: Exception) {
             Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
