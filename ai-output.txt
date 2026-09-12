@@ -1,324 +1,325 @@
-//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/testmate/TestResultNormalizer.kt =====
-package com.checkmate.learning.testmate
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsViewModel.kt =====
+package com.checkmate.ui.testresults
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
-import com.checkmate.learning.analytics.ScoredQuestionFact
-import com.checkmate.learning.analytics.SubjectScore
-import com.checkmate.learning.analytics.SubjectScoreCalculator
-import com.checkmate.learning.engine.ErrorEngine
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.graph.KnowledgeGraph
-import com.checkmate.learning.model.LearningEvent
-import com.checkmate.learning.model.LearningEventType
-import com.checkmate.learning.model.LearningIds
-import com.checkmate.learning.model.Question
-import com.checkmate.learning.model.QuestionAttempt
-import com.checkmate.learning.repository.LearningDatabase
-import java.security.MessageDigest
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
+import com.checkmate.learning.analytics.ScorePredictor
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-/**
- * Upgrade Blueprint Phase 1.3: "Testmate → TestResultNormalizer → LearningEvents
- * → MasteryEngine → StudentModel → Planner." This is the normalizer AND, as of
- * Phase 1.5/1.6, the wiring that closes the first half of that loop: every
- * successful import now also classifies its wrong attempts (ErrorEngine) and
- * recomputes mastery for every concept touched (MasteryEngine) before returning.
- *
- * Test-report wiring pass: [NormalizeResult] now also carries the canonical exam
- * key and a per-test, real-scoring [SubjectScore] breakdown — see that class's own
- * doc — so [com.checkmate.ui.testresults.TestResultsViewModel] doesn't need to
- * re-parse the report or guess an exam identifier to build a
- * [com.checkmate.learning.analytics.PerformanceAnalyzer.PerformanceReport]
- * afterward. StudentModel/PerformanceAnalyzer consumption itself still happens at
- * the caller, not here — this stays a Room-write + immediate-derived-metadata step,
- * not a place that also builds the full cross-test StudentModel.
- *
- * A mock isn't "done" at "618 marks" — it's done when Checkmate knows *why* 618.
- * This is what turns a report.md dump into that "why": one Question row per
- * question, one QuestionAttempt per attempt, a LearningEvent per question outcome
- * (QUESTION_CORRECT/WRONG/SKIPPED) plus one MOCK_COMPLETED summary event, then one
- * ErrorRecord per newly-classified wrong attempt and one recomputed ConceptMastery
- * row per concept the report touched.
- *
- * KNOWN LIMITATION: report.md carries no "test taken at" timestamp, so every
- * attempt/event from one import shares [testTimestamp], which defaults to import
- * time (now), not actual test time. Pass [testTimestamp] explicitly once there's
- * a real source for it (e.g. a file-modified date or a user-entered date) — not
- * guessed here.
- */
-object TestResultNormalizer {
+private const val TAG = "TestResultsViewModel"
 
-    private const val TAG = "TestResultNormalizer"
+data class TestResultsState(
+    val sessionId: String = "",
+    val loading: Boolean = false,
+    val result: TestmateResult? = null,
+    val error: String? = null,
+    // ── Upgrade Blueprint wiring gap fix ──
+    // Phase 1 (MasteryEngine/ErrorEngine/RetentionEngine/KnowledgeGraph/
+    // TestResultNormalizer) was fully built but nothing ever called
+    // TestResultNormalizer — TestmateApi's /results endpoint only returns
+    // chapter/topic aggregates, never per-question detail, so there was no
+    // data shape TestResultNormalizer could consume. Rather than add a new
+    // testmate2.com endpoint, this reuses the report.md TestResultNormalizer
+    // already parses (TestReportParser) via a manual file picker (see
+    // TestResultsScreen's "Import report.md" section) — the student downloads
+    // the report from TestmateWebScreen's WebView (already wired to
+    // DownloadManager) and picks it here. No backend change, no
+    // DownloadManager-watching/polling, no push/pull sync layer to maintain
+    // across app updates — just a Storage Access Framework file read.
+    val importing: Boolean = false,
+    val importResult: TestResultNormalizer.NormalizeResult? = null,
+    val importError: String? = null,
+    // ── Test-report wiring pass ──
+    // Closes normalizeAndPersist() -> StudentModelBuilder.build() ->
+    // PerformanceAnalyzer.analyze() -> PerformanceReport, the second half of the
+    // loop the import above only started. Deliberately separate loading/error
+    // state from importing/importError above: a successful import that commits
+    // to Room is real and final the moment importResult is set, regardless of
+    // whether analysis afterward succeeds — see importReport's own doc on why
+    // analysis failure never rolls back or hides importResult.
+    val analyzing: Boolean = false,
+    val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
+    val analysisError: String? = null,
+    // ── ScoreGainEstimator wiring pass ──
+    // Blueprint §2.2. Built from the SAME PerformanceReport + StudentModel this
+    // buildPerformanceReport call already produced — never recomputed
+    // separately, so this can never drift out of sync with performanceReport
+    // (same "one source of truth per Room read" discipline StudentModel's own
+    // doc requires). Ranked highest-expectedGain first; empty until analysis
+    // has run at least once. Kept as its own field (not folded into
+    // performanceReport) because it's a downstream DECISION-shaped view over
+    // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
+    // own class doc on that boundary.
+    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList(),
+    // ── ScorePredictor wiring pass ──
+    // Blueprint §2.3. Built from the SAME PerformanceReport + StudentModel as
+    // scoreGainEstimates above — never a separate StudentModelBuilder.build/
+    // PerformanceAnalyzer.analyze call, same "one Room read, three derived views"
+    // discipline. targetScore comes from ConsultationProfile (the Student Profile
+    // screen's own "Target Score" field), not invented here. Null until analysis
+    // has run at least once.
+    val expectedScore: ScorePredictor.ExpectedScore? = null,
+    // ── LearningDecisionEngine wiring pass (Blueprint §2.4) ──
+    // The frontier piece: everything above this line is EVIDENCE (PerformanceReport)
+    // or a DECISION-shaped ranking over one dimension at a time (scoreGainEstimates
+    // ranks by marks, expectedScore explains a gap) — this is the first field that's
+    // an actual ranked, typed ACTION ("what should this student do next"), built
+    // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
+    // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
+    // read, N derived views" doc). Null until analysis has run at least once.
+    val decisionReport: LearningDecisionEngine.DecisionReport? = null,
+    // ── LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam) ──
+    // The orchestrator's own class doc named this exact gap: it consumes an
+    // already-built DecisionReport but "does not itself decide when to run." A
+    // fresh test import IS that trigger — see buildPerformanceReport's doc on why
+    // this only fires when `!alreadyImported`. Built from the SAME decisionReport
+    // this call already produced — sixth derived view over one Room read, same
+    // discipline as every field above it. Null until an orchestration run has
+    // actually happened (i.e. never set on the `alreadyImported` replay path).
+    val orchestrationResult: LearningInterventionOrchestrator.OrchestrationResult? = null,
+    val orchestrationError: String? = null
+)
 
-    data class NormalizeResult(
-        val alreadyImported: Boolean,
-        /**
-         * Canonical [com.checkmate.core.ExamSyllabus]/[com.checkmate.core.PYQWeightage]
-         * exam key (e.g. "NEET"), normalized from the report's raw exam string (e.g.
-         * "NEET-2027") via [KnowledgeGraph.normalizeExam] — the same normalization
-         * [seedExamSyllabus] itself already applies. Null only when the report's
-         * title carried no parseable exam suffix at all (see [TestReportParser]).
-         * Populated on every parse, including an [alreadyImported] short-circuit,
-         * since the exam string comes from parsing alone, before the idempotency
-         * check runs.
-         */
-        val examType: String?,
-        val title: String? = null,
-        val scoreObtained: Double? = null,
-        val scoreTotal: Double? = null,
-        val scorePercent: Double? = null,
-        /** Real +marks/-marks tally per subject for THIS test, resolved via
-         *  [SubjectScoreCalculator] — populated on every parse, same reasoning as
-         *  [examType] above. Empty if [examType] is null (nothing to resolve
-         *  subjects against) or no question resolved to a known subject. */
-        val subjectScores: List<SubjectScore> = emptyList(),
-        val questionsWritten: Int,
-        val attemptsWritten: Int,
-        val eventsWritten: Int,
-        val warnings: List<String>,
-        // Phase 1.5/1.6 wiring — 0 whenever alreadyImported is true, since nothing new was written.
-        val errorsClassified: Int = 0,
-        val conceptsRecomputed: Int = 0
-    )
+class TestResultsViewModel : ViewModel() {
+    private val _state = MutableStateFlow(TestResultsState())
+    val state: StateFlow<TestResultsState> = _state.asStateFlow()
 
-    suspend fun normalizeAndPersist(
-        context: Context,
-        reportText: String,
-        studentId: String = LearningIds.LOCAL_STUDENT_ID,
-        source: String = "testmate_report",
-        testTimestamp: Long = System.currentTimeMillis()
-    ): NormalizeResult {
-        val report = TestReportParser.parse(reportText)
-        val warnings = mutableListOf<String>()
-
-        // Computed once, reused for seedExamSyllabus below AND surfaced on
-        // NormalizeResult — see that field's own doc on why this must happen before
-        // the idempotency check, not after.
-        val normalizedExam = report.exam?.let { KnowledgeGraph.normalizeExam(it) }
-        val subjectScores = normalizedExam?.let { exam ->
-            SubjectScoreCalculator.compute(exam, report.questions.map { it.toScoredQuestionFact() })
-        } ?: emptyList()
-
-        // Upgrade Blueprint Phase 1.4 wiring: KnowledgeGraph.seedExamSyllabus was
-        // flagged (its own doc, and twice in chat) as "not called anywhere yet" —
-        // this is that call site. Every import already knows its own exam
-        // (report.exam, e.g. "NEET-2027"); normalizing it to an ExamSyllabus key
-        // ("NEET") and seeding here means diagnosePrerequisiteFailure has real
-        // prerequisite edges to walk by the time StudentModelBuilder next runs for
-        // this student, instead of silently finding none because seeding never
-        // happened. Safe on every import, including a duplicate re-import that gets
-        // caught by the idempotency guard below — see seedExamSyllabus's own doc for
-        // why a repeat call is a no-op, not a duplication risk. Fails open: a report
-        // for an exam ExamSyllabus doesn't recognize just returns from
-        // seedExamSyllabus without seeding anything, and the import continues
-        // normally either way.
-        normalizedExam?.let { KnowledgeGraph.seedExamSyllabus(context, it) }
-
-        if (report.questions.isEmpty()) {
-            warnings.add(
-                "No question rows parsed — report format may not match " +
-                    "TestReportParser's expected shape."
-            )
-        }
-        report.attempted?.let { expected ->
-            val actualAttempted = report.questions.count { it.status != ParsedQuestionStatus.SKIPPED }
-            if (actualAttempted != expected) {
-                warnings.add(
-                    "Header says $expected attempted, but $actualAttempted question rows " +
-                        "were non-skipped after parsing."
-                )
-            }
-        }
-
-        val db = LearningDatabase.getInstance(context)
-        val testId = deterministicTestId(report)
-        // testId scheme changed from title+exam to title+exam+score+count (see the
-        // doc comment on deterministicTestId). Rows written before that change are
-        // still sitting in Room keyed on the OLD scheme, so a bare new-scheme check
-        // would miss them and re-write a report that's already imported. Checking the
-        // legacy id too, one time, keeps existing data from getting duplicated; this
-        // fallback can be deleted once you're confident no pre-migration data remains.
-        val legacyTestId = legacyDeterministicTestId(report)
-
-        // Idempotency guard: the same report re-imported (e.g. user re-shares the same
-        // file) must not double-count attempts/events. Question ids are deterministic
-        // from (testId, question number), so checking the first one tells us whether
-        // this exact test was already normalized.
-        val firstQuestionId = report.questions.firstOrNull()?.let { deterministicQuestionId(testId, it.number) }
-        val legacyFirstQuestionId = if (legacyTestId != testId) {
-            report.questions.firstOrNull()?.let { deterministicQuestionId(legacyTestId, it.number) }
-        } else null
-        val alreadyImportedRow =
-            (firstQuestionId != null && db.questionDao().getById(firstQuestionId) != null) ||
-                (legacyFirstQuestionId != null && db.questionDao().getById(legacyFirstQuestionId) != null)
-        if (alreadyImportedRow) {
-            Log.w(TAG, "Report '${report.title}' ($testId) already imported — skipping to avoid duplicate attempts.")
-            return NormalizeResult(
-                alreadyImported = true,
-                examType = normalizedExam,
-                title = report.title,
-                scoreObtained = report.scoreObtained,
-                scoreTotal = report.scoreTotal,
-                scorePercent = report.scorePercent,
-                subjectScores = subjectScores,
-                questionsWritten = 0,
-                attemptsWritten = 0,
-                eventsWritten = 0,
-                warnings = warnings
-            )
-        }
-
-        val questions = mutableListOf<Question>()
-        val attempts = mutableListOf<QuestionAttempt>()
-        val events = mutableListOf<LearningEvent>()
-
-        events.add(
-            LearningEvent(
-                studentId = studentId,
-                eventType = LearningEventType.MOCK_COMPLETED,
-                timestamp = testTimestamp,
-                source = source,
-                accuracy = report.scorePercent?.let { it / 100.0 }
-            )
-        )
-
-        for (q in report.questions) {
-            val questionId = deterministicQuestionId(testId, q.number)
-
-            questions.add(
-                Question(
-                    id = questionId,
-                    source = source,
-                    exam = report.exam,
-                    chapter = q.chapter,
-                    topic = q.topic,
-                    correctOption = q.correctOption,
-                    questionText = q.questionText,
-                    // ADDED: options/explanation now flow through from the parser —
-                    // previously dropped even though Question.explanation already
-                    // existed as a column, because TestReportParser had nowhere to
-                    // read them from until Testmate's report started emitting them.
-                    // This is the actual evidence ErrorEngine needs (see Question.kt's
-                    // doc on `options`); nothing downstream that only reads
-                    // correctOption/questionText is affected by these being populated.
-                    explanation = q.explanation,
-                    options = q.options
-                )
-            )
-
-            // A QuestionAttempt row means "the student attempted this question" —
-            // SKIPPED questions never should have produced one. Previously every
-            // question got a row with correct=false, so ErrorEngine's
-            // `WHERE correct = 0` query (getWrongAttempts) counted every skip as a
-            // wrong answer alongside real ones (confirmed against a real 180-question
-            // Testmate report: 175 skips + 5 wrong were both landing in
-            // getWrongAttempts, producing "Attempts: 180 / Errors: 180" instead of the
-            // true 5/5). Question and LearningEvent still get a row for every
-            // question, skipped or not — only the attempt table is affected.
-            if (q.status != ParsedQuestionStatus.SKIPPED) {
-                attempts.add(
-                    QuestionAttempt(
-                        studentId = studentId,
-                        questionId = questionId,
-                        timestamp = testTimestamp,
-                        selectedOption = q.selectedOption,
-                        correct = q.status == ParsedQuestionStatus.CORRECT,
-                        timeTakenSeconds = q.timeSeconds
-                    )
-                )
-            }
-
-            val eventType = when (q.status) {
-                ParsedQuestionStatus.CORRECT -> LearningEventType.QUESTION_CORRECT
-                ParsedQuestionStatus.WRONG -> LearningEventType.QUESTION_WRONG
-                ParsedQuestionStatus.SKIPPED -> LearningEventType.QUESTION_SKIPPED
-            }
-            events.add(
-                LearningEvent(
-                    studentId = studentId,
-                    eventType = eventType,
-                    timestamp = testTimestamp,
-                    chapterId = q.chapter,
-                    topicId = q.topic,
-                    questionId = questionId,
-                    source = source,
-                    duration = q.timeSeconds
-                )
-            )
-        }
-
-        db.questionDao().upsertAll(questions)
-        db.questionAttemptDao().insertAll(attempts)
-        db.learningEventDao().insertAll(events)
-
-        // Phase 1.5/1.6: close the loop the blueprint diagram draws — a fresh import
-        // immediately gets its wrong answers classified and its touched concepts'
-        // mastery recomputed, rather than sitting inert until something else reads it.
-        val errorRecords = ErrorEngine.classifyAllUnclassified(context, studentId)
-        val recomputedMastery = MasteryEngine.recomputeAll(context, studentId)
-
-        warnings.forEach { Log.w(TAG, it) }
-        Log.d(
-            TAG,
-            "Normalized report '${report.title}': ${questions.size} questions, " +
-                "${attempts.size} attempts, ${events.size} events, ${errorRecords.size} error(s) " +
-                "classified, ${recomputedMastery.size} concept(s) recomputed, ${warnings.size} warning(s)"
-        )
-
-        return NormalizeResult(
-            alreadyImported = false,
-            examType = normalizedExam,
-            title = report.title,
-            scoreObtained = report.scoreObtained,
-            scoreTotal = report.scoreTotal,
-            scorePercent = report.scorePercent,
-            subjectScores = subjectScores,
-            questionsWritten = questions.size,
-            attemptsWritten = attempts.size,
-            eventsWritten = events.size,
-            warnings = warnings,
-            errorsClassified = errorRecords.size,
-            conceptsRecomputed = recomputedMastery.size
-        )
+    fun onSessionIdChange(value: String) {
+        _state.update { it.copy(sessionId = value, error = null) }
     }
 
-    private fun ParsedQuestionResult.toScoredQuestionFact() = ScoredQuestionFact(
-        chapter = chapter,
-        topic = topic,
-        correct = status == ParsedQuestionStatus.CORRECT,
-        attempted = status != ParsedQuestionStatus.SKIPPED
-    )
+    fun fetch() {
+        val id = _state.value.sessionId
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            when (val outcome = TestmateApi.fetchResult(id)) {
+                is com.checkmate.testmate.TestmateResultOutcome.Success ->
+                    _state.update { it.copy(loading = false, result = outcome.result, error = null) }
+                is com.checkmate.testmate.TestmateResultOutcome.Error ->
+                    _state.update { it.copy(loading = false, error = outcome.message) }
+            }
+        }
+    }
 
     /**
-     * Stable id derived from the report's own content, not a random UUID — the same
-     * report re-imported must resolve to the same testId so the idempotency guard
-     * above actually works.
+     * Reads the picked report.md (or .txt — Testmate's export mime type varies by
+     * provider) via SAF, hands the raw text straight to
+     * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
+     * (or the "already imported" idempotency result) in [TestResultsState]. File
+     * I/O + normalization both happen off the main thread.
      *
-     * Deliberately NOT title+exam alone: two genuinely different test attempts can
-     * share a title (an AI-recreated report reusing a prior title, or a student
-     * retaking a mock under its original name), and title+exam collapsed those into
-     * one, silently dropping the second import (alreadyImported=true) without
-     * surfacing anything beyond a Log.w. Folding in score + question count ties the
-     * id to the report's actual content instead of just its name, while staying
-     * resilient to whitespace/line-ending drift a full-text hash would choke on.
+     * Test-report wiring pass: once (and only once) normalizeAndPersist has
+     * actually committed — success or already-imported, both mean Room state is
+     * current — this chains into [buildPerformanceReport], closing
+     * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
+     * -> PerformanceReport -> ScoreGainEstimator.rankFromReport. The stages update
+     * state independently: `importResult` is set and `importing` flips false as
+     * soon as persistence succeeds, full stop; analysis (and the ranking built on
+     * top of it) runs after that as a separate concern, and if it fails, only
+     * `analysisError` is set — the already-committed import is never rolled back
+     * or hidden because a derived-view step afterward broke.
      */
-    private fun deterministicTestId(report: ParsedTestReport): String =
-        sha256Hex(
-            "${report.exam ?: ""}|${report.title}|${report.scoreObtained}|" +
-                "${report.scoreTotal}|${report.questions.size}"
-        ).take(16)
+    fun importReport(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    importing = true, importError = null, importResult = null,
+                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                    expectedScore = null, decisionReport = null,
+                    orchestrationResult = null, orchestrationError = null
+                )
+            }
+            try {
+                val text = withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                } ?: throw IllegalStateException("Couldn't open the selected file.")
 
-    /** Old testId scheme (title+exam only) — kept only for the one-time migration
-     *  fallback in [normalize]. Safe to delete once no pre-migration rows remain. */
-    private fun legacyDeterministicTestId(report: ParsedTestReport): String =
-        sha256Hex("${report.exam ?: ""}|${report.title}").take(16)
+                if (text.isBlank()) {
+                    _state.update {
+                        it.copy(importing = false, importError = "Selected file is empty.")
+                    }
+                    return@launch
+                }
 
-    private fun deterministicQuestionId(testId: String, questionNumber: Int): String =
-        "$testId-q$questionNumber"
+                val result = withContext(Dispatchers.IO) {
+                    TestResultNormalizer.normalizeAndPersist(context, text)
+                }
+                // Persistence has committed — this is final regardless of what
+                // buildPerformanceReport below does with it.
+                _state.update { it.copy(importing = false, importResult = result, importError = null) }
+                buildPerformanceReport(context, result.examType, result.alreadyImported)
+            } catch (e: Exception) {
+                Log.e(TAG, "Report import failed: ${e.message}", e)
+                _state.update {
+                    it.copy(importing = false, importError = "Import failed: ${e.message ?: "unknown error"}")
+                }
+            }
+        }
+    }
 
-    private fun sha256Hex(input: String): String =
-        MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
-            .joinToString("") { "%02x".format(it) }
+    /**
+     * Runs after a committed import (fresh or already-imported — both mean Room
+     * reflects this test). Reads current Room state fresh via
+     * [StudentModelBuilder.build] rather than anything cached from the import
+     * step, per [com.checkmate.learning.model.StudentModel]'s own "never hold a
+     * built StudentModel across a Room write" rule. `examType` comes straight from
+     * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
+     * guesses an exam identifier itself.
+     *
+     * ScoreGainEstimator wiring pass: [ScoreGainEstimator.rankFromReport] runs
+     * against the SAME `studentModel`/`report` this function just built — not a
+     * second `StudentModelBuilder.build`/`PerformanceAnalyzer.analyze` call — so
+     * `scoreGainEstimates` can never reflect a different Room snapshot than
+     * `performanceReport` does. Both are set together in one state update.
+     *
+     * ScorePredictor wiring pass (Blueprint §2.3): [ScorePredictor.predictFromReport]
+     * runs against that same `studentModel`/`report` too — third derived view over
+     * one Room read, same discipline as the ScoreGainEstimator call right above it.
+     * `targetScore` comes from [ConsultationProfile.load] (the Student Profile
+     * screen's own field, defaults to 650 if never set) — read fresh here, not
+     * cached, so a target the student just edited is reflected on the very next
+     * analysis run.
+     *
+     * LearningDecisionEngine wiring pass (Blueprint §2.4): [LearningDecisionEngine.decideFromReport]
+     * runs against the SAME `report`/`studentModel`/`estimates`/`expectedScore` this
+     * call already built — fourth derived view over one Room read, same "never
+     * recompute what's already in hand" discipline as the two calls above it.
+     *
+     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam):
+     * once `decisionReport` above is built, [executeTopIntervention] runs it through
+     * the orchestrator — the "post-test event" trigger the orchestrator's own class
+     * doc said was still missing. `alreadyImported` is threaded all the way down
+     * from [importReport] because this function also runs on the idempotent replay
+     * path (re-picking an already-imported report re-triggers analysis so the
+     * screen has something to show), and PolicyValidator has no duplicate-task
+     * guard of its own — see [executeTopIntervention]'s doc for why that path must
+     * not also autonomously create a task.
+     *
+     * Launched as its own coroutine (not inline in importReport's try block) so an
+     * analysis failure can only ever set [TestResultsState.analysisError] — it has
+     * no path back to importReport's own try/catch and can't turn a successful
+     * import into a failed one.
+     */
+    private fun buildPerformanceReport(context: Context, examType: String?, alreadyImported: Boolean) {
+        if (examType == null) {
+            // DIAGNOSTIC (surgical trace for "import succeeds but no task appears"):
+            // this branch alone means orchestration never even had a decisionReport to
+            // work with — remove once the no-task-created cause is confirmed.
+            Log.w(TAG, "DIAGNOSTIC: buildPerformanceReport bailing — examType is null, analysis skipped entirely")
+            _state.update {
+                it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
+            }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(analyzing = true, analysisError = null) }
+            try {
+                val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+                val report = PerformanceAnalyzer.analyze(studentModel, examType)
+                val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+                val targetScore = ConsultationProfile.load().targetScore
+                val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
+                val decisionReport = LearningDecisionEngine.decideFromReport(
+                    report, studentModel, estimates, expectedScore
+                )
+                _state.update {
+                    it.copy(
+                        analyzing = false, performanceReport = report,
+                        scoreGainEstimates = estimates, expectedScore = expectedScore,
+                        decisionReport = decisionReport
+                    )
+                }
+                executeTopIntervention(context, decisionReport, alreadyImported)
+            } catch (e: Exception) {
+                Log.e(TAG, "Performance analysis failed: ${e.message}", e)
+                _state.update {
+                    it.copy(
+                        analyzing = false,
+                        analysisError = "Couldn't build performance report: ${e.message ?: "unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5) — the trigger
+     * [LearningInterventionOrchestrator]'s own class doc said was still missing:
+     * "a schedule, a button, a WorkManager job." This is the schedule: every fresh
+     * test import is itself the natural "post-test event" trigger, so this fires
+     * right after `decisionReport` is built in [buildPerformanceReport], using
+     * that SAME DecisionReport.
+     *
+     * Gated on `!alreadyImported`: [buildPerformanceReport] also runs on the
+     * idempotent "already imported" replay path, and [PolicyValidator] has no
+     * duplicate-task guard of its own — without this gate, re-opening this screen
+     * and re-picking a report already in Room would rank the same top candidate
+     * again and autonomously create a fresh duplicate StudyTask every time. A
+     * fresh import is the only case that should actually cause a new autonomous
+     * action.
+     *
+     * Isolated in its own try/catch for the same reason analysis is isolated from
+     * import: a failure here can only ever set [TestResultsState.orchestrationError]
+     * — it has no path back to [buildPerformanceReport]'s try block and can't turn
+     * an already-successful decisionReport into a failed one.
+     */
+    private suspend fun executeTopIntervention(
+        context: Context,
+        decisionReport: LearningDecisionEngine.DecisionReport,
+        alreadyImported: Boolean
+    ) {
+        if (alreadyImported) {
+            // DIAGNOSTIC: this is the OTHER silent no-op — replay path never reaches
+            // the orchestrator at all. Remove once confirmed which gate is firing.
+            Log.w(TAG, "DIAGNOSTIC: executeTopIntervention skipped — alreadyImported=true, orchestrator never called")
+            return
+        }
+        try {
+            val result = withContext(Dispatchers.IO) {
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            }
+            // DIAGNOSTIC: executeTopCandidateLocked can reject every candidate (already-
+            // active task, already-covered concept, not-mappable, policy rejection) and
+            // return normally — none of that logs anywhere on its own. This line is the
+            // only way to see outcome/rejections without reading in-memory state.
+            // Remove alongside the two DIAGNOSTIC lines above once resolved.
+            Log.d(TAG, "DIAGNOSTIC: orchestration outcome=${result.outcome} rejections=${result.rejections}")
+            _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
+            _state.update {
+                it.copy(orchestrationError = "Couldn't create a study task from this analysis: ${e.message ?: "unknown error"}")
+            }
+        }
+    }
+
+    fun dismissImportResult() {
+        _state.update {
+            it.copy(
+                importResult = null, importError = null,
+                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
+                expectedScore = null, decisionReport = null,
+                orchestrationResult = null, orchestrationError = null
+            )
+        }
+    }
 }
-
 
