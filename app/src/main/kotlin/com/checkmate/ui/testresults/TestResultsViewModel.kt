@@ -239,6 +239,20 @@ class TestResultsViewModel : ViewModel() {
                 val decisionReport = LearningDecisionEngine.decideFromReport(
                     report, studentModel, estimates, expectedScore
                 )
+                // DIAGNOSTIC: tests the "hand-crafted report vs real Testmate export"
+                // theory directly — if topicImpacts show weightageConfidence/marksAtStake
+                // as garbage (0.0 / UNRESOLVED) for chapters that should resolve, or
+                // decisionReport.candidates comes back empty, that's the synthetic
+                // report's data shape (e.g. literal "—" topic placeholder) failing to
+                // resolve, not an app-side gate. Remove alongside the other DIAGNOSTIC
+                // lines once resolved.
+                Log.d(
+                    TAG,
+                    "DIAGNOSTIC: topicImpacts=${report.topicImpacts.map {
+                        "${it.chapter}/${it.topic} -> conf=${it.weightageConfidence} " +
+                            "stake=${it.marksAtStakeTotal} gap=${it.marksAtStakeGap}"
+                    }} candidates=${decisionReport.candidates.size}"
+                )
                 _state.update {
                     it.copy(
                         analyzing = false, performanceReport = report,
