@@ -420,26 +420,42 @@ object GapTaskManager {
     // ── P0b: Testmate targeted-test creation ────────────────────────────────
 
     /**
-     * Requests a Testmate targeted-repair test for the currently active gap concept, but
-     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
-     * means either this call already succeeded for this concept, or the concept is being
-     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
-     * across days (see its own doc). No-ops with nothing active, or with no
-     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * Requests a Testmate targeted-repair test for the currently active gap concept.
+     * [GapTaskLedger.activeTestmateSessionId] being non-null means either this call already
+     * succeeded for this concept, or the concept is being re-served after
+     * [GapTaskLedger.recordServed] deliberately preserved that session across days (see its
+     * own doc) — but that no longer means "never ask again." No-ops with nothing active, or
+     * with no [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
      * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
      * crashing the whole generation pass over it). A failed request is NOT retried until the
      * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
      * session that was actually recorded, so a create failure just means one day's targeted
      * test is missing, not a retry storm.
+     *
+     * BUGFIX (stale repair test never refreshed): a targeted test freezes its question set
+     * at creation time on the Testmate side, so the OLD "session exists -> return, full stop"
+     * guard meant a student stuck on an unfinished repair test never saw questions added by a
+     * LATER re-import of the same chapter — reproduced live on Biomolecules, which sat on a
+     * 282-question set built long before several subsequent imports. The route's own
+     * idempotency-by-intervention_id lookup is now staleness-aware server-side (see
+     * app/api/tests/targeted/route.ts's own doc) and will supersede + rebuild a stale `live`
+     * session — but that check only ever runs if this function actually calls the server.
+     * Re-verifying once per calendar day (this function already runs every 15-min cycle, see
+     * [generateIfNeededLocked]) means a re-import self-heals onto the active task within a
+     * day, even when the round never advances because the student hasn't finished the stale
+     * test yet — without hammering the endpoint every 15 minutes for an unchanged session.
      */
     private suspend fun createTargetedTestIfNeeded() {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val existingSession = GapTaskLedger.activeTestmateSessionId()
+        val todayKey = GapTaskLedger.todayKey()
         // DIAGNOSTIC: makes the guard's decision visible — was there already a session on
-        // file (and if so which round), or did this genuinely start from a clean slate.
+        // file (and if so which round), or did this genuinely start from a clean slate, and
+        // has it already been re-verified against the server today.
         Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
-            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()}")
-        if (existingSession != null) return
+            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()} " +
+            "checkedDay=${GapTaskLedger.activeTestmateSessionCheckedDay()} todayKey=$todayKey")
+        if (existingSession != null && GapTaskLedger.activeTestmateSessionCheckedDay() == todayKey) return
         val chapter = GapTaskLedger.activeChapter() ?: run {
             Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
             return
@@ -526,8 +542,19 @@ object GapTaskManager {
 
         when (outcome) {
             is TestmateTargetedTestOutcome.Success -> {
-                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
-                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                // Only overwrite (and bumpVersion, which triggers HomeScreen recompute) when
+                // the server actually handed back a DIFFERENT session than what we had — an
+                // unchanged same-day re-verify returns the identical ids and shouldn't touch
+                // the UI. A different id means the server superseded a stale session (see
+                // this function's own BUGFIX doc) or this is a genuinely first-time create.
+                if (outcome.test.sessionId != existingSession) {
+                    GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                    Log.d(TAG, "targeted test refreshed: concept=$conceptId session=${outcome.test.sessionId} " +
+                        "(was $existingSession)")
+                } else {
+                    Log.d(TAG, "targeted test re-verified unchanged: concept=$conceptId session=${outcome.test.sessionId}")
+                }
+                GapTaskLedger.markActiveTestmateSessionChecked(todayKey)
                 clearTestmateError()
             }
             is TestmateTargetedTestOutcome.Error -> {
@@ -738,6 +765,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
 
 
 
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
 package com.checkmate.planner.intervention
 
@@ -846,6 +874,15 @@ object GapTaskLedger {
     // the round does. Round 1 stays a bare conceptId (no suffix) for backward
     // compatibility with sessions already in flight before this fix.
     private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (stale repair test never refreshed): createTargetedTestIfNeeded used to skip
+    // the server entirely once a session id was recorded, so a chapter re-imported AFTER
+    // that session's test was built never got picked up until the round happened to advance
+    // (which requires the student finishing the stale test in the first place — reproduced
+    // live on Biomolecules, stuck on a 282-question set through several re-imports). This
+    // tracks the last dayKey the active session was re-verified against the server's own
+    // staleness check (see app/api/tests/targeted/route.ts), so that function can re-ask
+    // once per day instead of either never again or every 15-min cycle forever.
+    private const val KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY = "gap_task_active_testmate_session_checked_day"
     // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
     // literal 4-character string "null" (not a real null reference) whenever they were
     // ultimately derived from a Question row whose topic column was corrupted by the
@@ -994,6 +1031,7 @@ object GapTaskLedger {
             CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
             CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
             CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         }
         bumpVersion()
     }
@@ -1055,6 +1093,20 @@ object GapTaskLedger {
      *  genuinely different `intervention_id` per round instead of replaying round 1's. */
     fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
 
+    /** Last dayKey [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  re-verified the active session against the server's staleness check — see
+     *  [KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY]'s own doc. Null means never checked (a
+     *  brand new session, or one recorded before this fix shipped — either way the next
+     *  cycle will verify it). */
+    fun activeTestmateSessionCheckedDay(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, null)?.takeIf { it.isNotBlank() }
+
+    /** Called once per calendar day by [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  after it re-verifies (or freshly creates) the active session, so the same day's later
+     *  15-min cycles skip the network round-trip — see that function's own doc. */
+    fun markActiveTestmateSessionChecked(todayKey: String) =
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, todayKey)
+
     /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
      *  a targeted test was created (or already existed — see the endpoint's own idempotency
      *  by intervention_id) for the currently active concept. */
@@ -1109,6 +1161,7 @@ object GapTaskLedger {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
@@ -1146,6 +1199,7 @@ object GapTaskLedger {
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────
@@ -1262,6 +1316,449 @@ object GapTaskLedger {
             withContext(LockOwnerElement()) { block() }
         }
     }
+}
+
+
+
+
+//===== TERMUXFILE: Testmate/app/api/tests/targeted/route.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getServiceClient } from '@/lib/supabase';
+import { getCurrentUserFromRequest } from '@/lib/auth';
+
+// POST /api/tests/targeted
+// Body: {
+//   intervention_id: string,       // Checkmate's GapTaskLedger concept id
+//   chapter: string,
+//   topic?: string,
+//   question_count?: number,       // default 15 for pool 'NEW'; omitted/0/negative means
+//                                   // "no cap" for WRONG / SKIPPED / WRONG_SKIPPED — returns
+//                                   // every matching question instead of truncating at 15
+//   pool?: 'WRONG' | 'SKIPPED' | 'WRONG_SKIPPED' | 'NEW',  // default 'WRONG_SKIPPED'
+//   duration_seconds?: number      // default question_count * 90
+// }
+//
+// P0b — the "Testmate owns question selection, Checkmate owns why" endpoint. Builds a
+// student-specific test out of THIS student's own wrong/skipped history for one
+// chapter/topic (falling back to never-attempted questions from the same chapter/topic
+// if there aren't enough), then immediately creates and joins a solo session against it —
+// so Checkmate never has to also call POST /api/sessions or implement question selection
+// itself. Auth via getCurrentUserFromRequest (device-token compatible), unlike
+// POST /api/sessions, which currently only accepts the cookie session — Checkmate has no
+// browser session, so that route was never callable from the app for this.
+//
+// Idempotent on intervention_id (see db/migrations/009_targeted_tests.sql, refined by
+// 010_targeted_tests_reusable_intervention.sql): calling this again with the same
+// intervention_id for the same user, while a LIVE session for it still exists, returns
+// that SAME test/session rather than generating a new test every retry — UNLESS the
+// chapter/topic has been re-imported since that session's test was built, in which case
+// the old session is superseded (status -> 'ended') and a fresh one is generated from the
+// current question bank (see the staleness check below). A targeted test's question set is
+// frozen at creation time, so without this an unfinished repair test could never pick up
+// newly imported questions for its own chapter.
+//
+// KNOWN LIMITATION: "SKIPPED" only catches a question the student visited and left
+// unanswered (a `responses` row with a null selected_answer) — a question in a past test
+// the student never even navigated to (no `responses` row at all) can't be detected this
+// way without diffing every past test's full question list against responses, which this
+// endpoint doesn't do. Good enough for v1; revisit if that gap turns out to matter.
+//
+// BUGFIX (Aug 2026): the WRONG/SKIPPED lookup used to pull the student's ENTIRE response
+// history (every chapter, every subject, since day one) via `.eq('user_id', ...)`, then
+// filter it down to this chapter in memory. supabase-js sends `.in()` filters as URL query
+// params, and that unbounded history was stuffed into a single GET request's `.in('id', ...)`
+// filter — fine while history was small, but it grows without bound as the student keeps
+// using the app, and eventually exceeds the HTTP gateway's URL-length limit. That produces
+// a raw, non-JSON 400 from the gateway itself (not a normal PostgREST error), which
+// supabase-js surfaces as a generic `"Bad Request"` message — indistinguishable from a real
+// query error, and unrelated to which chapter/concept was being requested (hence "fails on
+// every chapter, even a brand new one" once history crossed the threshold).
+//
+// Fixed by flipping the query order: first fetch THIS CHAPTER's (optionally topic's)
+// question-id pool from `questions` — bounded by how many questions exist for one
+// chapter, not by the student's lifetime history — then filter `responses` down to only
+// those ids. That pool is batched defensively (CHUNK_SIZE) in case a single chapter's
+// question bank is ever large enough to risk the same URL-length problem on its own.
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUserFromRequest(req);
+  if (!user) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  const interventionId = body.intervention_id;
+  const chapter = body.chapter;
+  const topic = typeof body.topic === 'string' && body.topic.trim() ? body.topic.trim() : null;
+  const pool = (typeof body.pool === 'string' ? body.pool.toUpperCase() : 'WRONG_SKIPPED') as
+    | 'WRONG'
+    | 'SKIPPED'
+    | 'WRONG_SKIPPED'
+    | 'NEW';
+
+  // FIX (repair-test hard limit): question_count as a positive number is still a hard cap,
+  // same as always — this is what a retention check (Checkmate's RetentionCheckManager)
+  // keeps using to stay a short probe. But omitted/0/negative now means "no cap" for
+  // WRONG / SKIPPED / WRONG_SKIPPED — a repair test should pull in EVERY wrong/skipped
+  // question this student has for the chapter/topic, not just the first 15 the old default
+  // silently truncated to. 'NEW' still needs a real ceiling here since its candidate pool is
+  // the chapter's ENTIRE question bank, not bounded by the student's own history — an
+  // uncapped request for 'NEW' falls back to the same default of 15 it always had.
+  const rawQuestionCount = typeof body.question_count === 'number' ? Math.floor(body.question_count) : null;
+  const uncapped = pool !== 'NEW' && (rawQuestionCount === null || rawQuestionCount <= 0);
+  const questionCap = uncapped
+    ? Number.POSITIVE_INFINITY
+    : rawQuestionCount !== null && rawQuestionCount > 0
+      ? rawQuestionCount
+      : 15;
+
+  if (typeof interventionId !== 'string' || !interventionId.trim()) {
+    return NextResponse.json({ error: 'intervention_id is required' }, { status: 400 });
+  }
+  if (typeof chapter !== 'string' || !chapter.trim()) {
+    return NextResponse.json({ error: 'chapter is required' }, { status: 400 });
+  }
+  if (!['WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'].includes(pool)) {
+    return NextResponse.json(
+      { error: "pool must be one of 'WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'" },
+      { status: 400 }
+    );
+  }
+
+  const supabase = getServiceClient();
+
+  // Batches any `.in('id', [...])` filter so a single request's URL can't grow unbounded —
+  // see the BUGFIX note above. 150 ids/request comfortably stays under gateway URL limits
+  // even with 36-char UUIDs.
+  const CHUNK_SIZE = 150;
+  function chunk<T>(arr: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  // ── Idempotency: same student + same intervention_id => same LIVE test/session ──────
+  // BUGFIX (Aug 2026, reintroduced by 010's re-migration): this query used to have no
+  // status filter, which was only safe under 009's original unique index (one row per
+  // intervention_id, ever). 010_targeted_tests_reusable_intervention.sql rescoped that
+  // index to `status = 'live'` so a later, genuinely new occurrence of the same concept
+  // could get a fresh session once the earlier one ended — but this route wasn't updated
+  // to match, so once an old (ended) session and a new (live) session both existed for the
+  // same intervention_id, `.maybeSingle()` found more than one row and threw "JSON object
+  // requested, multiple (or no) rows returned" (HTTP 500). When only the old ended session
+  // existed, this also silently handed it back as "existing" instead of creating a new
+  // one — the cause of a fresh round's "Take Test" landing on a previous round's result
+  // page. Filtering to status = 'live' here matches the DB index and fixes both.
+  const { data: existingSession, error: idempotencyError } = await supabase
+    .from('test_sessions')
+    .select('id, test_id, intervention_id')
+    .eq('intervention_id', interventionId)
+    .eq('created_by', user.id)
+    .eq('status', 'live')
+    .maybeSingle();
+
+  if (idempotencyError) {
+    console.error('[targeted] idempotency check failed:', idempotencyError.message);
+    return NextResponse.json({ error: idempotencyError.message }, { status: 500 });
+  }
+
+  if (existingSession) {
+    const { data: existingTest, error: existingTestError } = await supabase
+      .from('tests')
+      .select('id, title, status, duration_seconds, created_at')
+      .eq('id', existingSession.test_id)
+      .single();
+    if (existingTestError) {
+      console.error('[targeted] existing-test lookup failed:', existingTestError.message);
+      return NextResponse.json({ error: existingTestError.message }, { status: 500 });
+    }
+
+    // BUGFIX (stale repair test never refreshed): a targeted test freezes its question set
+    // at creation time (see the copy-into-`questions` step below), so blindly reusing a
+    // still-`live` session forever meant a student stuck on an unfinished repair test never
+    // saw questions from a LATER re-import of the same chapter — reproduced live on
+    // Biomolecules, stuck on a 282-question set built well before several subsequent
+    // imports. Compare this test's created_at against the newest question row for this
+    // chapter/topic; if the chapter was (re-)imported after this test was built, the old
+    // session is stale and gets superseded instead of handed back.
+    let newestQuestionQuery = supabase
+      .from('questions')
+      .select('created_at')
+      .eq('chapter', chapter)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (topic) newestQuestionQuery = newestQuestionQuery.eq('topic', topic);
+    const { data: newestQuestionRows, error: newestQError } = await newestQuestionQuery;
+    if (newestQError) {
+      console.error('[targeted] staleness check failed, reusing existing session as-is:', newestQError.message);
+    }
+
+    const isStale =
+      !newestQError &&
+      newestQuestionRows?.[0]?.created_at != null &&
+      new Date(newestQuestionRows[0].created_at).getTime() > new Date(existingTest.created_at).getTime();
+
+    if (!isStale) {
+      return NextResponse.json({
+        test: existingTest,
+        session: existingSession,
+        question_count: uncapped ? null : questionCap,
+        reused: true
+      });
+    }
+
+    console.log(
+      `[targeted] session ${existingSession.id} (intervention_id=${interventionId}) is stale — ` +
+      `chapter "${chapter}" was re-imported after this test was built. Superseding and rebuilding.`
+    );
+    const { error: supersedeError } = await supabase
+      .from('test_sessions')
+      .update({ status: 'ended' }) // reuses the existing enum value — already outside the `status = 'live'` unique index, no migration needed
+      .eq('id', existingSession.id);
+    if (supersedeError) {
+      // Couldn't mark it superseded — reusing the (still technically live, if stale) session
+      // beats erroring the whole request or, worse, ending up with two live sessions for the
+      // same intervention_id once a new one is inserted below.
+      console.error('[targeted] failed to supersede stale session, reusing it instead:', supersedeError.message);
+      return NextResponse.json({
+        test: existingTest,
+        session: existingSession,
+        question_count: uncapped ? null : questionCap,
+        reused: true
+      });
+    }
+    // fall through — builds a fresh test/session below, same path as "no existing session"
+  }
+
+  // ── Build the candidate question pool from this student's own history ──────────────
+  type CandidateRow = {
+    id: string;
+    question_text: string;
+    question_image_url: string | null;
+    question_data: unknown;
+    options: unknown;
+    option_images: unknown;
+    correct_answer: string | null;
+    marks: number | null;
+    negative_marks: number | null;
+    chapter: string | null;
+    topic: string | null;
+    difficulty: string | null;
+    question_type: string | null;
+    explanation: string | null;
+    answered_at?: string | null;
+  };
+
+  const QUESTION_SELECT =
+    'id, question_text, question_image_url, question_data, options, option_images, correct_answer, marks, negative_marks, chapter, topic, difficulty, question_type, explanation';
+
+  const chosen: CandidateRow[] = [];
+  const chosenIds = new Set<string>();
+
+  if (pool === 'WRONG' || pool === 'SKIPPED' || pool === 'WRONG_SKIPPED') {
+    // Scope by CHAPTER first — bounded by this chapter's question bank, not by the
+    // student's entire lifetime response history (see BUGFIX note above).
+    let chapterQuestionsQuery = supabase.from('questions').select('id').eq('chapter', chapter);
+    if (topic) chapterQuestionsQuery = chapterQuestionsQuery.eq('topic', topic);
+    const { data: chapterQuestions, error: chapterQError } = await chapterQuestionsQuery;
+    if (chapterQError) {
+      console.error('[targeted] chapter question-pool lookup failed:', chapterQError.message);
+      return NextResponse.json({ error: chapterQError.message }, { status: 500 });
+    }
+    const chapterQuestionIds = (chapterQuestions ?? []).map((q) => q.id);
+
+    if (chapterQuestionIds.length > 0) {
+      // Fetch this student's responses restricted to THIS chapter's question ids only,
+      // batched defensively in case one chapter's bank is itself very large.
+      const responseRows: { question_id: string; selected_answer: string | null; is_correct: boolean | null; answered_at: string | null }[] = [];
+      for (const idsBatch of chunk(chapterQuestionIds, CHUNK_SIZE)) {
+        const { data: batch, error: rError } = await supabase
+          .from('responses')
+          .select('question_id, selected_answer, is_correct, answered_at')
+          .eq('user_id', user.id)
+          .in('question_id', idsBatch);
+        if (rError) {
+          console.error('[targeted] responses lookup failed:', rError.message);
+          return NextResponse.json({ error: rError.message }, { status: 500 });
+        }
+        if (batch) responseRows.push(...batch);
+      }
+
+      if (responseRows.length > 0) {
+        const uniqueAnsweredIds = Array.from(new Set(responseRows.map((r) => r.question_id)));
+        const questionById = new Map<string, CandidateRow>();
+        for (const idsBatch of chunk(uniqueAnsweredIds, CHUNK_SIZE)) {
+          const { data: qBatch, error: qError } = await supabase
+            .from('questions')
+            .select(QUESTION_SELECT)
+            .in('id', idsBatch);
+          if (qError) {
+            console.error('[targeted] candidate-question lookup failed:', qError.message);
+            return NextResponse.json({ error: qError.message }, { status: 500 });
+          }
+          for (const q of qBatch ?? []) questionById.set(q.id, q as CandidateRow);
+        }
+
+        const wantWrong = pool === 'WRONG' || pool === 'WRONG_SKIPPED';
+        const wantSkipped = pool === 'SKIPPED' || pool === 'WRONG_SKIPPED';
+
+        // Most-recent-first, and de-duped by question_id (a question can have been
+        // attempted in more than one past test session) — keep only the latest attempt
+        // at each one.
+        const sorted = [...responseRows].sort(
+          (a, b) => new Date(b.answered_at ?? 0).getTime() - new Date(a.answered_at ?? 0).getTime()
+        );
+
+        for (const r of sorted) {
+          if (chosen.length >= questionCap) break;
+          if (chosenIds.has(r.question_id)) continue;
+          const q = questionById.get(r.question_id);
+          if (!q) continue;
+
+          const isWrong = r.is_correct === false;
+          const isSkipped = r.selected_answer === null || r.selected_answer === undefined;
+          if ((wantWrong && isWrong) || (wantSkipped && isSkipped)) {
+            chosen.push(q);
+            chosenIds.add(r.question_id);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Backfill (or serve entirely, for pool === 'NEW') from never-attempted questions ──
+  // Skipped entirely when `uncapped`: an uncapped WRONG/SKIPPED/WRONG_SKIPPED request wants
+  // exactly this student's actual wrong/skipped set, not padded up to some target size with
+  // questions they've never even seen.
+  if (!uncapped && chosen.length < questionCap) {
+    // Only needs to know WHICH of this chapter's questions the student has already
+    // attempted, so scope this the same bounded way — not the student's full history.
+    let backfillQuery = supabase.from('questions').select(QUESTION_SELECT).eq('chapter', chapter).limit(questionCap * 3); // overfetch — some will be filtered out below
+    if (topic) backfillQuery = backfillQuery.eq('topic', topic);
+
+    const { data: backfillCandidates, error: bError } = await backfillQuery;
+    if (bError) {
+      console.error('[targeted] backfill lookup failed:', bError.message);
+      return NextResponse.json({ error: bError.message }, { status: 500 });
+    }
+
+    const backfillIds = (backfillCandidates ?? []).map((q) => q.id);
+    const attemptedIds = new Set<string>();
+    for (const idsBatch of chunk(backfillIds, CHUNK_SIZE)) {
+      const { data: attempted, error: aError } = await supabase
+        .from('responses')
+        .select('question_id')
+        .eq('user_id', user.id)
+        .in('question_id', idsBatch);
+      if (aError) {
+        console.error('[targeted] attempted-ids lookup failed:', aError.message);
+        return NextResponse.json({ error: aError.message }, { status: 500 });
+      }
+      for (const r of attempted ?? []) attemptedIds.add(r.question_id);
+    }
+
+    for (const q of backfillCandidates ?? []) {
+      if (chosen.length >= questionCap) break;
+      if (chosenIds.has(q.id)) continue;
+      if (attemptedIds.has(q.id)) continue; // "NEW" means genuinely never attempted
+      chosen.push(q as CandidateRow);
+      chosenIds.add(q.id);
+    }
+  }
+
+  if (chosen.length === 0) {
+    return NextResponse.json(
+      { error: `No questions available for chapter "${chapter}"${topic ? ` / topic "${topic}"` : ''} yet.` },
+      { status: 422 }
+    );
+  }
+
+  // Computed from the actual selected set (chosen.length), not the nominal cap — matters
+  // once `pool` is uncapped, since there is no fixed target question_count left to multiply
+  // by 90 in that case.
+  const durationSeconds =
+    typeof body.duration_seconds === 'number' && body.duration_seconds > 0
+      ? body.duration_seconds
+      : chosen.length * 90;
+
+  // ── Create the test, copy the chosen questions into it, start a solo session ────────
+  const { data: newTest, error: testError } = await supabase
+    .from('tests')
+    .insert({
+      title: `Repair: ${chapter}${topic ? ` — ${topic}` : ''}`,
+      status: 'published', // system-generated from already-tagged questions — skip draft/review
+      owner_user_id: user.id,
+      generated_from: { intervention_id: interventionId, chapter, topic, pool, question_count: chosen.length },
+      duration_seconds: durationSeconds
+    })
+    .select()
+    .single();
+  if (testError) {
+    console.error('[targeted] test insert failed:', testError.message);
+    return NextResponse.json({ error: testError.message }, { status: 500 });
+  }
+
+  const questionRows = chosen.map((q, i) => ({
+    test_id: newTest.id,
+    question_number: i + 1,
+    question_text: q.question_text,
+    question_image_url: q.question_image_url,
+    question_data: q.question_data,
+    options: q.options,
+    option_images: q.option_images,
+    correct_answer: q.correct_answer,
+    marks: q.marks ?? 4,
+    negative_marks: q.negative_marks ?? 1,
+    chapter: q.chapter,
+    topic: q.topic,
+    difficulty: q.difficulty,
+    question_type: q.question_type,
+    explanation: q.explanation,
+    origin_question_id: q.id,
+    tag_source: 'targeted_copy'
+  }));
+
+  const { error: qInsertError } = await supabase.from('questions').insert(questionRows);
+  if (qInsertError) {
+    console.error('[targeted] question copy insert failed:', qInsertError.message);
+    return NextResponse.json({ error: qInsertError.message }, { status: 500 });
+  }
+
+  const { data: session, error: sessionError } = await supabase
+    .from('test_sessions')
+    .insert({
+      test_id: newTest.id,
+      mode: 'solo',
+      server_start_time: new Date().toISOString(),
+      duration_seconds: durationSeconds,
+      status: 'live',
+      created_by: user.id,
+      intervention_id: interventionId
+    })
+    .select()
+    .single();
+  if (sessionError) {
+    console.error('[targeted] session insert failed:', sessionError.message);
+    return NextResponse.json({ error: sessionError.message }, { status: 500 });
+  }
+
+  const { error: joinError } = await supabase
+    .from('session_participants')
+    .insert({ session_id: session.id, user_id: user.id });
+  if (joinError) {
+    console.error('[targeted] session join failed:', joinError.message);
+    return NextResponse.json({ error: joinError.message }, { status: 500 });
+  }
+
+  return NextResponse.json(
+    { test: newTest, session, question_count: questionRows.length, reused: false },
+    { status: 201 }
+  );
 }
 
 
