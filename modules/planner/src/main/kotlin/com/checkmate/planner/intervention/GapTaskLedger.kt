@@ -267,6 +267,22 @@ object GapTaskLedger {
     fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)?.takeIf { it.isNotBlank() }
     fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
     fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
+
+    /**
+     * SKIPPED-task retry-in-place (see GapTaskManager.resolveActiveConceptState's SKIPPED
+     * branch): moves the active pointer to a freshly re-served copy of the SAME still-open
+     * task, without touching conceptId, days-served streak, or any P0b test/session/round
+     * field. Deliberately narrower than [recordServed] — that function's isNewConcept branch
+     * exists specifically to reset P0b state for a genuinely NEW intervention, which this
+     * is not: the concept, its test, and its session (if any) are unchanged, only WHICH
+     * task instance represents "today's shot at it" has.
+     */
+    fun updateActiveTaskPointer(taskId: String, dayKey: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        bumpVersion()
+    }
+
     fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
     fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
     fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }

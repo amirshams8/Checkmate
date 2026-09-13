@@ -196,6 +196,40 @@ object GapTaskManager {
         Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
         if (task.state == TaskState.DONE) {
             resolveDoneConcept(context, conceptId, dayKey)
+        } else if (task.state == TaskState.SKIPPED && dayKey != GapTaskLedger.todayKey()) {
+            // "Retry in place": a SKIPPED task from a stale prior day never gets another
+            // chance to surface — PlanStore only ever exposes today's dayKey's list to the
+            // Task tab (HomeViewModel reads PlanStore.todayTasks exclusively), so once the
+            // day rolls over, the task itself becomes permanently unreachable through the
+            // UI while GapTaskLedger's active pointer still points straight at it — nothing
+            // else in this class handles that state, so it would otherwise sit blocking
+            // AlreadyActive forever. Re-serves the SAME task (same concept/subject/topic/
+            // duration/rationale/conceptId — not a new intervention) as a fresh PENDING
+            // entry in today's list, giving the student another shot at exactly what they
+            // skipped. Deliberately does NOT touch the P0b test/session/round fields (see
+            // GapTaskLedger.resetForNextRound's own doc for why those are reserved for the
+            // DONE-but-still-below-mastery case): the student never took the associated
+            // Testmate test, so whatever session is on file (if any) is still valid and
+            // unsubmitted — nothing to reset.
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was SKIPPED on " +
+                "$dayKey (not today=${GapTaskLedger.todayKey()}) — re-surfacing a fresh copy in today's list")
+            val freshTask = task.copy(
+                id = java.util.UUID.randomUUID().toString(),
+                state = TaskState.PENDING,
+                completedAt = null,
+                scheduledAt = System.currentTimeMillis(),
+                scheduledStartTime = null,
+                pausedAt = null,
+                totalPausedMs = 0L,
+                actualMinutes = 0,
+                focusMinutes = 0,
+                checksPassed = 0,
+                checksMissed = 0,
+                pauseCount = 0,
+                completedStatus = null
+            )
+            PlanStore.createTask(freshTask)
+            GapTaskLedger.updateActiveTaskPointer(freshTask.id, GapTaskLedger.todayKey())
         }
     }
 
