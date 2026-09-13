@@ -1,338 +1,1265 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/ui/testresults/TestResultsViewModel.kt =====
-package com.checkmate.ui.testresults
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+package com.checkmate.service
 
 import android.content.Context
-import android.net.Uri
 import android.util.Log
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.learning.analytics.ConceptWeightage
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
-import com.checkmate.learning.testmate.TestResultNormalizer
+import com.checkmate.learning.tutor.TutorSessionLedger
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.testmate.TestmateApi
-import com.checkmate.testmate.TestmateResult
+import com.checkmate.testmate.TestmateQuestionPool
+import com.checkmate.testmate.TestmateResultOutcome
+import com.checkmate.testmate.TestmateTargetedTestOutcome
+import com.checkmate.ui.mentor.MentorViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done — and warn the student, with escalating persuasion, when one is being
+ * ignored." Three entry points now, all called from [ReminderService]'s existing 15-min
+ * loop (same wiring pattern as every [ProactiveMentor] check already there):
+ *
+ * - [generateIfNeeded] — the daily trigger [LearningInterventionOrchestrator]'s own class
+ *   doc always said was still missing, now filled by a genuine day-level schedule instead
+ *   of only firing on fresh test import ([com.checkmate.ui.testresults.TestResultsViewModel]
+ *   still owns that import-time trigger; this is the *ongoing* one). Also now requests the
+ *   P0b Testmate targeted test for whichever concept ends up active (see
+ *   [createTargetedTestIfNeeded]).
+ * - [escalationCheckIfNeeded] — reads [GapTaskLedger]'s streak for whichever concept is
+ *   currently being served and, once it's gone unaddressed for more than a day, sends an
+ *   escalating warning via the SAME delivery path [ProactiveMentor] already uses
+ *   ([MentorViewModel.appendProactiveMessage] + [MentorNotifier.notify]).
+ * - [evidencePollIfNeeded] — P0b: the actual return arrow. Every 15-min cycle (NOT
+ *   once-a-day gated, unlike the two above — the student could submit the Testmate test at
+ *   any time), checks whether the active concept's targeted-test result is in yet and, if
+ *   so, hands it to [TargetedTestEvidenceImporter] so mastery moves off REAL evidence
+ *   instead of only the task's DONE flag.
+ *
+ * Neither [generateIfNeeded] nor [escalationCheckIfNeeded] needs its own "is there anything
+ * to analyze" gate beyond checking `studentModel.concepts.isEmpty()` — an empty StudentModel
+ * (no test ever imported) just means [LearningDecisionEngine.decideFromReport] returns no
+ * candidates and nothing happens, same as the import-time trigger's own behavior.
+ */
+object GapTaskManager {
+
+    private const val TAG = "GapTaskManager"
+
+    // FIX (repair-test hard limit): a repair test must cover every wrong/skipped question
+    // the student has for the concept's chapter/topic, not a fixed slice of them. 0 is the
+    // sentinel Testmate's POST /api/tests/targeted route.ts reads as "no cap" for the
+    // WRONG_SKIPPED pool (see that route's own doc) — it was 15 before, which silently
+    // truncated any repair set bigger than that. Retention checks are a different, smaller
+    // probe and intentionally keep their own fixed count — see
+    // RetentionCheckManager.RETENTION_QUESTION_COUNT, untouched by this.
+    private const val TARGETED_TEST_QUESTION_COUNT = 0
+
+    // Persisted (not just logged) so a create-test failure is visible in Settings → Test
+    // Platform without needing adb logcat — Log.w/Log.e alone rotate out of the buffer
+    // within hours, which is exactly what made a 2-day-old missing token invisible on
+    // device. Cleared on the next successful attempt, or manually from Settings.
+    const val PREF_TESTMATE_LAST_ERROR = "gap_task_testmate_last_error"
+    const val PREF_TESTMATE_LAST_ERROR_AT = "gap_task_testmate_last_error_at"
+
+    // BUGFIX (topic-"null" 422 loop, one-time data repair): once-ever guard for
+    // repairLegacyNullTopicsIfNeeded — the repair itself is a cheap single UPDATE per
+    // table, but there's no reason to run it on every generateIfNeeded call for the rest
+    // of this install's life once it's confirmed done.
+    private const val PREF_REPAIRED_LEGACY_NULL_TOPICS = "gap_task_repaired_legacy_null_topics_v1"
+
+    // ── Daily generation ─────────────────────────────────────────────────────
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasGeneratedToday]): resolves whether
+     * yesterday's gap-task actually got finished (see [resolveActiveConceptState]), then runs
+     * the exact same StudentModel -> PerformanceReport -> ScoreGainEstimator -> ExpectedScore
+     * -> DecisionReport pipeline [com.checkmate.ui.testresults.TestResultsViewModel] runs
+     * after a fresh import, sourcing `examType`/`targetScore` from [ConsultationProfile]
+     * instead of a just-parsed report since there may be no fresh import today at all.
+     * [LearningInterventionOrchestrator] itself handles skipping already-covered concepts
+     * and picking up where yesterday left off. Once that's done, also requests (or confirms)
+     * the P0b Testmate targeted test for whichever concept is now active — see
+     * [createTargetedTestIfNeeded]. Marks today done, success or failure either way (a failed
+     * analysis run shouldn't retry every 15 minutes for the rest of the day).
+     */
+    /**
+     * BUGFIX (unsynchronized ledger race): this whole body used to run un-serialized
+     * against the two other call chains that also read-then-write [GapTaskLedger]'s
+     * active-round/session state ([LearningInterventionOrchestrator.executeTopCandidate]
+     * called directly from [com.checkmate.ui.testresults.TestResultsViewModel], and this
+     * same function called from [com.checkmate.ui.home.HomeViewModel.confirmCompletion]).
+     * See [GapTaskLedger.withLock]'s own doc for the concrete failure this closes.
+     */
+    suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
+        generateIfNeededLocked(context)
+    }
+
+    private suspend fun generateIfNeededLocked(context: Context) {
+        // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
+        // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
+        // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
+        // 15-min cycle, same cadence as evidencePollIfNeeded, NOT only once per calendar
+        // day. The active concept's task can legitimately go DONE-with-evidence-imported
+        // more than once in a single day (a fast student, or a same-day repro/test cycle),
+        // and each time it does, the loop needs to advance the round and request the next
+        // Testmate retest THE SAME DAY — not sit inert until hasGeneratedToday resets
+        // tomorrow. Confirmed live: with this gated, marking the round-2 task Done and
+        // re-importing its evidence same-day did nothing at all until
+        // gap_task_last_generated_day was manually deleted from prefs to force a fresh
+        // generateIfNeeded run — the ONLY code path that ever calls
+        // resolveActiveConceptState/createTargetedTestIfNeeded. Both are cheap, ledger-
+        // driven, and safely no-op with nothing active, so running them unconditionally
+        // here is safe — unlike the StudentModel/PerformanceAnalyzer pipeline below, which
+        // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
+        // part.
+        resolveActiveConceptState(context)
+        createTargetedTestIfNeeded()
+
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+
+        repairLegacyNullTopicsIfNeeded(context)
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+            val decisionReport = LearningDecisionEngine.decideFromReport(
+                report, studentModel, estimates, expectedScore
+            )
+            val orchestrationResult =
+                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
+            // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
+            // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
+            // startFromCandidate's own doc for which intents this actually applies to.
+            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
+                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
+            createTargetedTestIfNeeded()
+        } catch (e: Exception) {
+            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+        } finally {
+            GapTaskLedger.markGeneratedToday(todayKey)
+        }
+    }
+
+    /**
+     * If [GapTaskLedger]'s active concept's task has actually reached DONE, resolves whether
+     * the concept is truly finished (see [resolveDoneConcept]) BEFORE re-ranking — otherwise
+     * today's run would still see it as active (streak intact) for the few seconds between
+     * "the student finished it" and "the ledger found out," and [LearningInterventionOrchestrator]
+     * would have no way to know without this being called first. Safe to call with nothing
+     * active (both lookups return null and this no-ops).
+     */
+    private suspend fun resolveActiveConceptState(context: Context) {
+        // DIAGNOSTIC (round-2 redirect-to-old-result investigation): every early return
+        // below used to be silent — logcat showed createTargetedTestIfNeeded either firing
+        // or not, with no way to tell WHY resolveDoneConcept never ran when it should have.
+        // Logging each branch so the next repro run pinpoints the actual break instead of
+        // requiring another guess-and-rebuild cycle.
+        val conceptId = GapTaskLedger.activeConceptId() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: no active concept — no-op")
+            return
+        }
+        val taskId = GapTaskLedger.activeTaskId() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId has no active taskId — no-op")
+            return
+        }
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId has no dayKey — no-op")
+            return
+        }
+        val task = findTask(taskId, dayKey) ?: run {
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId dayKey=$dayKey — " +
+                "task not found in PlanStore.todayTasks or loadDay($dayKey) — no-op")
+            return
+        }
+        Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
+        if (task.state == TaskState.DONE) {
+            resolveDoneConcept(context, conceptId, dayKey)
+        } else if (task.state == TaskState.SKIPPED && dayKey != GapTaskLedger.todayKey()) {
+            // "Retry in place": a SKIPPED task from a stale prior day never gets another
+            // chance to surface — PlanStore only ever exposes today's dayKey's list to the
+            // Task tab (HomeViewModel reads PlanStore.todayTasks exclusively), so once the
+            // day rolls over, the task itself becomes permanently unreachable through the
+            // UI while GapTaskLedger's active pointer still points straight at it — nothing
+            // else in this class handles that state, so it would otherwise sit blocking
+            // AlreadyActive forever. Re-serves the SAME task (same concept/subject/topic/
+            // duration/rationale/conceptId — not a new intervention) as a fresh PENDING
+            // entry in today's list, giving the student another shot at exactly what they
+            // skipped. Deliberately does NOT touch the P0b test/session/round fields (see
+            // GapTaskLedger.resetForNextRound's own doc for why those are reserved for the
+            // DONE-but-still-below-mastery case): the student never took the associated
+            // Testmate test, so whatever session is on file (if any) is still valid and
+            // unsubmitted — nothing to reset.
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was SKIPPED on " +
+                "$dayKey (not today=${GapTaskLedger.todayKey()}) — re-surfacing a fresh copy in today's list")
+            val freshTask = task.copy(
+                id = java.util.UUID.randomUUID().toString(),
+                state = TaskState.PENDING,
+                completedAt = null,
+                scheduledAt = System.currentTimeMillis(),
+                scheduledStartTime = null,
+                pausedAt = null,
+                totalPausedMs = 0L,
+                actualMinutes = 0,
+                focusMinutes = 0,
+                checksPassed = 0,
+                checksMissed = 0,
+                pauseCount = 0,
+                completedStatus = null
+            )
+            PlanStore.createTask(freshTask)
+            GapTaskLedger.updateActiveTaskPointer(freshTask.id, GapTaskLedger.todayKey())
+        }
+    }
+
+    /**
+     * BUGFIX (topic-"null" 422 loop, one-time data repair): a JSON `null` topic used to
+     * survive TestmateApi.parseResult's bare optString() calls as the literal string
+     * "null" instead of a real Kotlin null — see that class's parseResult doc and
+     * GapTaskLedger.sanitizeTopicOrChapter's doc for the full chain. That fix stops NEW
+     * corruption, but does nothing for Question/Concept rows already written to Room
+     * before this build — MasteryEngine.recomputeAll re-derives Concept.topic from a
+     * sample Question row on every single recompute, so an already-poisoned row keeps
+     * re-poisoning GapTaskLedger's active topic (and therefore the Testmate request
+     * payload) forever, purely patching the client never fixes it. Runs once ever per
+     * install (see [PREF_REPAIRED_LEGACY_NULL_TOPICS]) since it's a permanent repair, not
+     * an ongoing condition — every future write already goes through the parseResult fix
+     * plus the GapTaskLedger/TestmateApi sanitize guards.
+     */
+    private suspend fun repairLegacyNullTopicsIfNeeded(context: Context) {
+        if (CheckmatePrefs.getBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, false)) return
+        try {
+            val db = LearningDatabase.getInstance(context)
+            val questionsFixed = withContext(Dispatchers.IO) { db.questionDao().repairLiteralNullTopics() }
+            val conceptsFixed = withContext(Dispatchers.IO) { db.conceptDao().repairLiteralNullTopics() }
+            Log.d(TAG, "repairLegacyNullTopicsIfNeeded: fixed $questionsFixed question row(s), " +
+                "$conceptsFixed concept row(s) with literal topic=\"null\"")
+            CheckmatePrefs.putBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, true)
+        } catch (e: Exception) {
+            // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
+            // runs again on the next generateIfNeeded call instead of silently giving up.
+            Log.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
+        }
+    }
+
+    /**
+     * BUGFIX (P0b re-intervention loop): a task reaching DONE only means the student finished
+     * the *review task* — it says nothing about whether the concept itself is actually
+     * mastered. The previous behavior called [GapTaskLedger.markCovered] unconditionally as
+     * soon as the task hit DONE, which permanently retired the concept even when the Testmate
+     * retest evidence for that exact concept came back still below
+     * [MasteryEngine.MASTERY_THRESHOLD]. Once covered, [LearningInterventionOrchestrator]
+     * never re-ranks that concept again no matter how weak it stays — this is what silently
+     * broke the "retest -> still weak -> another targeted retest" cycle the whole P0b loop
+     * exists for (confirmed live: report -> targeted test -> retest submitted -> evidence
+     * imported -> mastery recomputed still below threshold -> no next retest was ever
+     * requested, because the concept had already been marked covered the moment its task
+     * card was checked off).
+     *
+     * Now: only mark covered once P0b evidence has actually been imported for this concept
+     * AND mastery has genuinely cleared the bar.
+     * - No evidence imported yet -> nothing to recheck against, same cover-on-DONE behavior
+     *   as before this fix.
+     * - Evidence imported and mastery >= threshold -> genuinely done, cover it.
+     * - Evidence imported and mastery still < threshold, OR no mastery row found at all ->
+     *   concept stays active; only its P0b session fields reset (see
+     *   [GapTaskLedger.resetForNextRound]) so [createTargetedTestIfNeeded] requests a
+     *   brand-new Testmate retest for the SAME concept on the next run instead of the loop
+     *   silently stopping.
+     *
+     * BUGFIX (false-covered on conceptId drift): "no mastery row at all" used to be folded
+     * into the same branch as "mastery cleared the bar" — markCovered either way. That's
+     * only safe if a missing row genuinely means "nothing to check," but by the time this
+     * runs [GapTaskLedger.isActiveEvidenceImported] is already true, meaning REAL P0b
+     * evidence WAS imported for this exact round. [MasteryEngine.recomputeAll] re-derives
+     * its grouping key ([com.checkmate.learning.graph.KnowledgeGraph.conceptId]) from each
+     * [com.checkmate.learning.model.Question]'s own chapter/topic tag on every single run —
+     * see that class's own doc — so a retest's Testmate-tagged questions whose chapter/topic
+     * string isn't byte-for-byte identical to the original import's produces a brand-new
+     * hash bucket instead of updating this one, leaving a lookup for the OLD active
+     * conceptId returning null even though the real concept is nowhere near mastered.
+     * Confirmed live: this exact path fired while real mastery was still 0.744 (well under
+     * [MasteryEngine.MASTERY_THRESHOLD]), [GapTaskLedger.markCovered] wiped the still-
+     * unresolved concept, and the identical real gap resurfaced minutes later under a fresh
+     * conceptId — eventually exhausting Testmate's wrong/skipped question pool for that
+     * chapter (repeated fresh-round requests instead of one continuing round). Missing
+     * mastery data with evidence already imported is now treated the same as "still below
+     * threshold" — one extra retest round is far cheaper than silently abandoning a real gap.
+     *
+     * BUGFIX (revert-to-PENDING silent no-op via day-key mismatch): [dayKey] is now required
+     * from the caller (both already have it in scope) instead of this function reaching for
+     * [PlanStore]'s today-only [PlanStore.markTask] — see [PlanStore.markTaskInDay]'s own doc
+     * for the full mechanism. Without the correct day, the "evidence not imported, revert to
+     * PENDING" branch below silently failed to revert anything whenever the active task
+     * wasn't from strictly today, leaving [LearningInterventionOrchestrator.executeTopCandidate]'s
+     * AlreadyActive guard blind to the true PENDING intent and creating a duplicate task for
+     * the same still-unresolved concept — confirmed live via the round-stuck-at-1 /
+     * redirect-to-old-result repro.
+     */
+    private suspend fun resolveDoneConcept(context: Context, conceptId: String, dayKey: String) {
+        if (!GapTaskLedger.isActiveEvidenceImported()) {
+            val round = GapTaskLedger.activeTestmateRound()
+            val sessionId = GapTaskLedger.activeTestmateSessionId()
+
+            if (sessionId == null) {
+                // Genuinely nothing to check yet — no targeted test was ever requested for
+                // this concept (round 1, no session on file). Covering is correct here.
+                Log.d(TAG, "resolveDoneConcept: concept=$conceptId no session ever created " +
+                    "(round=$round) — nothing to check, covering")
+                GapTaskLedger.markCovered(conceptId)
+                return
+            }
+
+            // BUGFIX (P0b premature-cover): a session exists (round=$round) but its evidence
+            // hasn't been imported yet — the review task was marked DONE before
+            // evidencePollIfNeeded's 15-min cycle caught up. Confirmed live (see repro log
+            // 08-30 22:26:16): covering unconditionally here closed round 2 of concept
+            // neet-biomolecules-ii-...-56718eb2 with no evidence check at all, right after
+            // round 1 correctly found mastery still below threshold — exactly the silent-
+            // abandon path this diagnostic was added to catch. Defer instead: put the task
+            // back to PENDING so the next evidencePollIfNeeded/generateIfNeeded pass
+            // re-resolves it once real evidence has actually landed, rather than guessing
+            // blind. escalationCheckIfNeeded and resolveActiveConceptState both call this
+            // function again on their own next pass, so this concept won't get stuck.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId == null) {
+                Log.w(TAG, "resolveDoneConcept: concept=$conceptId evidence not imported and " +
+                    "no activeTaskId to revert — leaving as-is for next pass")
+                return
+            }
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId evidence NOT imported yet " +
+                "(round=$round, sessionId=$sessionId) — deferring resolution instead of " +
+                "covering (see BUGFIX note), reverting taskId=$taskId (dayKey=$dayKey) to PENDING")
+            // BUGFIX: was PlanStore.markTask(taskId, PENDING) — today-list-only, silently
+            // no-op'd for a task whose dayKey wasn't today's (see PlanStore.markTaskInDay doc
+            // and this function's own class doc). Logging the outcome so a future miss (task
+            // genuinely missing from both today's list AND plan_$dayKey) is visible instead
+            // of silently trusted.
+            val reverted = PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            if (!reverted) {
+                Log.w(TAG, "resolveDoneConcept: concept=$conceptId taskId=$taskId dayKey=$dayKey " +
+                    "— revert-to-PENDING found no matching task in plan_$dayKey either; " +
+                    "AlreadyActive guard may still see this as DONE next run")
+            }
+            return
+        }
+
+        val mastery = try {
+            withContext(Dispatchers.IO) {
+                LearningDatabase.getInstance(context).masteryDao()
+                    .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            return // retry this check on the next generateIfNeeded run rather than guessing
+        }
+
+        if (mastery == null) {
+            // BUGFIX (false-covered on conceptId drift): see doc above — evidence was
+            // already confirmed imported for this round, so a missing row here means the
+            // recomputed mastery likely landed under a different conceptId, not that
+            // there's nothing left to check. Treat as unresolved, not done.
+            Log.w(TAG, "resolveDoneConcept: concept=$conceptId has evidence imported but NO " +
+                "mastery row — likely conceptId drift (see BUGFIX doc). Treating as unresolved " +
+                "instead of covering.")
+            GapTaskLedger.resetForNextRound()
+            // BUGFIX (Branch B never reverted DONE task): resetForNextRound() alone doesn't
+            // move the task's own state — only the evidence-not-imported branch above did
+            // that. Without this, a task marked DONE stays DONE while the ledger considers
+            // the concept unresolved, so the AlreadyActive guard sees "already active" AND
+            // "already done" at once and the retest loop stalls with the task stuck on the
+            // plan as complete. Mirror Branch A's revert-to-PENDING here.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId != null) {
+                PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            }
+        } else if (mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
+            GapTaskLedger.markCovered(conceptId)
+        } else {
+            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+                "(${mastery.mastery}) after evidence — requesting another targeted retest round")
+            GapTaskLedger.resetForNextRound()
+            // BUGFIX (Branch B never reverted DONE task): same gap as above — mastery below
+            // threshold means the concept isn't actually resolved, but without reverting the
+            // task itself, it stays DONE on the plan even as the ledger starts a new round.
+            val taskId = GapTaskLedger.activeTaskId()
+            if (taskId != null) {
+                PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
+            }
+        }
+    }
+
+    /** Checks today's live list first (cheap, common case), falls back to [PlanStore.loadDay]
+     *  for a task created on an earlier day that hasn't rolled into today's plan. */
+    private fun findTask(taskId: String, dayKey: String): StudyTask? =
+        PlanStore.todayTasks.value.find { it.id == taskId }
+            ?: PlanStore.loadDay(dayKey).find { it.id == taskId }
+
+    // ── P0b: Testmate targeted-test creation ────────────────────────────────
+
+    /**
+     * Requests a Testmate targeted-repair test for the currently active gap concept, but
+     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
+     * means either this call already succeeded for this concept, or the concept is being
+     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
+     * across days (see its own doc). No-ops with nothing active, or with no
+     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
+     * crashing the whole generation pass over it). A failed request is NOT retried until the
+     * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
+     * session that was actually recorded, so a create failure just means one day's targeted
+     * test is missing, not a retry storm.
+     */
+    private suspend fun createTargetedTestIfNeeded() {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val existingSession = GapTaskLedger.activeTestmateSessionId()
+        // DIAGNOSTIC: makes the guard's decision visible — was there already a session on
+        // file (and if so which round), or did this genuinely start from a clean slate.
+        Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
+            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()}")
+        if (existingSession != null) return
+        val chapter = GapTaskLedger.activeChapter() ?: run {
+            Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
+            return
+        }
+        val topic = GapTaskLedger.activeTopic()
+
+        // Same verbose-chapter-name problem already diagnosed for subject resolution
+        // (see ConceptWeightage's ALIASES doc): GapTaskLedger.activeChapter() is whatever
+        // free-text chapter label Testmate's own report exported (e.g. "Biomolecules-II
+        // (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors").
+        // This resolver was originally routed into the Testmate API call on the assumption
+        // that Testmate's question bank used Checkmate's own canonical chapter names —
+        // that assumption turned out to be wrong (see BUGFIX below) — but it's kept computed
+        // here purely for the diagnostic log line, since knowing what Checkmate's own
+        // weightage system considers this chapter is still useful context when debugging.
+        val exam = ConsultationProfile.load().examTarget
+        val subject = GapTaskLedger.activeSubject()
+        val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
+        val canonicalChapter = resolution.matchedKey ?: chapter
+        if (canonicalChapter != chapter) {
+            Log.d(TAG, "createTargetedTestIfNeeded: chapter '$chapter' resolves internally to " +
+                "'$canonicalChapter' (method=${resolution.method}) — sending raw label to Testmate, see BUGFIX")
+        }
+
+        // BUGFIX: this used to send canonicalChapter (above) to Testmate instead of the raw
+        // chapter string, on the assumption that Testmate's questions.chapter column used the
+        // same canonical names Checkmate's own ConceptWeightage resolver produces. Live data
+        // disproved that: Testmate stores the exact raw, unedited chapter label from each
+        // source PDF at import time (e.g. "The Living World" — 18 questions in Testmate;
+        // Checkmate's canonicalized "Diversity In Living World" — zero. Same story for
+        // "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes,
+        // Cofactors" — 33 questions raw; canonicalized to "Cell Structure And Function" — zero).
+        // route.ts does an exact .eq('chapter', chapter) match, so sending the canonicalized
+        // name was silently routing every one of these lookups at a chapter Testmate has never
+        // heard of. Sending the raw, uncanonicalized chapter is what actually matches Testmate's
+        // own tags.
+
+        // BUGFIX: GapTaskLedger.recordServed sets activeTopic() to the RAW (pre-canonicalization)
+        // chapter string as its "no real topic" sentinel (candidate.topic ?: candidate.chapter —
+        // see that function's own doc, matching Concept.kt's "topic then equals chapter" convention).
+        // Only forward topic when it's a genuinely distinct value from the raw chapter; otherwise
+        // sending chapter alone is correct, same as if no topic had ever been recorded.
+        //
+        // BUGFIX (topic-"null" 422 loop): GapTaskLedger.activeTopic() now sanitizes the literal
+        // string "null" itself, so this filter is redundant for anything served from here on.
+        // Kept anyway as defense-in-depth for [topic] values that reach this function some other
+        // way, and because "it != chapter" alone was never a substitute for a blank/literal-null
+        // check to begin with.
+        val topicForApi = topic?.takeIf { it != chapter && !it.equals("null", ignoreCase = true) }
+
+        // BUGFIX (P0b re-intervention loop, part 2): TestmateApi.createTargetedTest is
+        // idempotent BY intervention_id — Testmate returns the same test/session on a
+        // repeated call with the same id rather than creating a new one (see that
+        // function's own doc). conceptId never changes between rounds, so round 2's
+        // request here was sending the EXACT SAME intervention_id as round 1's, and
+        // Testmate correctly handed back round 1's session — already completed by the
+        // student. That's what made "Take Test" land on an old result page: it wasn't a
+        // stale UI/WebView issue, Testmate genuinely never created a new session. Round
+        // 1 keeps the bare conceptId (no behavior change for sessions already in flight);
+        // round 2+ gets a distinct suffix from GapTaskLedger's round counter (bumped in
+        // resetForNextRound) so each round is a genuinely separate intervention as far as
+        // Testmate's idempotency check is concerned.
+        val round = GapTaskLedger.activeTestmateRound()
+        val interventionId = if (round <= 1) conceptId else "$conceptId-r$round"
+        if (round > 1) {
+            Log.d(TAG, "createTargetedTestIfNeeded: round=$round for concept=$conceptId — " +
+                "using intervention_id=$interventionId so Testmate issues a fresh session " +
+                "instead of replaying round 1's completed one")
+        }
+
+        val outcome = try {
+            TestmateApi.createTargetedTest(
+                interventionId = interventionId,
+                chapter = chapter,
+                topic = topicForApi,
+                questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
+                pool = TestmateQuestionPool.WRONG_SKIPPED
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
+            return
+        }
+
+        when (outcome) {
+            is TestmateTargetedTestOutcome.Success -> {
+                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                clearTestmateError()
+            }
+            is TestmateTargetedTestOutcome.Error -> {
+                Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+                recordTestmateError(outcome.message)
+            }
+        }
+    }
+
+    /** Persists the failure so it survives past logcat's buffer — see [PREF_TESTMATE_LAST_ERROR]. */
+    private fun recordTestmateError(message: String) {
+        CheckmatePrefs.putString(PREF_TESTMATE_LAST_ERROR, message)
+        CheckmatePrefs.putLong(PREF_TESTMATE_LAST_ERROR_AT, System.currentTimeMillis())
+    }
+
+    private fun clearTestmateError() {
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR)
+        CheckmatePrefs.remove(PREF_TESTMATE_LAST_ERROR_AT)
+    }
+
+    // ── P0b: evidence import ─────────────────────────────────────────────────
+
+    /**
+     * Every 15-min cycle: if the active concept has a Testmate session ([createTargetedTestIfNeeded]
+     * already ran) whose evidence hasn't been imported yet, fetches the result and, once it's
+     * actually there (the student has submitted — an [TestmateResultOutcome.Error], including
+     * Testmate's "no result yet" 404, just means try again next cycle), hands the per-question
+     * breakdown to [TargetedTestEvidenceImporter]. This is deliberately NOT gated to once/day
+     * like [generateIfNeeded]/[escalationCheckIfNeeded] — the student can submit the test at any
+     * time, and the whole point of P0b is that mastery reflects that as soon as it's known, not
+     * up to 24 hours later.
+     */
+    /** BUGFIX (unsynchronized ledger race): see [GapTaskLedger.withLock]'s doc — this
+     *  reads then, once the student's submitted result lands, writes
+     *  [GapTaskLedger.markActiveEvidenceImported], the exact read-then-write shape the
+     *  other two entry points also race against. */
+    suspend fun evidencePollIfNeeded(context: Context) = GapTaskLedger.withLock {
+        evidencePollIfNeededLocked(context)
+    }
+
+    private suspend fun evidencePollIfNeededLocked(context: Context) {
+        if (GapTaskLedger.isActiveEvidenceImported()) return
+        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
+
+        val outcome = try {
+            TestmateApi.fetchResult(sessionId)
+        } catch (e: Exception) {
+            Log.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
+            return
+        }
+        val result = when (outcome) {
+            is TestmateResultOutcome.Success -> outcome.result
+            is TestmateResultOutcome.Error -> return // not submitted yet (or a real failure either way) — retry next cycle
+        }
+        if (result.breakdown.isEmpty()) return // submitted but no per-question data yet — treat like not-ready
+
+        try {
+            val exam = ConsultationProfile.load().examTarget
+            val chapter = GapTaskLedger.activeChapter()
+            val topic = GapTaskLedger.activeTopic()
+            TargetedTestEvidenceImporter.import(
+                context = context,
+                sessionId = sessionId,
+                exam = exam,
+                chapter = chapter,
+                topic = topic,
+                result = result
+            )
+            GapTaskLedger.markActiveEvidenceImported(
+                attemptCount = result.attemptedCount,
+                correctCount = result.correctCount
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "evidence import failed: ${e.message}", e)
+        }
+    }
+
+    // ── Escalating skip/stall warning ───────────────────────────────────────
+
+    private val TIER_1_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach warning a student about ONE specific unfinished
+task, not their whole day. Rules:
+- 1-3 sentences, direct and consequence-based, no generic praise or "you can do it"
+- Name the specific concept and why it matters (marks at stake), not vague encouragement
+- Tone: firm reminder, not yet an ultimatum
+""".trimIndent()
+
+    private val TIER_2_SYSTEM_PROMPT = """
+You are a strict but adaptive study coach. This specific gap has been ignored for several
+days running — this is the escalated warning, not the first nudge. Rules:
+- 3-5 sentences, still no fluff, but now make the full case
+- State plainly how many days this has been unaddressed
+- Connect this ONE concept to the real exam-day consequence (marks lost, gap to target score)
+- Reference the student's own skip pattern if given one, as evidence this is a pattern, not a one-off
+- End with a direct, specific ask — not "you should study" but "do this today"
+""".trimIndent()
+
+    /**
+     * Once per calendar day (guarded by [GapTaskLedger.hasEscalatedToday]). Depth scales with
+     * [GapTaskLedger.activeDaysServed]: day 1 gets no escalation at all (the task just showed
+     * up today — that's the normal experience, not a warning), day 2-3 names the concrete
+     * consequence, day 4+ is the full persuasive case tying this one concept to the exam-day
+     * outcome and the student's own skip pattern (see [BehaviorLedger.getSnapshot]). Skips
+     * entirely while the task is ACTIVE/PAUSED (the student is mid-session on it right now —
+     * interrupting with a warning would be counterproductive) and resolves it (see
+     * [resolveDoneConcept]) instead of warning if it turns out to already be DONE
+     * (belt-and-suspenders alongside [resolveActiveConceptState], which normally catches this
+     * first).
+     */
+    /** BUGFIX (unsynchronized ledger race): can call [resolveDoneConcept] ->
+     *  [GapTaskLedger.resetForNextRound] and [createTargetedTestIfNeeded] on the same
+     *  active-concept state the other two entry points touch — see
+     *  [GapTaskLedger.withLock]'s doc. */
+    suspend fun escalationCheckIfNeeded(context: Context) = GapTaskLedger.withLock {
+        escalationCheckIfNeededLocked(context)
+    }
+
+    private suspend fun escalationCheckIfNeededLocked(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (GapTaskLedger.hasEscalatedToday(todayKey)) return
+
+        val daysServed = GapTaskLedger.activeDaysServed()
+        if (daysServed < 2) return // day 1: normal experience, no warning
+
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val task = findTask(taskId, dayKey)
+
+        if (task == null || task.state == TaskState.DONE) {
+            if (task?.state == TaskState.DONE) {
+                resolveDoneConcept(context, conceptId, dayKey)
+                // BUGFIX (r1-result-on-r2-screen): resolveDoneConcept can call
+                // GapTaskLedger.resetForNextRound() (still-below-mastery / conceptId-drift
+                // branches), which clears the active session so a new round can be
+                // requested — but it doesn't request one itself. generateIfNeeded() always
+                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded() right
+                // after (see that function's own BUGFIX note); this path didn't, so a round
+                // reset discovered here sat un-actioned until the next generateIfNeeded
+                // cycle, by which point a fresh re-rank can pick a different top concept and
+                // recordServed's isNewConcept branch silently abandons this round's request —
+                // leaving the old round-1 Testmate session as the only one on file even
+                // though the ledger had already moved to round 2 (confirmed via repro log:
+                // resetForNextRound round 1->2 for biomolecules-ii, immediately followed by
+                // recordServed picking up an unrelated concept with no
+                // createTargetedTestIfNeeded ever firing for biomolecules' round 2). Calling
+                // it here too closes that gap the same way generateIfNeeded already does;
+                // it's a no-op whenever resolveDoneConcept covered the concept outright or
+                // deferred it back to PENDING, since both leave no active concept id.
+                createTargetedTestIfNeeded()
+            }
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+        if (task.state != TaskState.PENDING && task.state != TaskState.SKIPPED) {
+            return // ACTIVE/PAUSED right now — don't interrupt an in-progress session
+        }
+
+        val tier = if (daysServed >= 4) 2 else 1
+        val message = try {
+            buildEscalationMessage(tier, daysServed)
+        } catch (e: Exception) {
+            Log.e(TAG, "escalation message build failed: ${e.message}", e)
+            GapTaskLedger.markEscalatedToday(todayKey)
+            return
+        }
+
+        MentorViewModel.appendProactiveMessage(message)
+        MentorNotifier.notify(context, message)
+        GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
+        GapTaskLedger.markEscalatedToday(todayKey)
+        Log.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+    }
+
+    private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {
+        val subject = GapTaskLedger.activeSubject()?.takeIf { it.isNotBlank() } ?: "this subject"
+        val topic = GapTaskLedger.activeTopic()?.takeIf { it.isNotBlank() } ?: subject
+        val rationale = GapTaskLedger.activeRationale()?.takeIf { it.isNotBlank() }
+            ?: "$topic still needs work."
+        val marksAtStake = GapTaskLedger.activeExpectedGain()
+
+        val patternLine = BehaviorLedger.getSnapshot().subjectPatterns
+            .filter { it.subject.equals(subject, ignoreCase = true) }
+            .maxByOrNull { it.occurrences }
+            ?.let { "You've skipped $subject ${it.taskType} tasks ${it.occurrences} times recently — this fits the pattern." }
+            ?: ""
+
+        val ruleMsg = when (tier) {
+            2 -> "Day $daysServed unaddressed: $topic. $rationale $patternLine " +
+                "This gap alone is worth roughly ${"%.1f".format(marksAtStake)} marks — " +
+                "left alone, it stays a hole on exam day. Do it today."
+            else -> "$topic has gone $daysServed days without being done. $rationale Do it today."
+        }
+
+        val systemPrompt = if (tier == 2) TIER_2_SYSTEM_PROMPT else TIER_1_SYSTEM_PROMPT
+        val userPrompt = "Concept: $topic ($subject). Days unaddressed: $daysServed. " +
+            "Why it matters: $rationale Approx marks at stake: ${"%.1f".format(marksAtStake)}. " +
+            "$patternLine Write the warning message now."
+
+        return try {
+            val llmMsg = LlmGateway.complete(userPrompt, systemPrompt)
+            if (llmMsg.isBlank()) ruleMsg else llmMsg
+        } catch (_: Exception) {
+            ruleMsg
+        }
+    }
+}
+
+
+
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
+package com.checkmate.planner.intervention
+
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.learning.engine.LearningDecisionEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 
-private const val TAG = "TestResultsViewModel"
+/**
+ * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
+ * is actually done" needs state that neither [LearningInterventionOrchestrator] nor
+ * [com.checkmate.planner.PlanStore] carry on their own:
+ *
+ * - [PlanStore.todayTasks] only ever holds the CURRENT day's list — there's nowhere to ask
+ *   "did the concept I served three days ago ever get finished."
+ * - [LearningInterventionOrchestrator.executeTopCandidate] re-ranks from scratch every run.
+ *   Without something outside it remembering what's already been served, re-running the
+ *   SAME [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport] output
+ *   tomorrow (mastery hasn't moved without the P0b evidence loop) would just re-pick
+ *   today's exact candidate forever — the backlog would never advance.
+ *
+ * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
+ * covering four things:
+ * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
+ *    `TaskState.DONE` *and* a mastery recheck against real P0b evidence confirms it actually
+ *    cleared [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — never merely
+ *    once a task was created for it, and never merely because the task was checked off with
+ *    mastery still weak (see [markCovered] and [resetForNextRound] docs for why task-DONE
+ *    alone isn't the right signal — that conflation is what silently broke the P0b
+ *    retest-until-mastered loop). [LearningInterventionOrchestrator] skips covered concepts
+ *    when walking the ranked candidate list.
+ * 2. **The active concept's streak** — how many consecutive days the current gap concept
+ *    has been re-served without reaching DONE, which is exactly the escalation-depth input
+ *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
+ *    persuasion — see [com.checkmate.service.GapTaskManager]).
+ * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
+ *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
+ * 4. **P0b: the active concept's linked Testmate targeted-test session** — which
+ *    `test_sessions.id`/`tests.id` Testmate created for the CURRENT active concept (see
+ *    [recordTestmateSession]), and whether that session's result has already been turned
+ *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
+ *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
+ *    creates the targeted test at most once per concept PER ROUND and imports its result at
+ *    most once per round. [resetForNextRound] clears just this slot when a round's evidence
+ *    came back still below mastery, so the SAME concept can start a fresh round.
+ *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
+ *    map, since there is only ever one active gap concept at a time in this single-user app.
+ *
+ * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
+ * per-student keying needed.
+ */
+object GapTaskLedger {
 
-data class TestResultsState(
-    val sessionId: String = "",
-    val loading: Boolean = false,
-    val result: TestmateResult? = null,
-    val error: String? = null,
-    // ── Upgrade Blueprint wiring gap fix ──
-    // Phase 1 (MasteryEngine/ErrorEngine/RetentionEngine/KnowledgeGraph/
-    // TestResultNormalizer) was fully built but nothing ever called
-    // TestResultNormalizer — TestmateApi's /results endpoint only returns
-    // chapter/topic aggregates, never per-question detail, so there was no
-    // data shape TestResultNormalizer could consume. Rather than add a new
-    // testmate2.com endpoint, this reuses the report.md TestResultNormalizer
-    // already parses (TestReportParser) via a manual file picker (see
-    // TestResultsScreen's "Import report.md" section) — the student downloads
-    // the report from TestmateWebScreen's WebView (already wired to
-    // DownloadManager) and picks it here. No backend change, no
-    // DownloadManager-watching/polling, no push/pull sync layer to maintain
-    // across app updates — just a Storage Access Framework file read.
-    val importing: Boolean = false,
-    val importResult: TestResultNormalizer.NormalizeResult? = null,
-    val importError: String? = null,
-    // ── Test-report wiring pass ──
-    // Closes normalizeAndPersist() -> StudentModelBuilder.build() ->
-    // PerformanceAnalyzer.analyze() -> PerformanceReport, the second half of the
-    // loop the import above only started. Deliberately separate loading/error
-    // state from importing/importError above: a successful import that commits
-    // to Room is real and final the moment importResult is set, regardless of
-    // whether analysis afterward succeeds — see importReport's own doc on why
-    // analysis failure never rolls back or hides importResult.
-    val analyzing: Boolean = false,
-    val performanceReport: PerformanceAnalyzer.PerformanceReport? = null,
-    val analysisError: String? = null,
-    // ── ScoreGainEstimator wiring pass ──
-    // Blueprint §2.2. Built from the SAME PerformanceReport + StudentModel this
-    // buildPerformanceReport call already produced — never recomputed
-    // separately, so this can never drift out of sync with performanceReport
-    // (same "one source of truth per Room read" discipline StudentModel's own
-    // doc requires). Ranked highest-expectedGain first; empty until analysis
-    // has run at least once. Kept as its own field (not folded into
-    // performanceReport) because it's a downstream DECISION-shaped view over
-    // PerformanceAnalyzer's EVIDENCE-shaped output — see ScoreGainEstimator's
-    // own class doc on that boundary.
-    val scoreGainEstimates: List<ScoreGainEstimator.ScoreGainEstimate> = emptyList(),
-    // ── ScorePredictor wiring pass ──
-    // Blueprint §2.3. Built from the SAME PerformanceReport + StudentModel as
-    // scoreGainEstimates above — never a separate StudentModelBuilder.build/
-    // PerformanceAnalyzer.analyze call, same "one Room read, three derived views"
-    // discipline. targetScore comes from ConsultationProfile (the Student Profile
-    // screen's own "Target Score" field), not invented here. Null until analysis
-    // has run at least once.
-    val expectedScore: ScorePredictor.ExpectedScore? = null,
-    // ── LearningDecisionEngine wiring pass (Blueprint §2.4) ──
-    // The frontier piece: everything above this line is EVIDENCE (PerformanceReport)
-    // or a DECISION-shaped ranking over one dimension at a time (scoreGainEstimates
-    // ranks by marks, expectedScore explains a gap) — this is the first field that's
-    // an actual ranked, typed ACTION ("what should this student do next"), built
-    // from the SAME performanceReport/scoreGainEstimates/expectedScore this call
-    // already produced (see LearningDecisionEngine.decideFromReport's own "one Room
-    // read, N derived views" doc). Null until analysis has run at least once.
-    val decisionReport: LearningDecisionEngine.DecisionReport? = null,
-    // ── LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam) ──
-    // The orchestrator's own class doc named this exact gap: it consumes an
-    // already-built DecisionReport but "does not itself decide when to run." A
-    // fresh test import IS that trigger — see buildPerformanceReport's doc on why
-    // this only fires when `!alreadyImported`. Built from the SAME decisionReport
-    // this call already produced — sixth derived view over one Room read, same
-    // discipline as every field above it. Null until an orchestration run has
-    // actually happened (i.e. never set on the `alreadyImported` replay path).
-    val orchestrationResult: LearningInterventionOrchestrator.OrchestrationResult? = null,
-    val orchestrationError: String? = null
-)
+    private const val TAG = "GapTaskLedger"
 
-class TestResultsViewModel : ViewModel() {
-    private val _state = MutableStateFlow(TestResultsState())
-    val state: StateFlow<TestResultsState> = _state.asStateFlow()
+    private val json = Json { ignoreUnknownKeys = true }
 
-    fun onSessionIdChange(value: String) {
-        _state.update { it.copy(sessionId = value, error = null) }
-    }
+    private const val KEY_COVERED_CONCEPT_IDS       = "gap_task_covered_concept_ids"
+    private const val KEY_ACTIVE_CONCEPT_ID         = "gap_task_active_concept_id"
+    private const val KEY_ACTIVE_TASK_ID            = "gap_task_active_task_id"
+    private const val KEY_ACTIVE_TASK_DAY_KEY       = "gap_task_active_task_day_key"
+    private const val KEY_ACTIVE_DAYS_SERVED        = "gap_task_active_days_served"
+    private const val KEY_ACTIVE_SUBJECT            = "gap_task_active_subject"
+    private const val KEY_ACTIVE_CHAPTER            = "gap_task_active_chapter"
+    private const val KEY_ACTIVE_TOPIC              = "gap_task_active_topic"
+    private const val KEY_ACTIVE_DURATION_MIN       = "gap_task_active_duration_min"
+    private const val KEY_ACTIVE_RATIONALE          = "gap_task_active_rationale"
+    private const val KEY_ACTIVE_EXPECTED_GAIN      = "gap_task_active_expected_gain"
+    private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
+    private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
+    private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
+    // Phase 3 (adaptive tutor state machine) execution bridge: the tutor FSM's
+    // PRACTICE -> VERIFY transition needs real attempt counts for THIS round specifically
+    // (see com.checkmate.learning.tutor.TutorEvidence.PracticeAttempts's own doc — it must
+    // be "this practice pass," not lifetime). This P0b loop already runs the exact Testmate
+    // targeted-test request/import for the same active concept the tutor session tracks
+    // (see TutorSessionLedger.startFromCandidate, called from the same
+    // GapTaskManager.generateIfNeeded call site that serves this ledger's active concept in
+    // the first place) — rather than have TutorCycleManager fire a SECOND, competing
+    // targeted-test request for the same concept, it reads these two fields, written
+    // alongside [markActiveEvidenceImported] from the SAME TestmateResult
+    // GapTaskManager.evidencePollIfNeeded already has in hand. "Extend the existing
+    // intervention pipeline, don't replace it" applied to the tutor bridge specifically.
+    private const val KEY_ACTIVE_LAST_IMPORT_ATTEMPTS = "gap_task_active_last_import_attempts"
+    private const val KEY_ACTIVE_LAST_IMPORT_CORRECT  = "gap_task_active_last_import_correct"
+    // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
+    // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
+    // id never changed between rounds, so a round-2 request for the SAME concept got the
+    // SAME (already-completed) session back instead of a fresh one — resetForNextRound
+    // correctly asked for another round, but Testmate had no way to tell it apart from a
+    // retried round-1 call. This counter gives each round a distinct suffix (see
+    // GapTaskManager.createTargetedTestIfNeeded) so intervention_id actually changes when
+    // the round does. Round 1 stays a bare conceptId (no suffix) for backward
+    // compatibility with sessions already in flight before this fix.
+    private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
+    // literal 4-character string "null" (not a real null reference) whenever they were
+    // ultimately derived from a Question row whose topic column was corrupted by the
+    // now-fixed TestmateApi.parseResult bare-optString bug — a JSON null surviving as
+    // the text "null", written to Room, then re-surfaced by MasteryEngine.recomputeAll
+    // every time it rebuilds a Concept from that same poisoned row. `candidate.topic ?:
+    // candidate.chapter ?: ""` never catches this because the value ISN'T null — the
+    // Elvis operator only fires on a real null reference. Filtering it out here, at the
+    // single place every active-topic/active-chapter read and write funnels through,
+    // means neither a fresh instance of this bug nor a not-yet-repaired historical one
+    // can reach GapTaskManager's Testmate request payload or any UI string.
+    private fun sanitizeTopicOrChapter(value: String?): String? =
+        value?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
 
-    fun fetch() {
-        val id = _state.value.sessionId
-        viewModelScope.launch {
-            _state.update { it.copy(loading = true, error = null) }
-            when (val outcome = TestmateApi.fetchResult(id)) {
-                is com.checkmate.testmate.TestmateResultOutcome.Success ->
-                    _state.update { it.copy(loading = false, result = outcome.result, error = null) }
-                is com.checkmate.testmate.TestmateResultOutcome.Error ->
-                    _state.update { it.copy(loading = false, error = outcome.message) }
-            }
-        }
-    }
+    private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
+    private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
+    private const val KEY_WARNING_LOG               = "gap_task_warning_log"
+    private const val MAX_WARNING_LOG_ENTRIES       = 50
 
-    /**
-     * Reads the picked report.md (or .txt — Testmate's export mime type varies by
-     * provider) via SAF, hands the raw text straight to
-     * [TestResultNormalizer.normalizeAndPersist], and surfaces the write counts
-     * (or the "already imported" idempotency result) in [TestResultsState]. File
-     * I/O + normalization both happen off the main thread.
-     *
-     * Test-report wiring pass: once (and only once) normalizeAndPersist has
-     * actually committed — success or already-imported, both mean Room state is
-     * current — this chains into [buildPerformanceReport], closing
-     * normalizeAndPersist -> StudentModelBuilder.build -> PerformanceAnalyzer.analyze
-     * -> PerformanceReport -> ScoreGainEstimator.rankFromReport. The stages update
-     * state independently: `importResult` is set and `importing` flips false as
-     * soon as persistence succeeds, full stop; analysis (and the ranking built on
-     * top of it) runs after that as a separate concern, and if it fails, only
-     * `analysisError` is set — the already-committed import is never rolled back
-     * or hidden because a derived-view step afterward broke.
-     */
-    fun importReport(context: Context, uri: Uri) {
-        viewModelScope.launch {
-            _state.update {
-                it.copy(
-                    importing = true, importError = null, importResult = null,
-                    performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                    expectedScore = null, decisionReport = null,
-                    orchestrationResult = null, orchestrationError = null
-                )
-            }
-            try {
-                val text = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                } ?: throw IllegalStateException("Couldn't open the selected file.")
+    // ── Reactive change signal (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
+    //
+    // Every field this object exposes is CheckmatePrefs-backed — plain SharedPreferences,
+    // with no Flow/observable of its own. [com.checkmate.ui.home.HomeScreen] used to call
+    // activeTaskId()/activeTestmateSessionId() straight from inside its @Composable body,
+    // which only re-runs when something IT collects via collectAsState (i.e.
+    // HomeViewModel.state, itself driven only by [com.checkmate.planner.PlanStore
+    // .todayTasks]) actually emits. That's fine for the round-desync case where a PlanStore
+    // write happens alongside the ledger write (e.g. resolveDoneConcept's evidence-not-
+    // imported-yet branch, which does revert the task via PlanStore.markTaskInDay) — but
+    // resolveDoneConcept's OTHER branch (evidence imported, mastery still below threshold)
+    // calls [resetForNextRound] then [com.checkmate.service.GapTaskManager
+    // .createTargetedTestIfNeeded] records the new round's session via
+    // [recordTestmateSession] — neither of those touches PlanStore at all. Both run from
+    // ReminderService's 15-minute background loop, entirely outside Compose. Confirmed
+    // live: with HomeScreen open and idle across that loop's tick, the round-2 session got
+    // created correctly, but the screen never recomposed to see it — repairSessionFor's
+    // activeSessionId stayed pinned to whatever it read at the LAST unrelated recompose,
+    // which (right after round 1's task went DONE) was round 1's own already-submitted
+    // session id. Tapping "Take repair test" then opened THAT session, and Testmate
+    // correctly redirected to its already-completed result page — this was never a
+    // session-creation or WebView-caching bug, the UI simply never learned a new session
+    // existed.
+    //
+    // A monotonic counter, not the state itself: every mutating function below that
+    // changes anything HomeScreen reads bumps this after writing (recordServed,
+    // recordTestmateSession, markActiveEvidenceImported, resetForNextRound, markCovered).
+    // [com.checkmate.ui.home.HomeViewModel] collects it and re-reads the ledger's live
+    // accessors into HomeState on every emission, the same "some background loop wrote
+    // through prefs, now push a fresh snapshot into Compose state" shape
+    // [com.checkmate.planner.PlanStore]'s own StateFlow already establishes for tasks —
+    // this just extends that same reactivity to the P0b session fields instead of leaving
+    // them as an unobserved side channel.
+    private val _version = MutableStateFlow(0L)
+    val version: StateFlow<Long> = _version.asStateFlow()
+    private fun bumpVersion() { _version.update { it + 1 } }
 
-                if (text.isBlank()) {
-                    _state.update {
-                        it.copy(importing = false, importError = "Selected file is empty.")
-                    }
-                    return@launch
-                }
+    // ── Covered concepts ────────────────────────────────────────────────────
 
-                val result = withContext(Dispatchers.IO) {
-                    TestResultNormalizer.normalizeAndPersist(context, text)
-                }
-                // Persistence has committed — this is final regardless of what
-                // buildPerformanceReport below does with it.
-                _state.update { it.copy(importing = false, importResult = result, importError = null) }
-                buildPerformanceReport(context, result.examType, result.alreadyImported)
-            } catch (e: Exception) {
-                Log.e(TAG, "Report import failed: ${e.message}", e)
-                _state.update {
-                    it.copy(importing = false, importError = "Import failed: ${e.message ?: "unknown error"}")
-                }
-            }
-        }
-    }
-
-    /**
-     * Runs after a committed import (fresh or already-imported — both mean Room
-     * reflects this test). Reads current Room state fresh via
-     * [StudentModelBuilder.build] rather than anything cached from the import
-     * step, per [com.checkmate.learning.model.StudentModel]'s own "never hold a
-     * built StudentModel across a Room write" rule. `examType` comes straight from
-     * [TestResultNormalizer.NormalizeResult] so this never re-parses the report or
-     * guesses an exam identifier itself.
-     *
-     * ScoreGainEstimator wiring pass: [ScoreGainEstimator.rankFromReport] runs
-     * against the SAME `studentModel`/`report` this function just built — not a
-     * second `StudentModelBuilder.build`/`PerformanceAnalyzer.analyze` call — so
-     * `scoreGainEstimates` can never reflect a different Room snapshot than
-     * `performanceReport` does. Both are set together in one state update.
-     *
-     * ScorePredictor wiring pass (Blueprint §2.3): [ScorePredictor.predictFromReport]
-     * runs against that same `studentModel`/`report` too — third derived view over
-     * one Room read, same discipline as the ScoreGainEstimator call right above it.
-     * `targetScore` comes from [ConsultationProfile.load] (the Student Profile
-     * screen's own field, defaults to 650 if never set) — read fresh here, not
-     * cached, so a target the student just edited is reflected on the very next
-     * analysis run.
-     *
-     * LearningDecisionEngine wiring pass (Blueprint §2.4): [LearningDecisionEngine.decideFromReport]
-     * runs against the SAME `report`/`studentModel`/`estimates`/`expectedScore` this
-     * call already built — fourth derived view over one Room read, same "never
-     * recompute what's already in hand" discipline as the two calls above it.
-     *
-     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5, P0a's last seam):
-     * once `decisionReport` above is built, [executeTopIntervention] runs it through
-     * the orchestrator — the "post-test event" trigger the orchestrator's own class
-     * doc said was still missing. `alreadyImported` is threaded all the way down
-     * from [importReport] because this function also runs on the idempotent replay
-     * path (re-picking an already-imported report re-triggers analysis so the
-     * screen has something to show), and PolicyValidator has no duplicate-task
-     * guard of its own — see [executeTopIntervention]'s doc for why that path must
-     * not also autonomously create a task.
-     *
-     * Launched as its own coroutine (not inline in importReport's try block) so an
-     * analysis failure can only ever set [TestResultsState.analysisError] — it has
-     * no path back to importReport's own try/catch and can't turn a successful
-     * import into a failed one.
-     */
-    private fun buildPerformanceReport(context: Context, examType: String?, alreadyImported: Boolean) {
-        if (examType == null) {
-            // DIAGNOSTIC (surgical trace for "import succeeds but no task appears"):
-            // this branch alone means orchestration never even had a decisionReport to
-            // work with — remove once the no-task-created cause is confirmed.
-            Log.w(TAG, "DIAGNOSTIC: buildPerformanceReport bailing — examType is null, analysis skipped entirely")
-            _state.update {
-                it.copy(analysisError = "Couldn't determine this report's exam type — performance analysis skipped.")
-            }
-            return
-        }
-        viewModelScope.launch {
-            _state.update { it.copy(analyzing = true, analysisError = null) }
-            try {
-                val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
-                val report = PerformanceAnalyzer.analyze(studentModel, examType)
-                val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
-                val targetScore = ConsultationProfile.load().targetScore
-                val expectedScore = ScorePredictor.predictFromReport(report, studentModel, targetScore)
-                val decisionReport = LearningDecisionEngine.decideFromReport(
-                    report, studentModel, estimates, expectedScore
-                )
-                // DIAGNOSTIC: tests the "hand-crafted report vs real Testmate export"
-                // theory directly — if topicImpacts show weightageConfidence/marksAtStake
-                // as garbage (0.0 / UNRESOLVED) for chapters that should resolve, or
-                // decisionReport.candidates comes back empty, that's the synthetic
-                // report's data shape (e.g. literal "—" topic placeholder) failing to
-                // resolve, not an app-side gate. Remove alongside the other DIAGNOSTIC
-                // lines once resolved.
-                Log.d(
-                    TAG,
-                    "DIAGNOSTIC: topicImpacts=${report.topicImpacts.map {
-                        "${it.chapter}/${it.topic} -> conf=${it.weightageConfidence} " +
-                            "stake=${it.marksAtStakeTotal} gap=${it.marksAtStakeGap}"
-                    }} candidates=${decisionReport.candidates.size}"
-                )
-                _state.update {
-                    it.copy(
-                        analyzing = false, performanceReport = report,
-                        scoreGainEstimates = estimates, expectedScore = expectedScore,
-                        decisionReport = decisionReport
-                    )
-                }
-                executeTopIntervention(context, decisionReport, alreadyImported)
-            } catch (e: Exception) {
-                Log.e(TAG, "Performance analysis failed: ${e.message}", e)
-                _state.update {
-                    it.copy(
-                        analyzing = false,
-                        analysisError = "Couldn't build performance report: ${e.message ?: "unknown error"}"
-                    )
-                }
-            }
-        }
-    }
+    fun isCovered(conceptId: String): Boolean =
+        coveredIds().contains(conceptId)
 
     /**
-     * LearningInterventionOrchestrator wiring pass (Blueprint §2.5) — the trigger
-     * [LearningInterventionOrchestrator]'s own class doc said was still missing:
-     * "a schedule, a button, a WorkManager job." This is the schedule: every fresh
-     * test import is itself the natural "post-test event" trigger, so this fires
-     * right after `decisionReport` is built in [buildPerformanceReport], using
-     * that SAME DecisionReport.
-     *
-     * Gated on `!alreadyImported`: [buildPerformanceReport] also runs on the
-     * idempotent "already imported" replay path, and [PolicyValidator] has no
-     * duplicate-task guard of its own — without this gate, re-opening this screen
-     * and re-picking a report already in Room would rank the same top candidate
-     * again and autonomously create a fresh duplicate StudyTask every time. A
-     * fresh import is the only case that should actually cause a new autonomous
-     * action.
-     *
-     * Isolated in its own try/catch for the same reason analysis is isolated from
-     * import: a failure here can only ever set [TestResultsState.orchestrationError]
-     * — it has no path back to [buildPerformanceReport]'s try block and can't turn
-     * an already-successful decisionReport into a failed one.
+     * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
+     * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
+     * DONE, AND (once P0b evidence exists) a mastery recheck actually cleared
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — see
+     * [com.checkmate.service.GapTaskManager]'s `resolveDoneConcept`. Never call this merely
+     * because a task once existed for the concept, and never merely because the task reached
+     * DONE while mastery is still known to be weak (use [resetForNextRound] for that case
+     * instead) — either would mean an unfinished gap silently "counts" as covered and the
+     * orchestrator moves on, permanently abandoning the one the student hasn't actually
+     * closed — the opposite of "till every gap is covered." Clears the active-concept pointer
+     * if [conceptId] was it, so the next [recordServed] call for a different concept starts a
+     * fresh streak instead of inheriting this one's day count.
      */
-    private suspend fun executeTopIntervention(
-        context: Context,
-        decisionReport: LearningDecisionEngine.DecisionReport,
-        alreadyImported: Boolean
-    ) {
-        if (alreadyImported) {
-            // DIAGNOSTIC: this is the OTHER silent no-op — replay path never reaches
-            // the orchestrator at all. Remove once confirmed which gate is firing.
-            Log.w(TAG, "DIAGNOSTIC: executeTopIntervention skipped — alreadyImported=true, orchestrator never called")
-            return
+    fun markCovered(conceptId: String) {
+        val updated = coveredIds() + conceptId
+        CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
+        recordWarningOutcome(conceptId)
+        if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
+            clearActive()
         }
-        try {
-            val result = withContext(Dispatchers.IO) {
-                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
-            }
-            // DIAGNOSTIC: executeTopCandidateLocked can reject every candidate (already-
-            // active task, already-covered concept, not-mappable, policy rejection) and
-            // return normally — none of that logs anywhere on its own. This line is the
-            // only way to see outcome/rejections without reading in-memory state.
-            // Remove alongside the two DIAGNOSTIC lines above once resolved.
-            Log.d(TAG, "DIAGNOSTIC: orchestration outcome=${result.outcome} rejections=${result.rejections}")
-            _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
-        } catch (e: Exception) {
-            Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
-            _state.update {
-                it.copy(orchestrationError = "Couldn't create a study task from this analysis: ${e.message ?: "unknown error"}")
-            }
-        }
+        bumpVersion()
     }
 
-    fun dismissImportResult() {
-        _state.update {
-            it.copy(
-                importResult = null, importError = null,
-                performanceReport = null, analysisError = null, scoreGainEstimates = emptyList(),
-                expectedScore = null, decisionReport = null,
-                orchestrationResult = null, orchestrationError = null
-            )
+    private fun coveredIds(): Set<String> =
+        CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
+            ?.split(",")
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
+
+    // ── Active concept + streak ─────────────────────────────────────────────
+
+    /**
+     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
+     * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
+     * SAME concept already active (re-served because it wasn't finished, or because it's
+     * starting a new P0b round after [resetForNextRound]); starts a fresh streak at 1 for a
+     * new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
+     * (e.g. day-level intents) — there's nothing to track streak-wise for those.
+     *
+     * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
+     * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
+     * day while its current round's session is still outstanding must leave that session
+     * alone, since the whole point of re-serving it is that the student hasn't taken that
+     * session yet. Once a round's evidence comes back still below mastery, those fields get
+     * reset separately by [resetForNextRound], not here.
+     */
+    fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
+        val conceptId = candidate.conceptId ?: return
+        val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
+        val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        val isNewConcept = previousConceptId != conceptId
+        val daysServed = if (isNewConcept) 1 else previousDays + 1
+
+        // DIAGNOSTIC (round-never-increments investigation): this is the ONLY place that can
+        // silently undo a resetForNextRound() bump that just happened earlier in the SAME
+        // generateIfNeeded call — if executeTopCandidate's fresh re-rank picks a different
+        // concept than the one resolveDoneConcept just reset for retry, isNewConcept is true
+        // here and the round/session fields get wiped back to round 1 before
+        // createTargetedTestIfNeeded ever runs. Logging the before-state makes that collision
+        // visible in the same logcat window instead of two separate-looking "round=1" reads.
+        Log.d(TAG, "recordServed: previousConceptId=$previousConceptId conceptId=$conceptId " +
+            "isNewConcept=$isNewConcept currentRound=${CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1)}")
+
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
+        // BUGFIX (topic-"null" 422 loop): see sanitizeTopicOrChapter's own doc — candidate.topic
+        // can hold the literal string "null" from a still-poisoned Question row, which would
+        // otherwise sail straight past the `?:` fallback below since it isn't a real null.
+        CheckmatePrefs.putString(
+            KEY_ACTIVE_TOPIC,
+            sanitizeTopicOrChapter(candidate.topic) ?: sanitizeTopicOrChapter(candidate.chapter) ?: ""
+        )
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
+
+        if (isNewConcept) {
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+            CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+            CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+        }
+        bumpVersion()
+    }
+
+    // BUGFIX: this was the one accessor in this object missing the blank-filter every
+    // sibling below it has (activeSubject/activeChapter/activeTopic/etc.). clearActive()
+    // writes "" (not null) to KEY_ACTIVE_CONCEPT_ID same as every other key — without the
+    // filter, a cleared ledger reported a truthy-but-empty concept id instead of null,
+    // which made createTargetedTestIfNeeded() (see GapTaskManager) treat "nothing active"
+    // as "an active concept with a missing chapter" and log a misleading warning every
+    // cycle instead of correctly no-op'ing.
+    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)?.takeIf { it.isNotBlank() }
+    fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
+    fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
+
+    /**
+     * SKIPPED-task retry-in-place (see GapTaskManager.resolveActiveConceptState's SKIPPED
+     * branch): moves the active pointer to a freshly re-served copy of the SAME still-open
+     * task, without touching conceptId, days-served streak, or any P0b test/session/round
+     * field. Deliberately narrower than [recordServed] — that function's isNewConcept branch
+     * exists specifically to reset P0b state for a genuinely NEW intervention, which this
+     * is not: the concept, its test, and its session (if any) are unchanged, only WHICH
+     * task instance represents "today's shot at it" has.
+     */
+    fun updateActiveTaskPointer(taskId: String, dayKey: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
+        bumpVersion()
+    }
+
+    fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
+    fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
+    fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
+    // BUGFIX (topic-"null" 422 loop): defense-in-depth alongside the write-side sanitize in
+    // recordServed — filters out a literal "null" written before this fix shipped, on any
+    // existing install that hasn't re-served a concept (and so hasn't re-run recordServed)
+    // since updating.
+    fun activeTopic(): String? = sanitizeTopicOrChapter(CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null))
+    fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
+    fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
+    fun activeExpectedGain(): Double =
+        CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
+
+    // ── P0b: active concept's Testmate targeted-test link ───────────────────
+
+    fun activeTestmateTestId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_TEST_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun activeTestmateSessionId(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_ID, null)?.takeIf { it.isNotBlank() }
+
+    fun isActiveEvidenceImported(): Boolean =
+        CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+
+    /** Which P0b retest round the active concept is on — 1 for a fresh concept or one
+     *  that's never had [resetForNextRound] called, incrementing each time evidence comes
+     *  back still below mastery. See the key's own doc for why this exists: it's what lets
+     *  [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded] send Testmate a
+     *  genuinely different `intervention_id` per round instead of replaying round 1's. */
+    fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
+
+    /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
+     *  a targeted test was created (or already existed — see the endpoint's own idempotency
+     *  by intervention_id) for the currently active concept. */
+    fun recordTestmateSession(testId: String, sessionId: String) {
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
+        bumpVersion()
+    }
+
+    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
+     *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
+     *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
+     *  session every 15 minutes for the rest of the day.
+     *
+     *  [attemptCount]/[correctCount] are this round's own counts (straight from the same
+     *  `TestmateResult` GapTaskManager.evidencePollIfNeeded already has in hand when it calls
+     *  this) — see [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc for why these exist. Optional,
+     *  defaulting to 0/0, so this stays source-compatible with any other caller that only
+     *  cares about the imported flag itself. */
+    fun markActiveEvidenceImported(attemptCount: Int = 0, correctCount: Int = 0) {
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, attemptCount)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, correctCount)
+        bumpVersion()
+    }
+
+    /** This round's attempt count from the last [markActiveEvidenceImported] call — see
+     *  [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc. 0 if nothing has been imported yet. */
+    fun activeLastImportAttemptCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+
+    /** This round's correct count from the last [markActiveEvidenceImported] call — see
+     *  [activeLastImportAttemptCount]'s own doc. */
+    fun activeLastImportCorrectCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+
+    /**
+     * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
+     * when the active concept's task reached DONE but a mastery recheck against real Testmate
+     * retest evidence showed it's still below
+     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — the student finished
+     * the *review task*, but the concept itself isn't mastered yet. Clears only the P0b
+     * session fields (test id, session id, evidence-imported flag) — deliberately NEVER
+     * touches [markCovered]'s covered-set, and NEVER touches the active concept/day-streak
+     * fields, since this concept is still active and its streak should keep counting. With
+     * these three fields blank again, [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     * reads "no session yet" and requests a fresh Testmate retest for the SAME concept on the
+     * next run, closing the loop that used to stop dead here.
+     */
+    fun resetForNextRound() {
+        val roundBefore = activeTestmateRound()
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
+        // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
+        // replaying this same concept's round-1 id and getting the already-completed
+        // session handed straight back.
+        val roundAfter = roundBefore + 1
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, roundAfter)
+        // DIAGNOSTIC (round-never-increments investigation): every write to
+        // KEY_ACTIVE_TESTMATE_ROUND should now self-announce (see the matching log in
+        // recordServed) so a later overwrite is traceable to whichever call did it, instead
+        // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
+        Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
+        // BUGFIX (r1-result-on-r2-screen, background-loop case): this is the write that
+        // used to leave HomeScreen stranded — see the [version] field's own doc. Bumping
+        // here means HomeViewModel is notified the moment the session/round fields go
+        // blank (so the repair-test button correctly disappears while round 2's request
+        // is in flight), and again when recordTestmateSession populates the fresh one —
+        // instead of the whole transition being invisible until some unrelated recompose.
+        bumpVersion()
+    }
+
+    private fun clearActive() {
+        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
+        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
+        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+    }
+
+    // ── Once-a-day guards ────────────────────────────────────────────────────
+
+    fun hasGeneratedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_GENERATED_DAY, null) == todayKey
+
+    fun markGeneratedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_GENERATED_DAY, todayKey)
+
+    fun hasEscalatedToday(todayKey: String): Boolean =
+        CheckmatePrefs.getString(KEY_LAST_ESCALATED_DAY, null) == todayKey
+
+    fun markEscalatedToday(todayKey: String) =
+        CheckmatePrefs.putString(KEY_LAST_ESCALATED_DAY, todayKey)
+
+    // ── Warning outcome log (data collection only — no style-selection logic yet) ──────
+
+    @Serializable
+    data class WarningLogEntry(
+        val conceptId: String,
+        val sentDayKey: String,
+        val daysServedAtEscalation: Int,
+        val tier: Int,
+        var completedAfterward: Boolean = false
+    )
+
+    /**
+     * Appends one record every time [com.checkmate.service.GapTaskManager] actually sends
+     * an escalation message. Deliberately just data collection for now — once there's
+     * enough history to mean anything, which [tier] (escalation depth) correlates with a
+     * concept actually reaching DONE afterward becomes a real, evidence-backed question
+     * instead of a guess. Capped at [MAX_WARNING_LOG_ENTRIES], oldest dropped first.
+     */
+    fun logWarningSent(conceptId: String, dayKey: String, daysServedAtEscalation: Int, tier: Int) {
+        val updated = (warningLog() + WarningLogEntry(conceptId, dayKey, daysServedAtEscalation, tier))
+            .takeLast(MAX_WARNING_LOG_ENTRIES)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    /** Called from [markCovered] — flips the most recent unresolved warning for
+     *  [conceptId], if any, so the log can later answer "did warning X actually work." */
+    private fun recordWarningOutcome(conceptId: String) {
+        val log = warningLog()
+        val lastUnresolvedIndex = log.indexOfLast { it.conceptId == conceptId && !it.completedAfterward }
+        if (lastUnresolvedIndex == -1) return
+        val updated = log.toMutableList()
+        updated[lastUnresolvedIndex] = updated[lastUnresolvedIndex].copy(completedAfterward = true)
+        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
+    }
+
+    fun warningLog(): List<WarningLogEntry> =
+        CheckmatePrefs.getString(KEY_WARNING_LOG, null)?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+
+    // ── Shared day-key helper — same "YYYY_dayOfYear" format PlanStore uses ────────────
+
+    fun todayKey(): String {
+        val cal = Calendar.getInstance()
+        return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+    }
+
+    // ── Mutual exclusion ────────────────────────────────────────────────────
+
+    /**
+     * Serializes every read-then-write sequence against this ledger's active-concept /
+     * P0b-round / session state. Same shape as [TaskEscrow]'s own per-key `Mutex` +
+     * `withLock` (see its class doc: "the actual correctness boundary is in-process
+     * mutual exclusion, not a DB transaction") — this ledger is the single-active-concept
+     * singleton the whole gap-task subsystem assumes is only ever touched one call at a
+     * time, which stopped being guaranteed once THREE independent, unsynchronized call
+     * chains started reading/writing it:
+     *  1. ReminderService's 15-min loop -> GapTaskManager.generateIfNeeded /
+     *     escalationCheckIfNeeded / evidencePollIfNeeded
+     *  2. TestResultsViewModel.executeTopIntervention -> LearningInterventionOrchestrator
+     *     .executeTopCandidate directly, bypassing GapTaskManager, on Dispatchers.IO
+     *  3. HomeViewModel.confirmCompletion -> GapTaskManager.generateIfNeeded, on
+     *     viewModelScope
+     * Two of these landing close enough in time can both read the same round before
+     * either writes, independently bump it, and produce two different Testmate
+     * intervention_ids for what should be one round — see this class's own doc and
+     * [resetForNextRound]'s doc for the round-counter mechanism this races against.
+     *
+     * A single object-level [Mutex] (not per-key like [TaskEscrow]'s) is correct here
+     * specifically because this ledger only ever tracks ONE active concept at a time
+     * (see class doc) — there's no second key to key a lock off of.
+     *
+     * Reentrant by coroutine: [GapTaskManager.generateIfNeeded] and
+     * [GapTaskManager.escalationCheckIfNeeded] each call into
+     * [LearningInterventionOrchestrator.executeTopCandidate] from WITHIN their own
+     * already-locked section. Without reentrancy, that nested call would try to
+     * re-acquire a [Mutex] its own caller is still holding and deadlock the first time
+     * this path actually runs. [LockOwnerElement] in the coroutine's context is how a
+     * nested call recognizes "this call chain already holds the lock" and runs its block
+     * inline instead of re-acquiring. This only protects a single already-serialized call
+     * chain against itself — two genuinely different callers (e.g. the ReminderService
+     * loop and a HomeViewModel tap) still serialize through [mutex] exactly as intended.
+     */
+    private val mutex = Mutex()
+
+    private object LockOwnerKey : CoroutineContext.Key<LockOwnerElement>
+    private class LockOwnerElement : CoroutineContext.Element {
+        override val key: CoroutineContext.Key<*> get() = LockOwnerKey
+    }
+
+    suspend fun <T> withLock(block: suspend () -> T): T {
+        if (coroutineContext[LockOwnerKey] != null) {
+            // Already inside this lock on this call chain (e.g. GapTaskManager's own
+            // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
+            return block()
+        }
+        return mutex.withLock {
+            withContext(LockOwnerElement()) { block() }
         }
     }
 }
