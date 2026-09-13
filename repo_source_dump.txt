@@ -2933,26 +2933,42 @@ object GapTaskManager {
     // ── P0b: Testmate targeted-test creation ────────────────────────────────
 
     /**
-     * Requests a Testmate targeted-repair test for the currently active gap concept, but
-     * only the FIRST time — [GapTaskLedger.activeTestmateSessionId] being non-null already
-     * means either this call already succeeded for this concept, or the concept is being
-     * re-served after [GapTaskLedger.recordServed] deliberately preserved that session
-     * across days (see its own doc). No-ops with nothing active, or with no
-     * [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
+     * Requests a Testmate targeted-repair test for the currently active gap concept.
+     * [GapTaskLedger.activeTestmateSessionId] being non-null means either this call already
+     * succeeded for this concept, or the concept is being re-served after
+     * [GapTaskLedger.recordServed] deliberately preserved that session across days (see its
+     * own doc) — but that no longer means "never ask again." No-ops with nothing active, or
+     * with no [GapTaskLedger.activeChapter] to target (shouldn't happen for a real
      * [LearningDecisionEngine.CandidateIntervention], but this stays defensive rather than
      * crashing the whole generation pass over it). A failed request is NOT retried until the
      * next [generateIfNeeded] run (i.e. tomorrow) — [evidencePollIfNeeded] only polls a
      * session that was actually recorded, so a create failure just means one day's targeted
      * test is missing, not a retry storm.
+     *
+     * BUGFIX (stale repair test never refreshed): a targeted test freezes its question set
+     * at creation time on the Testmate side, so the OLD "session exists -> return, full stop"
+     * guard meant a student stuck on an unfinished repair test never saw questions added by a
+     * LATER re-import of the same chapter — reproduced live on Biomolecules, which sat on a
+     * 282-question set built long before several subsequent imports. The route's own
+     * idempotency-by-intervention_id lookup is now staleness-aware server-side (see
+     * app/api/tests/targeted/route.ts's own doc) and will supersede + rebuild a stale `live`
+     * session — but that check only ever runs if this function actually calls the server.
+     * Re-verifying once per calendar day (this function already runs every 15-min cycle, see
+     * [generateIfNeededLocked]) means a re-import self-heals onto the active task within a
+     * day, even when the round never advances because the student hasn't finished the stale
+     * test yet — without hammering the endpoint every 15 minutes for an unchanged session.
      */
     private suspend fun createTargetedTestIfNeeded() {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val existingSession = GapTaskLedger.activeTestmateSessionId()
+        val todayKey = GapTaskLedger.todayKey()
         // DIAGNOSTIC: makes the guard's decision visible — was there already a session on
-        // file (and if so which round), or did this genuinely start from a clean slate.
+        // file (and if so which round), or did this genuinely start from a clean slate, and
+        // has it already been re-verified against the server today.
         Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
-            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()}")
-        if (existingSession != null) return
+            "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()} " +
+            "checkedDay=${GapTaskLedger.activeTestmateSessionCheckedDay()} todayKey=$todayKey")
+        if (existingSession != null && GapTaskLedger.activeTestmateSessionCheckedDay() == todayKey) return
         val chapter = GapTaskLedger.activeChapter() ?: run {
             Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
             return
@@ -3039,8 +3055,19 @@ object GapTaskManager {
 
         when (outcome) {
             is TestmateTargetedTestOutcome.Success -> {
-                GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
-                Log.d(TAG, "targeted test ready: concept=$conceptId session=${outcome.test.sessionId}")
+                // Only overwrite (and bumpVersion, which triggers HomeScreen recompute) when
+                // the server actually handed back a DIFFERENT session than what we had — an
+                // unchanged same-day re-verify returns the identical ids and shouldn't touch
+                // the UI. A different id means the server superseded a stale session (see
+                // this function's own BUGFIX doc) or this is a genuinely first-time create.
+                if (outcome.test.sessionId != existingSession) {
+                    GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
+                    Log.d(TAG, "targeted test refreshed: concept=$conceptId session=${outcome.test.sessionId} " +
+                        "(was $existingSession)")
+                } else {
+                    Log.d(TAG, "targeted test re-verified unchanged: concept=$conceptId session=${outcome.test.sessionId}")
+                }
+                GapTaskLedger.markActiveTestmateSessionChecked(todayKey)
                 clearTestmateError()
             }
             is TestmateTargetedTestOutcome.Error -> {
@@ -28993,6 +29020,15 @@ object GapTaskLedger {
     // the round does. Round 1 stays a bare conceptId (no suffix) for backward
     // compatibility with sessions already in flight before this fix.
     private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (stale repair test never refreshed): createTargetedTestIfNeeded used to skip
+    // the server entirely once a session id was recorded, so a chapter re-imported AFTER
+    // that session's test was built never got picked up until the round happened to advance
+    // (which requires the student finishing the stale test in the first place — reproduced
+    // live on Biomolecules, stuck on a 282-question set through several re-imports). This
+    // tracks the last dayKey the active session was re-verified against the server's own
+    // staleness check (see app/api/tests/targeted/route.ts), so that function can re-ask
+    // once per day instead of either never again or every 15-min cycle forever.
+    private const val KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY = "gap_task_active_testmate_session_checked_day"
     // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
     // literal 4-character string "null" (not a real null reference) whenever they were
     // ultimately derived from a Question row whose topic column was corrupted by the
@@ -29141,6 +29177,7 @@ object GapTaskLedger {
             CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
             CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
             CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         }
         bumpVersion()
     }
@@ -29202,6 +29239,20 @@ object GapTaskLedger {
      *  genuinely different `intervention_id` per round instead of replaying round 1's. */
     fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
 
+    /** Last dayKey [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  re-verified the active session against the server's staleness check — see
+     *  [KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY]'s own doc. Null means never checked (a
+     *  brand new session, or one recorded before this fix shipped — either way the next
+     *  cycle will verify it). */
+    fun activeTestmateSessionCheckedDay(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, null)?.takeIf { it.isNotBlank() }
+
+    /** Called once per calendar day by [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  after it re-verifies (or freshly creates) the active session, so the same day's later
+     *  15-min cycles skip the network round-trip — see that function's own doc. */
+    fun markActiveTestmateSessionChecked(todayKey: String) =
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, todayKey)
+
     /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
      *  a targeted test was created (or already existed — see the endpoint's own idempotency
      *  by intervention_id) for the currently active concept. */
@@ -29256,6 +29307,7 @@ object GapTaskLedger {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
@@ -29293,6 +29345,7 @@ object GapTaskLedger {
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────
