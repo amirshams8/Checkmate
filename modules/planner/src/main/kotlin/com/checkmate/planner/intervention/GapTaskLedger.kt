@@ -105,6 +105,15 @@ object GapTaskLedger {
     // the round does. Round 1 stays a bare conceptId (no suffix) for backward
     // compatibility with sessions already in flight before this fix.
     private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
+    // BUGFIX (stale repair test never refreshed): createTargetedTestIfNeeded used to skip
+    // the server entirely once a session id was recorded, so a chapter re-imported AFTER
+    // that session's test was built never got picked up until the round happened to advance
+    // (which requires the student finishing the stale test in the first place — reproduced
+    // live on Biomolecules, stuck on a 282-question set through several re-imports). This
+    // tracks the last dayKey the active session was re-verified against the server's own
+    // staleness check (see app/api/tests/targeted/route.ts), so that function can re-ask
+    // once per day instead of either never again or every 15-min cycle forever.
+    private const val KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY = "gap_task_active_testmate_session_checked_day"
     // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
     // literal 4-character string "null" (not a real null reference) whenever they were
     // ultimately derived from a Question row whose topic column was corrupted by the
@@ -253,6 +262,7 @@ object GapTaskLedger {
             CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
             CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
             CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         }
         bumpVersion()
     }
@@ -314,6 +324,20 @@ object GapTaskLedger {
      *  genuinely different `intervention_id` per round instead of replaying round 1's. */
     fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
 
+    /** Last dayKey [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  re-verified the active session against the server's staleness check — see
+     *  [KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY]'s own doc. Null means never checked (a
+     *  brand new session, or one recorded before this fix shipped — either way the next
+     *  cycle will verify it). */
+    fun activeTestmateSessionCheckedDay(): String? =
+        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, null)?.takeIf { it.isNotBlank() }
+
+    /** Called once per calendar day by [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
+     *  after it re-verifies (or freshly creates) the active session, so the same day's later
+     *  15-min cycles skip the network round-trip — see that function's own doc. */
+    fun markActiveTestmateSessionChecked(todayKey: String) =
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, todayKey)
+
     /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
      *  a targeted test was created (or already existed — see the endpoint's own idempotency
      *  by intervention_id) for the currently active concept. */
@@ -368,6 +392,7 @@ object GapTaskLedger {
         CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
         // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
         // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
         // replaying this same concept's round-1 id and getting the already-completed
@@ -405,6 +430,7 @@ object GapTaskLedger {
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
         CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
+        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
     }
 
     // ── Once-a-day guards ────────────────────────────────────────────────────
