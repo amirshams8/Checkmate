@@ -1,287 +1,386 @@
-//===== FILE: modules/core/src/main/kotlin/com/checkmate/core/llm/LlmGateway.kt =====
-package com.checkmate.core.llm
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
+//===== FILE: app/src/main/kotlin/com/checkmate/ui/mentor/MentorViewModel.kt =====
+package com.checkmate.ui.mentor
 
-import android.util.Log
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CoachingPlannerEntry
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.ConsultationProfile.Companion.toPromptContext
+import com.checkmate.core.MentorKnowledge
+import com.checkmate.core.TodayContext
+import com.checkmate.core.llm.LlmGateway
+import com.checkmate.core.tts.CheckmateTTS
+import com.checkmate.learning.model.RetentionDecisionSnapshot
+import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.service.StudyStateSyncManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONException
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 
-/**
- * Unified LLM gateway supporting OpenRouter, Groq, Claude, Gemini, and VibeBuild.
- * FIX 1.4: Changed Groq model from deprecated "llama3-8b-8192" to "llama-3.1-8b-instant".
- * FIX 1.4: Added HTTP status check + response body logging on failure so errors are
- *           visible in logcat instead of silently returning empty string.
- *
- * VibeBuild (added): a third-party gateway (https://vibebuild.pro) fronting both an
- * OpenAI-compatible route (/proxy/openai) and an Anthropic-compatible route
- * (/proxy/anthropic) behind a single VibeBuild token. NOTE: this domain is not an
- * Anthropic- or OpenAI-published partner — it hasn't been independently verified as
- * trustworthy, only as reachable. The base URL is stored in prefs (not hardcoded) so
- * it can be repointed without a rebuild if it turns out to be unreliable. The OpenAI
- * route reuses the existing callOpenAiCompatible() request shape (confirmed working
- * against gpt-5.5-pro). The Anthropic route (callVibeBuildAnthropic) reuses callClaude()'s
- * request body shape.
- *
- * FIX 1.5: gpt-5.5-pro rejected requests with HTTP 400 "Unsupported parameter: 'temperature'
- *          is not supported with this model" — confirmed from live proxy error. Reasoning-tier
- *          OpenAI models (gpt-5.x, o3, o4) don't accept sampling temperature at all.
- *          callOpenAiCompatible() now omits it for those models instead of always sending 0.7.
- *
- * FIX 1.5: claude-fable-5 via VibeBuild was returning "" silently — two stacked bugs, both
- *          confirmed via live curl:
- *          1. Auth: the Bearer guess was wrong for this route — CONFIRMED via curl that
- *             VibeBuild's /proxy/anthropic route requires native Anthropic-style "x-api-key",
- *             not "Authorization: Bearer". callVibeBuildAnthropic() now sends x-api-key directly.
- *          2. Parsing: Fable 5 returns extended-thinking output, so content[0] is a
- *             {"type":"thinking",...} block with no "text" key — content[1] is the actual
- *             {"type":"text","text":"..."} block. The old code always read content[0], which
- *             threw on Fable 5 responses and got swallowed by the catch block into "". Both
- *             callClaude() and callVibeBuildAnthropic() now scan the content array for the
- *             first block with type=="text" instead of assuming index 0.
- */
-object LlmGateway {
+private val historyJson = Json { ignoreUnknownKeys = true }
+private const val PREFS_KEY_HISTORY = "mentor_chat_history"
+private const val MAX_PERSISTED_MESSAGES = 40
 
-    private const val TAG = "LlmGateway"
+@Serializable
+data class MentorMessage(
+    val role:    String,
+    val content: String,
+    val ts:      Long = System.currentTimeMillis()
+)
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+data class MentorUiState(
+    val messages:   List<MentorMessage> = emptyList(),
+    val inputText:  String              = "",
+    val isLoading:  Boolean             = false,
+    val ttsEnabled: Boolean             = CheckmatePrefs.getBoolean("tts_enabled", true)
+)
 
-    object VibeBuildModels {
-        const val GPT_5_5_PRO    = "gpt-5.5-pro"
-        const val CLAUDE_FABLE_5 = "claude-fable-5"
+class MentorViewModel : ViewModel() {
+
+    private val _state = MutableStateFlow(MentorUiState())
+    val state: StateFlow<MentorUiState> = _state.asStateFlow()
+
+    init {
+        loadHistory()
+        // CORRECTION: chat previously synced through a /mentor endpoint that was
+        // never added to the worker (permanent 404 — see StudyStateSyncManager's
+        // class doc). Now routed through /studystate's dedicated mentor path
+        // instead. Pull-on-open picks up whatever the OTHER device pushed since
+        // this device last had the screen open — pullStateIfEmpty() alone can't
+        // do this because it only restores when the local field is unset, which
+        // is false the moment this device has ever sent one message.
+        pullRemoteIfNewer()
     }
 
-    private const val VIBEBUILD_DEFAULT_BASE_URL = "https://vibebuild.pro"
+    private fun loadHistory() {
+        val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+        val messages = if (saved != null) {
+            try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+            catch (_: Exception) { emptyList() }
+        } else emptyList()
 
-    // FIX: true "unrestricted" isn't possible — both Anthropic's and OpenAI-compatible APIs
-    // require a numeric max_tokens — so this is set to each model's practical output ceiling
-    // instead of the 512 used for the other providers. GPT-5.5 Pro and Claude Fable 5 both
-    // support up to 64K output tokens; this is set conservatively below that so a very long
-    // reply still can't blow the 60s OkHttp readTimeout above.
-    private const val VIBEBUILD_MAX_TOKENS = 8192
+        val initial = if (messages.isEmpty())
+            listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        else messages
 
-    // FIX 1.5: reasoning-tier OpenAI models reject sampling params like temperature entirely.
-    private val REASONING_MODEL_PREFIXES = listOf("gpt-5", "o3", "o4")
-
-    private fun supportsTemperature(model: String): Boolean =
-        REASONING_MODEL_PREFIXES.none { model.startsWith(it) }
-
-    // FIX 1.5: Anthropic-style responses can lead with a {"type":"thinking",...} block
-    // (extended thinking) before the {"type":"text","text":"..."} block. Always scan for
-    // the first text block instead of assuming content[0] — assuming index 0 silently broke
-    // Fable 5 responses since thinking blocks have no "text" key.
-    private fun firstTextBlock(content: JSONArray): String {
-        for (i in 0 until content.length()) {
-            val block = content.getJSONObject(i)
-            if (block.optString("type") == "text") {
-                return block.getString("text").trim()
-            }
-        }
-        throw JSONException("No content block with type=text found")
-    }
-
-    suspend fun complete(prompt: String, systemPrompt: String = ""): String = withContext(Dispatchers.IO) {
-        val provider = CheckmatePrefs.getString("llm_provider", "Groq") ?: "Groq"
-        val apiKey   = CheckmatePrefs.getString("llm_key_${provider.lowercase()}", null)
-
-        if (apiKey.isNullOrBlank()) {
-            Log.w(TAG, "No API key for $provider — returning empty (rule-based fallback will handle)")
-            return@withContext ""
-        }
-
-        return@withContext when (provider) {
-            "Claude"      -> callClaude(prompt, systemPrompt, apiKey)
-            "Gemini"      -> callGemini(prompt, systemPrompt, apiKey)
-            "Groq"        -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://api.groq.com/openai/v1/chat/completions",
-                // FIX: "llama3-8b-8192" was deprecated by Groq → HTTP 400/404 → silent empty return
-                // → AdaptivePlanner always fell back to ruleBasedPlan() → vague tasks
-                "llama-3.1-8b-instant"
-            )
-            "OpenRouter"  -> callOpenAiCompatible(
-                prompt, systemPrompt, apiKey,
-                "https://openrouter.ai/api/v1/chat/completions",
-                "mistralai/mistral-7b-instruct:free"
-            )
-            "VibeBuild"   -> {
-                val model = CheckmatePrefs.getString("llm_vibebuild_model", VibeBuildModels.GPT_5_5_PRO)
-                    ?: VibeBuildModels.GPT_5_5_PRO
-                val baseUrl = (CheckmatePrefs.getString("llm_vibebuild_base_url", null)
-                    ?.trim()?.takeIf { it.isNotBlank() } ?: VIBEBUILD_DEFAULT_BASE_URL)
-                    .trimEnd('/')
-                when (model) {
-                    VibeBuildModels.CLAUDE_FABLE_5 ->
-                        callVibeBuildAnthropic(prompt, systemPrompt, apiKey, baseUrl, model)
-                    else ->
-                        callOpenAiCompatible(
-                            prompt, systemPrompt, apiKey,
-                            "$baseUrl/proxy/openai/v1/chat/completions",
-                            model,
-                            // FIX: VibeBuild responses were being cut off mid-sentence at the
-                            // default 512-token cap. VibeBuild gets a much higher ceiling; other
-                            // providers (Groq/OpenRouter) keep the original 512 default.
-                            maxTokens = VIBEBUILD_MAX_TOKENS
-                        )
-                }
-            }
-            else          -> ""
-        }
-    }
-
-    private fun callOpenAiCompatible(
-        prompt: String, system: String, apiKey: String, url: String, model: String,
-        maxTokens: Int = 512
-    ): String {
-        val messages = JSONArray().apply {
-            if (system.isNotBlank()) put(JSONObject().put("role", "system").put("content", system))
-            put(JSONObject().put("role", "user").put("content", prompt))
-        }
-        val body = JSONObject().apply {
-            put("model", model)
-            put("messages", messages)
-            put("max_tokens", maxTokens)
-            // FIX 1.5: reasoning-tier models (gpt-5.x, o3, o4) 400 on this param entirely.
-            if (supportsTemperature(model)) put("temperature", 0.7)
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder().url(url)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp     = client.newCall(req).execute()
-            val bodyStr  = resp.body?.string() ?: "{}"
-            // FIX: previously body was consumed before status check — error JSON was lost
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "OpenAI-compat HTTP ${resp.code} for model=$model url=$url body=$bodyStr")
-                return ""
-            }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("choices").getJSONObject(0)
-                .getJSONObject("message").getString("content").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "OpenAI-compat call failed: ${e.message}")
-            ""
-        }
-    }
-
-    private fun callClaude(prompt: String, system: String, apiKey: String): String {
-        val body = JSONObject().apply {
-            put("model", "claude-3-haiku-20240307")
-            put("max_tokens", 512)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("https://api.anthropic.com/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Claude HTTP ${resp.code} body=$bodyStr")
-                return ""
-            }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "Claude call failed: ${e.message}")
-            ""
-        }
+        _state.update { it.copy(messages = initial) }
     }
 
     /**
-     * VibeBuild's Anthropic-compatible route (/proxy/anthropic). Reuses callClaude()'s
-     * request body shape (model/max_tokens/system/messages, Anthropic's native /v1/messages
-     * schema) since VibeBuild fronts the Anthropic API rather than translating it.
-     *
-     * FIX 1.5: CONFIRMED via live curl against this exact route that VibeBuild requires
-     * native Anthropic-style "x-api-key" — "Authorization: Bearer" (which works on the
-     * OpenAI route) gets a flat 401 here. Also, Fable 5 responses lead with a "thinking"
-     * content block before the "text" block, so parsing now scans for the first
-     * type=="text" block via firstTextBlock() instead of assuming content[0].
+     * Fetches the server's mentor history and adopts it only if it's strictly
+     * newer than what's already loaded locally (by last-message timestamp) —
+     * last-write-wins, matching StudyStateSyncManager's flat-overwrite model.
+     * This guards against a slow network response landing after the student
+     * has already sent a new local message and stomping it with a stale pull.
+     * On adopt, re-persists locally but does NOT push back — that would just
+     * echo the same history the server already has.
      */
-    private fun callVibeBuildAnthropic(
-        prompt: String, system: String, apiKey: String, baseUrl: String, model: String
-    ): String {
-        val body = JSONObject().apply {
-            put("model", model)
-            put("max_tokens", VIBEBUILD_MAX_TOKENS)
-            if (system.isNotBlank()) put("system", system)
-            put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("$baseUrl/proxy/anthropic/v1/messages")
-            .addHeader("x-api-key", apiKey)
-            .addHeader("anthropic-version", "2023-06-01")
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "VibeBuild/Anthropic HTTP ${resp.code} model=$model body=$bodyStr")
-                return ""
+    private fun pullRemoteIfNewer() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val remoteJson = StudyStateSyncManager.pullMentorHistory() ?: return@launch
+            val remoteMessages = try {
+                historyJson.decodeFromString<List<MentorMessage>>(remoteJson)
+            } catch (_: Exception) {
+                return@launch
             }
-            val json = JSONObject(bodyStr)
-            firstTextBlock(json.getJSONArray("content"))
-        } catch (e: Exception) {
-            Log.e(TAG, "VibeBuild/Anthropic call failed: ${e.message}")
-            ""
+            if (remoteMessages.isEmpty()) return@launch
+
+            val remoteLastTs = remoteMessages.last().ts
+            val localLastTs = _state.value.messages.lastOrNull()?.ts ?: 0L
+            if (remoteLastTs > localLastTs) {
+                _state.update { it.copy(messages = remoteMessages) }
+                persistHistory(remoteMessages)
+            }
         }
     }
 
-    private fun callGemini(prompt: String, system: String, apiKey: String): String {
-        val fullPrompt = if (system.isNotBlank()) "$system\n\n$prompt" else prompt
-        val body = JSONObject().apply {
-            put("contents", JSONArray().put(
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", fullPrompt)))
-            ))
-        }.toString().toRequestBody("application/json".toMediaType())
+    private fun persistHistory(messages: List<MentorMessage>): String {
+        val trimmed = messages.takeLast(MAX_PERSISTED_MESSAGES)
+        val json = historyJson.encodeToString(trimmed)
+        CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
+        return json
+    }
 
-        // FIX: gemini-1.5-flash-latest was retired by Google — all Gemini 1.0/1.5 models now
-        // return a hard 404 on every request. Switched to the "gemini-flash-latest" alias,
-        // which Google auto-updates to whatever the current stable Flash release is (currently
-        // Gemini 3.x), so this won't silently rot again next time a version gets retired.
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$apiKey"
-        val req = Request.Builder().url(url)
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
+    /** Persists locally, then pushes to the other device off the main thread. */
+    private fun persistAndSync(messages: List<MentorMessage>) {
+        val json = persistHistory(messages)
+        viewModelScope.launch(Dispatchers.IO) { StudyStateSyncManager.pushMentorMessage(json) }
+    }
 
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
-                return ""
+    fun setInput(text: String) = _state.update { it.copy(inputText = text) }
+
+    fun send(context: Context) {
+        val text = _state.value.inputText.trim()
+        if (text.isBlank() || _state.value.isLoading) return
+
+        val userMsg = MentorMessage("user", text)
+        val updatedMessages = _state.value.messages + userMsg
+        _state.update { it.copy(messages = updatedMessages, inputText = "", isLoading = true) }
+        persistAndSync(updatedMessages)
+
+        viewModelScope.launch {
+            val response = try {
+                val systemPrompt = buildSystemPrompt(context, text)
+                val history      = buildHistoryForLlm()
+                LlmGateway.complete(history, systemPrompt)
+            } catch (e: Exception) {
+                "I couldn't process that right now. Try again."
             }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts").getJSONObject(0)
-                .getString("text").trim()
+
+            val assistantMsg = MentorMessage(
+                "assistant",
+                response.ifBlank { "No response. Check your API key in Settings." }
+            )
+            val finalMessages = _state.value.messages + assistantMsg
+            _state.update { it.copy(messages = finalMessages, isLoading = false) }
+            persistAndSync(finalMessages)
+
+            if (_state.value.ttsEnabled && response.isNotBlank()) {
+                val firstSentence = response.split(". ", ".\n").firstOrNull()?.take(200) ?: response.take(200)
+                CheckmateTTS.speak(context, firstSentence)
+            }
+        }
+    }
+
+    fun clearHistory() {
+        val initial = listOf(MentorMessage("assistant", "Ready. What do you need help with?"))
+        _state.update { it.copy(messages = initial) }
+        // FIX: putString(key, null) crashes on non-null String param — use remove() instead
+        CheckmatePrefs.remove(PREFS_KEY_HISTORY)
+        // Push the reset state too, so the other device's next pullRemoteIfNewer()
+        // picks up the clear instead of silently keeping stale history around.
+        viewModelScope.launch(Dispatchers.IO) {
+            StudyStateSyncManager.pushMentorMessage(historyJson.encodeToString(initial))
+        }
+    }
+
+    private fun buildHistoryForLlm(): String {
+        val msgs = _state.value.messages.takeLast(20)
+        return msgs.joinToString("\n") { msg ->
+            if (msg.role == "user") "Student: ${msg.content}"
+            else "Mentor: ${msg.content}"
+        }
+    }
+
+    // Upgrade Blueprint Phase 2 wiring ("Mentor" as a StudentModel consumer):
+    // suspend now — StudentModelBuilder.build() is a suspend DB read, same as every
+    // other suspend call this function already awaits nothing for (buildSystemPrompt
+    // itself did no suspending work before this). Its one call site (send(), above)
+    // already invokes it from inside viewModelScope.launch, so this is a signature-only
+    // change — no call-site rewrite needed.
+    private suspend fun buildSystemPrompt(context: Context, currentQuery: String): String {
+        val profile         = ConsultationProfile.load()
+        val ledger          = BehaviorLedger.getSummaryForPlanner()
+        val knowledgeBlocks = MentorKnowledge.getContextForQuery(currentQuery)
+
+        // Mentor v2 (spec 3.1): previously Mentor only saw the 7-day aggregate ledger string —
+        // blind to today's actual task list, custom tasks, live app usage, same-day free-text
+        // updates, and upcoming coaching tests. These four blocks close that gap.
+        val todayTasks = PlanStore.getTodayTasksSnapshot_Sync()
+        val planSummary = if (todayTasks.isEmpty()) "No plan generated for today yet." else {
+            todayTasks.joinToString("\n") { t ->
+                val marker = when (t.state) {
+                    TaskState.DONE    -> "[DONE]"
+                    TaskState.SKIPPED -> "[SKIPPED]"
+                    TaskState.ACTIVE  -> "[ACTIVE]"
+                    TaskState.PAUSED  -> "[PAUSED]"
+                    TaskState.PENDING -> "[PENDING]"
+                }
+                val custom = if (t.isCustom) " (custom)" else ""
+                "$marker ${t.subject}: ${t.topic} — ${t.durationMinutes}min, ${t.taskType}$custom"
+            }
+        }
+
+        val usageSummary = try {
+            AppUsageTracker.getTodayUsage(context, limit = 5)
+                .joinToString("\n") { "  ${it.label}: ${AppUsageTracker.formatDuration(it.foregroundMillis)}" }
+        } catch (_: Exception) { "" }
+
+        val todayContext = TodayContext.getSummaryText()
+        // FIX: was hardcoded to 3 days, clipping Mentor's visibility into upcoming
+        // coaching tests/lectures far shorter than everywhere else in the app.
+        // Widened to 20 days — deliberately further out than AdaptivePlanner's
+        // 7-day window (generateDailyPlan()) and upcomingContext()'s own 7-day
+        // default, since Mentor is a longer-horizon conversational context, not
+        // a next-day scheduling input like the planner.
+        val coachingContext = try { CoachingPlannerEntry.upcomingContext(20) } catch (_: Exception) { "" }
+
+        // Upgrade Blueprint Phase 2 wiring: StudentModelBuilder.build() aggregates
+        // Mastery/Error/Retention/KnowledgeGraph output (computed on every report.md
+        // import — see TestResultNormalizer) into one StudentModel, but nothing read
+        // it — Mentor was answering "how am I doing" purely from the 7-day behavior
+        // ledger, blind to actual test performance. buildLearningSummary() below
+        // compacts it into the same plain-text block style as planSummary/ledger.
+        val learningSummary = try {
+            buildLearningSummary(StudentModelBuilder.build(context))
         } catch (e: Exception) {
-            Log.e(TAG, "Gemini call failed: ${e.message}")
-            ""
+            "" // same fail-open pattern as usageSummary/coachingContext above — a
+               // learning-state read failure shouldn't block the rest of the prompt.
+        }
+
+        return buildString {
+            appendLine("""
+You are a strict but smart study mentor for a ${profile.examTarget} aspirant.
+You have full context about this student. Be specific, direct, and curriculum-aware.
+Keep responses under 5 lines unless a detailed breakdown is needed.
+Never give generic motivation. React to actual data.
+Refer to specific topics, chapters, marks gaps, and deadlines.
+You also have access to the full conversation history above — refer to it naturally when relevant.
+If TODAY'S PLAN shows pending/skipped tasks and the student is asking something unrelated,
+you may briefly flag it — but don't derail the actual question they asked.
+If LEARNING STATE shows weak concepts, review-due topics, or recurring errors relevant to
+the student's question, reference them specifically instead of speaking generically. When a
+weak concept lists a prerequisite issue, name the specific prerequisite topic (e.g. "your
+Rolling Motion mistakes trace back to Laws of Motion, which is still at 38%") rather than
+saying only that a prerequisite gap exists.
+            """.trimIndent())
+            appendLine()
+            appendLine("STUDENT PROFILE:")
+            appendLine(profile.toPromptContext())
+            appendLine()
+            appendLine("BEHAVIOR DATA: $ledger")
+            appendLine()
+            appendLine("TODAY'S PLAN:")
+            appendLine(planSummary)
+            appendLine()
+            if (learningSummary.isNotBlank()) {
+                appendLine("LEARNING STATE (from imported test reports — mastery/errors/retention):")
+                appendLine(learningSummary)
+                appendLine()
+            }
+            if (todayContext.isNotBlank()) {
+                appendLine("TODAY'S LOGGED UPDATES:")
+                appendLine(todayContext)
+                appendLine()
+            }
+            if (usageSummary.isNotBlank()) {
+                appendLine("TODAY'S APP USAGE (top 5):")
+                appendLine(usageSummary)
+                appendLine()
+            }
+            if (coachingContext.isNotBlank()) {
+                appendLine("UPCOMING COACHING TESTS/LECTURES (next 20 days):")
+                appendLine(coachingContext)
+                appendLine()
+            }
+            if (knowledgeBlocks.isNotBlank()) {
+                appendLine("RELEVANT KNOWLEDGE:")
+                appendLine(knowledgeBlocks)
+                appendLine()
+            }
+            appendLine("Respond as Mentor.")
+        }.trim()
+    }
+
+    /**
+     * Upgrade Blueprint Phase 2 wiring: compacts a [StudentModel] into a short
+     * plain-text block matching the existing planSummary/ledger style — Mentor's
+     * prompt is plain text throughout, unlike AdaptivePlanner's JSON-to-LLM
+     * convention, so this deliberately doesn't reuse AdaptivePlanner's
+     * StudentModelPromptSummary/Json.encodeToString approach.
+     *
+     * Empty-guard: returns "" when no report has ever been imported
+     * (conceptsTracked == 0) — same pattern as the other optional context blocks
+     * above (usageSummary/coachingContext) — so a student who hasn't imported a
+     * mock yet doesn't get a misleading "0 concepts tracked" section.
+     */
+    private fun buildLearningSummary(model: StudentModel): String {
+        if (model.overall.conceptsTracked == 0) return ""
+
+        val overall = model.overall
+        val weakest = model.concepts.values.sortedBy { it.mastery }.take(5)
+        val reviewDue = model.concepts.values
+            .filter { it.retentionDecision == RetentionDecisionSnapshot.REVIEW }
+            .sortedByDescending { it.forgettingRisk }
+            .take(5)
+        val topErrors = model.unresolvedErrors.take(5)
+
+        return buildString {
+            appendLine(
+                "Overall: ${overall.conceptsMastered}/${overall.conceptsTracked} concepts mastered, " +
+                    "avg mastery ${(overall.averageMastery * 100).toInt()}%, " +
+                    "${overall.unresolvedErrorCount} unresolved error occurrence(s)"
+            )
+            if (weakest.isNotEmpty()) {
+                appendLine("Weakest concepts:")
+                weakest.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    // Upgrade Blueprint Phase 2 wiring: name the specific weak
+                    // prerequisite(s) and, when known, their own mastery — see
+                    // ConceptSnapshot.prerequisiteIssues' CORRECTNESS FIX note.
+                    val prereqNote = if (c.prerequisiteIssues.isNotEmpty()) {
+                        val names = c.prerequisiteIssues.joinToString { ref ->
+                            val prereqLabel = ref.topic ?: ref.chapter ?: ref.subject ?: ref.conceptId
+                            val prereqMastery = model.concepts[ref.conceptId]?.mastery
+                            if (prereqMastery != null) "$prereqLabel (${(prereqMastery * 100).toInt()}%)"
+                            else "$prereqLabel (not yet attempted)"
+                        }
+                        " — traces to weak prerequisite(s): $names"
+                    } else ""
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label — ${(c.mastery * 100).toInt()}% mastery$prereqNote")
+                }
+            }
+            if (reviewDue.isNotEmpty()) {
+                appendLine("Due for review (forgetting risk rising):")
+                reviewDue.forEach { c ->
+                    val label = c.topic ?: c.chapter ?: "unknown"
+                    appendLine("  ${c.subject ?: "?"}/${c.chapter ?: "?"}/$label")
+                }
+            }
+            if (topErrors.isNotEmpty()) {
+                appendLine("Recurring errors:")
+                topErrors.forEach { e ->
+                    val concept = model.concepts[e.conceptId]
+                    val label = concept?.topic ?: concept?.chapter ?: e.conceptId
+                    appendLine("  $label — ${e.errorType} ×${e.occurrences}")
+                }
+            }
+        }.trim()
+    }
+
+    companion object {
+        /**
+         * Mentor v2 (spec 3.2): lets code outside a MentorViewModel instance (HomeViewModel on
+         * skip, DistractionGuard's listener on threshold, ReminderService's idle check) write
+         * directly into the same persisted chat history MentorViewModel reads on init — turning
+         * Mentor chat into a running log the mentor writes into, not only a box the user opens.
+         * Uses the same PREFS_KEY_HISTORY / historyJson / MAX_PERSISTED_MESSAGES as the instance
+         * methods above so a message appended here shows up next time MentorScreen is opened.
+         *
+         * Also pushes the update via StudyStateSyncManager. These callers (HomeViewModel button
+         * handlers, DistractionGuard's listener, ReminderService) aren't guaranteed to already be
+         * on a background thread the way the ViewModel's own viewModelScope.launch(Dispatchers.IO)
+         * calls are, so the push is wrapped in its own short-lived Thread here rather than assumed
+         * safe to run inline — StudyStateSyncManager's synchronous OkHttp calls must not run on
+         * the main thread.
+         */
+        fun appendProactiveMessage(text: String) {
+            val clean = text.trim()
+            if (clean.isEmpty()) return
+            val saved = CheckmatePrefs.getString(PREFS_KEY_HISTORY, null)
+            val existing = if (saved != null) {
+                try { historyJson.decodeFromString<List<MentorMessage>>(saved) }
+                catch (_: Exception) { emptyList() }
+            } else emptyList()
+            val updated = (existing + MentorMessage("assistant", clean)).takeLast(MAX_PERSISTED_MESSAGES)
+            val json = historyJson.encodeToString(updated)
+            CheckmatePrefs.putString(PREFS_KEY_HISTORY, json)
+            Thread { StudyStateSyncManager.pushMentorMessage(json) }.start()
         }
     }
 }
