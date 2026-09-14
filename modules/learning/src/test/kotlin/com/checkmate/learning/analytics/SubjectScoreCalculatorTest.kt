@@ -48,11 +48,19 @@ class SubjectScoreCalculatorTest {
     }
 
     @Test
-    fun `a question that resolves to no subject is dropped, not crashed on`() {
+    fun `a question that resolves to no subject is surfaced as Unmapped, not dropped`() {
+        // SubjectScoreCalculator's own doc: dropping unresolved-subject questions was
+        // the bug (a real report import silently lost 3 of 6 chapters' worth of marks
+        // this way) — UNMAPPED_SUBJECT is the deliberate replacement so a coverage gap
+        // shows up as a visible bucket instead of vanishing. This test previously
+        // asserted the old dropped-and-empty behavior; updated to match the fix.
         val questions = listOf(fact("Not A Real Chapter", "Not A Real Topic", correct = true))
 
         val scores = SubjectScoreCalculator.compute("NEET", questions)
 
-        assertTrue(scores.isEmpty())
+        assertEquals(1, scores.size)
+        val unmapped = scores.first()
+        assertEquals(SubjectScoreCalculator.UNMAPPED_SUBJECT, unmapped.subject)
+        assertEquals(1, unmapped.questionsCount)
     }
 }

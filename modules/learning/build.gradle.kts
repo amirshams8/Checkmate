@@ -33,4 +33,10 @@ dependencies {
     kapt("androidx.room:room-compiler:2.6.1")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+    // Real org.json impl for the JVM test classpath — LlmDiagnosticResponseParseTest
+    // and LlmExplanationResponseParseTest exercise actual JSONObject parsing, and
+    // the android.jar stub's org.json classes throw "not mocked" on every call
+    // instead of returning usable defaults. Same fix already applied in
+    // :modules:planner's build.gradle.kts for the identical LlmIntentParserTest gap.
+    testImplementation("org.json:json:20231013")
 }
