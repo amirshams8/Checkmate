@@ -2536,6 +2536,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateExternalQuestion
 import com.checkmate.testmate.TestmateQuestionPool
 import com.checkmate.testmate.TestmateResultOutcome
 import com.checkmate.testmate.TestmateTargetedTestOutcome
@@ -2642,7 +2643,7 @@ object GapTaskManager {
         // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
         // part.
         resolveActiveConceptState(context)
-        createTargetedTestIfNeeded()
+        createTargetedTestIfNeeded(context)
 
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
@@ -2668,7 +2669,7 @@ object GapTaskManager {
             // startFromCandidate's own doc for which intents this actually applies to.
             (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
                 ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
-            createTargetedTestIfNeeded()
+            createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
@@ -2979,7 +2980,7 @@ object GapTaskManager {
      * day, even when the round never advances because the student hasn't finished the stale
      * test yet — without hammering the endpoint every 15 minutes for an unchanged session.
      */
-    private suspend fun createTargetedTestIfNeeded() {
+    private suspend fun createTargetedTestIfNeeded(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val existingSession = GapTaskLedger.activeTestmateSessionId()
         val todayKey = GapTaskLedger.todayKey()
@@ -3060,13 +3061,40 @@ object GapTaskManager {
                 "instead of replaying round 1's completed one")
         }
 
+        // NEW (external-report pathway): a report Checkmate parsed locally but that was
+        // never actually taken on Testmate has no `questions`/`responses` history there
+        // to look up by chapter — see TestmateApi.createTargetedTest's own doc. Check
+        // Room first; only fall through to the native by-chapter call below when this
+        // comes back empty, so a chapter with BOTH a real Testmate history AND a local
+        // external import still prefers the explicit local content (the whole point of
+        // this pathway existing) rather than silently mixing the two.
+        val externalQuestions = LearningDatabase.getInstance(context).questionDao()
+            .getExternalWrongOrSkipped(
+                chapter = chapter,
+                topic = topicForApi,
+                source = "external_report",
+                studentId = LearningIds.LOCAL_STUDENT_ID
+            )
+        if (externalQuestions.isNotEmpty()) {
+            Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId using ${externalQuestions.size} " +
+                "locally-parsed external question(s) for chapter=$chapter — skipping native Testmate lookup")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = interventionId,
                 chapter = chapter,
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
-                pool = TestmateQuestionPool.WRONG_SKIPPED
+                pool = TestmateQuestionPool.WRONG_SKIPPED,
+                externalQuestions = externalQuestions.map { q ->
+                    TestmateExternalQuestion(
+                        questionText = q.questionText ?: "",
+                        options = q.options,
+                        correctOption = q.correctOption,
+                        explanation = q.explanation
+                    )
+                }
             )
         } catch (e: Exception) {
             Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
@@ -3225,7 +3253,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
                 // GapTaskLedger.resetForNextRound() (still-below-mastery / conceptId-drift
                 // branches), which clears the active session so a new round can be
                 // requested — but it doesn't request one itself. generateIfNeeded() always
-                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded() right
+                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded(context) right
                 // after (see that function's own BUGFIX note); this path didn't, so a round
                 // reset discovered here sat un-actioned until the next generateIfNeeded
                 // cycle, by which point a fresh re-rank can pick a different top concept and
@@ -3238,7 +3266,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
                 // it here too closes that gap the same way generateIfNeeded already does;
                 // it's a no-op whenever resolveDoneConcept covered the concept outright or
                 // deferred it back to PENDING, since both leave no active concept id.
-                createTargetedTestIfNeeded()
+                createTargetedTestIfNeeded(context)
             }
             GapTaskLedger.markEscalatedToday(todayKey)
             return
@@ -14864,6 +14892,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
@@ -14995,7 +15024,15 @@ class TestResultsViewModel : ViewModel() {
      * `analysisError` is set — the already-committed import is never rolled back
      * or hidden because a derived-view step afterward broke.
      */
-    fun importReport(context: Context, uri: Uri) {
+    // NEW: [source] defaults to "testmate_report" — every existing call site (the
+    // current single "Import Report" action) is unaffected. A future second entry
+    // point for reports that were never actually taken on Testmate should pass
+    // "external_report" here — see TestResultNormalizer.normalizeAndPersist's own
+    // [source] param and QuestionDao.getExternalWrongOrSkipped, which is what
+    // GapTaskManager.createTargetedTestIfNeeded keys off of to route those concepts
+    // to the external-report repair-test pathway instead of Testmate's by-chapter
+    // lookup.
+    fun importReport(context: Context, uri: Uri, source: String = "testmate_report") {
         viewModelScope.launch {
             _state.update {
                 it.copy(
@@ -15018,7 +15055,7 @@ class TestResultsViewModel : ViewModel() {
                 }
 
                 val result = withContext(Dispatchers.IO) {
-                    TestResultNormalizer.normalizeAndPersist(context, text)
+                    TestResultNormalizer.normalizeAndPersist(context, text, source = source)
                 }
                 // Persistence has committed — this is final regardless of what
                 // buildPerformanceReport below does with it.
@@ -15159,21 +15196,24 @@ class TestResultsViewModel : ViewModel() {
         alreadyImported: Boolean
     ) {
         if (alreadyImported) {
-            // DIAGNOSTIC: this is the OTHER silent no-op — replay path never reaches
-            // the orchestrator at all. Remove once confirmed which gate is firing.
-            Log.w(TAG, "DIAGNOSTIC: executeTopIntervention skipped — alreadyImported=true, orchestrator never called")
+            // DIAGNOSTIC: persisted, not logged — this device's logcat suppresses non-
+            // system app output entirely (confirmed: full unfiltered --pid dump showed
+            // nothing during a live import). Readable via:
+            //   adb shell run-as com.checkmate cat shared_prefs/checkmate_prefs.xml | grep debug_last_orchestration
+            CheckmatePrefs.putString("debug_last_orchestration_result", "alreadyImported=true, orchestrator never called")
             return
         }
         try {
             val result = withContext(Dispatchers.IO) {
                 LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
             }
-            // DIAGNOSTIC: executeTopCandidateLocked can reject every candidate (already-
-            // active task, already-covered concept, not-mappable, policy rejection) and
-            // return normally — none of that logs anywhere on its own. This line is the
-            // only way to see outcome/rejections without reading in-memory state.
-            // Remove alongside the two DIAGNOSTIC lines above once resolved.
-            Log.d(TAG, "DIAGNOSTIC: orchestration outcome=${result.outcome} rejections=${result.rejections}")
+            // DIAGNOSTIC: persisted, not logged — see note above.
+            CheckmatePrefs.putString(
+                "debug_last_orchestration_result",
+                "outcome=${result.outcome} rejections=${result.rejections.map {
+                    "rank=${it.rank} concept=${it.candidate.conceptId} source=${it.source} detail=${it.detail}"
+                }}"
+            )
             _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
         } catch (e: Exception) {
             Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
@@ -22915,6 +22955,35 @@ interface QuestionDao {
     // whether it actually did anything.
     @Query("UPDATE questions SET topic = NULL WHERE topic = 'null'")
     suspend fun repairLiteralNullTopics(): Int
+
+    // NEW (external-report pathway): questions from a report Checkmate parsed
+    // locally but that was never actually taken on Testmate (tagged with a
+    // non-"testmate_report" source at import — see TestResultNormalizer's
+    // [source] param) have no `responses` history on Testmate's server to look
+    // up by chapter. This is the local equivalent of that lookup: every wrong or
+    // skipped question this student has for the chapter/topic, scoped to
+    // [source] so a genuinely Testmate-taken attempt for the same chapter never
+    // gets mixed in here (that already has its own correct pathway). `topic`
+    // matching mirrors the server route's own "only filter by topic when one was
+    // recorded" behavior — see GapTaskManager.createTargetedTestIfNeeded's
+    // topicForApi handling for the same null-vs-blank reasoning.
+    @Query(
+        """
+        SELECT q.* FROM questions q
+        INNER JOIN question_attempts qa ON qa.questionId = q.id
+        WHERE q.chapter = :chapter
+          AND (:topic IS NULL OR q.topic = :topic)
+          AND q.source = :source
+          AND qa.studentId = :studentId
+          AND qa.correct = 0
+        """
+    )
+    suspend fun getExternalWrongOrSkipped(
+        chapter: String,
+        topic: String?,
+        source: String,
+        studentId: String
+    ): List<Question>
 }
 
 @Dao
@@ -36935,7 +37004,15 @@ object TestmateApi {
         chapter: String,
         topic: String?,
         questionCount: Int = 15,
-        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED
+        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED,
+        // NEW (external-report pathway): a report Checkmate parsed locally but that
+        // was never actually taken on Testmate has no `questions`/`responses` rows
+        // there to look up by chapter — see this function's own class doc and
+        // app/api/tests/targeted/route.ts's `external_questions` doc. When non-empty,
+        // this REPLACES server-side selection entirely; [questionCount]/[pool] are
+        // still sent for logging consistency but have no effect on which questions
+        // come back.
+        externalQuestions: List<TestmateExternalQuestion> = emptyList()
     ): TestmateTargetedTestOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateTargetedTestOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -36963,6 +37040,20 @@ object TestmateApi {
                 ?.let { put("topic", it) }
             put("question_count", questionCount)
             put("pool", pool.name)
+            if (externalQuestions.isNotEmpty()) {
+                put("external_questions", JSONArray().apply {
+                    externalQuestions.forEach { eq ->
+                        put(JSONObject().apply {
+                            put("question_text", eq.questionText)
+                            eq.options?.let { opts ->
+                                put("options", JSONObject().apply { opts.forEach { (k, v) -> put(k, v) } })
+                            }
+                            eq.correctOption?.let { put("correct_answer", it) }
+                            eq.explanation?.let { put("explanation", it) }
+                        })
+                    }
+                })
+            }
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
 
@@ -37174,6 +37265,23 @@ enum class TestmateQuestionPool {
      *  WRONG_SKIPPED don't have enough candidates to fill questionCount. */
     NEW
 }
+
+/**
+ * One question from a report Checkmate parsed locally but that was never actually
+ * taken on Testmate — see [TestmateApi.createTargetedTest]'s [externalQuestions]
+ * param and app/api/tests/targeted/route.ts's own `external_questions` doc for why
+ * this bypasses the normal by-chapter server lookup entirely. Deliberately not the
+ * app module's own `Question` type — this module has no dependency on
+ * `com.checkmate.learning.model` today, and this call site is the only thing that
+ * needs a subset of those fields, so the caller (GapTaskManager) maps into this
+ * shape rather than this module reaching across for the real one.
+ */
+data class TestmateExternalQuestion(
+    val questionText: String,
+    val options: Map<String, String>?,
+    val correctOption: String?,
+    val explanation: String?
+)
 
 data class TestmateTargetedTest(
     val testId: String,
