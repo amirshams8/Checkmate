@@ -1,4 +1,477 @@
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/PlanStore.kt =====
+
+package com.checkmate.planner
+
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import java.util.Calendar
+
+// Blueprint 2.6: aggregated pause/focus numbers for the Stats screen.
+// actualFocusMinutesToday sums StudyTask.actualMinutes (real focus time, pauses
+// excluded — see StudyTask.actualMinutes) across today's completed sessions.
+// avgPausesPerSession / pauseRatePercent are computed over the trailing 7 days
+// of *attempted* sessions (DONE or SKIPPED — a task that was never started has
+// no pause behavior to measure), so a fatigue/distraction trend is visible
+// even on a day with zero completions.
+data class PauseStats(
+    val actualFocusMinutesToday: Int   = 0,
+    val avgPausesPerSession:     Float = 0f,
+    val pauseRatePercent:        Int   = 0
+)
+
+object PlanStore {
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val _todayTasks = MutableStateFlow<List<StudyTask>>(emptyList())
+    val todayTasks: StateFlow<List<StudyTask>> = _todayTasks.asStateFlow()
+
+    init { reload() }
+
+    private fun reload() {
+        val saved = CheckmatePrefs.getString("plan_${todayKey()}", null)
+        _todayTasks.value = saved?.let {
+            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
+        } ?: emptyList()
+    }
+
+    fun saveTodayTasks(tasks: List<StudyTask>) = persist(tasks)
+
+    /**
+     * Appends a single manually-created task to today's plan WITHOUT touching any
+     * existing tasks (generated or custom). Unlike saveTodayTasks(), which replaces
+     * the whole list, this is additive — safe to call any time, any number of times.
+     * The new task goes through the exact same StudyTask model as AdaptivePlanner
+     * output, so it picks up Start/Pause/Done/Skip, AttentionCycleService, and
+     * GuardianNotifier WhatsApp + Telegram reporting automatically — no separate
+     * code path needed anywhere downstream.
+     */
+    fun addCustomTask(task: StudyTask) = persist(_todayTasks.value + task)
+
+    /**
+     * Upgrade Blueprint Phase 2.4/2.5 (P0a) — appends a single LearningDecisionEngine-
+     * originated task to today's plan. Same additive semantics as [addCustomTask]
+     * (existing tasks, generated or custom, are untouched); kept as its own entry point
+     * rather than reusing addCustomTask() so a StudyTask's provenance is never ambiguous:
+     * addCustomTask() is what HomeViewModel calls for a student-typed task (isCustom=true),
+     * this is what [com.checkmate.planner.intervention.TaskMutator.createTask] calls for a
+     * task whose shape and content came from a validated [com.checkmate.planner.intervention.CreateTaskRequest]
+     * (isCustom stays false — learningIntent/conceptId/targetedConceptIds carry the
+     * provenance instead, see StudyTask's doc on those fields).
+     *
+     * Caller is expected to have already run this through TaskEscrow + PolicyValidator —
+     * PlanStore itself has no opinion on validity, same as addCustomTask/saveTodayTasks.
+     */
+    fun createTask(task: StudyTask) = persist(_todayTasks.value + task)
+
+    /** Removes a single task by id (used to let a student delete a custom task they added by mistake). */
+    fun removeTask(taskId: String) = persist(_todayTasks.value.filterNot { it.id == taskId })
+
+    /** Edits the planned duration of a single task — used for custom-task duration editing. */
+    fun updateTaskDuration(taskId: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(durationMinutes = durationMinutes)
+    }
+
+    /**
+     * Manually assigns/edits a task's scheduledStartTime — backs the "Schedule" action on
+     * an Unscheduled TaskCard (see HomeViewModel.scheduleTask / HomeScreen's
+     * ScheduleTaskDialog). Works for both custom and AI-generated tasks: a generated task
+     * can land in "Unscheduled" too when AdaptivePlanner.assignScheduledTimes() couldn't
+     * fit it into today's free time, and this is how the student fixes that from HomeScreen
+     * without deleting and re-adding it.
+     */
+    fun updateTaskSchedule(taskId: String, scheduledStartTime: String) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime)
+    }
+
+    /**
+     * Manually sets both scheduledStartTime AND durationMinutes for a task in a single
+     * write — backs the Timeline/List clock-icon's start+end time editor (see
+     * HomeViewModel.rescheduleTask / HomeScreen's ScheduleTaskDialog). Unlike calling
+     * updateTaskSchedule() and updateTaskDuration() separately, this goes through one
+     * persist() call so the two fields can never observably desync mid-update (e.g. a
+     * StateFlow collector seeing the new start time paired with the old duration for one
+     * frame).
+     */
+    fun updateTaskScheduleAndDuration(taskId: String, scheduledStartTime: String, durationMinutes: Int) = updateTask(taskId) {
+        it.copy(scheduledStartTime = scheduledStartTime, durationMinutes = durationMinutes)
+    }
+
+    fun setTaskActive(taskId: String) = updateTask(taskId) { it.copy(state = TaskState.ACTIVE) }
+
+    fun markTask(taskId: String, state: TaskState) = updateTask(taskId) {
+        it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+    }
+
+    /**
+     * BUGFIX (P0b AlreadyActive-guard bypass via silent no-op revert): [markTask] only ever
+     * mutates [_todayTasks] (via [updateTask] -> [persist], both hardcoded to [todayKey]).
+     * Every READ path that needs a task from an arbitrary day already falls back to
+     * [loadDay] ([findTask] in GapTaskManager, [LearningInterventionOrchestrator]'s
+     * activeUnresolvedTask) — but there was no equivalent WRITE fallback. Confirmed live:
+     * GapTaskManager.resolveDoneConcept's "evidence not imported yet, revert taskId to
+     * PENDING" call used plain `markTask(taskId, PENDING)`. When the active task's
+     * dayKey ([GapTaskLedger.activeTaskDayKey]) wasn't today's key, `updateTask`'s
+     * `.map { if (it.id == taskId) ... }` against `_todayTasks.value` matched nothing,
+     * `persist()` re-saved today's (unrelated) list, and the task's real DONE state in
+     * `plan_<dayKey>` was never touched. The task then stayed reported as DONE — so
+     * LearningInterventionOrchestrator.executeTopCandidate's AlreadyActive guard (which
+     * treats a DONE task as "nothing blocking") let a fresh task get created for the same
+     * still-unresolved concept, while GapTaskLedger's session/round fields were untouched
+     * (this branch never calls resetForNextRound), so the new task pointed straight back at
+     * the OLD, already-submitted Testmate session — reproducing exactly the "retest button
+     * reopens the old result page" symptom. This targets the correct day's persisted list
+     * directly instead of assuming "today," and only touches [_todayTasks] when [dayKey] IS
+     * today's — same "today's live list first" contract every read path already follows.
+     * Returns true if a matching task was actually found and updated, so a caller that needs
+     * to know whether the revert actually landed (rather than silently doing nothing) can log
+     * or branch on it instead of assuming success the way the old markTask call did.
+     */
+    fun markTaskInDay(dayKey: String, taskId: String, state: TaskState): Boolean {
+        if (dayKey == todayKey()) {
+            val found = _todayTasks.value.any { it.id == taskId }
+            if (found) markTask(taskId, state)
+            return found
+        }
+        val existing = loadDay(dayKey)
+        val found = existing.any { it.id == taskId }
+        if (!found) return false
+        val updated = existing.map {
+            if (it.id == taskId) {
+                it.copy(state = state, completedAt = if (state == TaskState.DONE) System.currentTimeMillis() else null)
+            } else it
+        }
+        CheckmatePrefs.putString("plan_$dayKey", json.encodeToString(updated))
+        CheckmatePrefs.putLong("tasks_updated_at_$dayKey", System.currentTimeMillis())
+        return true
+    }
+
+    /**
+     * Blueprint 2.6: records the session's real focus time — as measured by
+     * AttentionCycleManager's tick loop, which freezes while PAUSED (see
+     * HomeViewModel.confirmCompletion/markSkip) — onto the task itself. Sets both
+     * focusMinutes (read by BehaviorLedger.record -> feeds Stats "Avg Focus") and
+     * actualMinutes (read by getPauseStats() -> Stats "actual focus time (not wall
+     * clock)"). Previously neither field was ever written, so both stats silently
+     * read 0 forever; this is the fix, called right before markTask() on completion/skip.
+     */
+    fun setFocusMinutes(taskId: String, minutes: Int) = updateTask(taskId) {
+        it.copy(focusMinutes = minutes, actualMinutes = minutes)
+    }
+
+    fun pauseTask(taskId: String, pausedAt: Long) = updateTask(taskId) {
+        it.copy(state = TaskState.PAUSED, pausedAt = pausedAt, pauseCount = it.pauseCount + 1)
+    }
+
+    fun resumeTask(taskId: String, resumedAt: Long) = updateTask(taskId) { task ->
+        val elapsed = if (task.pausedAt != null && task.pausedAt > 0L) resumedAt - task.pausedAt else 0L
+        task.copy(state = TaskState.ACTIVE, pausedAt = null, totalPausedMs = task.totalPausedMs + elapsed)
+    }
+
+    // ── Accountability Core: Intention Declaration + Session Check-In (Blueprint 10.1) ──
+
+    /** Stores the student's free-text answer to "What will you study?" before a session starts. */
+    fun setIntention(taskId: String, intentionText: String) = updateTask(taskId) {
+        it.copy(intentionText = intentionText)
+    }
+
+    /** Stores the student's self-report ("YES" | "PARTIAL" | "NO") to "Did you finish it?" after a session ends. */
+    fun setCompletionStatus(taskId: String, status: String) = updateTask(taskId) {
+        it.copy(completedStatus = status)
+    }
+
+    private fun updateTask(taskId: String, block: (StudyTask) -> StudyTask) {
+        persist(_todayTasks.value.map { if (it.id == taskId) block(it) else it })
+    }
+
+    /**
+     * Single write path for today's task list — every mutating function above funnels
+     * through this instead of duplicating the "encode + persist + update StateFlow"
+     * triplet. Also stamps tasks_updated_at_<dayKey> alongside plan_<dayKey> so
+     * TaskSyncManager (app layer) can tell whether the local copy or a synced remote
+     * copy is newer, without PlanStore itself knowing anything about sync/network —
+     * this module stays local-storage-only, same as before.
+     */
+    private fun persist(tasks: List<StudyTask>) {
+        val key = todayKey()
+        CheckmatePrefs.putString("plan_$key", json.encodeToString(tasks))
+        CheckmatePrefs.putLong("tasks_updated_at_$key", System.currentTimeMillis())
+        _todayTasks.value = tasks
+    }
+
+    /** Epoch ms today's plan was last locally modified — used by TaskSyncManager to decide push vs. pull. */
+    fun getLastUpdatedAt(): Long = CheckmatePrefs.getLong("tasks_updated_at_${todayKey()}", 0L)
+
+    /** Public day key (e.g. "2026_224") — exposed so TaskSyncManager's payloads use the exact same
+     *  day boundary PlanStore itself uses, instead of re-deriving it and risking drift. */
+    fun currentDayKey(): String = todayKey()
+
+    suspend fun getTodayTasksSnapshot(): List<StudyTask> = _todayTasks.value
+
+    // Synchronous version for BroadcastReceiver context (no coroutine scope available)
+    fun getTodayTasksSnapshot_Sync(): List<StudyTask> = _todayTasks.value
+
+    fun getTodayCompletionPercent(): Int {
+        val t = _todayTasks.value
+        return if (t.isEmpty()) 0 else t.count { it.state == TaskState.DONE } * 100 / t.size
+    }
+
+    // ── End-of-day cleanup (9 PM) ────────────────────────────────────────────
+
+    private const val EOD_CLEAR_HOUR = 21 // 9 PM — DONE/SKIPPED tasks clear, everything else keeps reminding
+    private const val KEY_LAST_EOD_CLEANUP_DAY = "plan_last_eod_cleanup_day"
+
+    /**
+     * Returned by [cleanupCompletedIfDue] when tasks were carried onto tomorrow's plan, so
+     * the app layer (ReminderService) can push that exact day's list to TaskSyncManager
+     * without PlanStore itself importing anything sync/network-related — same "this module
+     * stays local-storage-only" boundary [persist]'s doc already describes. [tasks] is the
+     * FULL merged list for [dayKey] (not just the newly-carried ones), matching what
+     * TaskSyncManager.pushTasks already expects: a whole-list replace, not a delta.
+     */
+    data class CarryForwardPush(val dayKey: String, val tasks: List<StudyTask>, val updatedAt: Long)
+
+    /**
+     * Bugfix ("old tasks not clearing at end of day"): [_todayTasks] was only ever populated
+     * at process start ([init]/[reload]) or by a local write ([persist]) — nothing re-derived
+     * it when the day moved on, so a DONE/SKIPPED task just sat in the list, and in Compose,
+     * forever, until the app process happened to restart. This is the fix: called from
+     * ReminderService's existing 15-min loop so it actually runs while the app is alive,
+     * not just at cold start.
+     *
+     * No-ops (returns null) before [EOD_CLEAR_HOUR] (9 PM) local time, and no-ops again once
+     * it's already run for [todayKey]'s date — see the BUGFIX note below for exactly when
+     * [KEY_LAST_EOD_CLEANUP_DAY] gets claimed and why.
+     *
+     * DONE/SKIPPED tasks are dropped — nothing left to remind about. Everything still
+     * unresolved (PENDING/ACTIVE/PAUSED) is left untouched in [_todayTasks] — it keeps
+     * showing on Today and keeps triggering ReminderService.checkPendingTasks()'s nudge
+     * exactly as before — and is ALSO copied onto tomorrow's persisted plan
+     * (plan_<tomorrowKey>), deduped by task id, so it isn't simply abandoned the moment the
+     * real calendar day rolls over and PlanStore starts reading a different SharedPrefs key.
+     * That write also stamps tasks_updated_at_<tomorrowKey> (same convention [persist] uses
+     * for today, and [markTaskInDay] already uses for an arbitrary day) instead of leaving it
+     * at 0L, and returns a [CarryForwardPush] so the caller can push the carried list to sync
+     * immediately rather than waiting on some unrelated future edit to that day's plan to
+     * happen to trigger a push.
+     *
+     * BUGFIX (task stranded on a stale day, never carried forward): [KEY_LAST_EOD_CLEANUP_DAY]
+     * used to be claimed BEFORE the carry-forward write below, on the theory that a crash
+     * mid-cleanup shouldn't cause the next 15-min tick to re-run this and duplicate tasks
+     * onto tomorrow's plan. That reasoning ignored that the carry-forward's own dedup
+     * (`carried = unresolved.filterNot { it.id in existingIds }`) already makes a RE-RUN
+     * safe — so claiming the guard early bought nothing except making a genuine crash
+     * unrecoverable: confirmed live, the process died between the early guard-claim and the
+     * `plan_$tomorrowKey` write, leaving `plan_last_eod_cleanup_day` marking that day done
+     * forever while the actual carry-forward never happened — a PENDING task
+     * (62a776fc-8370-491f-8623-0fb0a8a1f906) sat orphaned in the old day's `plan_<dayKey>`,
+     * invisible to `_todayTasks`/HomeScreen from that point on, since this function will
+     * never run again for that day. The guard is now claimed at every return point, AFTER
+     * whatever persistence that path actually needed has completed — so a crash before a
+     * write finishes leaves the guard unclaimed and the next tick retries safely instead of
+     * silently giving up.
+     */
+    fun cleanupCompletedIfDue(): CarryForwardPush? {
+        val cal = Calendar.getInstance()
+        if (cal.get(Calendar.HOUR_OF_DAY) < EOD_CLEAR_HOUR) return null
+
+        val key = todayKey()
+        if (CheckmatePrefs.getString(KEY_LAST_EOD_CLEANUP_DAY, "") == key) return null
+
+        val current = _todayTasks.value
+        val unresolved = current.filter { it.state != TaskState.DONE && it.state != TaskState.SKIPPED }
+        if (unresolved.size != current.size) persist(unresolved)
+
+        if (unresolved.isEmpty()) {
+            CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+            return null
+        }
+
+        val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
+        val tomorrowKey = keyForDay(tomorrowCal)
+        val existingTomorrow = loadDay(tomorrowKey)
+        val existingIds = existingTomorrow.map { it.id }.toSet()
+        val carried = unresolved.filterNot { it.id in existingIds }
+        if (carried.isEmpty()) {
+            CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+            return null
+        }
+
+        val merged = existingTomorrow + carried
+        val stamp = System.currentTimeMillis()
+        CheckmatePrefs.putString("plan_$tomorrowKey", json.encodeToString(merged))
+        CheckmatePrefs.putLong("tasks_updated_at_$tomorrowKey", stamp)
+        CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+        return CarryForwardPush(tomorrowKey, merged, stamp)
+    }
+
+    fun getStreakDays(): Int {
+        var streak = 0
+        val cal = Calendar.getInstance()
+        for (i in 0..30) {
+            val saved = CheckmatePrefs.getString("plan_${keyForDay(cal)}", null) ?: break
+            val tasks = try { json.decodeFromString<List<StudyTask>>(saved) } catch (_: Exception) { break }
+            if (tasks.isEmpty() || tasks.none { it.state == TaskState.DONE }) break
+            streak++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return streak
+    }
+
+    // ── Consistency tracking (Stats consistency calendar + "no plan == no study") ──────────
+
+    /**
+     * Per-day study status used by the Stats consistency calendar and by
+     * [getConsecutiveMissedDays]. A day with no saved plan at all, or a plan saved with zero
+     * tasks in it, is MISSED — "no tasks in plan" is treated as "no study happened", not as a
+     * neutral/unknown state, which is what silently reading everything as 0% used to do.
+     */
+    enum class DayStudyStatus { COMPLETE, PARTIAL, MISSED, FUTURE }
+
+    /** Status for a single calendar day. Days after today are FUTURE (not yet knowable). */
+    fun getDayStatus(cal: Calendar): DayStudyStatus {
+        val today = Calendar.getInstance()
+        val isFuture = cal.get(Calendar.YEAR) > today.get(Calendar.YEAR) ||
+            (cal.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                cal.get(Calendar.DAY_OF_YEAR) > today.get(Calendar.DAY_OF_YEAR))
+        if (isFuture) return DayStudyStatus.FUTURE
+
+        val tasks = loadDay(keyForDay(cal))
+        if (tasks.isEmpty()) return DayStudyStatus.MISSED // no tasks in plan == no study
+        val done = tasks.count { it.state == TaskState.DONE }
+        return when {
+            done == tasks.size -> DayStudyStatus.COMPLETE
+            done > 0            -> DayStudyStatus.PARTIAL
+            else                 -> DayStudyStatus.MISSED
+        }
+    }
+
+    /**
+     * Day-of-month -> status for every day in [year]/[month] (month is 0-based, matching
+     * java.util.Calendar). Backs the Stats screen's consistency calendar (green/yellow/red
+     * dots per day, like a GitHub-style contribution grid).
+     */
+    fun getMonthConsistency(year: Int, month: Int): Map<Int, DayStudyStatus> {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.YEAR, year)
+        cal.set(Calendar.MONTH, month)
+        cal.set(Calendar.DAY_OF_MONTH, 1)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val result = LinkedHashMap<Int, DayStudyStatus>()
+        for (d in 1..daysInMonth) {
+            cal.set(Calendar.DAY_OF_MONTH, d)
+            result[d] = getDayStatus(cal)
+        }
+        return result
+    }
+
+    /**
+     * Number of consecutive days, counting back from yesterday (today isn't over yet, so it's
+     * excluded), with MISSED status — no plan generated OR nothing completed. This is what
+     * lets the app actually notice "the student hasn't studied in N days" instead of that
+     * information only existing implicitly as a bunch of empty SharedPrefs keys nobody reads.
+     * Used by ProactiveMentor.consistencyCheckIfNeeded() to nudge the student and alert the
+     * guardian once this crosses a threshold.
+     */
+    fun getConsecutiveMissedDays(): Int {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -1)
+        var missed = 0
+        for (i in 0 until 60) {
+            if (getDayStatus(cal) != DayStudyStatus.MISSED) break
+            missed++
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return missed
+    }
+
+    fun getWeekCompletionPercent(): Int {
+        val cal = Calendar.getInstance(); var total = 0; var done = 0
+        repeat(7) {
+            val tasks = loadDay(keyForDay(cal))
+            total += tasks.size; done += tasks.count { it.state == TaskState.DONE }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return if (total == 0) 0 else done * 100 / total
+    }
+
+    fun getWeeklyData(): List<Pair<String, Int>> {
+        val cal = Calendar.getInstance()
+        val days = listOf("Mon","Tue","Wed","Thu","Fri","Sat","Sun")
+        val result = mutableListOf<Pair<String, Int>>()
+        repeat(7) { i ->
+            val tasks = loadDay(keyForDay(cal))
+            val pct = if (tasks.isEmpty()) 0 else tasks.count { it.state == TaskState.DONE } * 100 / tasks.size
+            result.add(0, Pair(days[6 - i], pct))
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return result
+    }
+
+    fun getSubjectStats(): List<Pair<String, Int>> =
+        _todayTasks.value.groupBy { it.subject }.map { (subj, list) ->
+            Pair(subj, if (list.isEmpty()) 0 else list.count { it.state == TaskState.DONE } * 100 / list.size)
+        }
+
+    /** Blueprint 2.6 — see PauseStats doc above. */
+    fun getPauseStats(): PauseStats {
+        val actualFocusToday = _todayTasks.value
+            .filter { it.state == TaskState.DONE }
+            .sumOf { it.actualMinutes }
+
+        val cal = Calendar.getInstance()
+        val weekSessions = mutableListOf<StudyTask>()
+        repeat(7) {
+            weekSessions += loadDay(keyForDay(cal)).filter { it.state == TaskState.DONE || it.state == TaskState.SKIPPED }
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+
+        if (weekSessions.isEmpty()) return PauseStats(actualFocusMinutesToday = actualFocusToday)
+
+        val avgPauses  = weekSessions.sumOf { it.pauseCount }.toFloat() / weekSessions.size
+        val pauseRate  = weekSessions.count { it.pauseCount > 0 } * 100 / weekSessions.size
+
+        return PauseStats(
+            actualFocusMinutesToday = actualFocusToday,
+            avgPausesPerSession     = avgPauses,
+            pauseRatePercent        = pauseRate
+        )
+    }
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed. [GapTaskManager] (app layer)
+     * needs to read a SPECIFIC past day's plan to check whether an autonomously-created
+     * gap-repair task ever reached DONE — [todayTasks] only ever holds the current day's
+     * list, so there was no way to answer "what happened to the task from 3 days ago"
+     * without this. Behavior is unchanged for every existing caller in this file.
+     */
+    fun loadDay(key: String): List<StudyTask> {
+        val s = CheckmatePrefs.getString("plan_$key", null) ?: return emptyList()
+        return try { json.decodeFromString(s) } catch (_: Exception) { emptyList() }
+    }
+
+    private fun todayKey() = keyForDay(Calendar.getInstance())
+
+    /**
+     * Gap-task escalation pass: was `private`, now exposed alongside [loadDay] — same
+     * caller, same reason: [GapTaskManager] needs to compute the exact day-key for "N days
+     * ago" itself so it can pair it with [loadDay].
+     */
+    fun keyForDay(cal: Calendar) =
+        "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
+}
+
+
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/service/GapTaskManager.kt =====
+
 package com.checkmate.service
 
 import android.content.Context
@@ -231,6 +704,27 @@ object GapTaskManager {
             )
             PlanStore.createTask(freshTask)
             GapTaskLedger.updateActiveTaskPointer(freshTask.id, GapTaskLedger.todayKey())
+        } else if (dayKey != GapTaskLedger.todayKey() &&
+            PlanStore.todayTasks.value.none { it.id == taskId }
+        ) {
+            // BUGFIX (task stranded on a stale day, never carried forward): a PENDING/
+            // ACTIVE/PAUSED task's only path onto a later day's list is
+            // PlanStore.cleanupCompletedIfDue()'s 9 PM carry-forward — see that function's
+            // own BUGFIX doc for how a mid-cleanup crash used to leave a task stuck in an
+            // old day's plan_<dayKey> forever, with GapTaskLedger's active pointer still
+            // referencing it (so this same task keeps blocking AlreadyActive in
+            // LearningInterventionOrchestrator) while PlanStore.todayTasks — and therefore
+            // HomeScreen — has no idea it exists. Confirmed live for
+            // taskId=62a776fc-8370-491f-8623-0fb0a8a1f906, dayKey=2026_256, never present
+            // in plan_2026_257. Unlike the SKIPPED branch above, this carries the SAME task
+            // forward (not a fresh copy) — a PENDING/ACTIVE/PAUSED task has no completed
+            // session to reset, it's simply missing from view. Guarded by "not already in
+            // today's list" so this is a no-op once the carry-forward lands normally (or on
+            // a repeat cycle after this branch already fixed it once).
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state} " +
+                "stranded on stale dayKey=$dayKey (today=${GapTaskLedger.todayKey()}) — carrying forward into today's list")
+            PlanStore.createTask(task)
+            GapTaskLedger.updateActiveTaskPointer(task.id, GapTaskLedger.todayKey())
         }
     }
 
@@ -761,1004 +1255,6 @@ days running — this is the escalated warning, not the first nudge. Rules:
             ruleMsg
         }
     }
-}
-
-
-
-
-//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/GapTaskLedger.kt =====
-package com.checkmate.planner.intervention
-
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.learning.engine.LearningDecisionEngine
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import java.util.Calendar
-import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.coroutineContext
-
-/**
- * "One gap-repair task a day, cycling through every gap the test surfaced, until each one
- * is actually done" needs state that neither [LearningInterventionOrchestrator] nor
- * [com.checkmate.planner.PlanStore] carry on their own:
- *
- * - [PlanStore.todayTasks] only ever holds the CURRENT day's list — there's nowhere to ask
- *   "did the concept I served three days ago ever get finished."
- * - [LearningInterventionOrchestrator.executeTopCandidate] re-ranks from scratch every run.
- *   Without something outside it remembering what's already been served, re-running the
- *   SAME [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport] output
- *   tomorrow (mastery hasn't moved without the P0b evidence loop) would just re-pick
- *   today's exact candidate forever — the backlog would never advance.
- *
- * This object is that memory, CheckmatePrefs-backed (same pattern as [PlanStore] itself),
- * covering four things:
- * 1. **Covered concepts** — a concept is "covered" only once its gap-task reaches
- *    `TaskState.DONE` *and* a mastery recheck against real P0b evidence confirms it actually
- *    cleared [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — never merely
- *    once a task was created for it, and never merely because the task was checked off with
- *    mastery still weak (see [markCovered] and [resetForNextRound] docs for why task-DONE
- *    alone isn't the right signal — that conflation is what silently broke the P0b
- *    retest-until-mastered loop). [LearningInterventionOrchestrator] skips covered concepts
- *    when walking the ranked candidate list.
- * 2. **The active concept's streak** — how many consecutive days the current gap concept
- *    has been re-served without reaching DONE, which is exactly the escalation-depth input
- *    the gap-task warning needs (day 1 silent, day 2-3 names the consequence, day 4+ full
- *    persuasion — see [com.checkmate.service.GapTaskManager]).
- * 3. **Once-a-day guards** for generation and escalation, same "day-key written after
- *    firing" pattern [com.checkmate.service.ProactiveMentor]'s own checks already use.
- * 4. **P0b: the active concept's linked Testmate targeted-test session** — which
- *    `test_sessions.id`/`tests.id` Testmate created for the CURRENT active concept (see
- *    [recordTestmateSession]), and whether that session's result has already been turned
- *    into real [com.checkmate.learning.model.QuestionAttempt]/[com.checkmate.learning.model.LearningEvent]
- *    evidence (see [markActiveEvidenceImported]) — so [com.checkmate.service.GapTaskManager]
- *    creates the targeted test at most once per concept PER ROUND and imports its result at
- *    most once per round. [resetForNextRound] clears just this slot when a round's evidence
- *    came back still below mastery, so the SAME concept can start a fresh round.
- *    Deliberately tied to the SAME "active concept" slot as #2 above, not a separate
- *    map, since there is only ever one active gap concept at a time in this single-user app.
- *
- * Single-user app (see this module's other CheckmatePrefs-backed singletons) — no
- * per-student keying needed.
- */
-object GapTaskLedger {
-
-    private const val TAG = "GapTaskLedger"
-
-    private val json = Json { ignoreUnknownKeys = true }
-
-    private const val KEY_COVERED_CONCEPT_IDS       = "gap_task_covered_concept_ids"
-    private const val KEY_ACTIVE_CONCEPT_ID         = "gap_task_active_concept_id"
-    private const val KEY_ACTIVE_TASK_ID            = "gap_task_active_task_id"
-    private const val KEY_ACTIVE_TASK_DAY_KEY       = "gap_task_active_task_day_key"
-    private const val KEY_ACTIVE_DAYS_SERVED        = "gap_task_active_days_served"
-    private const val KEY_ACTIVE_SUBJECT            = "gap_task_active_subject"
-    private const val KEY_ACTIVE_CHAPTER            = "gap_task_active_chapter"
-    private const val KEY_ACTIVE_TOPIC              = "gap_task_active_topic"
-    private const val KEY_ACTIVE_DURATION_MIN       = "gap_task_active_duration_min"
-    private const val KEY_ACTIVE_RATIONALE          = "gap_task_active_rationale"
-    private const val KEY_ACTIVE_EXPECTED_GAIN      = "gap_task_active_expected_gain"
-    private const val KEY_ACTIVE_TESTMATE_TEST_ID   = "gap_task_active_testmate_test_id"
-    private const val KEY_ACTIVE_TESTMATE_SESSION_ID = "gap_task_active_testmate_session_id"
-    private const val KEY_ACTIVE_EVIDENCE_IMPORTED  = "gap_task_active_evidence_imported"
-    // Phase 3 (adaptive tutor state machine) execution bridge: the tutor FSM's
-    // PRACTICE -> VERIFY transition needs real attempt counts for THIS round specifically
-    // (see com.checkmate.learning.tutor.TutorEvidence.PracticeAttempts's own doc — it must
-    // be "this practice pass," not lifetime). This P0b loop already runs the exact Testmate
-    // targeted-test request/import for the same active concept the tutor session tracks
-    // (see TutorSessionLedger.startFromCandidate, called from the same
-    // GapTaskManager.generateIfNeeded call site that serves this ledger's active concept in
-    // the first place) — rather than have TutorCycleManager fire a SECOND, competing
-    // targeted-test request for the same concept, it reads these two fields, written
-    // alongside [markActiveEvidenceImported] from the SAME TestmateResult
-    // GapTaskManager.evidencePollIfNeeded already has in hand. "Extend the existing
-    // intervention pipeline, don't replace it" applied to the tutor bridge specifically.
-    private const val KEY_ACTIVE_LAST_IMPORT_ATTEMPTS = "gap_task_active_last_import_attempts"
-    private const val KEY_ACTIVE_LAST_IMPORT_CORRECT  = "gap_task_active_last_import_correct"
-    // BUGFIX (P0b re-intervention, round 2): createTargetedTestIfNeeded sends
-    // interventionId=conceptId to Testmate's idempotent-by-intervention_id endpoint. That
-    // id never changed between rounds, so a round-2 request for the SAME concept got the
-    // SAME (already-completed) session back instead of a fresh one — resetForNextRound
-    // correctly asked for another round, but Testmate had no way to tell it apart from a
-    // retried round-1 call. This counter gives each round a distinct suffix (see
-    // GapTaskManager.createTargetedTestIfNeeded) so intervention_id actually changes when
-    // the round does. Round 1 stays a bare conceptId (no suffix) for backward
-    // compatibility with sessions already in flight before this fix.
-    private const val KEY_ACTIVE_TESTMATE_ROUND     = "gap_task_active_testmate_round"
-    // BUGFIX (stale repair test never refreshed): createTargetedTestIfNeeded used to skip
-    // the server entirely once a session id was recorded, so a chapter re-imported AFTER
-    // that session's test was built never got picked up until the round happened to advance
-    // (which requires the student finishing the stale test in the first place — reproduced
-    // live on Biomolecules, stuck on a 282-question set through several re-imports). This
-    // tracks the last dayKey the active session was re-verified against the server's own
-    // staleness check (see app/api/tests/targeted/route.ts), so that function can re-ask
-    // once per day instead of either never again or every 15-min cycle forever.
-    private const val KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY = "gap_task_active_testmate_session_checked_day"
-    // BUGFIX (topic-"null" 422 loop): candidate.topic/chapter have arrived holding the
-    // literal 4-character string "null" (not a real null reference) whenever they were
-    // ultimately derived from a Question row whose topic column was corrupted by the
-    // now-fixed TestmateApi.parseResult bare-optString bug — a JSON null surviving as
-    // the text "null", written to Room, then re-surfaced by MasteryEngine.recomputeAll
-    // every time it rebuilds a Concept from that same poisoned row. `candidate.topic ?:
-    // candidate.chapter ?: ""` never catches this because the value ISN'T null — the
-    // Elvis operator only fires on a real null reference. Filtering it out here, at the
-    // single place every active-topic/active-chapter read and write funnels through,
-    // means neither a fresh instance of this bug nor a not-yet-repaired historical one
-    // can reach GapTaskManager's Testmate request payload or any UI string.
-    private fun sanitizeTopicOrChapter(value: String?): String? =
-        value?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
-
-    private const val KEY_LAST_GENERATED_DAY        = "gap_task_last_generated_day"
-    private const val KEY_LAST_ESCALATED_DAY        = "gap_task_last_escalated_day"
-    private const val KEY_WARNING_LOG               = "gap_task_warning_log"
-    private const val MAX_WARNING_LOG_ENTRIES       = 50
-
-    // ── Reactive change signal (BUGFIX: r1-result-on-r2-screen, background-loop case) ──
-    //
-    // Every field this object exposes is CheckmatePrefs-backed — plain SharedPreferences,
-    // with no Flow/observable of its own. [com.checkmate.ui.home.HomeScreen] used to call
-    // activeTaskId()/activeTestmateSessionId() straight from inside its @Composable body,
-    // which only re-runs when something IT collects via collectAsState (i.e.
-    // HomeViewModel.state, itself driven only by [com.checkmate.planner.PlanStore
-    // .todayTasks]) actually emits. That's fine for the round-desync case where a PlanStore
-    // write happens alongside the ledger write (e.g. resolveDoneConcept's evidence-not-
-    // imported-yet branch, which does revert the task via PlanStore.markTaskInDay) — but
-    // resolveDoneConcept's OTHER branch (evidence imported, mastery still below threshold)
-    // calls [resetForNextRound] then [com.checkmate.service.GapTaskManager
-    // .createTargetedTestIfNeeded] records the new round's session via
-    // [recordTestmateSession] — neither of those touches PlanStore at all. Both run from
-    // ReminderService's 15-minute background loop, entirely outside Compose. Confirmed
-    // live: with HomeScreen open and idle across that loop's tick, the round-2 session got
-    // created correctly, but the screen never recomposed to see it — repairSessionFor's
-    // activeSessionId stayed pinned to whatever it read at the LAST unrelated recompose,
-    // which (right after round 1's task went DONE) was round 1's own already-submitted
-    // session id. Tapping "Take repair test" then opened THAT session, and Testmate
-    // correctly redirected to its already-completed result page — this was never a
-    // session-creation or WebView-caching bug, the UI simply never learned a new session
-    // existed.
-    //
-    // A monotonic counter, not the state itself: every mutating function below that
-    // changes anything HomeScreen reads bumps this after writing (recordServed,
-    // recordTestmateSession, markActiveEvidenceImported, resetForNextRound, markCovered).
-    // [com.checkmate.ui.home.HomeViewModel] collects it and re-reads the ledger's live
-    // accessors into HomeState on every emission, the same "some background loop wrote
-    // through prefs, now push a fresh snapshot into Compose state" shape
-    // [com.checkmate.planner.PlanStore]'s own StateFlow already establishes for tasks —
-    // this just extends that same reactivity to the P0b session fields instead of leaving
-    // them as an unobserved side channel.
-    private val _version = MutableStateFlow(0L)
-    val version: StateFlow<Long> = _version.asStateFlow()
-    private fun bumpVersion() { _version.update { it + 1 } }
-
-    // ── Covered concepts ────────────────────────────────────────────────────
-
-    fun isCovered(conceptId: String): Boolean =
-        coveredIds().contains(conceptId)
-
-    /**
-     * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
-     * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
-     * DONE, AND (once P0b evidence exists) a mastery recheck actually cleared
-     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — see
-     * [com.checkmate.service.GapTaskManager]'s `resolveDoneConcept`. Never call this merely
-     * because a task once existed for the concept, and never merely because the task reached
-     * DONE while mastery is still known to be weak (use [resetForNextRound] for that case
-     * instead) — either would mean an unfinished gap silently "counts" as covered and the
-     * orchestrator moves on, permanently abandoning the one the student hasn't actually
-     * closed — the opposite of "till every gap is covered." Clears the active-concept pointer
-     * if [conceptId] was it, so the next [recordServed] call for a different concept starts a
-     * fresh streak instead of inheriting this one's day count.
-     */
-    fun markCovered(conceptId: String) {
-        val updated = coveredIds() + conceptId
-        CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
-        recordWarningOutcome(conceptId)
-        if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
-            clearActive()
-        }
-        bumpVersion()
-    }
-
-    private fun coveredIds(): Set<String> =
-        CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
-            ?.split(",")
-            ?.filter { it.isNotBlank() }
-            ?.toSet()
-            ?: emptySet()
-
-    // ── Active concept + streak ─────────────────────────────────────────────
-
-    /**
-     * Called by [LearningInterventionOrchestrator.executeTopCandidate] right after a
-     * candidate is successfully turned into a task. Bumps the streak if [candidate] is the
-     * SAME concept already active (re-served because it wasn't finished, or because it's
-     * starting a new P0b round after [resetForNextRound]); starts a fresh streak at 1 for a
-     * new concept. No-ops for a candidate with no [conceptId][LearningDecisionEngine.CandidateIntervention.conceptId]
-     * (e.g. day-level intents) — there's nothing to track streak-wise for those.
-     *
-     * P0b: only resets the Testmate session/evidence-imported fields (see class doc #4)
-     * when [candidate] is a genuinely NEW concept — re-serving the SAME concept for another
-     * day while its current round's session is still outstanding must leave that session
-     * alone, since the whole point of re-serving it is that the student hasn't taken that
-     * session yet. Once a round's evidence comes back still below mastery, those fields get
-     * reset separately by [resetForNextRound], not here.
-     */
-    fun recordServed(candidate: LearningDecisionEngine.CandidateIntervention, taskId: String, dayKey: String) {
-        val conceptId = candidate.conceptId ?: return
-        val previousConceptId = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)
-        val previousDays = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
-        val isNewConcept = previousConceptId != conceptId
-        val daysServed = if (isNewConcept) 1 else previousDays + 1
-
-        // DIAGNOSTIC (round-never-increments investigation): this is the ONLY place that can
-        // silently undo a resetForNextRound() bump that just happened earlier in the SAME
-        // generateIfNeeded call — if executeTopCandidate's fresh re-rank picks a different
-        // concept than the one resolveDoneConcept just reset for retry, isNewConcept is true
-        // here and the round/session fields get wiped back to round 1 before
-        // createTargetedTestIfNeeded ever runs. Logging the before-state makes that collision
-        // visible in the same logcat window instead of two separate-looking "round=1" reads.
-        Log.d(TAG, "recordServed: previousConceptId=$previousConceptId conceptId=$conceptId " +
-            "isNewConcept=$isNewConcept currentRound=${CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1)}")
-
-        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, conceptId)
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
-        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, daysServed)
-        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, candidate.subject ?: "")
-        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, candidate.chapter ?: "")
-        // BUGFIX (topic-"null" 422 loop): see sanitizeTopicOrChapter's own doc — candidate.topic
-        // can hold the literal string "null" from a still-poisoned Question row, which would
-        // otherwise sail straight past the `?:` fallback below since it isn't a real null.
-        CheckmatePrefs.putString(
-            KEY_ACTIVE_TOPIC,
-            sanitizeTopicOrChapter(candidate.topic) ?: sanitizeTopicOrChapter(candidate.chapter) ?: ""
-        )
-        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, candidate.durationMinutes)
-        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, candidate.rationale)
-        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, candidate.expectedGain.toString())
-
-        if (isNewConcept) {
-            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
-            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
-            CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
-            CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
-            CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
-        }
-        bumpVersion()
-    }
-
-    // BUGFIX: this was the one accessor in this object missing the blank-filter every
-    // sibling below it has (activeSubject/activeChapter/activeTopic/etc.). clearActive()
-    // writes "" (not null) to KEY_ACTIVE_CONCEPT_ID same as every other key — without the
-    // filter, a cleared ledger reported a truthy-but-empty concept id instead of null,
-    // which made createTargetedTestIfNeeded() (see GapTaskManager) treat "nothing active"
-    // as "an active concept with a missing chapter" and log a misleading warning every
-    // cycle instead of correctly no-op'ing.
-    fun activeConceptId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null)?.takeIf { it.isNotBlank() }
-    fun activeTaskId(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null)
-    fun activeTaskDayKey(): String? = CheckmatePrefs.getString(KEY_ACTIVE_TASK_DAY_KEY, null)
-
-    /**
-     * SKIPPED-task retry-in-place (see GapTaskManager.resolveActiveConceptState's SKIPPED
-     * branch): moves the active pointer to a freshly re-served copy of the SAME still-open
-     * task, without touching conceptId, days-served streak, or any P0b test/session/round
-     * field. Deliberately narrower than [recordServed] — that function's isNewConcept branch
-     * exists specifically to reset P0b state for a genuinely NEW intervention, which this
-     * is not: the concept, its test, and its session (if any) are unchanged, only WHICH
-     * task instance represents "today's shot at it" has.
-     */
-    fun updateActiveTaskPointer(taskId: String, dayKey: String) {
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, dayKey)
-        bumpVersion()
-    }
-
-    fun activeDaysServed(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DAYS_SERVED, 0)
-    fun activeSubject(): String? = CheckmatePrefs.getString(KEY_ACTIVE_SUBJECT, null)?.takeIf { it.isNotBlank() }
-    fun activeChapter(): String? = CheckmatePrefs.getString(KEY_ACTIVE_CHAPTER, null)?.takeIf { it.isNotBlank() }
-    // BUGFIX (topic-"null" 422 loop): defense-in-depth alongside the write-side sanitize in
-    // recordServed — filters out a literal "null" written before this fix shipped, on any
-    // existing install that hasn't re-served a concept (and so hasn't re-run recordServed)
-    // since updating.
-    fun activeTopic(): String? = sanitizeTopicOrChapter(CheckmatePrefs.getString(KEY_ACTIVE_TOPIC, null))
-    fun activeDurationMinutes(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_DURATION_MIN, 0)
-    fun activeRationale(): String? = CheckmatePrefs.getString(KEY_ACTIVE_RATIONALE, null)?.takeIf { it.isNotBlank() }
-    fun activeExpectedGain(): Double =
-        CheckmatePrefs.getString(KEY_ACTIVE_EXPECTED_GAIN, null)?.toDoubleOrNull() ?: 0.0
-
-    // ── P0b: active concept's Testmate targeted-test link ───────────────────
-
-    fun activeTestmateTestId(): String? =
-        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_TEST_ID, null)?.takeIf { it.isNotBlank() }
-
-    fun activeTestmateSessionId(): String? =
-        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_ID, null)?.takeIf { it.isNotBlank() }
-
-    fun isActiveEvidenceImported(): Boolean =
-        CheckmatePrefs.getBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
-
-    /** Which P0b retest round the active concept is on — 1 for a fresh concept or one
-     *  that's never had [resetForNextRound] called, incrementing each time evidence comes
-     *  back still below mastery. See the key's own doc for why this exists: it's what lets
-     *  [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded] send Testmate a
-     *  genuinely different `intervention_id` per round instead of replaying round 1's. */
-    fun activeTestmateRound(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_TESTMATE_ROUND, 1).coerceAtLeast(1)
-
-    /** Last dayKey [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
-     *  re-verified the active session against the server's staleness check — see
-     *  [KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY]'s own doc. Null means never checked (a
-     *  brand new session, or one recorded before this fix shipped — either way the next
-     *  cycle will verify it). */
-    fun activeTestmateSessionCheckedDay(): String? =
-        CheckmatePrefs.getString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, null)?.takeIf { it.isNotBlank() }
-
-    /** Called once per calendar day by [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
-     *  after it re-verifies (or freshly creates) the active session, so the same day's later
-     *  15-min cycles skip the network round-trip — see that function's own doc. */
-    fun markActiveTestmateSessionChecked(todayKey: String) =
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, todayKey)
-
-    /** Called once by [com.checkmate.service.GapTaskManager] right after Testmate confirms
-     *  a targeted test was created (or already existed — see the endpoint's own idempotency
-     *  by intervention_id) for the currently active concept. */
-    fun recordTestmateSession(testId: String, sessionId: String) {
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, testId)
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, sessionId)
-        bumpVersion()
-    }
-
-    /** Called once [com.checkmate.service.TargetedTestEvidenceImporter] has actually written
-     *  QuestionAttempt/LearningEvent rows for the active concept's session — stops
-     *  [com.checkmate.service.GapTaskManager] from re-polling/re-importing an already-scored
-     *  session every 15 minutes for the rest of the day.
-     *
-     *  [attemptCount]/[correctCount] are this round's own counts (straight from the same
-     *  `TestmateResult` GapTaskManager.evidencePollIfNeeded already has in hand when it calls
-     *  this) — see [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc for why these exist. Optional,
-     *  defaulting to 0/0, so this stays source-compatible with any other caller that only
-     *  cares about the imported flag itself. */
-    fun markActiveEvidenceImported(attemptCount: Int = 0, correctCount: Int = 0) {
-        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, true)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, attemptCount)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, correctCount)
-        bumpVersion()
-    }
-
-    /** This round's attempt count from the last [markActiveEvidenceImported] call — see
-     *  [KEY_ACTIVE_LAST_IMPORT_ATTEMPTS]'s own doc. 0 if nothing has been imported yet. */
-    fun activeLastImportAttemptCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
-
-    /** This round's correct count from the last [markActiveEvidenceImported] call — see
-     *  [activeLastImportAttemptCount]'s own doc. */
-    fun activeLastImportCorrectCount(): Int = CheckmatePrefs.getInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
-
-    /**
-     * P0b re-intervention: called by [com.checkmate.service.GapTaskManager] (`resolveDoneConcept`)
-     * when the active concept's task reached DONE but a mastery recheck against real Testmate
-     * retest evidence showed it's still below
-     * [com.checkmate.learning.engine.MasteryEngine.MASTERY_THRESHOLD] — the student finished
-     * the *review task*, but the concept itself isn't mastered yet. Clears only the P0b
-     * session fields (test id, session id, evidence-imported flag) — deliberately NEVER
-     * touches [markCovered]'s covered-set, and NEVER touches the active concept/day-streak
-     * fields, since this concept is still active and its streak should keep counting. With
-     * these three fields blank again, [com.checkmate.service.GapTaskManager.createTargetedTestIfNeeded]
-     * reads "no session yet" and requests a fresh Testmate retest for the SAME concept on the
-     * next run, closing the loop that used to stop dead here.
-     */
-    fun resetForNextRound() {
-        val roundBefore = activeTestmateRound()
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
-        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
-        // BUGFIX: bump the round counter so the NEXT createTargetedTestIfNeeded call sends
-        // Testmate a fresh intervention_id (see KEY_ACTIVE_TESTMATE_ROUND doc) instead of
-        // replaying this same concept's round-1 id and getting the already-completed
-        // session handed straight back.
-        val roundAfter = roundBefore + 1
-        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, roundAfter)
-        // DIAGNOSTIC (round-never-increments investigation): every write to
-        // KEY_ACTIVE_TESTMATE_ROUND should now self-announce (see the matching log in
-        // recordServed) so a later overwrite is traceable to whichever call did it, instead
-        // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
-        Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
-        // BUGFIX (r1-result-on-r2-screen, background-loop case): this is the write that
-        // used to leave HomeScreen stranded — see the [version] field's own doc. Bumping
-        // here means HomeViewModel is notified the moment the session/round fields go
-        // blank (so the repair-test button correctly disappears while round 2's request
-        // is in flight), and again when recordTestmateSession populates the fresh one —
-        // instead of the whole transition being invisible until some unrelated recompose.
-        bumpVersion()
-    }
-
-    private fun clearActive() {
-        CheckmatePrefs.putString(KEY_ACTIVE_CONCEPT_ID, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TASK_DAY_KEY, "")
-        CheckmatePrefs.putInt(KEY_ACTIVE_DAYS_SERVED, 0)
-        CheckmatePrefs.putString(KEY_ACTIVE_SUBJECT, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_CHAPTER, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TOPIC, "")
-        CheckmatePrefs.putInt(KEY_ACTIVE_DURATION_MIN, 0)
-        CheckmatePrefs.putString(KEY_ACTIVE_RATIONALE, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_EXPECTED_GAIN, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_TEST_ID, "")
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_ID, "")
-        CheckmatePrefs.putBoolean(KEY_ACTIVE_EVIDENCE_IMPORTED, false)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_ATTEMPTS, 0)
-        CheckmatePrefs.putInt(KEY_ACTIVE_LAST_IMPORT_CORRECT, 0)
-        CheckmatePrefs.putInt(KEY_ACTIVE_TESTMATE_ROUND, 1)
-        CheckmatePrefs.putString(KEY_ACTIVE_TESTMATE_SESSION_CHECKED_DAY, "")
-    }
-
-    // ── Once-a-day guards ────────────────────────────────────────────────────
-
-    fun hasGeneratedToday(todayKey: String): Boolean =
-        CheckmatePrefs.getString(KEY_LAST_GENERATED_DAY, null) == todayKey
-
-    fun markGeneratedToday(todayKey: String) =
-        CheckmatePrefs.putString(KEY_LAST_GENERATED_DAY, todayKey)
-
-    fun hasEscalatedToday(todayKey: String): Boolean =
-        CheckmatePrefs.getString(KEY_LAST_ESCALATED_DAY, null) == todayKey
-
-    fun markEscalatedToday(todayKey: String) =
-        CheckmatePrefs.putString(KEY_LAST_ESCALATED_DAY, todayKey)
-
-    // ── Warning outcome log (data collection only — no style-selection logic yet) ──────
-
-    @Serializable
-    data class WarningLogEntry(
-        val conceptId: String,
-        val sentDayKey: String,
-        val daysServedAtEscalation: Int,
-        val tier: Int,
-        var completedAfterward: Boolean = false
-    )
-
-    /**
-     * Appends one record every time [com.checkmate.service.GapTaskManager] actually sends
-     * an escalation message. Deliberately just data collection for now — once there's
-     * enough history to mean anything, which [tier] (escalation depth) correlates with a
-     * concept actually reaching DONE afterward becomes a real, evidence-backed question
-     * instead of a guess. Capped at [MAX_WARNING_LOG_ENTRIES], oldest dropped first.
-     */
-    fun logWarningSent(conceptId: String, dayKey: String, daysServedAtEscalation: Int, tier: Int) {
-        val updated = (warningLog() + WarningLogEntry(conceptId, dayKey, daysServedAtEscalation, tier))
-            .takeLast(MAX_WARNING_LOG_ENTRIES)
-        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
-    }
-
-    /** Called from [markCovered] — flips the most recent unresolved warning for
-     *  [conceptId], if any, so the log can later answer "did warning X actually work." */
-    private fun recordWarningOutcome(conceptId: String) {
-        val log = warningLog()
-        val lastUnresolvedIndex = log.indexOfLast { it.conceptId == conceptId && !it.completedAfterward }
-        if (lastUnresolvedIndex == -1) return
-        val updated = log.toMutableList()
-        updated[lastUnresolvedIndex] = updated[lastUnresolvedIndex].copy(completedAfterward = true)
-        CheckmatePrefs.putString(KEY_WARNING_LOG, json.encodeToString(updated))
-    }
-
-    fun warningLog(): List<WarningLogEntry> =
-        CheckmatePrefs.getString(KEY_WARNING_LOG, null)?.let {
-            try { json.decodeFromString(it) } catch (_: Exception) { emptyList() }
-        } ?: emptyList()
-
-    // ── Shared day-key helper — same "YYYY_dayOfYear" format PlanStore uses ────────────
-
-    fun todayKey(): String {
-        val cal = Calendar.getInstance()
-        return "${cal.get(Calendar.YEAR)}_${cal.get(Calendar.DAY_OF_YEAR)}"
-    }
-
-    // ── Mutual exclusion ────────────────────────────────────────────────────
-
-    /**
-     * Serializes every read-then-write sequence against this ledger's active-concept /
-     * P0b-round / session state. Same shape as [TaskEscrow]'s own per-key `Mutex` +
-     * `withLock` (see its class doc: "the actual correctness boundary is in-process
-     * mutual exclusion, not a DB transaction") — this ledger is the single-active-concept
-     * singleton the whole gap-task subsystem assumes is only ever touched one call at a
-     * time, which stopped being guaranteed once THREE independent, unsynchronized call
-     * chains started reading/writing it:
-     *  1. ReminderService's 15-min loop -> GapTaskManager.generateIfNeeded /
-     *     escalationCheckIfNeeded / evidencePollIfNeeded
-     *  2. TestResultsViewModel.executeTopIntervention -> LearningInterventionOrchestrator
-     *     .executeTopCandidate directly, bypassing GapTaskManager, on Dispatchers.IO
-     *  3. HomeViewModel.confirmCompletion -> GapTaskManager.generateIfNeeded, on
-     *     viewModelScope
-     * Two of these landing close enough in time can both read the same round before
-     * either writes, independently bump it, and produce two different Testmate
-     * intervention_ids for what should be one round — see this class's own doc and
-     * [resetForNextRound]'s doc for the round-counter mechanism this races against.
-     *
-     * A single object-level [Mutex] (not per-key like [TaskEscrow]'s) is correct here
-     * specifically because this ledger only ever tracks ONE active concept at a time
-     * (see class doc) — there's no second key to key a lock off of.
-     *
-     * Reentrant by coroutine: [GapTaskManager.generateIfNeeded] and
-     * [GapTaskManager.escalationCheckIfNeeded] each call into
-     * [LearningInterventionOrchestrator.executeTopCandidate] from WITHIN their own
-     * already-locked section. Without reentrancy, that nested call would try to
-     * re-acquire a [Mutex] its own caller is still holding and deadlock the first time
-     * this path actually runs. [LockOwnerElement] in the coroutine's context is how a
-     * nested call recognizes "this call chain already holds the lock" and runs its block
-     * inline instead of re-acquiring. This only protects a single already-serialized call
-     * chain against itself — two genuinely different callers (e.g. the ReminderService
-     * loop and a HomeViewModel tap) still serialize through [mutex] exactly as intended.
-     */
-    private val mutex = Mutex()
-
-    private object LockOwnerKey : CoroutineContext.Key<LockOwnerElement>
-    private class LockOwnerElement : CoroutineContext.Element {
-        override val key: CoroutineContext.Key<*> get() = LockOwnerKey
-    }
-
-    suspend fun <T> withLock(block: suspend () -> T): T {
-        if (coroutineContext[LockOwnerKey] != null) {
-            // Already inside this lock on this call chain (e.g. GapTaskManager's own
-            // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
-            return block()
-        }
-        return mutex.withLock {
-            withContext(LockOwnerElement()) { block() }
-        }
-    }
-}
-
-
-
-
-//===== TERMUXFILE: Testmate/app/api/tests/targeted/route.ts =====
-import { NextRequest, NextResponse } from 'next/server';
-import { getServiceClient } from '@/lib/supabase';
-import { getCurrentUserFromRequest } from '@/lib/auth';
-
-// POST /api/tests/targeted
-// Body: {
-//   intervention_id: string,       // Checkmate's GapTaskLedger concept id
-//   chapter: string,
-//   topic?: string,
-//   question_count?: number,       // default 15 for pool 'NEW'; omitted/0/negative means
-//                                   // "no cap" for WRONG / SKIPPED / WRONG_SKIPPED — returns
-//                                   // every matching question instead of truncating at 15
-//   pool?: 'WRONG' | 'SKIPPED' | 'WRONG_SKIPPED' | 'NEW',  // default 'WRONG_SKIPPED'
-//   duration_seconds?: number      // default question_count * 90
-// }
-//
-// P0b — the "Testmate owns question selection, Checkmate owns why" endpoint. Builds a
-// student-specific test out of THIS student's own wrong/skipped history for one
-// chapter/topic (falling back to never-attempted questions from the same chapter/topic
-// if there aren't enough), then immediately creates and joins a solo session against it —
-// so Checkmate never has to also call POST /api/sessions or implement question selection
-// itself. Auth via getCurrentUserFromRequest (device-token compatible), unlike
-// POST /api/sessions, which currently only accepts the cookie session — Checkmate has no
-// browser session, so that route was never callable from the app for this.
-//
-// Idempotent on intervention_id (see db/migrations/009_targeted_tests.sql, refined by
-// 010_targeted_tests_reusable_intervention.sql): calling this again with the same
-// intervention_id for the same user, while a LIVE session for it still exists, returns
-// that SAME test/session rather than generating a new test every retry — UNLESS the
-// chapter/topic has been re-imported since that session's test was built, in which case
-// the old session is superseded (status -> 'ended') and a fresh one is generated from the
-// current question bank (see the staleness check below). A targeted test's question set is
-// frozen at creation time, so without this an unfinished repair test could never pick up
-// newly imported questions for its own chapter.
-//
-// KNOWN LIMITATION: "SKIPPED" only catches a question the student visited and left
-// unanswered (a `responses` row with a null selected_answer) — a question in a past test
-// the student never even navigated to (no `responses` row at all) can't be detected this
-// way without diffing every past test's full question list against responses, which this
-// endpoint doesn't do. Good enough for v1; revisit if that gap turns out to matter.
-//
-// BUGFIX (Aug 2026): the WRONG/SKIPPED lookup used to pull the student's ENTIRE response
-// history (every chapter, every subject, since day one) via `.eq('user_id', ...)`, then
-// filter it down to this chapter in memory. supabase-js sends `.in()` filters as URL query
-// params, and that unbounded history was stuffed into a single GET request's `.in('id', ...)`
-// filter — fine while history was small, but it grows without bound as the student keeps
-// using the app, and eventually exceeds the HTTP gateway's URL-length limit. That produces
-// a raw, non-JSON 400 from the gateway itself (not a normal PostgREST error), which
-// supabase-js surfaces as a generic `"Bad Request"` message — indistinguishable from a real
-// query error, and unrelated to which chapter/concept was being requested (hence "fails on
-// every chapter, even a brand new one" once history crossed the threshold).
-//
-// Fixed by flipping the query order: first fetch THIS CHAPTER's (optionally topic's)
-// question-id pool from `questions` — bounded by how many questions exist for one
-// chapter, not by the student's lifetime history — then filter `responses` down to only
-// those ids. That pool is batched defensively (CHUNK_SIZE) in case a single chapter's
-// question bank is ever large enough to risk the same URL-length problem on its own.
-export async function POST(req: NextRequest) {
-  const user = await getCurrentUserFromRequest(req);
-  if (!user) {
-    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
-  }
-
-  let body: Record<string, unknown>;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
-  }
-
-  const interventionId = body.intervention_id;
-  const chapter = body.chapter;
-  const topic = typeof body.topic === 'string' && body.topic.trim() ? body.topic.trim() : null;
-  const pool = (typeof body.pool === 'string' ? body.pool.toUpperCase() : 'WRONG_SKIPPED') as
-    | 'WRONG'
-    | 'SKIPPED'
-    | 'WRONG_SKIPPED'
-    | 'NEW';
-
-  // FIX (repair-test hard limit): question_count as a positive number is still a hard cap,
-  // same as always — this is what a retention check (Checkmate's RetentionCheckManager)
-  // keeps using to stay a short probe. But omitted/0/negative now means "no cap" for
-  // WRONG / SKIPPED / WRONG_SKIPPED — a repair test should pull in EVERY wrong/skipped
-  // question this student has for the chapter/topic, not just the first 15 the old default
-  // silently truncated to. 'NEW' still needs a real ceiling here since its candidate pool is
-  // the chapter's ENTIRE question bank, not bounded by the student's own history — an
-  // uncapped request for 'NEW' falls back to the same default of 15 it always had.
-  const rawQuestionCount = typeof body.question_count === 'number' ? Math.floor(body.question_count) : null;
-  const uncapped = pool !== 'NEW' && (rawQuestionCount === null || rawQuestionCount <= 0);
-  const questionCap = uncapped
-    ? Number.POSITIVE_INFINITY
-    : rawQuestionCount !== null && rawQuestionCount > 0
-      ? rawQuestionCount
-      : 15;
-
-  if (typeof interventionId !== 'string' || !interventionId.trim()) {
-    return NextResponse.json({ error: 'intervention_id is required' }, { status: 400 });
-  }
-  if (typeof chapter !== 'string' || !chapter.trim()) {
-    return NextResponse.json({ error: 'chapter is required' }, { status: 400 });
-  }
-  if (!['WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'].includes(pool)) {
-    return NextResponse.json(
-      { error: "pool must be one of 'WRONG', 'SKIPPED', 'WRONG_SKIPPED', 'NEW'" },
-      { status: 400 }
-    );
-  }
-
-  const supabase = getServiceClient();
-
-  // Batches any `.in('id', [...])` filter so a single request's URL can't grow unbounded —
-  // see the BUGFIX note above. 150 ids/request comfortably stays under gateway URL limits
-  // even with 36-char UUIDs.
-  const CHUNK_SIZE = 150;
-  function chunk<T>(arr: T[], size: number): T[][] {
-    const out: T[][] = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
-  }
-
-  // ── Idempotency: same student + same intervention_id => same LIVE test/session ──────
-  // BUGFIX (Aug 2026, reintroduced by 010's re-migration): this query used to have no
-  // status filter, which was only safe under 009's original unique index (one row per
-  // intervention_id, ever). 010_targeted_tests_reusable_intervention.sql rescoped that
-  // index to `status = 'live'` so a later, genuinely new occurrence of the same concept
-  // could get a fresh session once the earlier one ended — but this route wasn't updated
-  // to match, so once an old (ended) session and a new (live) session both existed for the
-  // same intervention_id, `.maybeSingle()` found more than one row and threw "JSON object
-  // requested, multiple (or no) rows returned" (HTTP 500). When only the old ended session
-  // existed, this also silently handed it back as "existing" instead of creating a new
-  // one — the cause of a fresh round's "Take Test" landing on a previous round's result
-  // page. Filtering to status = 'live' here matches the DB index and fixes both.
-  const { data: existingSession, error: idempotencyError } = await supabase
-    .from('test_sessions')
-    .select('id, test_id, intervention_id')
-    .eq('intervention_id', interventionId)
-    .eq('created_by', user.id)
-    .eq('status', 'live')
-    .maybeSingle();
-
-  if (idempotencyError) {
-    console.error('[targeted] idempotency check failed:', idempotencyError.message);
-    return NextResponse.json({ error: idempotencyError.message }, { status: 500 });
-  }
-
-  if (existingSession) {
-    const { data: existingTest, error: existingTestError } = await supabase
-      .from('tests')
-      .select('id, title, status, duration_seconds, created_at')
-      .eq('id', existingSession.test_id)
-      .single();
-    if (existingTestError) {
-      console.error('[targeted] existing-test lookup failed:', existingTestError.message);
-      return NextResponse.json({ error: existingTestError.message }, { status: 500 });
-    }
-
-    // BUGFIX (stale repair test never refreshed): a targeted test freezes its question set
-    // at creation time (see the copy-into-`questions` step below), so blindly reusing a
-    // still-`live` session forever meant a student stuck on an unfinished repair test never
-    // saw questions from a LATER re-import of the same chapter — reproduced live on
-    // Biomolecules, stuck on a 282-question set built well before several subsequent
-    // imports. Compare this test's created_at against the newest question row for this
-    // chapter/topic; if the chapter was (re-)imported after this test was built, the old
-    // session is stale and gets superseded instead of handed back.
-    let newestQuestionQuery = supabase
-      .from('questions')
-      .select('created_at')
-      .eq('chapter', chapter)
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (topic) newestQuestionQuery = newestQuestionQuery.eq('topic', topic);
-    const { data: newestQuestionRows, error: newestQError } = await newestQuestionQuery;
-    if (newestQError) {
-      console.error('[targeted] staleness check failed, reusing existing session as-is:', newestQError.message);
-    }
-
-    const isStale =
-      !newestQError &&
-      newestQuestionRows?.[0]?.created_at != null &&
-      new Date(newestQuestionRows[0].created_at).getTime() > new Date(existingTest.created_at).getTime();
-
-    if (!isStale) {
-      return NextResponse.json({
-        test: existingTest,
-        session: existingSession,
-        question_count: uncapped ? null : questionCap,
-        reused: true
-      });
-    }
-
-    console.log(
-      `[targeted] session ${existingSession.id} (intervention_id=${interventionId}) is stale — ` +
-      `chapter "${chapter}" was re-imported after this test was built. Superseding and rebuilding.`
-    );
-    const { error: supersedeError } = await supabase
-      .from('test_sessions')
-      .update({ status: 'ended' }) // reuses the existing enum value — already outside the `status = 'live'` unique index, no migration needed
-      .eq('id', existingSession.id);
-    if (supersedeError) {
-      // Couldn't mark it superseded — reusing the (still technically live, if stale) session
-      // beats erroring the whole request or, worse, ending up with two live sessions for the
-      // same intervention_id once a new one is inserted below.
-      console.error('[targeted] failed to supersede stale session, reusing it instead:', supersedeError.message);
-      return NextResponse.json({
-        test: existingTest,
-        session: existingSession,
-        question_count: uncapped ? null : questionCap,
-        reused: true
-      });
-    }
-    // fall through — builds a fresh test/session below, same path as "no existing session"
-  }
-
-  // ── Build the candidate question pool from this student's own history ──────────────
-  type CandidateRow = {
-    id: string;
-    question_text: string;
-    question_image_url: string | null;
-    question_data: unknown;
-    options: unknown;
-    option_images: unknown;
-    correct_answer: string | null;
-    marks: number | null;
-    negative_marks: number | null;
-    chapter: string | null;
-    topic: string | null;
-    difficulty: string | null;
-    question_type: string | null;
-    explanation: string | null;
-    answered_at?: string | null;
-  };
-
-  const QUESTION_SELECT =
-    'id, question_text, question_image_url, question_data, options, option_images, correct_answer, marks, negative_marks, chapter, topic, difficulty, question_type, explanation';
-
-  const chosen: CandidateRow[] = [];
-  const chosenIds = new Set<string>();
-
-  if (pool === 'WRONG' || pool === 'SKIPPED' || pool === 'WRONG_SKIPPED') {
-    // Scope by CHAPTER first — bounded by this chapter's question bank, not by the
-    // student's entire lifetime response history (see BUGFIX note above).
-    let chapterQuestionsQuery = supabase.from('questions').select('id').eq('chapter', chapter);
-    if (topic) chapterQuestionsQuery = chapterQuestionsQuery.eq('topic', topic);
-    const { data: chapterQuestions, error: chapterQError } = await chapterQuestionsQuery;
-    if (chapterQError) {
-      console.error('[targeted] chapter question-pool lookup failed:', chapterQError.message);
-      return NextResponse.json({ error: chapterQError.message }, { status: 500 });
-    }
-    const chapterQuestionIds = (chapterQuestions ?? []).map((q) => q.id);
-
-    if (chapterQuestionIds.length > 0) {
-      // Fetch this student's responses restricted to THIS chapter's question ids only,
-      // batched defensively in case one chapter's bank is itself very large.
-      const responseRows: { question_id: string; selected_answer: string | null; is_correct: boolean | null; answered_at: string | null }[] = [];
-      for (const idsBatch of chunk(chapterQuestionIds, CHUNK_SIZE)) {
-        const { data: batch, error: rError } = await supabase
-          .from('responses')
-          .select('question_id, selected_answer, is_correct, answered_at')
-          .eq('user_id', user.id)
-          .in('question_id', idsBatch);
-        if (rError) {
-          console.error('[targeted] responses lookup failed:', rError.message);
-          return NextResponse.json({ error: rError.message }, { status: 500 });
-        }
-        if (batch) responseRows.push(...batch);
-      }
-
-      if (responseRows.length > 0) {
-        const uniqueAnsweredIds = Array.from(new Set(responseRows.map((r) => r.question_id)));
-        const questionById = new Map<string, CandidateRow>();
-        for (const idsBatch of chunk(uniqueAnsweredIds, CHUNK_SIZE)) {
-          const { data: qBatch, error: qError } = await supabase
-            .from('questions')
-            .select(QUESTION_SELECT)
-            .in('id', idsBatch);
-          if (qError) {
-            console.error('[targeted] candidate-question lookup failed:', qError.message);
-            return NextResponse.json({ error: qError.message }, { status: 500 });
-          }
-          for (const q of qBatch ?? []) questionById.set(q.id, q as CandidateRow);
-        }
-
-        const wantWrong = pool === 'WRONG' || pool === 'WRONG_SKIPPED';
-        const wantSkipped = pool === 'SKIPPED' || pool === 'WRONG_SKIPPED';
-
-        // Most-recent-first, and de-duped by question_id (a question can have been
-        // attempted in more than one past test session) — keep only the latest attempt
-        // at each one.
-        const sorted = [...responseRows].sort(
-          (a, b) => new Date(b.answered_at ?? 0).getTime() - new Date(a.answered_at ?? 0).getTime()
-        );
-
-        for (const r of sorted) {
-          if (chosen.length >= questionCap) break;
-          if (chosenIds.has(r.question_id)) continue;
-          const q = questionById.get(r.question_id);
-          if (!q) continue;
-
-          const isWrong = r.is_correct === false;
-          const isSkipped = r.selected_answer === null || r.selected_answer === undefined;
-          if ((wantWrong && isWrong) || (wantSkipped && isSkipped)) {
-            chosen.push(q);
-            chosenIds.add(r.question_id);
-          }
-        }
-      }
-    }
-  }
-
-  // ── Backfill (or serve entirely, for pool === 'NEW') from never-attempted questions ──
-  // Skipped entirely when `uncapped`: an uncapped WRONG/SKIPPED/WRONG_SKIPPED request wants
-  // exactly this student's actual wrong/skipped set, not padded up to some target size with
-  // questions they've never even seen.
-  if (!uncapped && chosen.length < questionCap) {
-    // Only needs to know WHICH of this chapter's questions the student has already
-    // attempted, so scope this the same bounded way — not the student's full history.
-    let backfillQuery = supabase.from('questions').select(QUESTION_SELECT).eq('chapter', chapter).limit(questionCap * 3); // overfetch — some will be filtered out below
-    if (topic) backfillQuery = backfillQuery.eq('topic', topic);
-
-    const { data: backfillCandidates, error: bError } = await backfillQuery;
-    if (bError) {
-      console.error('[targeted] backfill lookup failed:', bError.message);
-      return NextResponse.json({ error: bError.message }, { status: 500 });
-    }
-
-    const backfillIds = (backfillCandidates ?? []).map((q) => q.id);
-    const attemptedIds = new Set<string>();
-    for (const idsBatch of chunk(backfillIds, CHUNK_SIZE)) {
-      const { data: attempted, error: aError } = await supabase
-        .from('responses')
-        .select('question_id')
-        .eq('user_id', user.id)
-        .in('question_id', idsBatch);
-      if (aError) {
-        console.error('[targeted] attempted-ids lookup failed:', aError.message);
-        return NextResponse.json({ error: aError.message }, { status: 500 });
-      }
-      for (const r of attempted ?? []) attemptedIds.add(r.question_id);
-    }
-
-    for (const q of backfillCandidates ?? []) {
-      if (chosen.length >= questionCap) break;
-      if (chosenIds.has(q.id)) continue;
-      if (attemptedIds.has(q.id)) continue; // "NEW" means genuinely never attempted
-      chosen.push(q as CandidateRow);
-      chosenIds.add(q.id);
-    }
-  }
-
-  if (chosen.length === 0) {
-    return NextResponse.json(
-      { error: `No questions available for chapter "${chapter}"${topic ? ` / topic "${topic}"` : ''} yet.` },
-      { status: 422 }
-    );
-  }
-
-  // Computed from the actual selected set (chosen.length), not the nominal cap — matters
-  // once `pool` is uncapped, since there is no fixed target question_count left to multiply
-  // by 90 in that case.
-  const durationSeconds =
-    typeof body.duration_seconds === 'number' && body.duration_seconds > 0
-      ? body.duration_seconds
-      : chosen.length * 90;
-
-  // ── Create the test, copy the chosen questions into it, start a solo session ────────
-  const { data: newTest, error: testError } = await supabase
-    .from('tests')
-    .insert({
-      title: `Repair: ${chapter}${topic ? ` — ${topic}` : ''}`,
-      status: 'published', // system-generated from already-tagged questions — skip draft/review
-      owner_user_id: user.id,
-      generated_from: { intervention_id: interventionId, chapter, topic, pool, question_count: chosen.length },
-      duration_seconds: durationSeconds
-    })
-    .select()
-    .single();
-  if (testError) {
-    console.error('[targeted] test insert failed:', testError.message);
-    return NextResponse.json({ error: testError.message }, { status: 500 });
-  }
-
-  const questionRows = chosen.map((q, i) => ({
-    test_id: newTest.id,
-    question_number: i + 1,
-    question_text: q.question_text,
-    question_image_url: q.question_image_url,
-    question_data: q.question_data,
-    options: q.options,
-    option_images: q.option_images,
-    correct_answer: q.correct_answer,
-    marks: q.marks ?? 4,
-    negative_marks: q.negative_marks ?? 1,
-    chapter: q.chapter,
-    topic: q.topic,
-    difficulty: q.difficulty,
-    question_type: q.question_type,
-    explanation: q.explanation,
-    origin_question_id: q.id,
-    tag_source: 'targeted_copy'
-  }));
-
-  const { error: qInsertError } = await supabase.from('questions').insert(questionRows);
-  if (qInsertError) {
-    console.error('[targeted] question copy insert failed:', qInsertError.message);
-    return NextResponse.json({ error: qInsertError.message }, { status: 500 });
-  }
-
-  const { data: session, error: sessionError } = await supabase
-    .from('test_sessions')
-    .insert({
-      test_id: newTest.id,
-      mode: 'solo',
-      server_start_time: new Date().toISOString(),
-      duration_seconds: durationSeconds,
-      status: 'live',
-      created_by: user.id,
-      intervention_id: interventionId
-    })
-    .select()
-    .single();
-  if (sessionError) {
-    console.error('[targeted] session insert failed:', sessionError.message);
-    return NextResponse.json({ error: sessionError.message }, { status: 500 });
-  }
-
-  const { error: joinError } = await supabase
-    .from('session_participants')
-    .insert({ session_id: session.id, user_id: user.id });
-  if (joinError) {
-    console.error('[targeted] session join failed:', joinError.message);
-    return NextResponse.json({ error: joinError.message }, { status: 500 });
-  }
-
-  return NextResponse.json(
-    { test: newTest, session, question_count: questionRows.length, reused: false },
-    { status: 201 }
-  );
 }
 
 
