@@ -31,6 +31,13 @@ android {
             "TELEGRAM_BOT_TOKEN",
             "\"${localProps.getProperty("telegram_bot_token", "")}\""
         )
+
+        // Testing backlog item 1 (baseline smoke test): AndroidJUnitRunner is the
+        // default already applied by the AGP when this isn't set, but pinning it
+        // explicitly here documents the assumption RoomSmokeTest /
+        // MainActivitySmokeTest / ScreenInitializationSmokeTest below rely on —
+        // connectedCheck runs androidTest through this runner.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     // ============================================================
@@ -94,6 +101,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    // Testing backlog item 1: plain JVM unit tests (./gradlew test) run against the
+    // android.jar stub, where every method throws "not mocked" by default. Matches
+    // the same isReturnDefaultValues :modules:planner already sets for the same
+    // reason (see its build.gradle.kts) — harmless here since app has no JVM tests
+    // that depend on a real return value from a framework call.
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -132,4 +150,29 @@ dependencies {
     implementation(project(":modules:planner"))
     implementation(project(":modules:testmate"))
     implementation(project(":modules:learning"))
+
+    // ============================================================
+    // Testing backlog item 1 — baseline smoke test (JVM + instrumented)
+    // ============================================================
+    // Nothing below existed before: app/build.gradle.kts had no test
+    // dependencies at all, even though ExampleInstrumentedTest.kt and
+    // LearningInterventionOrchestratorIntegrationTest.kt already reference
+    // androidx.test.ext.junit / InstrumentationRegistry — those two files were
+    // only compiling because Gradle silently resolves androidTest sources
+    // against whatever's on the main classpath plus AGP's implicit test deps;
+    // this makes the requirement explicit and adds what RoomSmokeTest /
+    // MainActivitySmokeTest / ScreenInitializationSmokeTest need on top.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.02.00"))
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test:rules:1.5.0")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+    // Drives MainScreen's Compose tree from MainActivitySmokeTest /
+    // ScreenInitializationSmokeTest (click nav items, assert selection state).
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    // RoomSmokeTest's three DB-open checks are suspend calls run via runTest.
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
