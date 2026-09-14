@@ -160,7 +160,15 @@ object TestmateApi {
         chapter: String,
         topic: String?,
         questionCount: Int = 15,
-        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED
+        pool: TestmateQuestionPool = TestmateQuestionPool.WRONG_SKIPPED,
+        // NEW (external-report pathway): a report Checkmate parsed locally but that
+        // was never actually taken on Testmate has no `questions`/`responses` rows
+        // there to look up by chapter — see this function's own class doc and
+        // app/api/tests/targeted/route.ts's `external_questions` doc. When non-empty,
+        // this REPLACES server-side selection entirely; [questionCount]/[pool] are
+        // still sent for logging consistency but have no effect on which questions
+        // come back.
+        externalQuestions: List<TestmateExternalQuestion> = emptyList()
     ): TestmateTargetedTestOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateTargetedTestOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -188,6 +196,20 @@ object TestmateApi {
                 ?.let { put("topic", it) }
             put("question_count", questionCount)
             put("pool", pool.name)
+            if (externalQuestions.isNotEmpty()) {
+                put("external_questions", JSONArray().apply {
+                    externalQuestions.forEach { eq ->
+                        put(JSONObject().apply {
+                            put("question_text", eq.questionText)
+                            eq.options?.let { opts ->
+                                put("options", JSONObject().apply { opts.forEach { (k, v) -> put(k, v) } })
+                            }
+                            eq.correctOption?.let { put("correct_answer", it) }
+                            eq.explanation?.let { put("explanation", it) }
+                        })
+                    }
+                })
+            }
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
 

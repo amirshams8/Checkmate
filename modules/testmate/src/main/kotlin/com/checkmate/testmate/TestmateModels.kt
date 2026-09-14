@@ -86,6 +86,23 @@ enum class TestmateQuestionPool {
     NEW
 }
 
+/**
+ * One question from a report Checkmate parsed locally but that was never actually
+ * taken on Testmate — see [TestmateApi.createTargetedTest]'s [externalQuestions]
+ * param and app/api/tests/targeted/route.ts's own `external_questions` doc for why
+ * this bypasses the normal by-chapter server lookup entirely. Deliberately not the
+ * app module's own `Question` type — this module has no dependency on
+ * `com.checkmate.learning.model` today, and this call site is the only thing that
+ * needs a subset of those fields, so the caller (GapTaskManager) maps into this
+ * shape rather than this module reaching across for the real one.
+ */
+data class TestmateExternalQuestion(
+    val questionText: String,
+    val options: Map<String, String>?,
+    val correctOption: String?,
+    val explanation: String?
+)
+
 data class TestmateTargetedTest(
     val testId: String,
     val sessionId: String,

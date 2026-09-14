@@ -52,6 +52,35 @@ interface QuestionDao {
     // whether it actually did anything.
     @Query("UPDATE questions SET topic = NULL WHERE topic = 'null'")
     suspend fun repairLiteralNullTopics(): Int
+
+    // NEW (external-report pathway): questions from a report Checkmate parsed
+    // locally but that was never actually taken on Testmate (tagged with a
+    // non-"testmate_report" source at import — see TestResultNormalizer's
+    // [source] param) have no `responses` history on Testmate's server to look
+    // up by chapter. This is the local equivalent of that lookup: every wrong or
+    // skipped question this student has for the chapter/topic, scoped to
+    // [source] so a genuinely Testmate-taken attempt for the same chapter never
+    // gets mixed in here (that already has its own correct pathway). `topic`
+    // matching mirrors the server route's own "only filter by topic when one was
+    // recorded" behavior — see GapTaskManager.createTargetedTestIfNeeded's
+    // topicForApi handling for the same null-vs-blank reasoning.
+    @Query(
+        """
+        SELECT q.* FROM questions q
+        INNER JOIN question_attempts qa ON qa.questionId = q.id
+        WHERE q.chapter = :chapter
+          AND (:topic IS NULL OR q.topic = :topic)
+          AND q.source = :source
+          AND qa.studentId = :studentId
+          AND qa.correct = 0
+        """
+    )
+    suspend fun getExternalWrongOrSkipped(
+        chapter: String,
+        topic: String?,
+        source: String,
+        studentId: String
+    ): List<Question>
 }
 
 @Dao

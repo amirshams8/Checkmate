@@ -22,6 +22,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateExternalQuestion
 import com.checkmate.testmate.TestmateQuestionPool
 import com.checkmate.testmate.TestmateResultOutcome
 import com.checkmate.testmate.TestmateTargetedTestOutcome
@@ -128,7 +129,7 @@ object GapTaskManager {
         // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
         // part.
         resolveActiveConceptState(context)
-        createTargetedTestIfNeeded()
+        createTargetedTestIfNeeded(context)
 
         val todayKey = GapTaskLedger.todayKey()
         if (GapTaskLedger.hasGeneratedToday(todayKey)) return
@@ -154,7 +155,7 @@ object GapTaskManager {
             // startFromCandidate's own doc for which intents this actually applies to.
             (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
                 ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
-            createTargetedTestIfNeeded()
+            createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
             Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
@@ -465,7 +466,7 @@ object GapTaskManager {
      * day, even when the round never advances because the student hasn't finished the stale
      * test yet — without hammering the endpoint every 15 minutes for an unchanged session.
      */
-    private suspend fun createTargetedTestIfNeeded() {
+    private suspend fun createTargetedTestIfNeeded(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val existingSession = GapTaskLedger.activeTestmateSessionId()
         val todayKey = GapTaskLedger.todayKey()
@@ -546,13 +547,40 @@ object GapTaskManager {
                 "instead of replaying round 1's completed one")
         }
 
+        // NEW (external-report pathway): a report Checkmate parsed locally but that was
+        // never actually taken on Testmate has no `questions`/`responses` history there
+        // to look up by chapter — see TestmateApi.createTargetedTest's own doc. Check
+        // Room first; only fall through to the native by-chapter call below when this
+        // comes back empty, so a chapter with BOTH a real Testmate history AND a local
+        // external import still prefers the explicit local content (the whole point of
+        // this pathway existing) rather than silently mixing the two.
+        val externalQuestions = LearningDatabase.getInstance(context).questionDao()
+            .getExternalWrongOrSkipped(
+                chapter = chapter,
+                topic = topicForApi,
+                source = "external_report",
+                studentId = LearningIds.LOCAL_STUDENT_ID
+            )
+        if (externalQuestions.isNotEmpty()) {
+            Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId using ${externalQuestions.size} " +
+                "locally-parsed external question(s) for chapter=$chapter — skipping native Testmate lookup")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = interventionId,
                 chapter = chapter,
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
-                pool = TestmateQuestionPool.WRONG_SKIPPED
+                pool = TestmateQuestionPool.WRONG_SKIPPED,
+                externalQuestions = externalQuestions.map { q ->
+                    TestmateExternalQuestion(
+                        questionText = q.questionText ?: "",
+                        options = q.options,
+                        correctOption = q.correctOption,
+                        explanation = q.explanation
+                    )
+                }
             )
         } catch (e: Exception) {
             Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
@@ -711,7 +739,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
                 // GapTaskLedger.resetForNextRound() (still-below-mastery / conceptId-drift
                 // branches), which clears the active session so a new round can be
                 // requested — but it doesn't request one itself. generateIfNeeded() always
-                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded() right
+                // pairs its resolveDoneConcept call with createTargetedTestIfNeeded(context) right
                 // after (see that function's own BUGFIX note); this path didn't, so a round
                 // reset discovered here sat un-actioned until the next generateIfNeeded
                 // cycle, by which point a fresh re-rank can pick a different top concept and
@@ -724,7 +752,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
                 // it here too closes that gap the same way generateIfNeeded already does;
                 // it's a no-op whenever resolveDoneConcept covered the concept outright or
                 // deferred it back to PENDING, since both leave no active concept id.
-                createTargetedTestIfNeeded()
+                createTargetedTestIfNeeded(context)
             }
             GapTaskLedger.markEscalatedToday(todayKey)
             return

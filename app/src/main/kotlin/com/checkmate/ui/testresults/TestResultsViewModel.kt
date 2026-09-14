@@ -5,6 +5,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
@@ -136,7 +137,15 @@ class TestResultsViewModel : ViewModel() {
      * `analysisError` is set — the already-committed import is never rolled back
      * or hidden because a derived-view step afterward broke.
      */
-    fun importReport(context: Context, uri: Uri) {
+    // NEW: [source] defaults to "testmate_report" — every existing call site (the
+    // current single "Import Report" action) is unaffected. A future second entry
+    // point for reports that were never actually taken on Testmate should pass
+    // "external_report" here — see TestResultNormalizer.normalizeAndPersist's own
+    // [source] param and QuestionDao.getExternalWrongOrSkipped, which is what
+    // GapTaskManager.createTargetedTestIfNeeded keys off of to route those concepts
+    // to the external-report repair-test pathway instead of Testmate's by-chapter
+    // lookup.
+    fun importReport(context: Context, uri: Uri, source: String = "testmate_report") {
         viewModelScope.launch {
             _state.update {
                 it.copy(
@@ -159,7 +168,7 @@ class TestResultsViewModel : ViewModel() {
                 }
 
                 val result = withContext(Dispatchers.IO) {
-                    TestResultNormalizer.normalizeAndPersist(context, text)
+                    TestResultNormalizer.normalizeAndPersist(context, text, source = source)
                 }
                 // Persistence has committed — this is final regardless of what
                 // buildPerformanceReport below does with it.
@@ -300,21 +309,24 @@ class TestResultsViewModel : ViewModel() {
         alreadyImported: Boolean
     ) {
         if (alreadyImported) {
-            // DIAGNOSTIC: this is the OTHER silent no-op — replay path never reaches
-            // the orchestrator at all. Remove once confirmed which gate is firing.
-            Log.w(TAG, "DIAGNOSTIC: executeTopIntervention skipped — alreadyImported=true, orchestrator never called")
+            // DIAGNOSTIC: persisted, not logged — this device's logcat suppresses non-
+            // system app output entirely (confirmed: full unfiltered --pid dump showed
+            // nothing during a live import). Readable via:
+            //   adb shell run-as com.checkmate cat shared_prefs/checkmate_prefs.xml | grep debug_last_orchestration
+            CheckmatePrefs.putString("debug_last_orchestration_result", "alreadyImported=true, orchestrator never called")
             return
         }
         try {
             val result = withContext(Dispatchers.IO) {
                 LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
             }
-            // DIAGNOSTIC: executeTopCandidateLocked can reject every candidate (already-
-            // active task, already-covered concept, not-mappable, policy rejection) and
-            // return normally — none of that logs anywhere on its own. This line is the
-            // only way to see outcome/rejections without reading in-memory state.
-            // Remove alongside the two DIAGNOSTIC lines above once resolved.
-            Log.d(TAG, "DIAGNOSTIC: orchestration outcome=${result.outcome} rejections=${result.rejections}")
+            // DIAGNOSTIC: persisted, not logged — see note above.
+            CheckmatePrefs.putString(
+                "debug_last_orchestration_result",
+                "outcome=${result.outcome} rejections=${result.rejections.map {
+                    "rank=${it.rank} concept=${it.candidate.conceptId} source=${it.source} detail=${it.detail}"
+                }}"
+            )
             _state.update { it.copy(orchestrationResult = result, orchestrationError = null) }
         } catch (e: Exception) {
             Log.e(TAG, "Intervention orchestration failed: ${e.message}", e)
