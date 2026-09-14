@@ -230,6 +230,27 @@ object GapTaskManager {
             )
             PlanStore.createTask(freshTask)
             GapTaskLedger.updateActiveTaskPointer(freshTask.id, GapTaskLedger.todayKey())
+        } else if (dayKey != GapTaskLedger.todayKey() &&
+            PlanStore.todayTasks.value.none { it.id == taskId }
+        ) {
+            // BUGFIX (task stranded on a stale day, never carried forward): a PENDING/
+            // ACTIVE/PAUSED task's only path onto a later day's list is
+            // PlanStore.cleanupCompletedIfDue()'s 9 PM carry-forward — see that function's
+            // own BUGFIX doc for how a mid-cleanup crash used to leave a task stuck in an
+            // old day's plan_<dayKey> forever, with GapTaskLedger's active pointer still
+            // referencing it (so this same task keeps blocking AlreadyActive in
+            // LearningInterventionOrchestrator) while PlanStore.todayTasks — and therefore
+            // HomeScreen — has no idea it exists. Confirmed live for
+            // taskId=62a776fc-8370-491f-8623-0fb0a8a1f906, dayKey=2026_256, never present
+            // in plan_2026_257. Unlike the SKIPPED branch above, this carries the SAME task
+            // forward (not a fresh copy) — a PENDING/ACTIVE/PAUSED task has no completed
+            // session to reset, it's simply missing from view. Guarded by "not already in
+            // today's list" so this is a no-op once the carry-forward lands normally (or on
+            // a repeat cycle after this branch already fixed it once).
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state} " +
+                "stranded on stale dayKey=$dayKey (today=${GapTaskLedger.todayKey()}) — carrying forward into today's list")
+            PlanStore.createTask(task)
+            GapTaskLedger.updateActiveTaskPointer(task.id, GapTaskLedger.todayKey())
         }
     }
 

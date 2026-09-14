@@ -244,10 +244,8 @@ object PlanStore {
      * not just at cold start.
      *
      * No-ops (returns null) before [EOD_CLEAR_HOUR] (9 PM) local time, and no-ops again once
-     * it's already run for [todayKey]'s date — [KEY_LAST_EOD_CLEANUP_DAY] is claimed BEFORE
-     * the list is touched specifically so a crash mid-cleanup can't leave the guard unset and
-     * cause the next 15-min tick to re-run the carry-forward below and duplicate tasks onto
-     * tomorrow's plan ("misswiring" the reminders on the ones that are still pending).
+     * it's already run for [todayKey]'s date — see the BUGFIX note below for exactly when
+     * [KEY_LAST_EOD_CLEANUP_DAY] gets claimed and why.
      *
      * DONE/SKIPPED tasks are dropped — nothing left to remind about. Everything still
      * unresolved (PENDING/ACTIVE/PAUSED) is left untouched in [_todayTasks] — it keeps
@@ -260,6 +258,22 @@ object PlanStore {
      * at 0L, and returns a [CarryForwardPush] so the caller can push the carried list to sync
      * immediately rather than waiting on some unrelated future edit to that day's plan to
      * happen to trigger a push.
+     *
+     * BUGFIX (task stranded on a stale day, never carried forward): [KEY_LAST_EOD_CLEANUP_DAY]
+     * used to be claimed BEFORE the carry-forward write below, on the theory that a crash
+     * mid-cleanup shouldn't cause the next 15-min tick to re-run this and duplicate tasks
+     * onto tomorrow's plan. That reasoning ignored that the carry-forward's own dedup
+     * (`carried = unresolved.filterNot { it.id in existingIds }`) already makes a RE-RUN
+     * safe — so claiming the guard early bought nothing except making a genuine crash
+     * unrecoverable: confirmed live, the process died between the early guard-claim and the
+     * `plan_$tomorrowKey` write, leaving `plan_last_eod_cleanup_day` marking that day done
+     * forever while the actual carry-forward never happened — a PENDING task
+     * (62a776fc-8370-491f-8623-0fb0a8a1f906) sat orphaned in the old day's `plan_<dayKey>`,
+     * invisible to `_todayTasks`/HomeScreen from that point on, since this function will
+     * never run again for that day. The guard is now claimed at every return point, AFTER
+     * whatever persistence that path actually needed has completed — so a crash before a
+     * write finishes leaves the guard unclaimed and the next tick retries safely instead of
+     * silently giving up.
      */
     fun cleanupCompletedIfDue(): CarryForwardPush? {
         val cal = Calendar.getInstance()
@@ -267,25 +281,31 @@ object PlanStore {
 
         val key = todayKey()
         if (CheckmatePrefs.getString(KEY_LAST_EOD_CLEANUP_DAY, "") == key) return null
-        CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
 
         val current = _todayTasks.value
         val unresolved = current.filter { it.state != TaskState.DONE && it.state != TaskState.SKIPPED }
         if (unresolved.size != current.size) persist(unresolved)
 
-        if (unresolved.isEmpty()) return null
+        if (unresolved.isEmpty()) {
+            CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+            return null
+        }
 
         val tomorrowCal = (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }
         val tomorrowKey = keyForDay(tomorrowCal)
         val existingTomorrow = loadDay(tomorrowKey)
         val existingIds = existingTomorrow.map { it.id }.toSet()
         val carried = unresolved.filterNot { it.id in existingIds }
-        if (carried.isEmpty()) return null
+        if (carried.isEmpty()) {
+            CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
+            return null
+        }
 
         val merged = existingTomorrow + carried
         val stamp = System.currentTimeMillis()
         CheckmatePrefs.putString("plan_$tomorrowKey", json.encodeToString(merged))
         CheckmatePrefs.putLong("tasks_updated_at_$tomorrowKey", stamp)
+        CheckmatePrefs.putString(KEY_LAST_EOD_CLEANUP_DAY, key)
         return CarryForwardPush(tomorrowKey, merged, stamp)
     }
 
