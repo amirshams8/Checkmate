@@ -6,6 +6,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.checkmate.learning.model.Question
 import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.model.QuestionSource
 
 /**
  * Blueprint §1.2's repository/ listing names only QuestionDao.kt (no separate
@@ -81,6 +82,39 @@ interface QuestionDao {
         source: String,
         studentId: String
     ): List<Question>
+
+    // NEW — Q-bank MVP (see QBankSelector). Hardcodes source = QuestionSource.QBANK
+    // rather than taking a `source: String` parameter — the whole point of a
+    // semantically named DAO method here is that a caller structurally cannot
+    // accidentally pass "external_report" (or any other source) and end up
+    // re-treading [getExternalWrongOrSkipped]'s territory. `topic` is intentionally
+    // NOT filtered here (unlike getExternalWrongOrSkipped) — Q-bank selection is
+    // chapter-scoped per DailyQuestionTarget.chapterAllocations' own granularity;
+    // per-question topic/concept priority is ranked afterward in Kotlin by
+    // QBankSelector, not filtered in SQL.
+    @Query(
+        "SELECT * FROM questions WHERE source = '${QuestionSource.QBANK}' AND chapter = :chapter " +
+            "ORDER BY id LIMIT :limit"
+    )
+    suspend fun qbankPoolByChapter(chapter: String, limit: Int): List<Question>
+
+    // NEW — Q-bank MVP. How many distinct qbank questions this chapter has already
+    // had a *correct* attempt on — QuestionTargetEngine subtracts this from
+    // TestPlan.chapterTargets[chapter] to get the day's remaining coverage need.
+    // DISTINCT on q.id, not COUNT(qa.*) — a question re-attempted correctly twice
+    // must still only count once toward "covered," same reasoning as
+    // getExternalWrongOrSkipped's own "don't double count a re-attempt" precedent.
+    @Query(
+        """
+        SELECT COUNT(DISTINCT q.id) FROM questions q
+        INNER JOIN question_attempts qa ON qa.questionId = q.id
+        WHERE q.source = '${QuestionSource.QBANK}'
+          AND q.chapter = :chapter
+          AND qa.studentId = :studentId
+          AND qa.correct = 1
+        """
+    )
+    suspend fun countQbankCorrectByChapter(chapter: String, studentId: String): Int
 }
 
 @Dao
@@ -104,4 +138,11 @@ interface QuestionAttemptDao {
 
     @Query("SELECT COUNT(*) FROM question_attempts WHERE studentId = :studentId")
     suspend fun count(studentId: String): Int
+
+    // NEW — Q-bank MVP. QBankSelector's "not recently attempted" ranking signal (see
+    // chat history's priority list). studentId-scoped, not question-source-scoped: a
+    // question recently seen via ANY pathway (testmate import, external report,
+    // qbank) shouldn't be re-served as "fresh" qbank practice today.
+    @Query("SELECT questionId FROM question_attempts WHERE studentId = :studentId AND timestamp >= :sinceMillis")
+    suspend fun getRecentQuestionIds(studentId: String, sinceMillis: Long): List<String>
 }

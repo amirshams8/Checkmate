@@ -36,6 +36,22 @@ interface ConceptDao {
     @Query("SELECT * FROM concepts WHERE exam = :exam")
     suspend fun getByExam(exam: String): List<Concept>
 
+    // NEW — QuestionTargetEngine/QBankSelector (Q-bank MVP): resolves every concept
+    // under a given chapter so daily-target readiness and per-question priority
+    // scoring can look up mastery without one getById round trip per question's own
+    // (chapter, topic) pair.
+    //
+    // HONEST GAP: filters on the exact `exam` string TestPlan.exam carries (e.g.
+    // "NEET"). KnowledgeGraph.conceptId normalizes a trailing "-YYYY" year suffix
+    // before hashing (see that function's own BUGFIX comment: real imports can carry
+    // "NEET-2027"), but this query does a plain `exam = :exam` match against
+    // Concept.exam's raw stored value, which may or may not already be normalized
+    // depending on which call site wrote that particular row. Not verified against
+    // live data in this change — if QuestionTargetEngine's readiness gap looks wrong
+    // for a chapter that DOES have real imported mastery data, check this first.
+    @Query("SELECT * FROM concepts WHERE exam = :exam AND chapter = :chapter")
+    suspend fun getByExamAndChapter(exam: String, chapter: String): List<Concept>
+
     // BUGFIX (topic-"null" 422 loop, one-time data repair): companion to
     // QuestionDao.repairLiteralNullTopics — Concept rows already rebuilt from a poisoned
     // Question row (see that query's doc) carry the same literal "null" string in their

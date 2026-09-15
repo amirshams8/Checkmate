@@ -9,17 +9,20 @@ import com.checkmate.learning.graph.ConceptDependency
 import com.checkmate.learning.graph.ConceptDependencyDao
 import com.checkmate.learning.model.Concept
 import com.checkmate.learning.model.ConceptMastery
+import com.checkmate.learning.model.DailyQuestionTarget
 import com.checkmate.learning.model.ErrorPattern
 import com.checkmate.learning.model.ErrorRecord
 import com.checkmate.learning.model.LearningEvent
 import com.checkmate.learning.model.Question
 import com.checkmate.learning.model.QuestionAttempt
+import com.checkmate.learning.model.TestPlan
 
 /**
  * Upgrade Blueprint Phase 1.1-1.2 (v1), extended for Phase 1.4-1.7 (v2) with the
  * knowledge graph (Concept, ConceptDependency), mastery (ConceptMastery), and error
  * classification (ErrorRecord, ErrorPattern) tables. v3 adds Question.options (the
- * evidence-pipeline column — see Question.kt's doc).
+ * evidence-pipeline column — see Question.kt's doc). v4 adds TestPlan and
+ * DailyQuestionTarget (Q-bank MVP — see chat history).
  *
  * VERSION BUMP NOTE: v1 shipped with no upgrade migration, only
  * fallbackToDestructiveMigrationOnDowngrade() — "no upgrade path needed yet" was
@@ -39,14 +42,20 @@ import com.checkmate.learning.model.QuestionAttempt
  * on any existing v2 install. Bumping to 3 routes that through the same
  * fallbackToDestructiveMigration() already in place below, so any local
  * checkmate_learning.db from a prior test import gets wiped and rebuilt, not a crash.
+ *
+ * v3 -> v4: adds two new tables (test_plans, daily_question_targets); no existing
+ * table's columns touched. Still routed through fallbackToDestructiveMigration() for
+ * the same "no real user data at stake yet" reasoning above — write a real Migration
+ * once any table in this database has real data worth keeping across an upgrade.
  */
 @Database(
     entities = [
         LearningEvent::class, Question::class, QuestionAttempt::class,
         Concept::class, ConceptMastery::class, ConceptDependency::class,
-        ErrorRecord::class, ErrorPattern::class
+        ErrorRecord::class, ErrorPattern::class,
+        TestPlan::class, DailyQuestionTarget::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -60,6 +69,8 @@ abstract class LearningDatabase : RoomDatabase() {
     abstract fun conceptDependencyDao(): ConceptDependencyDao
     abstract fun errorRecordDao(): ErrorRecordDao
     abstract fun errorPatternDao(): ErrorPatternDao
+    abstract fun testPlanDao(): TestPlanDao
+    abstract fun dailyQuestionTargetDao(): DailyQuestionTargetDao
 
     companion object {
         @Volatile
