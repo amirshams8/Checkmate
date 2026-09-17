@@ -3,6 +3,8 @@ package com.checkmate.workmode
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.provider.Settings as AndroidSettings
+import android.telecom.TelecomManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.StudyMode
@@ -46,6 +48,19 @@ object WorkModeManager {
     // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
     private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
     private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
+
+    // LOOPHOLE FIX (adaptive app block over-blocking): guardian-extendable exemption list,
+    // same comma-separated storage idiom as "escalation_watchlist". Use this for anything
+    // that can't be resolved dynamically via PackageManager (see essentialPackages()) — e.g.
+    // a doubt-solving app, or a device-specific system app that slips past the dynamic
+    // resolution below.
+    private const val KEY_ESSENTIAL_EXTRA = "essential_apps_extra"
+
+    // Fixed exemption: kept reachable during Work Mode for doubt-solving. Not resolvable
+    // dynamically (there's no Intent category for "the doubt-solving app"), so it's hardcoded
+    // here rather than left to whatever the guardian remembers to type into
+    // essential_apps_extra. Add more fixed exemptions the same way if needed.
+    private const val CHATGPT_PKG = "com.openai.chatgpt"
 
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
@@ -190,13 +205,18 @@ object WorkModeManager {
      * overdue-PENDING window. That last piece is what lets this catch a student's actual
      * procrastination target — a game, a browser tab, anything not on the fixed list —
      * rather than only ever blocking the same static seven apps.
+     *
+     * [context] is threaded through to [getBlockedApps] so the essential-app exemption
+     * (launcher/dialer/Settings/ChatGPT) applies here too — the escalation watchlist is a
+     * superset of the permanent blocklist, so without this an essential app exempted from
+     * normal blocking would still get force-closed the moment a lockdown window opened.
      */
-    fun getEscalationWatchlist(): Set<String> {
+    fun getEscalationWatchlist(context: Context): Set<String> {
         val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
         val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
         val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
             ?.takeIf { it.isNotBlank() }
-        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
+        return getBlockedApps(context) + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
     }
 
     /**
@@ -292,10 +312,76 @@ object WorkModeManager {
         CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
     }
 
-    /** Returns package names of apps to block. */
-    fun getBlockedApps(): Set<String> {
+    /**
+     * LOOPHOLE FIX (adaptive app block over-blocking): packages that must never be treated
+     * as "blocked" no matter what's saved in "blocked_apps" — blocking the student's own
+     * launcher, phone/dialer, or system Settings app bricks device navigation outright
+     * (there'd be no way back to Home or Settings to even fix the block list), and ChatGPT
+     * is kept reachable for legitimate doubt-solving during study, per guardian policy.
+     *
+     * Launcher/dialer/Settings are resolved dynamically via PackageManager rather than
+     * hardcoded: exact package names for these vary across OEM skins (e.g. this device's
+     * Settings/launcher fork), and a wrong hardcoded guess would silently exempt nothing.
+     * ChatGPT has no resolvable Intent category ("the doubt-solving app" isn't a system
+     * role), so it's a fixed constant instead — add more the same way, or via
+     * "essential_apps_extra" for anything the guardian wants exempted without a rebuild.
+     */
+    fun essentialPackages(context: Context): Set<String> {
+        val pm = context.packageManager
+        val result = mutableSetOf<String>()
+
+        // Home launcher — query all resolvable launchers, not just the current default,
+        // so switching launchers later doesn't reopen this loophole.
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        try {
+            pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.let { result.add(it) }
+            pm.queryIntentActivities(homeIntent, 0).forEach { info ->
+                info.activityInfo?.packageName?.let { result.add(it) }
+            }
+        } catch (_: Exception) { /* best-effort — never let this crash the guard */ }
+
+        // Phone / dialer
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                telecom?.defaultDialerPackage?.let { result.add(it) }
+            }
+            pm.resolveActivity(Intent(Intent.ACTION_DIAL), 0)?.activityInfo?.packageName?.let { result.add(it) }
+        } catch (_: Exception) { }
+
+        // System Settings app — covers OEM forks (e.g. OnePlus/ColorOS) regardless of
+        // their actual package name, since it's resolved by intent action, not guessed.
+        try {
+            pm.resolveActivity(Intent(AndroidSettings.ACTION_SETTINGS), 0)?.activityInfo?.packageName?.let {
+                result.add(it)
+            }
+        } catch (_: Exception) { }
+
+        // Never block Checkmate's own UI.
+        result.add(context.packageName)
+
+        // Fixed doubt-solving exemption.
+        result.add(CHATGPT_PKG)
+
+        // Guardian-extendable list — same comma-separated storage pattern as
+        // "escalation_watchlist" above.
+        val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""
+        extra.split(",").map { it.trim() }.filterTo(result) { it.isNotBlank() }
+
+        return result
+    }
+
+    /**
+     * Returns package names of apps to block. [context] is required now so the
+     * essential-app exemption above can be resolved and subtracted — whatever's saved
+     * under "blocked_apps" (via AppSelectorScreen) never overrides it, so an accidental
+     * or well-intentioned block of the launcher/Settings/dialer/ChatGPT can't brick
+     * navigation or cut off doubt-solving.
+     */
+    fun getBlockedApps(context: Context): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
-        return saved.split(",").filter { it.isNotBlank() }.toSet()
+        val requested = saved.split(",").filter { it.isNotBlank() }.toSet()
+        return requested - essentialPackages(context)
     }
 
     /**

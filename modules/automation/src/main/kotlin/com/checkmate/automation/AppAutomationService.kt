@@ -225,7 +225,7 @@ class AppAutomationService : AccessibilityService() {
         // 3rd try before acting.
         if (WorkModeManager.isInPostSkipLockdown() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            pkg in WorkModeManager.getEscalationWatchlist()
+            pkg in WorkModeManager.getEscalationWatchlist(applicationContext)
         ) {
             performGlobalAction(GLOBAL_ACTION_HOME)
             DistractionGuard.recordAppAttempt(this, pkg)
@@ -235,10 +235,14 @@ class AppAutomationService : AccessibilityService() {
         // ── Work Mode: blocked app check ─────────────────────────────────────
         // isEnforcing() (not the raw isActive flag) so the hardcoded window
         // blocks apps even when no manual task session is running.
+        // LOOPHOLE FIX: getBlockedApps() now takes context and subtracts
+        // WorkModeManager.essentialPackages() (launcher, dialer, Settings,
+        // ChatGPT) before returning, so those can never end up in this set
+        // even if they're sitting in the saved "blocked_apps" list.
         if (WorkModeManager.isEnforcing() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
-            val blockedApps = WorkModeManager.getBlockedApps()
+            val blockedApps = WorkModeManager.getBlockedApps(applicationContext)
             if (pkg in blockedApps) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
                 // Record attempt — alert guardian on 3rd
@@ -269,9 +273,28 @@ class AppAutomationService : AccessibilityService() {
         // the preemptive freeze; it still had to wait for checkGuardedScreen()
         // to walk the node tree before blocking anything, which is exactly
         // the gap a fast/repeated tap was winning.
-        if (pkg in UninstallGuard.WATCHED_PACKAGES && !UninstallGuard.isUnlocked()) {
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+        //
+        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside
+        // Settings proper — e.g. an OEM "app info" card/bubble hosted by
+        // SystemUI or a OnePlus/ColorOS fork that doesn't run under
+        // "com.android.settings"): CONTENT_CHANGED stays gated to the known
+        // WATCHED_PACKAGES set (that's the specific fragment-swap fix above,
+        // and staying gated there avoids scanning every scroll/content tick
+        // system-wide). STATE_CHANGED — which only fires on window/activity
+        // transitions, not on every content tick — is now ALSO checked for any
+        // package matching UninstallGuard.isLikelySystemSurface(), which covers
+        // SystemUI and known Settings-fork prefixes without needing to guess
+        // this device's exact package name. checkGuardedScreen() itself is
+        // unchanged: it still requires BOTH "checkmate" text AND a guard
+        // keyword (e.g. "force stop") before it acts, so this widening can't
+        // introduce false positives on ordinary system-app screens.
+        val isWatchedForUninstall =
+            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
+            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            if (isStateChange || isKnownContentChange) {
                 blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
                 checkGuardedScreen()
             }

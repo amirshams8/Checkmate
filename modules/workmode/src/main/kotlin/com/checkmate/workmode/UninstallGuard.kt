@@ -137,6 +137,34 @@ object UninstallGuard {
         "com.samsung.accessibility"
     )
 
+    // LOOPHOLE FIX (Force Stop reachable via a Battery/App-info card that doesn't run
+    // under "com.android.settings" — e.g. a floating "app info" bubble hosted by
+    // SystemUI, or a OnePlus/ColorOS-specific Settings fork): rather than guess this
+    // device's exact package name for that surface (a wrong guess would silently
+    // exempt nothing), match by prefix against the OEM/system packages that are
+    // plausible hosts for such a screen. AppAutomationService only uses this to widen
+    // which windows get the (already name+keyword gated) guarded-screen text scan on
+    // window-open events — it does NOT change what counts as guarded. checkGuardedScreen()
+    // still requires "checkmate" + a GUARD_KEYWORDS match before it acts, so widening
+    // which packages get scanned can't introduce a false positive on an unrelated
+    // system screen.
+    private val SYSTEM_PACKAGE_PREFIXES = listOf(
+        "com.android.systemui",
+        "com.android.settings",
+        "com.oneplus.",
+        "com.oplus.",
+        "com.coloros.",
+        "com.samsung.",
+        "com.miui.",
+        "com.xiaomi."
+    )
+
+    /** True if [pkg] looks like an OS/OEM system surface (Settings/SystemUI fork) worth
+     *  scanning for a guarded screen, even though it isn't one of the specific
+     *  [WATCHED_PACKAGES] entries above. */
+    fun isLikelySystemSurface(pkg: String): Boolean =
+        SYSTEM_PACKAGE_PREFIXES.any { pkg == it || pkg.startsWith(it) }
+
     // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
     // on both the activate AND deactivate device-admin paths. It never
     // mentions "Checkmate" by name (it's the OS's generic copy for ANY
