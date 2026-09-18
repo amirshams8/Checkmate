@@ -225,7 +225,7 @@ class AppAutomationService : AccessibilityService() {
         // 3rd try before acting.
         if (WorkModeManager.isInPostSkipLockdown() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            pkg in WorkModeManager.getEscalationWatchlist(applicationContext)
+            pkg in WorkModeManager.getEscalationWatchlist()
         ) {
             performGlobalAction(GLOBAL_ACTION_HOME)
             DistractionGuard.recordAppAttempt(this, pkg)
@@ -235,14 +235,10 @@ class AppAutomationService : AccessibilityService() {
         // ── Work Mode: blocked app check ─────────────────────────────────────
         // isEnforcing() (not the raw isActive flag) so the hardcoded window
         // blocks apps even when no manual task session is running.
-        // LOOPHOLE FIX: getBlockedApps() now takes context and subtracts
-        // WorkModeManager.essentialPackages() (launcher, dialer, Settings,
-        // ChatGPT) before returning, so those can never end up in this set
-        // even if they're sitting in the saved "blocked_apps" list.
         if (WorkModeManager.isEnforcing() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
-            val blockedApps = WorkModeManager.getBlockedApps(applicationContext)
+            val blockedApps = WorkModeManager.getBlockedApps()
             if (pkg in blockedApps) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
                 // Record attempt — alert guardian on 3rd
