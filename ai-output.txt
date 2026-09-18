@@ -1,0 +1,972 @@
+//===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+//===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+package com.checkmate.automation
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.TrustedTime
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
+
+class AppAutomationService : AccessibilityService() {
+
+    private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
+    private val WHATSAPP = "com.whatsapp"
+
+    // How long to freeze touch the instant a *new* watched-package screen
+    // appears, before checkGuardedScreen() has even read+classified it. This
+    // has to cover the rootInActiveWindow() binder call + collectAllText()'s
+    // node walk, which is the real source of the exploitable gap — a fast or
+    // auto-tap can beat detection itself, not just the Home transition.
+    private val PRE_CHECK_BLOCK_MS = 350L
+    // How long to hold the block once a screen IS confirmed guarded, giving
+    // GLOBAL_ACTION_HOME time to actually take effect.
+    private val POST_DETECT_BLOCK_MS = 700L
+    private val SELF_PKG get() = packageName // "com.checkmate"
+
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
+
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
+
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
+
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
+
+    // Throttle for reconciling WorkModeManager against the hardcoded daily
+    // schedule (WorkModeSchedule) — cheap timestamp check, real work only
+    // happens at most once per 30s even though accessibility events can
+    // fire dozens of times a second.
+    private var lastScheduleCheckAt = 0L
+
+    // Last foreground package, used only to detect when a ScrollGuard-watched
+    // app leaves the foreground so its scroll session resets cleanly.
+    private var lastForegroundPkg = ""
+
+    // ── Guarded-screen touch blocker ────────────────────────────────────────
+    // checkGuardedScreen() only fires on an accessibility event (window
+    // state/content changed), and performGlobalAction(GLOBAL_ACTION_HOME)
+    // itself takes a beat to actually navigate away. In that gap the guarded
+    // screen (e.g. the accessibility service's own "Installed apps" toggle,
+    // or the uninstall confirmation) is still fully tappable — fast/repeated
+    // tapping ("brute forcing") can hit the real Disable/Uninstall button
+    // before Home takes effect. TYPE_ACCESSIBILITY_OVERLAY lets an
+    // AccessibilityService add a system-level window without the
+    // SYSTEM_ALERT_WINDOW permission; a full-screen, transparent, non-focusable
+    // instance of it still swallows every touch that lands on it, which is
+    // exactly what's needed to close that window without changing anything
+    // about how the guard screen is detected.
+    private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private var touchBlockerView: View? = null
+    private val touchBlockerHandler = Handler(Looper.getMainLooper())
+    private val removeTouchBlockerRunnable = Runnable { removeTouchBlocker() }
+
+    // Absolute timestamp (epoch ms) the current block is scheduled to release at.
+    // FIX: blockTouchesBriefly() used to unconditionally cancel+reschedule the
+    // removal for whatever duration it was called with — including PRE_CHECK_BLOCK_MS
+    // (350ms), which fires on *every* qualifying accessibility event. When
+    // GLOBAL_ACTION_HOME was triggered from checkGuardedScreen() (after arming a
+    // longer POST_DETECT_BLOCK_MS block, or the 5-minute HARD_LOCK), the guarded
+    // Settings window would keep emitting trailing CONTENT_CHANGED events while it
+    // tore down, each re-entering onAccessibilityEvent and re-calling
+    // blockTouchesBriefly(PRE_CHECK_BLOCK_MS) — silently cutting the longer block
+    // (even the 5-minute hard lock) down to 350ms. touchBlockUntil tracks the
+    // furthest-out release time requested so far; a later call can only extend it,
+    // never shorten it.
+    private var touchBlockUntil = 0L
+
+    /**
+     * Adds a full-screen, invisible, touch-swallowing overlay so nothing under it
+     * can be tapped, then auto-removes itself after [durationMs]. Safe to call
+     * repeatedly while a guarded screen keeps re-triggering the watchdog — it just
+     * extends the existing overlay's lifetime instead of stacking a second window,
+     * and (see [touchBlockUntil]) a shorter subsequent call can never cut short a
+     * longer block already in flight.
+     */
+    private fun blockTouchesBriefly(durationMs: Long = 700L) {
+        val requestedUntil = System.currentTimeMillis() + durationMs
+        if (requestedUntil <= touchBlockUntil) {
+            // A longer block (POST_DETECT_BLOCK_MS or the hard lock) is already
+            // scheduled to release later than this request would — ignore, don't
+            // shorten it.
+            return
+        }
+        touchBlockUntil = requestedUntil
+
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        if (touchBlockerView == null) {
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            val view = View(this)
+            try {
+                windowManager.addView(view, params)
+                touchBlockerView = view
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "touch blocker overlay failed to add", e)
+                touchBlockUntil = 0L
+                return
+            }
+        }
+        touchBlockerHandler.postDelayed(removeTouchBlockerRunnable, durationMs)
+    }
+
+    private fun removeTouchBlocker() {
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        touchBlockUntil = 0L
+        val view = touchBlockerView ?: return
+        touchBlockerView = null
+        try {
+            windowManager.removeView(view)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "touch blocker overlay failed to remove", e)
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "=== AutomationService CONNECTED ===")
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
+
+        // ── Hardcoded schedule reconciliation ──────────────────────────────────
+        // Keeps Work Mode's forced 19:00-05:00 window (plus the extra Sun/Wed 01:00-15:10 window) enforced even if the
+        // student never starts a task, or if the process restarted mid-window
+        // and lost its in-memory isActive flag.
+        val now = System.currentTimeMillis()
+        if (now - lastScheduleCheckAt > 30_000L) {
+            lastScheduleCheckAt = now
+            TrustedTime.refreshIfNeeded(applicationContext)
+            WorkModeManager.evaluateSchedule(applicationContext)
+        }
+
+        // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
+        // Deliberately independent of Work Mode / isEnforcing() — this applies
+        // at all times, not just during study sessions, per product decision.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != lastForegroundPkg) {
+            if (lastForegroundPkg in ScrollGuard.WATCHED_PACKAGES) {
+                ScrollGuard.onAppBackgrounded(lastForegroundPkg)
+            }
+            lastForegroundPkg = pkg
+        }
+        if (pkg in ScrollGuard.WATCHED_PACKAGES && event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (ScrollGuard.recordScroll(this, pkg)) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            return
+        }
+
+        // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────
+        // Independent of, and checked before, the normal Work Mode blocklist below:
+        // during the timed window opened by WorkModeManager.startPostSkipLockdown()
+        // (HomeViewModel.markSkip()), any app on the escalation watchlist is bounced
+        // immediately on first foreground — no 3-attempt grace period like the normal
+        // DistractionGuard flow. Still records the attempt (so the guardian alert and
+        // BehaviorLedger correlation data stay consistent), just doesn't wait for a
+        // 3rd try before acting.
+        if (WorkModeManager.isInPostSkipLockdown() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            pkg in WorkModeManager.getEscalationWatchlist()
+        ) {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            DistractionGuard.recordAppAttempt(this, pkg)
+            return
+        }
+
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        // isEnforcing() (not the raw isActive flag) so the hardcoded window
+        // blocks apps even when no manual task session is running.
+        if (WorkModeManager.isEnforcing() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
+                return
+            }
+        }
+
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
+            }
+        }
+
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        //
+        // NOTE on why this now blocks on CONTENT_CHANGED too, not just
+        // STATE_CHANGED: on most OEM Settings builds, drilling from the
+        // "Accessibility" list into a specific service's detail screen (the
+        // one with the actual Disable toggle) does NOT open a new Activity —
+        // it's a fragment swap inside the same window. That transition only
+        // fires TYPE_WINDOW_CONTENT_CHANGED, never TYPE_WINDOW_STATE_CHANGED.
+        // The previous version only pre-armed the blocker on STATE_CHANGED,
+        // so that specific screen — the one that actually matters — never got
+        // the preemptive freeze; it still had to wait for checkGuardedScreen()
+        // to walk the node tree before blocking anything, which is exactly
+        // the gap a fast/repeated tap was winning.
+        //
+        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside
+        // Settings proper — e.g. an OEM "app info" card/bubble hosted by
+        // SystemUI or a OnePlus/ColorOS fork that doesn't run under
+        // "com.android.settings"): CONTENT_CHANGED stays gated to the known
+        // WATCHED_PACKAGES set (that's the specific fragment-swap fix above,
+        // and staying gated there avoids scanning every scroll/content tick
+        // system-wide). STATE_CHANGED — which only fires on window/activity
+        // transitions, not on every content tick — is now ALSO checked for any
+        // package matching UninstallGuard.isLikelySystemSurface(), which covers
+        // SystemUI and known Settings-fork prefixes without needing to guess
+        // this device's exact package name. checkGuardedScreen() itself is
+        // unchanged: it still requires BOTH "checkmate" text AND a guard
+        // keyword (e.g. "force stop") before it acts, so this widening can't
+        // introduce false positives on ordinary system-app screens.
+        val isWatchedForUninstall =
+            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
+            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            if (isStateChange || isKnownContentChange) {
+                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
+                checkGuardedScreen()
+            }
+        }
+
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
+
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
+            }, 1200)
+        }
+    }
+
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for either:
+     *  (a) "this is about Checkmate" + "this is an uninstall/force-stop/disable
+     *      screen" (looksLikeGuardedScreen — requires BOTH signals so we never
+     *      interfere with unrelated Settings browsing), or
+     *  (b) a name-agnostic OS/bypass screen that never mentions Checkmate at
+     *      all — the device-admin activate/deactivate prompt, or a Developer
+     *      Options screen exposing USB/Wireless debugging (the on-device path
+     *      to an `adb uninstall`/`adb shell pm disable` that skips this
+     *      watchdog entirely).
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert.
+     */
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) { removeTouchBlocker(); return }
+
+        val root = rootInActiveWindow ?: run {
+            // Can't classify without a node tree — release the pre-check
+            // block rather than leave touch frozen on a screen we never
+            // actually inspected.
+            removeTouchBlocker()
+            return
+        }
+        val text = collectAllText(root)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
+        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
+        val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
+            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing)
+            // — drop the pre-check block immediately instead of waiting out
+            // its timer, so normal Settings use doesn't feel laggy.
+            removeTouchBlocker()
+            return
+        }
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+
+        // Three consecutive attempts (within the burst window — see UninstallGuard's
+        // CONSEC_RESET_MS) escalate from the normal brief touch-block to a full-screen,
+        // full-duration hard lock — the same touch-swallowing overlay used everywhere else in
+        // this class, just held for HARD_LOCK_DURATION_MS instead of POST_DETECT_BLOCK_MS.
+        val hardLock = UninstallGuard.recordGuardedAttempt()
+        if (hardLock) {
+            Log.w(GUARD_TAG, "3rd consecutive disable/uninstall attempt — hard-locking touch for 5 minutes")
+            blockTouchesBriefly(UninstallGuard.HARD_LOCK_DURATION_MS)
+            UninstallGuard.resetConsecutiveAttempts() // next hard lock needs a fresh burst
+        } else {
+            // Extend/refresh the block to cover the Home transition itself — the pre-check
+            // block above was only sized for classification, not for GLOBAL_ACTION_HOME
+            // actually taking effect.
+            blockTouchesBriefly(POST_DETECT_BLOCK_MS)
+        }
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            val reason = if (hardLock) "repeated_disable_attempt_hard_lock" else "settings_screen_blocked"
+            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, reason)
+        }
+    }
+
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
+    }
+
+    // ── URL scanning ──────────────────────────────────────────────────────────
+
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
+
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
+
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
+
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
+
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
+    }
+
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
+        }
+
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
+    }
+
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
+
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
+
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
+        val inputNode =
+            findNodeById(root, "com.whatsapp:id/entry")
+                ?.also { Log.d(TAG, "input via id/entry") }
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
+            ?: findNodeByClass(root, "android.widget.EditText")
+                ?.also { Log.d(TAG, "input via EditText fallback") }
+
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
+
+        typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
+
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
+
+        AutomationEngine.consumePendingWhatsAppMessage()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
+            val sendNode =
+                findNodeById(freshRoot, "com.whatsapp:id/send")
+                    ?.also { Log.d(TAG, "send btn via id/send") }
+                ?: findNodeByDesc(freshRoot, "Send")
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
+        }, 500)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    override fun onInterrupt() {
+        Log.d(TAG, "Service interrupted")
+        removeTouchBlocker()
+    }
+
+    override fun onDestroy() {
+        removeTouchBlocker()
+        super.onDestroy()
+    }
+}
+
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+package com.checkmate.workmode
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings as AndroidSettings
+import android.telecom.TelecomManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.StudyMode
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object WorkModeManager {
+
+    private const val KEY_ACTIVE_SOURCE = "work_mode_active_source"
+    private const val SOURCE_MANUAL   = "manual"
+    private const val SOURCE_SCHEDULE = "schedule"
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown window.
+    private const val KEY_LOCKDOWN_UNTIL     = "post_skip_lockdown_until"
+    private const val DEFAULT_LOCKDOWN_MIN   = 45
+    private const val KEY_LOCKDOWN_MINUTES   = "post_skip_lockdown_minutes"
+    // Fixed default watchlist for the escalation window — deliberately broader than the
+    // permanent blocklist since it's temporary. Guardian can extend it via
+    // "escalation_watchlist" (comma-separated package names), same storage pattern as
+    // getBlockedApps()/getBlockedDomains(). Package names, not labels — matched directly
+    // against AccessibilityEvent.packageName in AppAutomationService.
+    private val DEFAULT_ESCALATION_WATCHLIST = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",   // TikTok
+        "com.snapchat.android",
+        "com.facebook.katana",
+        "com.twitter.android",
+        "com.reddit.frontpage"
+    )
+
+    // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
+    private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
+    private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
+
+    // BUGFIX (silent delay never enforced): idempotency ledger for overdue-PENDING
+    // enforcement, plus the dynamically-detected top-time-consuming app for the current
+    // overdue window. See hasAppliedOverdueEnforcement/markOverdueEnforcementApplied/
+    // retainOverdueEnforcementOnly/setOverdueTopApp for the actual logic; these two keys
+    // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
+    private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
+    private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
+
+    // LOOPHOLE FIX (adaptive app block over-blocking): guardian-extendable exemption list,
+    // same comma-separated storage idiom as "escalation_watchlist". Use this for anything
+    // that can't be resolved dynamically via PackageManager (see essentialPackages()) — e.g.
+    // a doubt-solving app, or a device-specific system app that slips past the dynamic
+    // resolution below.
+    private const val KEY_ESSENTIAL_EXTRA = "essential_apps_extra"
+
+    // Fixed exemption: kept reachable during Work Mode for doubt-solving. Not resolvable
+    // dynamically (there's no Intent category for "the doubt-solving app"), so it's hardcoded
+    // here rather than left to whatever the guardian remembers to type into
+    // essential_apps_extra. Add more fixed exemptions the same way if needed.
+    private const val CHATGPT_PKG = "com.openai.chatgpt"
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    /**
+     * Call once from CheckmateApp.onCreate and BootReceiver, after
+     * CheckmatePrefs.init()/CheckmateState.init(). Syncs the in-memory flag
+     * with whatever was persisted before this process started — previously
+     * _isActive always reset to false on a fresh process even if the
+     * student had an active session, which silently turned off app
+     * blocking until the app UI was reopened. Also immediately reconciles
+     * against the hardcoded schedule.
+     */
+    fun init(context: Context) {
+        TrustedTime.refreshIfNeeded(context)
+        _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
+        evaluateSchedule(context)
+    }
+
+    fun activate(context: Context, source: String = SOURCE_MANUAL) {
+        CheckmateState.setMode(context, StudyMode.STUDY)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, source)
+        _isActive.value = true
+        startService(context)
+    }
+
+    /**
+     * Turns Work Mode off. Returns true if it actually turned off.
+     *
+     * Returns false — and leaves blocking ON — if the hardcoded daily
+     * schedule (WorkModeSchedule) is currently in force and no guardian PIN
+     * unlock is active. This is what closes the "mark the task done/skip it,
+     * then browse freely until the next one" loophole during the
+     * 19:00-02:00 window: block mode isn't tied to any single task while
+     * the schedule says it should be on.
+     */
+    fun deactivate(context: Context): Boolean {
+        DistractionGuard.reset()
+        if (WorkModeSchedule.isWithinScheduledWindow() && !UninstallGuard.isUnlocked()) {
+            // Whatever session requested this deactivate (e.g. a manual task
+            // finishing) is over, but the hardcoded schedule is still in force.
+            // Hand the active-source tag back to "schedule" so evaluateSchedule()
+            // can auto-release Work Mode once the window itself ends — otherwise
+            // this stays tagged as the task's source (e.g. "manual") forever, the
+            // natural-end auto-release check never matches, and blocking silently
+            // continues past the hardcoded window until manually toggled off.
+            CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
+            return false
+        }
+        CheckmateState.setMode(context, StudyMode.NORMAL)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, "")
+        _isActive.value = false
+        context.stopService(Intent(context, WorkModeService::class.java))
+        return true
+    }
+
+    fun toggle(context: Context) {
+        if (_isActive.value) deactivate(context) else activate(context)
+    }
+
+    /**
+     * True whenever app/website blocking must be enforced right now —
+     * either a manual/task session is active, or the hardcoded 19:00-02:00
+     * window is live. AppAutomationService keys blocking decisions off
+     * this instead of the raw [isActive] flag, so the hardcoded window
+     * can't be bypassed just by never starting a task, or by the
+     * accessibility-service process restarting and losing in-memory state.
+     */
+    fun isEnforcing(): Boolean = _isActive.value || WorkModeSchedule.isWithinScheduledWindow()
+
+    /**
+     * True when Work Mode settings (Blocked Apps, Blocked Websites, Focus
+     * Cycle toggles, Guardian Telegram Chat ID) must be read-only in the UI.
+     *
+     * Locked permanently as soon as a guardian PIN exists — NOT just while
+     * a session/the hardcoded window is enforcing. Before any PIN has been
+     * generated (first launch / initial setup) these stay open so the
+     * guardian can configure them once. After that, the only way past this
+     * gate is a guardian PIN unlock — the same UninstallGuard mechanism
+     * that gates uninstall protection, so there's still exactly one PIN,
+     * and the student never sees it either way. Tying this to enforcement
+     * state alone used to leave a window (outside 19:00-02:00, no active
+     * session) where these were freely editable; that loophole is now closed.
+     */
+    // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —
+    // even a correct guardian PIN unlock doesn't reopen settings while the recent skip rate
+    // is over threshold. This is deliberate escalation, not a bug: a guardian who's just
+    // unlocked settings during a bad week should still see them locked back down once the
+    // unlock window (UNLOCK_WINDOW_MS in UninstallGuard) lapses, same as before — the new
+    // clause only matters while skipRateExceedsThreshold() is true, which requires an actual
+    // sustained skip pattern (see DEFAULT_ESCALATION_THRESHOLD), not a one-off.
+    // Recommended mitigation for the "guardian genuinely needs in during an escalation"
+    // case: UninstallGuard.grantRemoteOverride() (Telegram-command driven, see that file) —
+    // it bypasses this gate entirely rather than fighting it.
+    fun settingsLocked(): Boolean =
+        UninstallGuard.hasPinConfigured() &&
+        !UninstallGuard.hasRemoteOverride() &&
+        (!UninstallGuard.isUnlocked() || skipRateExceedsThreshold())
+
+    /**
+     * Mentor v2 (spec 3.5): reads the skip rate PsycheEngine.refreshBehaviorSummaryCache()
+     * writes into "recent_skip_rate" (a plain CheckmatePrefs bridge, same pattern as the
+     * "behavior_summary" cache — :modules:workmode has no dependency on :modules:psyche, so
+     * this avoids adding one). Threshold is configurable via "escalation_skip_threshold";
+     * defaults to DEFAULT_ESCALATION_THRESHOLD.
+     */
+    fun skipRateExceedsThreshold(): Boolean {
+        val rate = CheckmatePrefs.getString("recent_skip_rate", "0")?.toFloatOrNull() ?: 0f
+        val threshold = CheckmatePrefs.getString(KEY_ESCALATION_THRESHOLD, null)?.toFloatOrNull()
+            ?: DEFAULT_ESCALATION_THRESHOLD
+        return rate > threshold
+    }
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown.
+
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip() —
+     *  and, as of the overdue-enforcement fix, from `app`'s OverdueEnforcementCoordinator
+     *  for a badly-overdue still-PENDING task. Deliberately the same function for both:
+     *  it's the identical consequence (temporary lockdown + escalation watchlist), just
+     *  reached by two different triggers — an explicit Skip tap, or silence past
+     *  threshold. Neither caller may pair this with a TaskState change other than what
+     *  that caller already legitimately does on its own terms (markSkip marks SKIPPED
+     *  for its own reasons; the overdue path must NOT mark anything). */
+    fun startPostSkipLockdown(context: Context) {
+        val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
+            .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
+        val until = System.currentTimeMillis() + minutes * 60 * 1000L
+        CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+    }
+
+    /** True while a post-skip lockdown window is active. AppAutomationService checks this
+     *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
+     *  grace period for apps on [getEscalationWatchlist]. */
+    fun isInPostSkipLockdown(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
+
+    /**
+     * Returns [getBlockedApps] plus a fixed distraction-prone watchlist (extendable via
+     * prefs), plus (BUGFIX, silent delay never enforced) whichever single app
+     * [setOverdueTopApp] most recently recorded as the top time-consumer during an
+     * overdue-PENDING window. That last piece is what lets this catch a student's actual
+     * procrastination target — a game, a browser tab, anything not on the fixed list —
+     * rather than only ever blocking the same static seven apps.
+     */
+    fun getEscalationWatchlist(): Set<String> {
+        val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
+        val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
+            ?.takeIf { it.isNotBlank() }
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
+    }
+
+    /**
+     * Reconciles [isActive] with the hardcoded schedule. Call on app start,
+     * boot, from the twice-daily schedule alarms (WorkModeScheduleReceiver),
+     * and periodically from the accessibility service.
+     *
+     * Only ever force-starts or force-stops sessions that IT started
+     * (tracked via [KEY_ACTIVE_SOURCE] = "schedule") — a manual task session
+     * that happens to be running is never auto-cancelled here, and a manual
+     * session that outlasts the window keeps running under student control
+     * exactly as before.
+     */
+    fun evaluateSchedule(context: Context) {
+        val inWindow = WorkModeSchedule.isWithinScheduledWindow()
+        val currentSource = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "")
+
+        if (inWindow && !_isActive.value) {
+            activate(context, source = SOURCE_SCHEDULE)
+        } else if (!inWindow && _isActive.value && currentSource == SOURCE_SCHEDULE) {
+            // Window ended naturally and nothing manual took over — release
+            // it without requiring a PIN, since this isn't a student action.
+            deactivate(context)
+        }
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
+     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
+     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
+     * that a guardian toggled on manually or that the hardcoded schedule opened,
+     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
+     * fix; nothing outside this object needed to read it.
+     */
+    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
+    /**
+     * BUGFIX (silent delay never enforced): true once overdue enforcement has already
+     * been applied for this specific task id. [InterventionTriggerWorker] calls
+     * [OverdueEnforcementGateway.applyOverdueEnforcement] every ~15-minute cycle the task
+     * stays PENDING past threshold — this is what stops that from re-running
+     * startPostSkipLockdown()/re-detecting the top app on every single cycle
+     * (09:35 apply, 09:50 no-op, 10:05 no-op, ...) instead of exactly once per overdue
+     * episode. Keyed on StudyTask.id (a fresh UUID per generated task — see StudyTask's
+     * own doc — never reused across days), not a global flag, so one overdue task doesn't
+     * suppress detection for a different one.
+     */
+    fun hasAppliedOverdueEnforcement(taskId: String): Boolean =
+        overdueEscalatedIds().contains(taskId)
+
+    /** Records that overdue enforcement has now been applied for [taskId] — call exactly
+     *  once, from the same code path that calls [startPostSkipLockdown] for this reason. */
+    fun markOverdueEnforcementApplied(taskId: String) {
+        persistOverdueEscalatedIds(overdueEscalatedIds() + taskId)
+    }
+
+    /**
+     * Drops every escalated-task id NOT in [stillPendingTaskIds]. Call from
+     * [com.checkmate.service.WorkModeTaskReconciler] on every PlanStore.todayTasks
+     * emission — that's the one place that already observes every task leaving PENDING,
+     * regardless of why (started, done, skipped, reverted back to PENDING by
+     * GapTaskManager's resolveDoneConcept path, or dropped off today's list entirely by
+     * day rollover). A task that's since been resolved has nothing left to guard against
+     * re-escalating, and if it ever legitimately becomes PENDING again later (the
+     * GapTaskManager revert case), it deserves a fresh overdue evaluation rather than
+     * being permanently suppressed by a stale flag from its last time around.
+     *
+     * Also clears the detected top-app watchlist entry once nothing is left escalated, so
+     * a stale detection from an already-resolved delay doesn't linger in
+     * [getEscalationWatchlist] indefinitely.
+     */
+    fun retainOverdueEnforcementOnly(stillPendingTaskIds: Set<String>) {
+        val current = overdueEscalatedIds()
+        val retained = current.intersect(stillPendingTaskIds)
+        if (retained != current) persistOverdueEscalatedIds(retained)
+        if (retained.isEmpty() && current.isNotEmpty()) setOverdueTopApp(null)
+    }
+
+    /** Records which app [com.checkmate.core.AppUsageTracker.getTopAppInRange] found was
+     *  eating the most time during the current overdue-PENDING window — folded into
+     *  [getEscalationWatchlist] alongside the fixed watchlist. Pass null to clear it. */
+    fun setOverdueTopApp(pkg: String?) {
+        CheckmatePrefs.putString(KEY_OVERDUE_TOP_APP, pkg ?: "")
+    }
+
+    private fun overdueEscalatedIds(): Set<String> {
+        val saved = CheckmatePrefs.getString(KEY_OVERDUE_ESCALATED_TASK_IDS, "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun persistOverdueEscalatedIds(ids: Set<String>) {
+        CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
+    }
+
+    /**
+     * LOOPHOLE FIX (adaptive app block over-blocking): packages that must never be treated
+     * as "blocked" no matter what's saved in "blocked_apps" — blocking the student's own
+     * launcher, phone/dialer, or system Settings app bricks device navigation outright
+     * (there'd be no way back to Home or Settings to even fix the block list), and ChatGPT
+     * is kept reachable for legitimate doubt-solving during study, per guardian policy.
+     *
+     * Launcher/dialer/Settings are resolved dynamically via PackageManager rather than
+     * hardcoded: exact package names for these vary across OEM skins (e.g. this device's
+     * Settings/launcher fork), and a wrong hardcoded guess would silently exempt nothing.
+     * ChatGPT has no resolvable Intent category ("the doubt-solving app" isn't a system
+     * role), so it's a fixed constant instead — add more the same way, or via
+     * "essential_apps_extra" for anything the guardian wants exempted without a rebuild.
+     */
+    fun essentialPackages(context: Context): Set<String> {
+        val pm = context.packageManager
+        val result = mutableSetOf<String>()
+
+        // Home launcher — query all resolvable launchers, not just the current default,
+        // so switching launchers later doesn't reopen this loophole.
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        try {
+            pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.let { result.add(it) }
+            pm.queryIntentActivities(homeIntent, 0).forEach { info ->
+                info.activityInfo?.packageName?.let { result.add(it) }
+            }
+        } catch (_: Exception) { /* best-effort — never let this crash the guard */ }
+
+        // Phone / dialer
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                telecom?.defaultDialerPackage?.let { result.add(it) }
+            }
+            pm.resolveActivity(Intent(Intent.ACTION_DIAL), 0)?.activityInfo?.packageName?.let { result.add(it) }
+        } catch (_: Exception) { }
+
+        // System Settings app — covers OEM forks (e.g. OnePlus/ColorOS) regardless of
+        // their actual package name, since it's resolved by intent action, not guessed.
+        try {
+            pm.resolveActivity(Intent(AndroidSettings.ACTION_SETTINGS), 0)?.activityInfo?.packageName?.let {
+                result.add(it)
+            }
+        } catch (_: Exception) { }
+
+        // Never block Checkmate's own UI.
+        result.add(context.packageName)
+
+        // Fixed doubt-solving exemption.
+        result.add(CHATGPT_PKG)
+
+        // Guardian-extendable list — same comma-separated storage pattern as
+        // "escalation_watchlist" above.
+        val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""
+        extra.split(",").map { it.trim() }.filterTo(result) { it.isNotBlank() }
+
+        return result
+    }
+
+    /**
+     * Returns package names of apps to block. Stored as comma-separated values under
+     * "blocked_apps" (via AppSelectorScreen).
+     */
+    fun getBlockedApps(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    /**
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
+     */
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun startService(context: Context) {
+        val intent = Intent(context, WorkModeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * public (was folded into the private SOURCE_* consts before this fix) so
+     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
+     * own activate() calls and compare against [activeSource]. Kept as a plain
+     * string constant to match every other source tag's storage as raw
+     * CheckmatePrefs strings.
+     */
+    const val SOURCE_TASK = "task"
+}
+
+
