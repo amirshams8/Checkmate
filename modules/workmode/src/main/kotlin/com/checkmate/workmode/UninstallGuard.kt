@@ -212,6 +212,23 @@ object UninstallGuard {
         return if (remaining > 0) remaining / 1000 else 0
     }
 
+    /**
+     * Human-readable form of [regenCooldownRemainingSeconds]. Picks the coarsest
+     * unit that still reads naturally: days once over an hour, otherwise
+     * minutes/seconds.
+     */
+    fun regenCooldownRemainingLabel(): String {
+        val totalSeconds = regenCooldownRemainingSeconds()
+        if (totalSeconds <= 0) return "0s"
+        val days = totalSeconds / 86_400
+        val hours = (totalSeconds % 86_400) / 3_600
+        return when {
+            days > 0  -> "${days}d ${hours}h"
+            hours > 0 -> "${hours}h ${(totalSeconds % 3_600) / 60}m"
+            else      -> "${totalSeconds / 60}m ${totalSeconds % 60}s"
+        }
+    }
+
     private fun hashPin(pin: String): String {
         val bytes = MessageDigest.getInstance("SHA-256").digest(pin.trim().toByteArray())
         return bytes.joinToString("") { "%02x".format(it) }
