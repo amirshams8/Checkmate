@@ -232,13 +232,69 @@ class AppAutomationService : AccessibilityService() {
             return
         }
 
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        //
+        // ORDERING BUGFIX (2026-09, hard-lock silently never firing): this block now
+        // runs BEFORE the "Work Mode: blocked app check" below, not after. It used to
+        // run after, and that check `return`s immediately when the foreground package is
+        // in getBlockedApps() — which meant that if a guarded surface (e.g.
+        // "com.oplus.battery", the ColorOS per-app Battery/Force-Stop screen) was ALSO
+        // sitting in the guardian's saved "blocked_apps" list, the function would return
+        // right there and this watchdog block — checkGuardedScreen(),
+        // recordGuardedAttempt(), the whole hard-lock escalation — would never run at
+        // all. WorkModeManager.getBlockedApps() is now separately patched to never
+        // return a guarded surface in the first place (see its doc), but this reordering
+        // is the belt to that suspenders: uninstall/disable protection is meant to be
+        // unconditional, so it must not be placed somewhere a later, unrelated feature's
+        // early return can silently skip it — regardless of what ends up in any
+        // blocklist, now or in the future.
+        //
+        // NOTE on why this blocks on CONTENT_CHANGED too, not just STATE_CHANGED: on
+        // most OEM Settings builds, drilling from the "Accessibility" list into a
+        // specific service's detail screen (the one with the actual Disable toggle) does
+        // NOT open a new Activity — it's a fragment swap inside the same window. That
+        // transition only fires TYPE_WINDOW_CONTENT_CHANGED, never
+        // TYPE_WINDOW_STATE_CHANGED. An earlier version only pre-armed the blocker on
+        // STATE_CHANGED, so that specific screen — the one that actually matters — never
+        // got the preemptive freeze; it still had to wait for checkGuardedScreen() to
+        // walk the node tree before blocking anything, which is exactly the gap a
+        // fast/repeated tap was winning.
+        //
+        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside Settings
+        // proper — e.g. an OEM "app info" card/bubble hosted by SystemUI or a
+        // OnePlus/ColorOS fork that doesn't run under "com.android.settings"):
+        // CONTENT_CHANGED stays gated to the known WATCHED_PACKAGES set (that's the
+        // specific fragment-swap fix above, and staying gated there avoids scanning
+        // every scroll/content tick system-wide). STATE_CHANGED — which only fires on
+        // window/activity transitions, not on every content tick — is now ALSO checked
+        // for any package matching UninstallGuard.isLikelySystemSurface(), which covers
+        // SystemUI and known Settings-fork prefixes without needing to guess this
+        // device's exact package name. checkGuardedScreen() itself is unchanged: it
+        // still requires BOTH "checkmate" text AND a guard keyword (e.g. "force stop")
+        // before it acts, so this widening can't introduce false positives on ordinary
+        // system-app screens.
+        val isWatchedForUninstall =
+            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
+            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            if (isStateChange || isKnownContentChange) {
+                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
+                checkGuardedScreen()
+            }
+        }
+
         // ── Work Mode: blocked app check ─────────────────────────────────────
         // isEnforcing() (not the raw isActive flag) so the hardcoded window
         // blocks apps even when no manual task session is running.
-        // LOOPHOLE FIX: getBlockedApps() now takes context and subtracts
-        // WorkModeManager.essentialPackages() (launcher, dialer, Settings,
-        // ChatGPT) before returning, so those can never end up in this set
-        // even if they're sitting in the saved "blocked_apps" list.
+        // LOOPHOLE FIX: getBlockedApps() takes context and subtracts both
+        // WorkModeManager.essentialPackages() (launcher, dialer, Settings, ChatGPT)
+        // AND anything UninstallGuard considers a guarded system surface, before
+        // returning — so neither can ever end up in this set even if sitting in the
+        // saved "blocked_apps" list. See getBlockedApps()'s doc and the ordering note
+        // on the watchdog block above for why this needed a second, independent fix.
         if (WorkModeManager.isEnforcing() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
@@ -256,47 +312,6 @@ class AppAutomationService : AccessibilityService() {
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 checkAndBlockUrl(pkg)
-            }
-        }
-
-        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
-        // Runs regardless of Work Mode — uninstall protection is always on.
-        //
-        // NOTE on why this now blocks on CONTENT_CHANGED too, not just
-        // STATE_CHANGED: on most OEM Settings builds, drilling from the
-        // "Accessibility" list into a specific service's detail screen (the
-        // one with the actual Disable toggle) does NOT open a new Activity —
-        // it's a fragment swap inside the same window. That transition only
-        // fires TYPE_WINDOW_CONTENT_CHANGED, never TYPE_WINDOW_STATE_CHANGED.
-        // The previous version only pre-armed the blocker on STATE_CHANGED,
-        // so that specific screen — the one that actually matters — never got
-        // the preemptive freeze; it still had to wait for checkGuardedScreen()
-        // to walk the node tree before blocking anything, which is exactly
-        // the gap a fast/repeated tap was winning.
-        //
-        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside
-        // Settings proper — e.g. an OEM "app info" card/bubble hosted by
-        // SystemUI or a OnePlus/ColorOS fork that doesn't run under
-        // "com.android.settings"): CONTENT_CHANGED stays gated to the known
-        // WATCHED_PACKAGES set (that's the specific fragment-swap fix above,
-        // and staying gated there avoids scanning every scroll/content tick
-        // system-wide). STATE_CHANGED — which only fires on window/activity
-        // transitions, not on every content tick — is now ALSO checked for any
-        // package matching UninstallGuard.isLikelySystemSurface(), which covers
-        // SystemUI and known Settings-fork prefixes without needing to guess
-        // this device's exact package name. checkGuardedScreen() itself is
-        // unchanged: it still requires BOTH "checkmate" text AND a guard
-        // keyword (e.g. "force stop") before it acts, so this widening can't
-        // introduce false positives on ordinary system-app screens.
-        val isWatchedForUninstall =
-            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
-        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
-            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-            if (isStateChange || isKnownContentChange) {
-                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
-                checkGuardedScreen()
             }
         }
 

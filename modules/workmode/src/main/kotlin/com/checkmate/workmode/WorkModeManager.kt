@@ -372,16 +372,41 @@ object WorkModeManager {
     }
 
     /**
-     * Returns package names of apps to block. [context] is required now so the
-     * essential-app exemption above can be resolved and subtracted — whatever's saved
-     * under "blocked_apps" (via AppSelectorScreen) never overrides it, so an accidental
-     * or well-intentioned block of the launcher/Settings/dialer/ChatGPT can't brick
-     * navigation or cut off doubt-solving.
+     * BUGFIX (2026-09, hard-lock silently never firing): [essentialPackages] resolves
+     * "the Settings app" via ACTION_SETTINGS, but on this device (ColorOS/OnePlus) that
+     * resolves to the main Settings package only — the per-app Battery screen (with the
+     * Force Stop button, confirmed via dumpsys as "com.oplus.battery") is a SEPARATE
+     * system package that ACTION_SETTINGS never resolves to, so it was never covered.
+     *
+     * If that package (or any other package UninstallGuard treats as a guarded surface —
+     * see WATCHED_PACKAGES / isLikelySystemSurface) ends up in the guardian's saved
+     * "blocked_apps" list, [getBlockedApps] used to return it as blockable — which meant
+     * AppAutomationService's "blocked app" check fired and returned BEFORE its uninstall
+     * watchdog check ever ran, silently skipping checkGuardedScreen()/recordGuardedAttempt()
+     * entirely. The 3-strikes-in-a-row 5-minute hard lock (see UninstallGuard) could then
+     * never trigger no matter how many times Force Stop was tapped, since the counter
+     * never got a chance to increment.
+     *
+     * A guarded system surface should never be a blockable "distracting app" in the first
+     * place — this closes it at the source, on top of the ordering fix in
+     * AppAutomationService (belt-and-suspenders: neither alone should be relied on).
+     */
+    private fun isGuardedSystemSurface(pkg: String): Boolean =
+        pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+
+    /**
+     * Returns package names of apps to block. [context] is required so the essential-app
+     * exemption above can be resolved and subtracted — whatever's saved under
+     * "blocked_apps" (via AppSelectorScreen) never overrides it, so an accidental or
+     * well-intentioned block of the launcher/Settings/dialer/ChatGPT can't brick
+     * navigation or cut off doubt-solving. Also never returns anything
+     * [isGuardedSystemSurface] considers a guarded surface (Settings/SystemUI/OEM
+     * system-app forks) — see that function's doc for why.
      */
     fun getBlockedApps(context: Context): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
         val requested = saved.split(",").filter { it.isNotBlank() }.toSet()
-        return requested - essentialPackages(context)
+        return requested - essentialPackages(context) - requested.filter { isGuardedSystemSurface(it) }.toSet()
     }
 
     /**
