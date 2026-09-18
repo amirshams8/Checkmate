@@ -179,28 +179,37 @@ class AppAutomationService : AccessibilityService() {
         }
     }
 
-    // FIX (race that survived the WATCHED_PACKAGES/isLikelySystemSurface widening):
-    // checkGuardedScreen() used to call removeTouchBlocker() unconditionally on its
-    // "not guarded" / "no root" early-exit paths. That's safe in isolation, but once
-    // isWatchedForUninstall started matching broad system-surface prefixes
-    // (com.android.systemui, com.samsung., com.miui., etc.), a *later, unrelated*
-    // event — a status-bar update, a transient system dialog — could run
-    // checkGuardedScreen(), decide it isn't guarded, and unconditionally tear down
-    // an overlay that a *different, still-valid* classification had armed moments
-    // earlier for the real guarded screen (e.g. the POST_DETECT_BLOCK_MS block, or
-    // even the 5-minute hard lock). That reopened exactly the tap-through gap this
-    // whole watchdog exists to close.
+    // FIX (race that survived the WATCHED_PACKAGES/isLikelySystemSurface widening —
+    // v2, corrected): checkGuardedScreen() used to call removeTouchBlocker()
+    // unconditionally on its "not guarded" / "no root" early-exit paths. That's safe
+    // in isolation, but once isWatchedForUninstall started matching broad
+    // system-surface prefixes (com.android.systemui, com.samsung., com.miui.,
+    // etc.), a *later, unrelated* event — a status-bar update, swiping down the
+    // notification drawer, a transient system dialog — could run
+    // checkGuardedScreen(), decide it isn't guarded, and tear down an overlay a
+    // *different, still-valid* classification had armed moments earlier for the
+    // real guarded screen.
     //
-    // Fix mirrors the ratchet already used by blockTouchesBriefly(): each
-    // checkGuardedScreen() call only releases the block it itself is responsible
-    // for. expectedRelease is a snapshot of touchBlockUntil taken right after this
-    // event armed its own pre-check block; if touchBlockUntil has since moved past
-    // that snapshot, a different (and by definition later-armed, so more current)
-    // classification owns the block now, and this call must not cut it short — it
-    // just lets the existing scheduled removeTouchBlockerRunnable release it
-    // naturally when that block's own timer elapses.
-    private fun releaseIfStillOurs(expectedRelease: Long) {
-        if (touchBlockUntil <= expectedRelease) {
+    // A first attempt at this fix snapshotted touchBlockUntil right after arming
+    // this event's own pre-check block and only released if nothing had moved
+    // *past* that snapshot since. That's broken: if the confirmed-guarded block
+    // (POST_DETECT_BLOCK_MS or the hard lock) was already armed *before* this
+    // event's pre-check ran, the pre-check doesn't extend it (it's already
+    // further out), so the snapshot ends up numerically equal to touchBlockUntil
+    // — indistinguishable from "this is my own block" — and the notification-
+    // drawer swipe (or any other unrelated systemui event landing inside that
+    // window) would cancel the confirmed block anyway.
+    //
+    // Correct fix: track *confirmation*, not just the timestamp. guardConfirmedUntil
+    // is set only when checkGuardedScreen() itself classifies a screen as guarded
+    // (right before arming POST_DETECT_BLOCK_MS or the hard lock). The "not
+    // guarded" early-exit paths may only release the touch blocker while no
+    // confirmed-guarded block's window is currently running — regardless of which
+    // event happened to arm it or what the numbers coincidentally line up to.
+    private var guardConfirmedUntil = 0L
+
+    private fun releaseIfNotConfirmedGuarded() {
+        if (System.currentTimeMillis() >= guardConfirmedUntil) {
             removeTouchBlocker()
         }
     }
@@ -318,14 +327,7 @@ class AppAutomationService : AccessibilityService() {
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
             if (isStateChange || isKnownContentChange) {
                 blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
-                // Snapshot the release deadline immediately after arming our own
-                // pre-check block. If a different, overlapping event (e.g. a
-                // genuinely guarded Settings screen) has already armed a longer
-                // block — or does so before this call reaches its own early-exit
-                // paths — touchBlockUntil will read past this snapshot, and
-                // checkGuardedScreen() must not tear that down. See
-                // releaseIfStillOurs() below.
-                checkGuardedScreen(touchBlockUntil)
+                checkGuardedScreen()
             }
         }
 
@@ -367,14 +369,15 @@ class AppAutomationService : AccessibilityService() {
      * If matched and no guardian PIN unlock is active, bounces to Home and
      * fires a throttled guardian alert.
      */
-    private fun checkGuardedScreen(expectedRelease: Long) {
-        if (UninstallGuard.isUnlocked()) { releaseIfStillOurs(expectedRelease); return }
+    private fun checkGuardedScreen() {
+        if (UninstallGuard.isUnlocked()) { removeTouchBlocker(); return }
 
         val root = rootInActiveWindow ?: run {
             // Can't classify without a node tree — release the pre-check
             // block rather than leave touch frozen on a screen we never
-            // actually inspected.
-            releaseIfStillOurs(expectedRelease)
+            // actually inspected. (Never cuts short a confirmed-guarded
+            // block — see releaseIfNotConfirmedGuarded().)
+            releaseIfNotConfirmedGuarded()
             return
         }
         val text = collectAllText(root)
@@ -385,10 +388,12 @@ class AppAutomationService : AccessibilityService() {
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
         val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
         if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
-            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing)
-            // — drop the pre-check block immediately instead of waiting out
-            // its timer, so normal Settings use doesn't feel laggy.
-            releaseIfStillOurs(expectedRelease)
+            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing, or
+            // swiping down the notification drawer) — drop *our own* pre-check
+            // block immediately instead of waiting out its timer, so normal
+            // system use doesn't feel laggy. Still never cuts short a
+            // confirmed-guarded block armed by a different event.
+            releaseIfNotConfirmedGuarded()
             return
         }
 
@@ -409,6 +414,10 @@ class AppAutomationService : AccessibilityService() {
             // actually taking effect.
             blockTouchesBriefly(POST_DETECT_BLOCK_MS)
         }
+        // This screen is now CONFIRMED guarded — record how long that confirmation
+        // covers so no later "not guarded" classification from an unrelated event
+        // (e.g. a notification-drawer swipe) can tear this block down early.
+        guardConfirmedUntil = touchBlockUntil
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
