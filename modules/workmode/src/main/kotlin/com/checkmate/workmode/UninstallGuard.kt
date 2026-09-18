@@ -63,7 +63,14 @@ object UninstallGuard {
 
     // Minimum time between PIN (re)generations — stops a student from
     // spamming "generate" to flood the guardian's Telegram.
-    private const val REGEN_COOLDOWN_MS = 5 * 60 * 1000L
+    //
+    // 2026-09: bumped from 5 minutes to ~7 months (210 days) as a hard
+    // commitment lock — the "Generate PIN" button stays visible and tappable,
+    // but generateAndSendGuardianPin() below refuses every call until this
+    // window has fully elapsed since the last generation. This is a rolling
+    // duration off KEY_LAST_GENERATED, not a fixed calendar date — if that's
+    // ever needed instead, compare against a stored target timestamp here.
+    private const val REGEN_COOLDOWN_MS = 210L * 24 * 60 * 60 * 1000L
 
     // Brute-force protection on the unlock field itself.
     private const val MAX_FAILED_ATTEMPTS = 5
@@ -127,8 +134,44 @@ object UninstallGuard {
         // apps" service list (where Checkmate's accessibility toggle actually
         // lives on One UI) runs under this package, so it needed its own entry
         // or that screen was invisible to WATCHED_PACKAGES entirely.
-        "com.samsung.accessibility"
+        "com.samsung.accessibility",
+        // CONFIRMED via `adb shell dumpsys window | grep mCurrentFocus` on this
+        // device: the OnePlus/ColorOS per-app Battery screen (PowerControlActivity,
+        // reached via Settings → Apps → Checkmate → Battery, with the Force stop
+        // button on it) runs under this package, not com.android.settings. Already
+        // covered by the "com.oplus." prefix in isLikelySystemSurface() below for the
+        // STATE_CHANGED path; listed here too so the CONTENT_CHANGED path also
+        // applies to it, in case that screen swaps tabs without a full window change.
+        "com.oplus.battery"
     )
+
+    // LOOPHOLE FIX (Force Stop reachable via a Battery/App-info card that doesn't run
+    // under "com.android.settings" — e.g. a floating "app info" bubble hosted by
+    // SystemUI, or a OnePlus/ColorOS-specific Settings fork): rather than guess this
+    // device's exact package name for that surface (a wrong guess would silently
+    // exempt nothing), match by prefix against the OEM/system packages that are
+    // plausible hosts for such a screen. AppAutomationService only uses this to widen
+    // which windows get the (already name+keyword gated) guarded-screen text scan on
+    // window-open events — it does NOT change what counts as guarded. checkGuardedScreen()
+    // still requires "checkmate" + a GUARD_KEYWORDS match before it acts, so widening
+    // which packages get scanned can't introduce a false positive on an unrelated
+    // system screen.
+    private val SYSTEM_PACKAGE_PREFIXES = listOf(
+        "com.android.systemui",
+        "com.android.settings",
+        "com.oneplus.",
+        "com.oplus.",
+        "com.coloros.",
+        "com.samsung.",
+        "com.miui.",
+        "com.xiaomi."
+    )
+
+    /** True if [pkg] looks like an OS/OEM system surface (Settings/SystemUI fork) worth
+     *  scanning for a guarded screen, even though it isn't one of the specific
+     *  [WATCHED_PACKAGES] entries above. */
+    fun isLikelySystemSurface(pkg: String): Boolean =
+        SYSTEM_PACKAGE_PREFIXES.any { pkg == it || pkg.startsWith(it) }
 
     // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
     // on both the activate AND deactivate device-admin paths. It never
@@ -213,9 +256,10 @@ object UninstallGuard {
     }
 
     /**
-     * Human-readable form of [regenCooldownRemainingSeconds]. Picks the coarsest
-     * unit that still reads naturally: days once over an hour, otherwise
-     * minutes/seconds.
+     * Human-readable form of [regenCooldownRemainingSeconds] — now that
+     * REGEN_COOLDOWN_MS spans months rather than minutes, a raw second count
+     * (e.g. "18143987s") is useless in the UI. Picks the coarsest unit that
+     * still reads naturally: days once over an hour, otherwise minutes/seconds.
      */
     fun regenCooldownRemainingLabel(): String {
         val totalSeconds = regenCooldownRemainingSeconds()
