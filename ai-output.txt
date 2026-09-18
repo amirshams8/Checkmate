@@ -1,546 +1,596 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
-package com.checkmate.service
+//===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+package com.checkmate.automation
 
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
+import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.graphics.PixelFormat
 import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import com.checkmate.automation.AutomationEngine
-import com.checkmate.core.AppUsageTracker
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.core.DailyChecklist
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.model.TaskState
-import com.checkmate.psyche.PsycheEngine
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.TrustedTime
 import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeSchedule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import java.util.Calendar
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
 
-object GuardianNotifier {
+class AppAutomationService : AccessibilityService() {
 
-   private const val TAG = "GuardianNotifier"
-   const val ACTION_EOD_SUMMARY   = "com.checkmate.EOD_SUMMARY"
-   // Fires every 30 min — pushes a Telegram usage alert AND caches the same
-   // report in the worker's KV so a guardian texting "usage" any time in
-   // between gets an instant cached reply instead of nothing.
-   const val ACTION_USAGE_REPORT  = "com.checkmate.USAGE_REPORT"
-   // Fires weekly — builds PsycheEngine's weekly report and pushes it to
-   // the guardian. Previously nothing ever called this: PsycheEngine.
-   // getGuardianWeeklyReport() built the report string but no alarm,
-   // receiver, or call site existed anywhere in the app, so the weekly
-   // report never actually went out. This action + its alarm/receiver is
-   // the fix.
-   const val ACTION_WEEKLY_REPORT = "com.checkmate.WEEKLY_REPORT"
+    private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
+    private val WHATSAPP = "com.whatsapp"
 
-   // GuardianNotifier is a singleton object living for the app process's
-   // lifetime, same as it being wired from CheckmateApp.onCreate — a
-   // module-level scope here follows the same pattern used by long-lived
-   // services elsewhere (e.g. AttentionCycleService, ReminderService).
-   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // How long to freeze touch the instant a *new* watched-package screen
+    // appears, before checkGuardedScreen() has even read+classified it. This
+    // has to cover the rootInActiveWindow() binder call + collectAllText()'s
+    // node walk, which is the real source of the exploitable gap — a fast or
+    // auto-tap can beat detection itself, not just the Home transition.
+    private val PRE_CHECK_BLOCK_MS = 350L
+    // How long to hold the block once a screen IS confirmed guarded, giving
+    // GLOBAL_ACTION_HOME time to actually take effect.
+    private val POST_DETECT_BLOCK_MS = 700L
+    private val SELF_PKG get() = packageName // "com.checkmate"
 
-   fun notifyTaskStarted(context: Context, subject: String, topic: String, durationMinutes: Int) {
-       val number = getGuardianNumber() ?: return
-       val msg = "Checkmate: Started $subject — $topic (${durationMinutes}min) at ${timeNow()}"
-       openWhatsAppAndSend(context, number, msg)
-       Log.d(TAG, "Guardian notified: task started")
-   }
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
 
-   // Mentor v2 (spec 3.6): distractionApp is the label of whatever app was foregrounded
-   // right before the skip (from AppUsageTracker.getMostRecentForegroundApp, captured by
-   // HomeViewModel.markSkip). Null/blank means nothing was detected in the lookback window —
-   // message falls back to the original skip-only wording so this never regresses when usage
-   // access isn't granted.
-   fun notifySkipStreak(context: Context, skipCount: Int, lastTopic: String, distractionApp: String? = null) {
-       val number = getGuardianNumber() ?: return
-       val distractionClause = if (!distractionApp.isNullOrBlank()) " $distractionApp was open right before." else ""
-       val msg = "Checkmate Alert: $skipCount tasks skipped in a row. Last: $lastTopic.$distractionClause Time: ${timeNow()}"
-       openWhatsAppAndSend(context, number, msg)
-       Log.d(TAG, "Guardian notified: skip streak=$skipCount distractionApp=$distractionApp")
-   }
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
 
-   fun scheduleEndOfDaySummary(context: Context) {
-       val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-       val pi = PendingIntent.getBroadcast(
-           context, 9001,
-           Intent(context, EodSummaryReceiver::class.java).apply { action = ACTION_EOD_SUMMARY },
-           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-       )
-       val cal = Calendar.getInstance().apply {
-           set(Calendar.HOUR_OF_DAY, 21)
-           set(Calendar.MINUTE, 0)
-           set(Calendar.SECOND, 0)
-           set(Calendar.MILLISECOND, 0)
-           if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 1)
-       }
-       am.setRepeating(AlarmManager.RTC_WAKEUP, cal.timeInMillis, AlarmManager.INTERVAL_DAY, pi)
-       Log.d(TAG, "EOD summary alarm set for 21:00 daily")
-   }
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
 
-   /**
-    * Schedules a repeating alarm every 30 min that pushes an app-usage
-    * report to the guardian via Telegram (sendAppUsageReport). Independent
-    * of whether a focus session is active — this is a standalone "Digital
-    * Wellbeing" style check-in, not tied to AttentionCycleService.
-    */
-   fun scheduleUsageReports(context: Context) {
-       val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-       val pi = PendingIntent.getBroadcast(
-           context, 9002,
-           Intent(context, UsageReportReceiver::class.java).apply { action = ACTION_USAGE_REPORT },
-           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-       )
-       am.setRepeating(
-           AlarmManager.RTC_WAKEUP,
-           System.currentTimeMillis() + AlarmManager.INTERVAL_HALF_HOUR,
-           AlarmManager.INTERVAL_HALF_HOUR,
-           pi
-       )
-       Log.d(TAG, "Usage report alarm set for every 30 min")
-   }
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
 
-   /**
-    * Schedules a repeating weekly alarm (every 7 days, Sunday 20:00) that
-    * builds and delivers PsycheEngine's weekly report. This was previously
-    * missing entirely — PsycheEngine.getGuardianWeeklyReport() existed and
-    * worked, but nothing ever scheduled or invoked it, so no weekly report
-    * was ever sent. Mirrors the same fixed-clock-time am.setRepeating
-    * pattern as the EOD summary and usage-report alarms above, just with a
-    * 7-day interval and a day-of-week anchor instead of a daily one.
-    */
-   fun scheduleWeeklyReport(context: Context) {
-       val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-       val pi = PendingIntent.getBroadcast(
-           context, 9003,
-           Intent(context, WeeklyReportReceiver::class.java).apply { action = ACTION_WEEKLY_REPORT },
-           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-       )
-       val cal = Calendar.getInstance().apply {
-           set(Calendar.DAY_OF_WEEK, Calendar.SUNDAY)
-           set(Calendar.HOUR_OF_DAY, 20)
-           set(Calendar.MINUTE, 0)
-           set(Calendar.SECOND, 0)
-           set(Calendar.MILLISECOND, 0)
-           if (timeInMillis < System.currentTimeMillis()) add(Calendar.DAY_OF_YEAR, 7)
-       }
-       am.setRepeating(
-           AlarmManager.RTC_WAKEUP,
-           cal.timeInMillis,
-           AlarmManager.INTERVAL_DAY * 7,
-           pi
-       )
-       Log.d(TAG, "Weekly report alarm set for Sunday 20:00, every 7 days")
-   }
+    // Throttle for reconciling WorkModeManager against the hardcoded daily
+    // schedule (WorkModeSchedule) — cheap timestamp check, real work only
+    // happens at most once per 30s even though accessibility events can
+    // fire dozens of times a second.
+    private var lastScheduleCheckAt = 0L
 
-   /**
-    * Builds and sends the daily report to the guardian — tasks, checklist,
-    * and (new) an on-device app usage breakdown for the day, Digital
-    * Wellbeing-style. Sent via WhatsApp (existing path) and, if a Telegram
-    * chat id is configured, also pushed straight to the guardian bot so the
-    * Telegram channel carries the same usage history, not just screenshots.
-    */
-   fun sendEndOfDaySummary(context: Context) {
-       val number = getGuardianNumber()
-       val tasks   = PlanStore.getTodayTasksSnapshot_Sync()
-       val done    = tasks.count { it.state == TaskState.DONE }
-       val skipped = tasks.count { it.state == TaskState.SKIPPED }
-       val total   = tasks.size
-       val pct     = if (total > 0) done * 100 / total else 0
+    // Last foreground package, used only to detect when a ScrollGuard-watched
+    // app leaves the foreground so its scroll session resets cleanly.
+    private var lastForegroundPkg = ""
 
-       val taskLines = tasks.joinToString("\n") { t ->
-           val icon = when (t.state) {
-               TaskState.DONE    -> "done"
-               TaskState.SKIPPED -> "skip"
-               else              -> "miss"
-           }
-           "[$icon] ${t.subject}: ${t.topic}"
-       }
+    // ── Guarded-screen touch blocker ────────────────────────────────────────
+    // checkGuardedScreen() only fires on an accessibility event (window
+    // state/content changed), and performGlobalAction(GLOBAL_ACTION_HOME)
+    // itself takes a beat to actually navigate away. In that gap the guarded
+    // screen (e.g. the accessibility service's own "Installed apps" toggle,
+    // or the uninstall confirmation) is still fully tappable — fast/repeated
+    // tapping ("brute forcing") can hit the real Disable/Uninstall button
+    // before Home takes effect. TYPE_ACCESSIBILITY_OVERLAY lets an
+    // AccessibilityService add a system-level window without the
+    // SYSTEM_ALERT_WINDOW permission; a full-screen, transparent, non-focusable
+    // instance of it still swallows every touch that lands on it, which is
+    // exactly what's needed to close that window without changing anything
+    // about how the guard screen is detected.
+    private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private var touchBlockerView: View? = null
+    private val touchBlockerHandler = Handler(Looper.getMainLooper())
+    private val removeTouchBlockerRunnable = Runnable { removeTouchBlocker() }
 
-       val checklistSummary = DailyChecklist.getTodaySummaryText()
-       val usageSummary = AppUsageTracker.buildUsageReportText(context)
-       val candidateName = ConsultationProfile.candidateDisplayName()
+    // Absolute timestamp (epoch ms) the current block is scheduled to release at.
+    // FIX: blockTouchesBriefly() used to unconditionally cancel+reschedule the
+    // removal for whatever duration it was called with — including PRE_CHECK_BLOCK_MS
+    // (350ms), which fires on *every* qualifying accessibility event. When
+    // GLOBAL_ACTION_HOME was triggered from checkGuardedScreen() (after arming a
+    // longer POST_DETECT_BLOCK_MS block, or the 5-minute HARD_LOCK), the guarded
+    // Settings window would keep emitting trailing CONTENT_CHANGED events while it
+    // tore down, each re-entering onAccessibilityEvent and re-calling
+    // blockTouchesBriefly(PRE_CHECK_BLOCK_MS) — silently cutting the longer block
+    // (even the 5-minute hard lock) down to 350ms. touchBlockUntil tracks the
+    // furthest-out release time requested so far; a later call can only extend it,
+    // never shorten it.
+    private var touchBlockUntil = 0L
 
-       val msg = buildString {
-           appendLine("Checkmate Daily Report — ${dateToday()}")
-           appendLine("Candidate: $candidateName")
-           appendLine("Tasks: $done/$total ($pct%)")
-           if (skipped > 0) appendLine("Skipped: $skipped")
-           appendLine()
-           appendLine(taskLines)
-           if (checklistSummary.isNotBlank()) {
-               appendLine()
-               appendLine(checklistSummary)
-           }
-           appendLine()
-           appendLine(usageSummary)
-       }.trim()
+    /**
+     * Adds a full-screen, invisible, touch-swallowing overlay so nothing under it
+     * can be tapped, then auto-removes itself after [durationMs]. Safe to call
+     * repeatedly while a guarded screen keeps re-triggering the watchdog — it just
+     * extends the existing overlay's lifetime instead of stacking a second window,
+     * and (see [touchBlockUntil]) a shorter subsequent call can never cut short a
+     * longer block already in flight.
+     */
+    private fun blockTouchesBriefly(durationMs: Long = 700L) {
+        val requestedUntil = System.currentTimeMillis() + durationMs
+        if (requestedUntil <= touchBlockUntil) {
+            // A longer block (POST_DETECT_BLOCK_MS or the hard lock) is already
+            // scheduled to release later than this request would — ignore, don't
+            // shorten it.
+            return
+        }
+        touchBlockUntil = requestedUntil
 
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-           Log.d(TAG, "EOD summary sent to guardian via WhatsApp")
-       }
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        if (touchBlockerView == null) {
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            val view = View(this)
+            try {
+                windowManager.addView(view, params)
+                touchBlockerView = view
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "touch blocker overlay failed to add", e)
+                touchBlockUntil = 0L
+                return
+            }
+        }
+        touchBlockerHandler.postDelayed(removeTouchBlockerRunnable, durationMs)
+    }
 
-       // Push the same report straight to the Telegram bot, independent of
-       // the WhatsApp path, so guardians who only use Telegram still get it.
-     if (TelegramAlertBot.getChatId() != null) {
-           Thread {
-             TelegramAlertBot.sendAlert(context, msg)
-               Log.d(TAG, "EOD summary sent to guardian via Telegram")
-           }.start()
-       }
+    private fun removeTouchBlocker() {
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        touchBlockUntil = 0L
+        val view = touchBlockerView ?: return
+        touchBlockerView = null
+        try {
+            windowManager.removeView(view)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "touch blocker overlay failed to remove", e)
+        }
+    }
 
-       // Step 12 wiring: piggyback the Outcome Ledger's daily backup push on the same
-       // once-a-day cadence as the EOD summary itself, rather than giving it a separate
-       // alarm — the ledger only grows by a handful of rows a day (see
-       // OutcomeLedgerSyncManager's own doc), so there's no reason for its own schedule.
-       // No-op internally if no sync_code is configured.
-     OutcomeLedgerSyncManager.pushLedger(context)
+    // FIX (race that survived the WATCHED_PACKAGES/isLikelySystemSurface widening):
+    // checkGuardedScreen() used to call removeTouchBlocker() unconditionally on its
+    // "not guarded" / "no root" early-exit paths. That's safe in isolation, but once
+    // isWatchedForUninstall started matching broad system-surface prefixes
+    // (com.android.systemui, com.samsung., com.miui., etc.), a *later, unrelated*
+    // event — a status-bar update, a transient system dialog — could run
+    // checkGuardedScreen(), decide it isn't guarded, and unconditionally tear down
+    // an overlay that a *different, still-valid* classification had armed moments
+    // earlier for the real guarded screen (e.g. the POST_DETECT_BLOCK_MS block, or
+    // even the 5-minute hard lock). That reopened exactly the tap-through gap this
+    // whole watchdog exists to close.
+    //
+    // Fix mirrors the ratchet already used by blockTouchesBriefly(): each
+    // checkGuardedScreen() call only releases the block it itself is responsible
+    // for. expectedRelease is a snapshot of touchBlockUntil taken right after this
+    // event armed its own pre-check block; if touchBlockUntil has since moved past
+    // that snapshot, a different (and by definition later-armed, so more current)
+    // classification owns the block now, and this call must not cut it short — it
+    // just lets the existing scheduled removeTouchBlockerRunnable release it
+    // naturally when that block's own timer elapses.
+    private fun releaseIfStillOurs(expectedRelease: Long) {
+        if (touchBlockUntil <= expectedRelease) {
+            removeTouchBlocker()
+        }
+    }
 
-       // "Sync everything" pass: same once-a-day piggyback for the behavior event
-       // ledger — see BehaviorLedgerSyncManager's own doc. No-op if no sync_code
-       // is configured.
-     BehaviorLedgerSyncManager.pushLedger(context)
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "=== AutomationService CONNECTED ===")
+    }
 
-       // Same nightly cadence for the remaining bounded "current state" blobs
-       // (Mentor history, checklist template, coaching entries — see
-       // StudyStateSyncManager's own doc) and for the full day-by-day plan/
-       // checklist/check-in history (see DayHistorySyncManager's own doc).
-       // Unlike OutcomeLedgerSyncManager/BehaviorLedgerSyncManager above (which
-       // own their own IO-scoped coroutine internally), these two use plain
-       // synchronous OkHttp calls, same style as ProfileSyncManager — so they're
-       // backgrounded here explicitly, matching the Telegram send's Thread{}
-       // wrap just above. sendEndOfDaySummary() itself runs on EodSummaryReceiver's
-       // onReceive (main thread, no background dispatch of its own), so skipping
-       // this wrap would throw NetworkOnMainThreadException.
-       Thread {
-         StudyStateSyncManager.pushState()
-         DayHistorySyncManager.pushHistory()
-       }.start()
-   }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
 
-   /**
-    * Sends the app usage breakdown to the guardian via Telegram (active
-    * push, fired every 30 min by scheduleUsageReports), AND caches the same
-    * report in the worker's KV so a guardian who texts "usage" any time in
-    * between scheduled pushes still gets an instant on-demand reply
-    * (worker.js: /usage cache + "usage" command — see Cloudflare Worker).
-    * Cached data is at most ~30 min stale, never live — the worker only
-    * ever replies from cache, it never wakes the phone.
-    */
-   fun sendAppUsageReport(context: Context) {
-     if (TelegramAlertBot.getChatId() == null) {
-           Log.w(TAG, "telegram_chat_id not set — skipping usage report")
-           return
-       }
-       val report = AppUsageTracker.buildUsageReportText(context)
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val text = "Checkmate — ${dateToday()}\nCandidate: $candidateName\n$report"
-       Thread {
-         TelegramAlertBot.sendAlert(context, text)
-           // Cache carries the candidate line too, since the worker's "usage"
-           // command replies with exactly this cached string.
-         StatusReporter.pushUsageReport(context, "Candidate: $candidateName\n$report")
-           Log.d(TAG, "Usage report sent via Telegram + cached for on-demand 'usage' command")
-       }.start()
-   }
+        // ── Hardcoded schedule reconciliation ──────────────────────────────────
+        // Keeps Work Mode's forced 19:00-05:00 window (plus the extra Sun/Wed 01:00-15:10 window) enforced even if the
+        // student never starts a task, or if the process restarted mid-window
+        // and lost its in-memory isActive flag.
+        val now = System.currentTimeMillis()
+        if (now - lastScheduleCheckAt > 30_000L) {
+            lastScheduleCheckAt = now
+            TrustedTime.refreshIfNeeded(applicationContext)
+            WorkModeManager.evaluateSchedule(applicationContext)
+        }
 
-   /**
-    * Builds PsycheEngine's weekly report (streak, tasks missed, consistency,
-    * attention-check stats, week-over-week delta) and delivers it to the
-    * guardian via BOTH channels — WhatsApp (existing openWhatsAppAndSend
-    * path, same as the daily/EOD report) and Telegram (if a chat id is
-    * configured), matching sendEndOfDaySummary's dual-delivery pattern.
-    *
-    * PsycheEngine.getGuardianWeeklyReport() is a suspend fun (it may call
-    * out to LlmGateway), so this runs on GuardianNotifier's own IO-scoped
-    * coroutine rather than a raw Thread.
-    */
-   fun sendWeeklyReport(context: Context) {
-       val number = getGuardianNumber()
-     val hasTelegram = TelegramAlertBot.getChatId() != null
+        // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
+        // Deliberately independent of Work Mode / isEnforcing() — this applies
+        // at all times, not just during study sessions, per product decision.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != lastForegroundPkg) {
+            if (lastForegroundPkg in ScrollGuard.WATCHED_PACKAGES) {
+                ScrollGuard.onAppBackgrounded(lastForegroundPkg)
+            }
+            lastForegroundPkg = pkg
+        }
+        if (pkg in ScrollGuard.WATCHED_PACKAGES && event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (ScrollGuard.recordScroll(this, pkg)) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            return
+        }
 
-       if (number == null && !hasTelegram) {
-           Log.w(TAG, "No guardian number or Telegram chat id set — skipping weekly report")
-           return
-       }
+        // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────
+        // Independent of, and checked before, the normal Work Mode blocklist below:
+        // during the timed window opened by WorkModeManager.startPostSkipLockdown()
+        // (HomeViewModel.markSkip()), any app on the escalation watchlist is bounced
+        // immediately on first foreground — no 3-attempt grace period like the normal
+        // DistractionGuard flow. Still records the attempt (so the guardian alert and
+        // BehaviorLedger correlation data stay consistent), just doesn't wait for a
+        // 3rd try before acting.
+        if (WorkModeManager.isInPostSkipLockdown() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            pkg in WorkModeManager.getEscalationWatchlist()
+        ) {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            DistractionGuard.recordAppAttempt(this, pkg)
+            return
+        }
 
-       scope.launch {
-           val report = try {
-               PsycheEngine.getGuardianWeeklyReport()
-           } catch (e: Exception) {
-               Log.e(TAG, "Failed to build weekly report", e)
-               return@launch
-           }
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        // isEnforcing() (not the raw isActive flag) so the hardcoded window
+        // blocks apps even when no manual task session is running.
+        if (WorkModeManager.isEnforcing() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
-           if (number != null) {
-               openWhatsAppAndSend(context, number, report)
-               Log.d(TAG, "Weekly report sent to guardian via WhatsApp")
-           }
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
+                return
+            }
+        }
 
-           if (hasTelegram) {
-             TelegramAlertBot.sendAlert(context, report)
-               Log.d(TAG, "Weekly report sent to guardian via Telegram")
-           }
-       }
-   }
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
+            }
+        }
 
-   fun notifyDistractionAlert(
-       context: Context,
-       kind: String,
-       target: String,
-       screenshotUri: Uri? = null
-   ) {
-       val msg = when (kind) {
-           "app"    -> "⚠️ Checkmate Alert: Student attempted to open blocked app: $target " +
-                       "3 times during study session at ${timeNow()}."
-           "site"   -> "⚠️ Checkmate Alert: Student attempted to open blocked website: $target " +
-                       "3 times during study session at ${timeNow()}."
-           "scroll" -> "⚠️ Checkmate Alert: Student hit the continuous-scroll limit in $target " +
-                       "at ${timeNow()}."
-           else     -> "⚠️ Checkmate Alert: Student attempted to open blocked $target " +
-                       "3 times during study session at ${timeNow()}."
-       }
-       Log.w(TAG, "Distraction alert: $kind/$target")
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        //
+        // NOTE on why this now blocks on CONTENT_CHANGED too, not just
+        // STATE_CHANGED: on most OEM Settings builds, drilling from the
+        // "Accessibility" list into a specific service's detail screen (the
+        // one with the actual Disable toggle) does NOT open a new Activity —
+        // it's a fragment swap inside the same window. That transition only
+        // fires TYPE_WINDOW_CONTENT_CHANGED, never TYPE_WINDOW_STATE_CHANGED.
+        // The previous version only pre-armed the blocker on STATE_CHANGED,
+        // so that specific screen — the one that actually matters — never got
+        // the preemptive freeze; it still had to wait for checkGuardedScreen()
+        // to walk the node tree before blocking anything, which is exactly
+        // the gap a fast/repeated tap was winning.
+        //
+        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside
+        // Settings proper — e.g. an OEM "app info" card/bubble hosted by
+        // SystemUI or a OnePlus/ColorOS fork that doesn't run under
+        // "com.android.settings"): CONTENT_CHANGED stays gated to the known
+        // WATCHED_PACKAGES set (that's the specific fragment-swap fix above,
+        // and staying gated there avoids scanning every scroll/content tick
+        // system-wide). STATE_CHANGED — which only fires on window/activity
+        // transitions, not on every content tick — is now ALSO checked for any
+        // package matching UninstallGuard.isLikelySystemSurface(), which covers
+        // SystemUI and known Settings-fork prefixes without needing to guess
+        // this device's exact package name. checkGuardedScreen() itself is
+        // unchanged: it still requires BOTH "checkmate" text AND a guard
+        // keyword (e.g. "force stop") before it acts, so this widening can't
+        // introduce false positives on ordinary system-app screens.
+        val isWatchedForUninstall =
+            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
+            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            if (isStateChange || isKnownContentChange) {
+                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
+                // Snapshot the release deadline immediately after arming our own
+                // pre-check block. If a different, overlapping event (e.g. a
+                // genuinely guarded Settings screen) has already armed a longer
+                // block — or does so before this call reaches its own early-exit
+                // paths — touchBlockUntil will read past this snapshot, and
+                // checkGuardedScreen() must not tear that down. See
+                // releaseIfStillOurs() below.
+                checkGuardedScreen(touchBlockUntil)
+            }
+        }
 
-       val number = getGuardianNumber()
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-           Log.d(TAG, "Distraction alert sent via WhatsApp (text)")
-       }
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
 
-       Thread {
-         TelegramAlertBot.sendAlert(context, msg, screenshotUri)
-           Log.d(TAG, "Distraction alert sent via Telegram (screenshot)")
-       }.start()
-   }
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
 
-   /**
-    * Fired by CheckmateDeviceAdminReceiver and AppAutomationService's
-    * UninstallGuard watchdog whenever someone reaches a screen that could
-    * uninstall Checkmate, force-stop it, disable its device admin status,
-    * or disable its accessibility service. `reason` is a short machine tag
-    * (e.g. "settings_screen_blocked", "device_admin_disable_requested")
-    * kept out of the guardian-facing text but logged for debugging.
-    */
-   fun notifyUninstallAttempt(context: Context, reason: String) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = if (reason == "repeated_disable_attempt_hard_lock")
-           "🚨 Checkmate Security Alert: $candidateName tried to uninstall or disable Checkmate " +
-               "3 times in a row at ${timeNow()} on ${dateToday()}. The screen's touch input has " +
-               "been locked for 5 minutes."
-       else
-           "🚨 Checkmate Security Alert: $candidateName attempted to uninstall or disable " +
-               "Checkmate at ${timeNow()} on ${dateToday()}."
-       Log.w(TAG, "Uninstall attempt: reason=$reason")
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
 
-       val number = getGuardianNumber()
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-       }
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
+            }, 1200)
+        }
+    }
 
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
 
-   /**
-    * Fired by ProactiveMentor.consistencyCheckIfNeeded() once a gap of consecutive missed
-    * days (PlanStore.getConsecutiveMissedDays — no plan generated OR nothing completed)
-    * crosses the alert threshold. Previously nothing ever surfaced this pattern to the
-    * guardian at all — a student could go stretches with zero study and, short of manually
-    * reading the day-by-day plan history, nobody would notice.
-    */
-   fun notifyStudyInactivity(context: Context, missedDays: Int) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = "⚠️ Checkmate Alert: $candidateName has gone $missedDays days in a row with no " +
-                 "study recorded — no plan generated or nothing completed — as of ${timeNow()} " +
-                 "on ${dateToday()}."
-       Log.w(TAG, "Study inactivity alert: missedDays=$missedDays")
+    /**
+     * Scans the current window's visible text for either:
+     *  (a) "this is about Checkmate" + "this is an uninstall/force-stop/disable
+     *      screen" (looksLikeGuardedScreen — requires BOTH signals so we never
+     *      interfere with unrelated Settings browsing), or
+     *  (b) a name-agnostic OS/bypass screen that never mentions Checkmate at
+     *      all — the device-admin activate/deactivate prompt, or a Developer
+     *      Options screen exposing USB/Wireless debugging (the on-device path
+     *      to an `adb uninstall`/`adb shell pm disable` that skips this
+     *      watchdog entirely).
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert.
+     */
+    private fun checkGuardedScreen(expectedRelease: Long) {
+        if (UninstallGuard.isUnlocked()) { releaseIfStillOurs(expectedRelease); return }
 
-       val number = getGuardianNumber()
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-       }
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+        val root = rootInActiveWindow ?: run {
+            // Can't classify without a node tree — release the pre-check
+            // block rather than leave touch frozen on a screen we never
+            // actually inspected.
+            releaseIfStillOurs(expectedRelease)
+            return
+        }
+        val text = collectAllText(root)
+        val lower = text.lowercase()
 
-   /**
-    * Proactive Execution Engine — fixes a gap flagged in ActionExecutor's own comment:
-    * `PermittedAction.RequestGuardian` was always recognized and resolved the transaction,
-    * but nothing downstream ever notified anyone. Fired via
-    * [com.checkmate.planner.intervention.InterventionGuardianBridge] (wired from
-    * CheckmateApp.onCreate(), same pattern as InterventionNotificationBridge) right where
-    * the intervention pipeline observes `ExecutionOutcome.RequiresGuardianEscalation` —
-    * i.e. the student (or the LLM speaking for them, live in the AI Mentor negotiation)
-    * asked for a real person instead of continuing to negotiate with the app.
-    */
-   fun notifyInterventionGuardianRequest(context: Context, subject: String, topic: String) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = "🙋 Checkmate: $candidateName asked to talk to you instead of continuing " +
-                 "with the AI Mentor, about $subject — $topic, at ${timeNow()} on ${dateToday()}."
-       Log.d(TAG, "Intervention guardian request: $subject / $topic")
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
+        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
+        val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
+            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing)
+            // — drop the pre-check block immediately instead of waiting out
+            // its timer, so normal Settings use doesn't feel laggy.
+            releaseIfStillOurs(expectedRelease)
+            return
+        }
 
-       val number = getGuardianNumber()
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-       }
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
 
-   /**
-    * Fired by ProactiveMentor.holidayPromptIfNeeded() every Wednesday, once per week — a
-    * standing reminder for the guardian to review and mark any upcoming holiday, since that's
-    * the only way WorkModeSchedule's hardcoded window ever eases for a specific day (see
-    * HolidaySchedule). Purely informational; doesn't touch the holiday list itself.
-    */
-   fun notifyHolidayPrompt(context: Context) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = "🗓️ Checkmate: weekly holiday check-in for $candidateName. Any holidays " +
-                 "coming up? Mark them in the app's Settings \u2192 Work Mode \u2192 Holidays " +
-                 "(guardian PIN required) — a marked holiday reduces that day's lock to " +
-                 "1:00 AM \u2013 3:10 PM only, instead of the usual ${WorkModeSchedule.LABEL} schedule."
-       Log.d(TAG, "Holiday prompt sent")
+        // Three consecutive attempts (within the burst window — see UninstallGuard's
+        // CONSEC_RESET_MS) escalate from the normal brief touch-block to a full-screen,
+        // full-duration hard lock — the same touch-swallowing overlay used everywhere else in
+        // this class, just held for HARD_LOCK_DURATION_MS instead of POST_DETECT_BLOCK_MS.
+        val hardLock = UninstallGuard.recordGuardedAttempt()
+        if (hardLock) {
+            Log.w(GUARD_TAG, "3rd consecutive disable/uninstall attempt — hard-locking touch for 5 minutes")
+            blockTouchesBriefly(UninstallGuard.HARD_LOCK_DURATION_MS)
+            UninstallGuard.resetConsecutiveAttempts() // next hard lock needs a fresh burst
+        } else {
+            // Extend/refresh the block to cover the Home transition itself — the pre-check
+            // block above was only sized for classification, not for GLOBAL_ACTION_HOME
+            // actually taking effect.
+            blockTouchesBriefly(POST_DETECT_BLOCK_MS)
+        }
+        performGlobalAction(GLOBAL_ACTION_HOME)
 
-       val number = getGuardianNumber()
-       if (number != null) {
-           openWhatsAppAndSend(context, number, msg)
-       }
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+        if (UninstallGuard.shouldAlert()) {
+            val reason = if (hardLock) "repeated_disable_attempt_hard_lock" else "settings_screen_blocked"
+            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, reason)
+        }
+    }
 
-   /**
-    * Fired by BootReceiver when the device just booted into Safe Mode —
-    * Safe Mode disables all 3rd-party accessibility services and can bypass
-    * device-admin uninstall protection, which is the one gap this app
-    * cannot close from the app side. This is a best-effort notice only.
-    */
-   fun notifySafeModeBoot(context: Context) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = "⚠️ Checkmate Notice: $candidateName's device booted into Safe Mode at ${timeNow()} " +
-                 "on ${dateToday()}. Checkmate's protections are disabled while in Safe Mode."
-       Log.w(TAG, "Safe Mode boot detected")
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+    /** Depth-first collection of all text + content-description on screen, space-joined. */
+    private fun collectAllText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            node.text?.let { sb.append(it).append(' ') }
+            node.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
+    }
 
-   /**
-    * Generates a fresh 6-digit guardian PIN, stores only its hash on-device
-    * (UninstallGuard.storeNewPinHash), and sends the plaintext PIN to the
-    * guardian's Telegram chat — the only place it's ever visible. Whoever
-    * taps "Generate" on the phone (student or guardian) never sees the PIN
-    * itself, so generating a new one can't be used to self-authorize.
-    *
-    * Returns a short status string suitable for showing directly in the UI.
-    */
-   fun generateAndSendGuardianPin(context: Context, onResult: (success: Boolean, message: String) -> Unit) {
-     if (TelegramAlertBot.getChatId() == null) {
-           onResult(false, "Set Guardian Telegram Chat ID first")
-           return
-       }
-       if (!UninstallGuard.canRegeneratePin()) {
-           onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingSeconds()}s before generating another")
-           return
-       }
-       val pin = UninstallGuard.generateRandomPin()
-       UninstallGuard.storeNewPinHash(pin)
-       Thread {
-         TelegramAlertBot.sendAlert(
-               context,
-               "🔑 Checkmate Guardian PIN: $pin\n" +
-               "Enter this in the app to pass the uninstall-protection watchdog for 2 minutes. " +
-               "Keep it private from the student — anyone can request a new one from the phone, " +
-               "but only you ever see the code."
-           )
-           Log.d(TAG, "Guardian PIN generated and sent via Telegram")
-       }.start()
-       onResult(true, "New PIN sent to guardian via Telegram")
-   }
+    // ── URL scanning ──────────────────────────────────────────────────────────
 
-   /** Fired by the unlock screen when UninstallGuard reports a brute-force lockout. */
-   fun notifyPinBruteForce(context: Context) {
-       val candidateName = ConsultationProfile.candidateDisplayName()
-       val msg = "🚨 Checkmate Alert: $candidateName entered the wrong guardian PIN too many times " +
-                 "at ${timeNow()} on ${dateToday()}. Unlock is locked for 10 minutes."
-       Log.w(TAG, "Guardian PIN brute-force lockout triggered")
-     if (TelegramAlertBot.getChatId() != null) {
-         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
-       }
-   }
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
 
-   private fun openWhatsAppAndSend(context: Context, number: String, message: String) {
-       val clean = number.replace(Regex("[^0-9]"), "")
-       if (clean.isBlank()) { Log.e(TAG, "Empty guardian number"); return }
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
 
-       AutomationEngine.queueWhatsAppMessage(message)
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
 
-       val intentA = Intent(Intent.ACTION_VIEW,
-           Uri.parse("whatsapp://send?phone=$clean")).apply {
-           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-       }
-       if (runCatching { context.startActivity(intentA) }.isSuccess) {
-           Log.d(TAG, "WhatsApp opened via method A"); return
-       }
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
 
-       val intentB = Intent(Intent.ACTION_VIEW,
-           Uri.parse("https://wa.me/$clean")).apply {
-           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-       }
-       runCatching { context.startActivity(intentB) }
-           .onSuccess { Log.d(TAG, "WhatsApp opened via method B") }
-           .onFailure { Log.e(TAG, "Both WA methods failed: ${it.message}") }
-   }
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
+    }
 
-   private fun getGuardianNumber(): String? {
-       val n = CheckmatePrefs.getString("guardian_number", null)
-       if (n.isNullOrBlank()) { Log.w(TAG, "Guardian number not set"); return null }
-       return n
-   }
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
+        }
 
-   private fun timeNow(): String {
-       val c = Calendar.getInstance()
-       return String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
-   }
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
 
-   private fun dateToday(): String {
-       val c = Calendar.getInstance()
-       return String.format("%02d/%02d/%04d",
-           c.get(Calendar.DAY_OF_MONTH), c.get(Calendar.MONTH) + 1, c.get(Calendar.YEAR))
-   }
-}
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
+    }
 
-class EodSummaryReceiver : BroadcastReceiver() {
-   override fun onReceive(context: Context, intent: Intent?) {
-       if (intent?.action == GuardianNotifier.ACTION_EOD_SUMMARY)
-           GuardianNotifier.sendEndOfDaySummary(context)
-   }
-}
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
 
-class UsageReportReceiver : BroadcastReceiver() {
-   override fun onReceive(context: Context, intent: Intent?) {
-       if (intent?.action == GuardianNotifier.ACTION_USAGE_REPORT)
-           GuardianNotifier.sendAppUsageReport(context)
-   }
-}
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
 
-class WeeklyReportReceiver : BroadcastReceiver() {
-   override fun onReceive(context: Context, intent: Intent?) {
-       if (intent?.action == GuardianNotifier.ACTION_WEEKLY_REPORT)
-           GuardianNotifier.sendWeeklyReport(context)
-   }
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
+        val inputNode =
+            findNodeById(root, "com.whatsapp:id/entry")
+                ?.also { Log.d(TAG, "input via id/entry") }
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
+            ?: findNodeByClass(root, "android.widget.EditText")
+                ?.also { Log.d(TAG, "input via EditText fallback") }
+
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
+
+        typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
+
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
+
+        AutomationEngine.consumePendingWhatsAppMessage()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
+            val sendNode =
+                findNodeById(freshRoot, "com.whatsapp:id/send")
+                    ?.also { Log.d(TAG, "send btn via id/send") }
+                ?: findNodeByDesc(freshRoot, "Send")
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
+        }, 500)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    override fun onInterrupt() {
+        Log.d(TAG, "Service interrupted")
+        removeTouchBlocker()
+    }
+
+    override fun onDestroy() {
+        removeTouchBlocker()
+        super.onDestroy()
+    }
 }
 
 
