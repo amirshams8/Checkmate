@@ -3,8 +3,6 @@ package com.checkmate.workmode
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.provider.Settings as AndroidSettings
-import android.telecom.TelecomManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.StudyMode
@@ -40,27 +38,6 @@ object WorkModeManager {
     // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
     private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
     private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
-
-    // BUGFIX (silent delay never enforced): idempotency ledger for overdue-PENDING
-    // enforcement, plus the dynamically-detected top-time-consuming app for the current
-    // overdue window. See hasAppliedOverdueEnforcement/markOverdueEnforcementApplied/
-    // retainOverdueEnforcementOnly/setOverdueTopApp for the actual logic; these two keys
-    // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
-    private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
-    private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
-
-    // LOOPHOLE FIX (adaptive app block over-blocking): guardian-extendable exemption list,
-    // same comma-separated storage idiom as "escalation_watchlist". Use this for anything
-    // that can't be resolved dynamically via PackageManager (see essentialPackages()) — e.g.
-    // a doubt-solving app, or a device-specific system app that slips past the dynamic
-    // resolution below.
-    private const val KEY_ESSENTIAL_EXTRA = "essential_apps_extra"
-
-    // Fixed exemption: kept reachable during Work Mode for doubt-solving. Not resolvable
-    // dynamically (there's no Intent category for "the doubt-solving app"), so it's hardcoded
-    // here rather than left to whatever the guardian remembers to type into
-    // essential_apps_extra. Add more fixed exemptions the same way if needed.
-    private const val CHATGPT_PKG = "com.openai.chatgpt"
 
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
@@ -176,14 +153,7 @@ object WorkModeManager {
 
     // Mentor v2 (spec 3.4): post-skip escalation lockdown.
 
-    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip() —
-     *  and, as of the overdue-enforcement fix, from `app`'s OverdueEnforcementCoordinator
-     *  for a badly-overdue still-PENDING task. Deliberately the same function for both:
-     *  it's the identical consequence (temporary lockdown + escalation watchlist), just
-     *  reached by two different triggers — an explicit Skip tap, or silence past
-     *  threshold. Neither caller may pair this with a TaskState change other than what
-     *  that caller already legitimately does on its own terms (markSkip marks SKIPPED
-     *  for its own reasons; the overdue path must NOT mark anything). */
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip(). */
     fun startPostSkipLockdown(context: Context) {
         val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
             .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
@@ -197,26 +167,12 @@ object WorkModeManager {
     fun isInPostSkipLockdown(): Boolean =
         System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
 
-    /**
-     * Package names blocked on first foreground during a post-skip/overdue lockdown
-     * window — the permanent blocklist, plus a fixed distraction-prone watchlist
-     * (extendable via prefs), plus (BUGFIX, silent delay never enforced) whichever single
-     * app [setOverdueTopApp] most recently recorded as the top time-consumer during an
-     * overdue-PENDING window. That last piece is what lets this catch a student's actual
-     * procrastination target — a game, a browser tab, anything not on the fixed list —
-     * rather than only ever blocking the same static seven apps.
-     *
-     * [context] is threaded through to [getBlockedApps] so the essential-app exemption
-     * (launcher/dialer/Settings/ChatGPT) applies here too — the escalation watchlist is a
-     * superset of the permanent blocklist, so without this an essential app exempted from
-     * normal blocking would still get force-closed the moment a lockdown window opened.
-     */
-    fun getEscalationWatchlist(context: Context): Set<String> {
+    /** Package names blocked on first foreground during a post-skip lockdown window — the
+     *  permanent blocklist plus a fixed distraction-prone watchlist (extendable via prefs). */
+    fun getEscalationWatchlist(): Set<String> {
         val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
         val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
-        val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
-            ?.takeIf { it.isNotBlank() }
-        return getBlockedApps(context) + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet
     }
 
     /**
@@ -243,170 +199,10 @@ object WorkModeManager {
         }
     }
 
-    /**
-     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
-     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
-     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
-     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
-     * that a guardian toggled on manually or that the hardcoded schedule opened,
-     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
-     * fix; nothing outside this object needed to read it.
-     */
-    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
-
-    /**
-     * BUGFIX (silent delay never enforced): true once overdue enforcement has already
-     * been applied for this specific task id. [InterventionTriggerWorker] calls
-     * [OverdueEnforcementGateway.applyOverdueEnforcement] every ~15-minute cycle the task
-     * stays PENDING past threshold — this is what stops that from re-running
-     * startPostSkipLockdown()/re-detecting the top app on every single cycle
-     * (09:35 apply, 09:50 no-op, 10:05 no-op, ...) instead of exactly once per overdue
-     * episode. Keyed on StudyTask.id (a fresh UUID per generated task — see StudyTask's
-     * own doc — never reused across days), not a global flag, so one overdue task doesn't
-     * suppress detection for a different one.
-     */
-    fun hasAppliedOverdueEnforcement(taskId: String): Boolean =
-        overdueEscalatedIds().contains(taskId)
-
-    /** Records that overdue enforcement has now been applied for [taskId] — call exactly
-     *  once, from the same code path that calls [startPostSkipLockdown] for this reason. */
-    fun markOverdueEnforcementApplied(taskId: String) {
-        persistOverdueEscalatedIds(overdueEscalatedIds() + taskId)
-    }
-
-    /**
-     * Drops every escalated-task id NOT in [stillPendingTaskIds]. Call from
-     * [com.checkmate.service.WorkModeTaskReconciler] on every PlanStore.todayTasks
-     * emission — that's the one place that already observes every task leaving PENDING,
-     * regardless of why (started, done, skipped, reverted back to PENDING by
-     * GapTaskManager's resolveDoneConcept path, or dropped off today's list entirely by
-     * day rollover). A task that's since been resolved has nothing left to guard against
-     * re-escalating, and if it ever legitimately becomes PENDING again later (the
-     * GapTaskManager revert case), it deserves a fresh overdue evaluation rather than
-     * being permanently suppressed by a stale flag from its last time around.
-     *
-     * Also clears the detected top-app watchlist entry once nothing is left escalated, so
-     * a stale detection from an already-resolved delay doesn't linger in
-     * [getEscalationWatchlist] indefinitely.
-     */
-    fun retainOverdueEnforcementOnly(stillPendingTaskIds: Set<String>) {
-        val current = overdueEscalatedIds()
-        val retained = current.intersect(stillPendingTaskIds)
-        if (retained != current) persistOverdueEscalatedIds(retained)
-        if (retained.isEmpty() && current.isNotEmpty()) setOverdueTopApp(null)
-    }
-
-    /** Records which app [com.checkmate.core.AppUsageTracker.getTopAppInRange] found was
-     *  eating the most time during the current overdue-PENDING window — folded into
-     *  [getEscalationWatchlist] alongside the fixed watchlist. Pass null to clear it. */
-    fun setOverdueTopApp(pkg: String?) {
-        CheckmatePrefs.putString(KEY_OVERDUE_TOP_APP, pkg ?: "")
-    }
-
-    private fun overdueEscalatedIds(): Set<String> {
-        val saved = CheckmatePrefs.getString(KEY_OVERDUE_ESCALATED_TASK_IDS, "") ?: ""
-        return saved.split(",").filter { it.isNotBlank() }.toSet()
-    }
-
-    private fun persistOverdueEscalatedIds(ids: Set<String>) {
-        CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
-    }
-
-    /**
-     * LOOPHOLE FIX (adaptive app block over-blocking): packages that must never be treated
-     * as "blocked" no matter what's saved in "blocked_apps" — blocking the student's own
-     * launcher, phone/dialer, or system Settings app bricks device navigation outright
-     * (there'd be no way back to Home or Settings to even fix the block list), and ChatGPT
-     * is kept reachable for legitimate doubt-solving during study, per guardian policy.
-     *
-     * Launcher/dialer/Settings are resolved dynamically via PackageManager rather than
-     * hardcoded: exact package names for these vary across OEM skins (e.g. this device's
-     * Settings/launcher fork), and a wrong hardcoded guess would silently exempt nothing.
-     * ChatGPT has no resolvable Intent category ("the doubt-solving app" isn't a system
-     * role), so it's a fixed constant instead — add more the same way, or via
-     * "essential_apps_extra" for anything the guardian wants exempted without a rebuild.
-     */
-    fun essentialPackages(context: Context): Set<String> {
-        val pm = context.packageManager
-        val result = mutableSetOf<String>()
-
-        // Home launcher — query all resolvable launchers, not just the current default,
-        // so switching launchers later doesn't reopen this loophole.
-        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-        try {
-            pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.let { result.add(it) }
-            pm.queryIntentActivities(homeIntent, 0).forEach { info ->
-                info.activityInfo?.packageName?.let { result.add(it) }
-            }
-        } catch (_: Exception) { /* best-effort — never let this crash the guard */ }
-
-        // Phone / dialer
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
-                telecom?.defaultDialerPackage?.let { result.add(it) }
-            }
-            pm.resolveActivity(Intent(Intent.ACTION_DIAL), 0)?.activityInfo?.packageName?.let { result.add(it) }
-        } catch (_: Exception) { }
-
-        // System Settings app — covers OEM forks (e.g. OnePlus/ColorOS) regardless of
-        // their actual package name, since it's resolved by intent action, not guessed.
-        try {
-            pm.resolveActivity(Intent(AndroidSettings.ACTION_SETTINGS), 0)?.activityInfo?.packageName?.let {
-                result.add(it)
-            }
-        } catch (_: Exception) { }
-
-        // Never block Checkmate's own UI.
-        result.add(context.packageName)
-
-        // Fixed doubt-solving exemption.
-        result.add(CHATGPT_PKG)
-
-        // Guardian-extendable list — same comma-separated storage pattern as
-        // "escalation_watchlist" above.
-        val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""
-        extra.split(",").map { it.trim() }.filterTo(result) { it.isNotBlank() }
-
-        return result
-    }
-
-    /**
-     * BUGFIX (2026-09, hard-lock silently never firing): [essentialPackages] resolves
-     * "the Settings app" via ACTION_SETTINGS, but on this device (ColorOS/OnePlus) that
-     * resolves to the main Settings package only — the per-app Battery screen (with the
-     * Force Stop button, confirmed via dumpsys as "com.oplus.battery") is a SEPARATE
-     * system package that ACTION_SETTINGS never resolves to, so it was never covered.
-     *
-     * If that package (or any other package UninstallGuard treats as a guarded surface —
-     * see WATCHED_PACKAGES / isLikelySystemSurface) ends up in the guardian's saved
-     * "blocked_apps" list, [getBlockedApps] used to return it as blockable — which meant
-     * AppAutomationService's "blocked app" check fired and returned BEFORE its uninstall
-     * watchdog check ever ran, silently skipping checkGuardedScreen()/recordGuardedAttempt()
-     * entirely. The 3-strikes-in-a-row 5-minute hard lock (see UninstallGuard) could then
-     * never trigger no matter how many times Force Stop was tapped, since the counter
-     * never got a chance to increment.
-     *
-     * A guarded system surface should never be a blockable "distracting app" in the first
-     * place — this closes it at the source, on top of the ordering fix in
-     * AppAutomationService (belt-and-suspenders: neither alone should be relied on).
-     */
-    private fun isGuardedSystemSurface(pkg: String): Boolean =
-        pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
-
-    /**
-     * Returns package names of apps to block. [context] is required so the essential-app
-     * exemption above can be resolved and subtracted — whatever's saved under
-     * "blocked_apps" (via AppSelectorScreen) never overrides it, so an accidental or
-     * well-intentioned block of the launcher/Settings/dialer/ChatGPT can't brick
-     * navigation or cut off doubt-solving. Also never returns anything
-     * [isGuardedSystemSurface] considers a guarded surface (Settings/SystemUI/OEM
-     * system-app forks) — see that function's doc for why.
-     */
-    fun getBlockedApps(context: Context): Set<String> {
+    /** Returns package names of apps to block. */
+    fun getBlockedApps(): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
-        val requested = saved.split(",").filter { it.isNotBlank() }.toSet()
-        return requested - essentialPackages(context) - requested.filter { isGuardedSystemSurface(it) }.toSet()
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
     }
 
     /**
@@ -425,14 +221,4 @@ object WorkModeManager {
         else
             context.startService(intent)
     }
-
-    /**
-     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
-     * public (was folded into the private SOURCE_* consts before this fix) so
-     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
-     * own activate() calls and compare against [activeSource]. Kept as a plain
-     * string constant to match every other source tag's storage as raw
-     * CheckmatePrefs strings.
-     */
-    const val SOURCE_TASK = "task"
 }
