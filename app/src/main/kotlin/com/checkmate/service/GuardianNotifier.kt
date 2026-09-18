@@ -451,7 +451,7 @@ object GuardianNotifier {
            return
        }
        if (!UninstallGuard.canRegeneratePin()) {
-           onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingLabel()} before generating another")
+           onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingSeconds()}s before generating another")
            return
        }
        val pin = UninstallGuard.generateRandomPin()
