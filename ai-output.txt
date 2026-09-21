@@ -79,7 +79,9 @@ import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.learning.engine.RetentionEngine
 import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -180,6 +182,7 @@ object GapTaskManager {
      */
     suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
         generateIfNeededLocked(context)
+        generateRetentionIfNeededLocked(context)
     }
 
     private suspend fun generateIfNeededLocked(context: Context) {
@@ -295,6 +298,119 @@ object GapTaskManager {
         } catch (e: Exception) {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message} — day NOT marked, retry in " +
                 "${RETRY_INTERVAL_MS / 60_000L} min", e)
+        }
+    }
+
+    // ── Retention-check generation (its own lane) ────────────────────────────
+
+    // BUGFIX (retention checks never generated): a retention check used to require
+    // RetentionEngine's REVIEW verdict (mastery >= 0.83 AND forgettingRisk >= 0.5). With
+    // risk = (1 - e^(-days/14)) * (1 - mastery/2), a 0.85-mastery concept needs ~29 days
+    // unseen to reach 0.5 — no concept in a normal prep cycle ever qualified — and the
+    // candidate then had to out-rank every repair candidate for the single daily slot AND
+    // survive the covered-concept filter (covered = mastered = the only concepts eligible).
+    // This lane uses a plain spaced-repetition interval instead and runs independently of
+    // the gap-repair pass. RetentionEngine's own decay/thresholds are untouched.
+    private const val PREF_RETENTION_LAST_DAY = "retention_last_generated_day"
+    private const val PREF_RETENTION_LAST_ATTEMPT_MS = "retention_last_attempt_ms"
+    private const val RETENTION_REVIEW_INTERVAL_DAYS = 15.0
+    private const val MAX_RETENTION_TASKS_PER_DAY = 2
+    private const val RETENTION_TEST_MINUTES = 10
+    private const val MS_PER_DAY = 86_400_000.0
+
+    private suspend fun generateRetentionIfNeededLocked(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (CheckmatePrefs.getString(PREF_RETENTION_LAST_DAY, null) == todayKey) {
+            DebugTrail.d(TAG, "retentionGen: gate CLOSED — already handled today ($todayKey)")
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        val sinceMs = nowMs - CheckmatePrefs.getLong(PREF_RETENTION_LAST_ATTEMPT_MS, 0L)
+        if (sinceMs < RETRY_INTERVAL_MS) {
+            DebugTrail.d(TAG, "retentionGen: THROTTLED — last attempt ${sinceMs / 1000}s ago, skipping")
+            return
+        }
+        CheckmatePrefs.putLong(PREF_RETENTION_LAST_ATTEMPT_MS, nowMs)
+        DebugTrail.d(TAG, "retentionGen: pass START day=$todayKey interval=${RETENTION_REVIEW_INTERVAL_DAYS}d")
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) {
+                DebugTrail.w(TAG, "retentionGen: StudentModel EMPTY — will retry")
+                return
+            }
+            val outstandingChapters = (RetentionTaskLedger.pendingSessionCreation() +
+                RetentionTaskLedger.pendingEvidence()).mapNotNull { it.chapter }.toSet()
+
+            val highMastery = studentModel.concepts.values
+                .filter { it.mastery >= RetentionEngine.HIGH_MASTERY_THRESHOLD }
+            val scored = highMastery.map { snap ->
+                val days = snap.lastSeen?.let { (nowMs - it).coerceAtLeast(0L) / MS_PER_DAY }
+                snap to days
+            }
+            scored.forEach { (snap, days) ->
+                DebugTrail.d(TAG, "  retention-eligible concept=${snap.conceptId} chapter=${snap.chapter} " +
+                    "mastery=${snap.mastery} daysUnseen=$days due=${days != null && days >= RETENTION_REVIEW_INTERVAL_DAYS} " +
+                    "chapterOutstanding=${snap.chapter in outstandingChapters}")
+            }
+
+            // one candidate per chapter (concept ids can exist twice for the same chapter under
+            // different source prefixes), most overdue first
+            val ordered = scored
+                .mapNotNull { (snap, days) ->
+                    if (days == null || days < RETENTION_REVIEW_INTERVAL_DAYS) null
+                    else if (snap.chapter.isNullOrBlank() || snap.subject.isNullOrBlank()) null
+                    else if (snap.chapter in outstandingChapters) null
+                    else snap to days
+                }
+                .groupBy { it.first.subject to it.first.chapter }
+                .map { (_, group) -> group.maxByOrNull { it.second }!! }
+                .sortedByDescending { it.second }
+            DebugTrail.d(TAG, "retentionGen: highMastery=${highMastery.size} due(after chapter dedupe)=${ordered.size}")
+
+            var created = 0
+            val examType = ConsultationProfile.load().examTarget
+            for ((snap, days) in ordered) {
+                if (created >= MAX_RETENTION_TASKS_PER_DAY) break
+                val label = snap.topic ?: snap.chapter ?: "this concept"
+                val candidate = LearningDecisionEngine.CandidateIntervention(
+                    intent = LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST,
+                    conceptId = snap.conceptId,
+                    subject = snap.subject,
+                    chapter = snap.chapter,
+                    topic = snap.topic,
+                    durationMinutes = RETENTION_TEST_MINUTES,
+                    expectedGain = 0.0,
+                    priorityScore = days,
+                    rationale = "$label is well-mastered (%.0f%%) but unseen for %.0f days — a short recall check, not a re-teach."
+                        .format(snap.mastery * 100, days)
+                )
+                val report = LearningDecisionEngine.DecisionReport(
+                    studentId = studentModel.studentId,
+                    examType = examType,
+                    generatedAt = nowMs,
+                    candidates = listOf(candidate)
+                )
+                val result = LearningInterventionOrchestrator.from(context).executeTopCandidate(report)
+                DebugTrail.d(TAG, "retentionGen: concept=${snap.conceptId} outcome=${result.outcome::class.simpleName}")
+                result.rejections.forEach {
+                    DebugTrail.d(TAG, "  retention rejection source=${it.source} :: ${it.detail}")
+                }
+                val outcome = result.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created
+                if (outcome != null && outcome.executionOutcome is ExecutionOutcome.Applied) {
+                    created++
+                    DebugTrail.d(TAG, "retentionGen: CREATED retention check taskId=${outcome.taskId} concept=${snap.conceptId}")
+                }
+            }
+
+            if (created > 0 || ordered.isEmpty()) {
+                CheckmatePrefs.putString(PREF_RETENTION_LAST_DAY, todayKey)
+                DebugTrail.d(TAG, "retentionGen: day marked (created=$created, due=${ordered.size})")
+            } else {
+                DebugTrail.w(TAG, "retentionGen: ${ordered.size} due but none created — day NOT marked, retry hourly")
+            }
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "retentionGen failed: ${e.message}", e)
         }
     }
 
@@ -2614,8 +2730,14 @@ class LearningInterventionOrchestrator(
         // BUGFIX (duplicate task via re-ranking, part 2): resolved ONCE, before any
         // candidate is walked, so a re-rank that promotes a different concept to rank 1
         // can never slip a new task past a still-unresolved active one — see class doc.
+        // Retention checks have their own per-task ledger (RetentionTaskLedger) and never touch
+        // GapTaskLedger's single active-concept slot, so a report made up ONLY of retention
+        // candidates must not be blocked by an unresolved gap-repair task.
+        val retentionOnly = report.candidates.isNotEmpty() && report.candidates.all {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+        }
         val activeConceptId = GapTaskLedger.activeConceptId()
-        if (activeConceptId != null) {
+        if (activeConceptId != null && !retentionOnly) {
             val blockingTask = activeUnresolvedTask()
             if (blockingTask != null) {
                 // Attribute the rejection to whichever candidate this run's ranking would
@@ -2655,7 +2777,11 @@ class LearningInterventionOrchestrator(
             val rank = index + 1
 
             val conceptId = candidate.conceptId
-            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
+            // "Covered" means the gap was repaired — which is exactly when a retention check
+            // becomes relevant, so SCHEDULE_RETENTION_TEST is exempt from the covered filter.
+            if (conceptId != null && GapTaskLedger.isCovered(conceptId) &&
+                candidate.intent != LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+            ) {
                 rejections += CandidateRejection(
                     candidate = candidate,
                     rank = rank,
@@ -2860,6 +2986,175 @@ private class LoggingRejectionList : ArrayList<LearningInterventionOrchestrator.
         olog("REJECTED rank=${element.rank} concept=${element.candidate.conceptId} " +
             "intent=${element.candidate.intent} source=${element.source} :: ${element.detail}")
         return super.add(element)
+    }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/RetentionCheckManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import com.checkmate.core.DebugTrail
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.planner.intervention.RetentionTaskLedger
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateQuestionPool
+import com.checkmate.testmate.TestmateResultOutcome
+import com.checkmate.testmate.TestmateTargetedTestOutcome
+
+/**
+ * next-session-retention-loop.txt — the RETENTION CHECK execution/evidence path. Mirrors
+ * [GapTaskManager]'s P0b Testmate session/evidence functions exactly (same
+ * [TestmateApi.createTargetedTest] -> [TestmateApi.fetchResult] -> [TargetedTestEvidenceImporter]
+ * pipeline, reused rather than duplicated), but driven off
+ * [com.checkmate.planner.intervention.RetentionTaskLedger] instead of
+ * [com.checkmate.planner.intervention.GapTaskLedger] — see that ledger's own class doc for why
+ * retention checks get a separate, per-task ledger instead of joining GapTaskLedger's
+ * single-active-concept slot.
+ *
+ * Both entry points are called from [ReminderService]'s existing 15-min loop, same wiring
+ * pattern as every [GapTaskManager] function already there. Neither is gated to once/day —
+ * [createRetentionTestsIfNeeded] should fire the moment a RETENTION CHECK task exists with no
+ * session yet, and [evidencePollIfNeeded] should pick up a submitted result as soon as it's
+ * there, same reasoning as [GapTaskManager.createTargetedTestIfNeeded]/`evidencePollIfNeeded`.
+ *
+ * Deliberately does NOT push a new retention decision anywhere itself — see
+ * [RetentionTaskLedger]'s own doc for why that isn't needed: [MasteryEngine.recomputeAll]
+ * (called inside [TargetedTestEvidenceImporter.import]) already refreshes `lastSeen`/mastery
+ * for the concept, and [com.checkmate.learning.engine.RetentionEngine.decide] re-reads that on
+ * its own next pass through [com.checkmate.learning.engine.LearningDecisionEngine.decideFromReport]
+ * (i.e. [GapTaskManager.generateIfNeeded]'s next daily run). RetentionEngine's 14-day decay and
+ * REVIEW/TEACH/MOVE_ON thresholds are untouched — this file only closes the evidence loop
+ * around it, per next-session-retention-loop.txt's explicit constraint.
+ */
+object RetentionCheckManager {
+
+    private const val TAG = "RetentionCheckManager"
+
+    // A retention check is a short recall probe, not a full repair set — sized to match
+    // LearningDecisionEngine.RETENTION_TEST_MINUTES (10 min), the StudyTask duration a
+    // SCHEDULE_RETENTION_TEST candidate already carries.
+    private const val RETENTION_QUESTION_COUNT = 10
+
+    // HONEST GAP (flagged, not silently worked around): TestmateQuestionPool only offers
+    // WRONG / SKIPPED / WRONG_SKIPPED / NEW — there is no "previously answered correctly,
+    // retest for recall" pool, which is what a genuine retention probe should draw from.
+    // WRONG_SKIPPED is the closest available option and is what this uses today, but it
+    // means a "retention check" and a gap-repair retest currently pull from the same
+    // question pool on the Testmate side — testing what the student got wrong before, not
+    // whether they still remember what they'd already gotten right. Properly closing this
+    // needs a MASTERED/CORRECT pool added to Testmate's own `/api/tests/targeted` endpoint
+    // (testmate2.vercel.app) — that's a Testmate-side change, out of scope for this
+    // Checkmate-client-only pass, and NOT something to route around with client-side
+    // filtering of Testmate's response (Testmate selects the question set server-side).
+    private val RETENTION_POOL = TestmateQuestionPool.WRONG_SKIPPED
+
+    /**
+     * For every RETENTION CHECK task that doesn't have a Testmate session yet, requests one.
+     * `intervention_id = retention-<taskId>` is already unique per task (every retention
+     * task gets its own taskId from [LearningInterventionOrchestrator]), so — unlike
+     * [GapTaskManager]'s P0b round counter — there's no round-suffix bookkeeping needed here;
+     * a retry of an already-created session is naturally idempotent via Testmate's own
+     * intervention_id de-dupe (see [TestmateApi.createTargetedTest]'s own doc).
+     */
+    suspend fun createRetentionTestsIfNeeded() {
+        val pending = RetentionTaskLedger.pendingSessionCreation()
+        DebugTrail.d(TAG, "createRetentionTestsIfNeeded: ${pending.size} task(s) awaiting a Testmate session")
+        for (session in pending) {
+            val chapter = session.chapter?.takeIf { it.isNotBlank() }
+            if (chapter == null) {
+                DebugTrail.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
+                continue
+            }
+            // Same "only forward topic when it's genuinely distinct from chapter" rule
+            // GapTaskManager.createTargetedTestIfNeeded applies, for the same reason:
+            // GapTaskLedger/RetentionTaskLedger both fall back to the raw chapter string as
+            // their "no real topic" sentinel.
+            val topic = session.topic?.takeIf { it != chapter }
+
+            val interventionId = "retention-${session.taskId}"
+            val outcome = try {
+                TestmateApi.createTargetedTest(
+                    interventionId = interventionId,
+                    chapter = chapter,
+                    topic = topic,
+                    questionCount = RETENTION_QUESTION_COUNT,
+                    pool = RETENTION_POOL
+                )
+            } catch (e: Exception) {
+                DebugTrail.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
+                continue
+            }
+
+            when (outcome) {
+                is TestmateTargetedTestOutcome.Success -> {
+                    RetentionTaskLedger.recordTestmateSession(
+                        session.taskId, outcome.test.testId, outcome.test.sessionId
+                    )
+                    DebugTrail.d(TAG, "retention test ready: taskId=${session.taskId} session=${outcome.test.sessionId}")
+                }
+                is TestmateTargetedTestOutcome.Error -> {
+                    DebugTrail.w(TAG, "createTargetedTest error for taskId=${session.taskId}: ${outcome.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Every 15-min cycle: for every RETENTION CHECK task with a Testmate session whose
+     * result hasn't been imported yet, fetches it and — once the student has actually
+     * submitted (an [TestmateResultOutcome.Error], including Testmate's "no result yet" 404,
+     * just means try again next cycle) — hands the per-question breakdown to
+     * [TargetedTestEvidenceImporter], the exact same import path
+     * [GapTaskManager.evidencePollIfNeeded] already uses for gap-repair retests. This is
+     * the actual "student answers questions -> Testmate result -> QuestionAttempt +
+     * LearningEvent -> MasteryEngine" arrow the retention loop was missing.
+     */
+    suspend fun evidencePollIfNeeded(context: Context) {
+        val pending = RetentionTaskLedger.pendingEvidence()
+        DebugTrail.d(TAG, "retention evidencePoll: ${pending.size} session(s) awaiting a result")
+        for (session in pending) {
+            val sessionId = session.testmateSessionId ?: continue
+
+            val outcome = try {
+                TestmateApi.fetchResult(sessionId)
+            } catch (e: Exception) {
+                DebugTrail.w(TAG, "evidencePollIfNeeded fetch threw for taskId=${session.taskId}: ${e.message}")
+                continue
+            }
+            val result = when (outcome) {
+                is TestmateResultOutcome.Success -> outcome.result
+                is TestmateResultOutcome.Error -> {
+                    // not submitted yet (or a real failure) — retry next cycle
+                    DebugTrail.d(TAG, "retention evidencePoll: taskId=${session.taskId} result not available yet: $outcome")
+                    continue
+                }
+            }
+            if (result.breakdown.isEmpty()) {
+                DebugTrail.d(TAG, "retention evidencePoll: taskId=${session.taskId} empty breakdown — not ready")
+                continue // submitted but no per-question data yet
+            }
+
+            try {
+                val exam = ConsultationProfile.load().examTarget
+                TargetedTestEvidenceImporter.import(
+                    context = context,
+                    sessionId = sessionId,
+                    exam = exam,
+                    chapter = session.chapter,
+                    topic = session.topic,
+                    result = result,
+                    // Distinct source tag from gap-repair's "testmate_targeted" so a
+                    // LearningEvent/Question row's provenance is honest about which loop
+                    // produced it, without needing a schema change to either model.
+                    source = "testmate_retention"
+                )
+                RetentionTaskLedger.markEvidenceImported(session.taskId)
+                DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
+            } catch (e: Exception) {
+                DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
+            }
+        }
     }
 }
 
