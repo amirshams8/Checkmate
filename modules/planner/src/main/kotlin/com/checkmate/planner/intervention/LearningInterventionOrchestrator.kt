@@ -1,7 +1,7 @@
 package com.checkmate.planner.intervention
 
 import android.content.Context
-import android.util.Log
+import com.checkmate.core.DebugTrail
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
@@ -568,10 +568,9 @@ class LearningInterventionOrchestrator(
 
 private const val ORCH_TAG = "InterventionOrchestrator"
 
-/** Log.d that never throws — plain-JVM unit tests run against the stubbed android.jar where
- *  every android.util.Log call throws "not mocked". */
+/** Logs to logcat AND the persisted DebugTrail (never throws — see DebugTrail). */
 private fun olog(msg: String) {
-    try { Log.d(ORCH_TAG, msg) } catch (_: Throwable) {}
+    DebugTrail.d(ORCH_TAG, msg)
 }
 
 /** ArrayList that logs each [LearningInterventionOrchestrator.CandidateRejection] as it is added. */

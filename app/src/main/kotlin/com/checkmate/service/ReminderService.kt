@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
+import com.checkmate.core.DebugTrail
 import androidx.core.app.NotificationCompat
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
@@ -53,7 +53,7 @@ class ReminderService : Service() {
         startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
         scope.launch {
             while (isActive) {
-                Log.d(TAG, "cycle START")
+                DebugTrail.d(TAG, "cycle START")
                 // Bugfix ("old tasks not clearing at end of day"): PlanStore.todayTasks is
                 // only ever populated at process start or by a local write, so a DONE/SKIPPED
                 // task just sat there until the app restarted. Runs first each cycle so every
@@ -74,7 +74,7 @@ class ReminderService : Service() {
                     }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
-                    Log.e(TAG, "step 'cleanupCompletedIfDue' failed: ${e.message}", e)
+                    DebugTrail.e(TAG, "step 'cleanupCompletedIfDue' failed: ${e.message}", e)
                 }
                 step("checkPendingTasks") { checkPendingTasks() }
                 // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
@@ -123,7 +123,7 @@ class ReminderService : Service() {
                 step("RetentionCheckManager.evidencePoll") { RetentionCheckManager.evidencePollIfNeeded(applicationContext) }
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 step("pollRemoteOverride") { pollRemoteOverride() }
-                Log.d(TAG, "cycle END — sleeping 15 min")
+                DebugTrail.d(TAG, "cycle END — sleeping 15 min")
                 delay(15 * 60 * 1000L) // check every 15 min
             }
         }
@@ -136,11 +136,11 @@ class ReminderService : Service() {
         val t0 = System.currentTimeMillis()
         try {
             block()
-            Log.d(TAG, "step '$name' ok in ${System.currentTimeMillis() - t0}ms")
+            DebugTrail.d(TAG, "step '$name' ok in ${System.currentTimeMillis() - t0}ms")
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "step '$name' FAILED after ${System.currentTimeMillis() - t0}ms: ${e.message}", e)
+            DebugTrail.e(TAG, "step '$name' FAILED after ${System.currentTimeMillis() - t0}ms: ${e.message}", e)
         }
     }
 

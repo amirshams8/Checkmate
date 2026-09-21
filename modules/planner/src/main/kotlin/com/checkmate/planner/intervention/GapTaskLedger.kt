@@ -183,7 +183,7 @@ object GapTaskLedger {
     /** Log.d that never throws — this module's plain-JVM unit tests run against the stubbed
      *  android.jar where every android.util.Log call throws "not mocked". */
     private fun safeLog(msg: String) {
-        try { Log.d(TAG, msg) } catch (_: Throwable) {}
+        com.checkmate.core.DebugTrail.d(TAG, msg)
     }
 
     /**
