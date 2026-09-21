@@ -1,7 +1,7 @@
 package com.checkmate.service
 
 import android.content.Context
-import android.util.Log
+import com.checkmate.core.DebugTrail
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.testmate.TestmateApi
@@ -66,10 +66,11 @@ object RetentionCheckManager {
      */
     suspend fun createRetentionTestsIfNeeded() {
         val pending = RetentionTaskLedger.pendingSessionCreation()
+        DebugTrail.d(TAG, "createRetentionTestsIfNeeded: ${pending.size} task(s) awaiting a Testmate session")
         for (session in pending) {
             val chapter = session.chapter?.takeIf { it.isNotBlank() }
             if (chapter == null) {
-                Log.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
+                DebugTrail.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
                 continue
             }
             // Same "only forward topic when it's genuinely distinct from chapter" rule
@@ -88,7 +89,7 @@ object RetentionCheckManager {
                     pool = RETENTION_POOL
                 )
             } catch (e: Exception) {
-                Log.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
+                DebugTrail.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
                 continue
             }
 
@@ -97,10 +98,10 @@ object RetentionCheckManager {
                     RetentionTaskLedger.recordTestmateSession(
                         session.taskId, outcome.test.testId, outcome.test.sessionId
                     )
-                    Log.d(TAG, "retention test ready: taskId=${session.taskId} session=${outcome.test.sessionId}")
+                    DebugTrail.d(TAG, "retention test ready: taskId=${session.taskId} session=${outcome.test.sessionId}")
                 }
                 is TestmateTargetedTestOutcome.Error -> {
-                    Log.w(TAG, "createTargetedTest error for taskId=${session.taskId}: ${outcome.message}")
+                    DebugTrail.w(TAG, "createTargetedTest error for taskId=${session.taskId}: ${outcome.message}")
                 }
             }
         }
@@ -118,20 +119,28 @@ object RetentionCheckManager {
      */
     suspend fun evidencePollIfNeeded(context: Context) {
         val pending = RetentionTaskLedger.pendingEvidence()
+        DebugTrail.d(TAG, "retention evidencePoll: ${pending.size} session(s) awaiting a result")
         for (session in pending) {
             val sessionId = session.testmateSessionId ?: continue
 
             val outcome = try {
                 TestmateApi.fetchResult(sessionId)
             } catch (e: Exception) {
-                Log.w(TAG, "evidencePollIfNeeded fetch threw for taskId=${session.taskId}: ${e.message}")
+                DebugTrail.w(TAG, "evidencePollIfNeeded fetch threw for taskId=${session.taskId}: ${e.message}")
                 continue
             }
             val result = when (outcome) {
                 is TestmateResultOutcome.Success -> outcome.result
-                is TestmateResultOutcome.Error -> continue // not submitted yet (or a real failure) — retry next cycle
+                is TestmateResultOutcome.Error -> {
+                    // not submitted yet (or a real failure) — retry next cycle
+                    DebugTrail.d(TAG, "retention evidencePoll: taskId=${session.taskId} result not available yet: $outcome")
+                    continue
+                }
             }
-            if (result.breakdown.isEmpty()) continue // submitted but no per-question data yet
+            if (result.breakdown.isEmpty()) {
+                DebugTrail.d(TAG, "retention evidencePoll: taskId=${session.taskId} empty breakdown — not ready")
+                continue // submitted but no per-question data yet
+            }
 
             try {
                 val exam = ConsultationProfile.load().examTarget
@@ -148,9 +157,9 @@ object RetentionCheckManager {
                     source = "testmate_retention"
                 )
                 RetentionTaskLedger.markEvidenceImported(session.taskId)
-                Log.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
+                DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
             } catch (e: Exception) {
-                Log.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
+                DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
             }
         }
     }

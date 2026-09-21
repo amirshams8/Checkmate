@@ -355,8 +355,14 @@ class LearningInterventionOrchestrator(
         // BUGFIX (duplicate task via re-ranking, part 2): resolved ONCE, before any
         // candidate is walked, so a re-rank that promotes a different concept to rank 1
         // can never slip a new task past a still-unresolved active one — see class doc.
+        // Retention checks have their own per-task ledger (RetentionTaskLedger) and never touch
+        // GapTaskLedger's single active-concept slot, so a report made up ONLY of retention
+        // candidates must not be blocked by an unresolved gap-repair task.
+        val retentionOnly = report.candidates.isNotEmpty() && report.candidates.all {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+        }
         val activeConceptId = GapTaskLedger.activeConceptId()
-        if (activeConceptId != null) {
+        if (activeConceptId != null && !retentionOnly) {
             val blockingTask = activeUnresolvedTask()
             if (blockingTask != null) {
                 // Attribute the rejection to whichever candidate this run's ranking would
@@ -396,7 +402,11 @@ class LearningInterventionOrchestrator(
             val rank = index + 1
 
             val conceptId = candidate.conceptId
-            if (conceptId != null && GapTaskLedger.isCovered(conceptId)) {
+            // "Covered" means the gap was repaired — which is exactly when a retention check
+            // becomes relevant, so SCHEDULE_RETENTION_TEST is exempt from the covered filter.
+            if (conceptId != null && GapTaskLedger.isCovered(conceptId) &&
+                candidate.intent != LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+            ) {
                 rejections += CandidateRejection(
                     candidate = candidate,
                     rank = rank,

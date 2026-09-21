@@ -17,7 +17,9 @@ import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.ExecutionOutcome
+import com.checkmate.learning.engine.RetentionEngine
 import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
@@ -118,6 +120,7 @@ object GapTaskManager {
      */
     suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
         generateIfNeededLocked(context)
+        generateRetentionIfNeededLocked(context)
     }
 
     private suspend fun generateIfNeededLocked(context: Context) {
@@ -233,6 +236,119 @@ object GapTaskManager {
         } catch (e: Exception) {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message} — day NOT marked, retry in " +
                 "${RETRY_INTERVAL_MS / 60_000L} min", e)
+        }
+    }
+
+    // ── Retention-check generation (its own lane) ────────────────────────────
+
+    // BUGFIX (retention checks never generated): a retention check used to require
+    // RetentionEngine's REVIEW verdict (mastery >= 0.83 AND forgettingRisk >= 0.5). With
+    // risk = (1 - e^(-days/14)) * (1 - mastery/2), a 0.85-mastery concept needs ~29 days
+    // unseen to reach 0.5 — no concept in a normal prep cycle ever qualified — and the
+    // candidate then had to out-rank every repair candidate for the single daily slot AND
+    // survive the covered-concept filter (covered = mastered = the only concepts eligible).
+    // This lane uses a plain spaced-repetition interval instead and runs independently of
+    // the gap-repair pass. RetentionEngine's own decay/thresholds are untouched.
+    private const val PREF_RETENTION_LAST_DAY = "retention_last_generated_day"
+    private const val PREF_RETENTION_LAST_ATTEMPT_MS = "retention_last_attempt_ms"
+    private const val RETENTION_REVIEW_INTERVAL_DAYS = 15.0
+    private const val MAX_RETENTION_TASKS_PER_DAY = 2
+    private const val RETENTION_TEST_MINUTES = 10
+    private const val MS_PER_DAY = 86_400_000.0
+
+    private suspend fun generateRetentionIfNeededLocked(context: Context) {
+        val todayKey = GapTaskLedger.todayKey()
+        if (CheckmatePrefs.getString(PREF_RETENTION_LAST_DAY, null) == todayKey) {
+            DebugTrail.d(TAG, "retentionGen: gate CLOSED — already handled today ($todayKey)")
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        val sinceMs = nowMs - CheckmatePrefs.getLong(PREF_RETENTION_LAST_ATTEMPT_MS, 0L)
+        if (sinceMs < RETRY_INTERVAL_MS) {
+            DebugTrail.d(TAG, "retentionGen: THROTTLED — last attempt ${sinceMs / 1000}s ago, skipping")
+            return
+        }
+        CheckmatePrefs.putLong(PREF_RETENTION_LAST_ATTEMPT_MS, nowMs)
+        DebugTrail.d(TAG, "retentionGen: pass START day=$todayKey interval=${RETENTION_REVIEW_INTERVAL_DAYS}d")
+
+        try {
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) {
+                DebugTrail.w(TAG, "retentionGen: StudentModel EMPTY — will retry")
+                return
+            }
+            val outstandingChapters = (RetentionTaskLedger.pendingSessionCreation() +
+                RetentionTaskLedger.pendingEvidence()).mapNotNull { it.chapter }.toSet()
+
+            val highMastery = studentModel.concepts.values
+                .filter { it.mastery >= RetentionEngine.HIGH_MASTERY_THRESHOLD }
+            val scored = highMastery.map { snap ->
+                val days = snap.lastSeen?.let { (nowMs - it).coerceAtLeast(0L) / MS_PER_DAY }
+                snap to days
+            }
+            scored.forEach { (snap, days) ->
+                DebugTrail.d(TAG, "  retention-eligible concept=${snap.conceptId} chapter=${snap.chapter} " +
+                    "mastery=${snap.mastery} daysUnseen=$days due=${days != null && days >= RETENTION_REVIEW_INTERVAL_DAYS} " +
+                    "chapterOutstanding=${snap.chapter in outstandingChapters}")
+            }
+
+            // one candidate per chapter (concept ids can exist twice for the same chapter under
+            // different source prefixes), most overdue first
+            val ordered = scored
+                .mapNotNull { (snap, days) ->
+                    if (days == null || days < RETENTION_REVIEW_INTERVAL_DAYS) null
+                    else if (snap.chapter.isNullOrBlank() || snap.subject.isNullOrBlank()) null
+                    else if (snap.chapter in outstandingChapters) null
+                    else snap to days
+                }
+                .groupBy { it.first.subject to it.first.chapter }
+                .map { (_, group) -> group.maxByOrNull { it.second }!! }
+                .sortedByDescending { it.second }
+            DebugTrail.d(TAG, "retentionGen: highMastery=${highMastery.size} due(after chapter dedupe)=${ordered.size}")
+
+            var created = 0
+            val examType = ConsultationProfile.load().examTarget
+            for ((snap, days) in ordered) {
+                if (created >= MAX_RETENTION_TASKS_PER_DAY) break
+                val label = snap.topic ?: snap.chapter ?: "this concept"
+                val candidate = LearningDecisionEngine.CandidateIntervention(
+                    intent = LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST,
+                    conceptId = snap.conceptId,
+                    subject = snap.subject,
+                    chapter = snap.chapter,
+                    topic = snap.topic,
+                    durationMinutes = RETENTION_TEST_MINUTES,
+                    expectedGain = 0.0,
+                    priorityScore = days,
+                    rationale = "$label is well-mastered (%.0f%%) but unseen for %.0f days — a short recall check, not a re-teach."
+                        .format(snap.mastery * 100, days)
+                )
+                val report = LearningDecisionEngine.DecisionReport(
+                    studentId = studentModel.studentId,
+                    examType = examType,
+                    generatedAt = nowMs,
+                    candidates = listOf(candidate)
+                )
+                val result = LearningInterventionOrchestrator.from(context).executeTopCandidate(report)
+                DebugTrail.d(TAG, "retentionGen: concept=${snap.conceptId} outcome=${result.outcome::class.simpleName}")
+                result.rejections.forEach {
+                    DebugTrail.d(TAG, "  retention rejection source=${it.source} :: ${it.detail}")
+                }
+                val outcome = result.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created
+                if (outcome != null && outcome.executionOutcome is ExecutionOutcome.Applied) {
+                    created++
+                    DebugTrail.d(TAG, "retentionGen: CREATED retention check taskId=${outcome.taskId} concept=${snap.conceptId}")
+                }
+            }
+
+            if (created > 0 || ordered.isEmpty()) {
+                CheckmatePrefs.putString(PREF_RETENTION_LAST_DAY, todayKey)
+                DebugTrail.d(TAG, "retentionGen: day marked (created=$created, due=${ordered.size})")
+            } else {
+                DebugTrail.w(TAG, "retentionGen: ${ordered.size} due but none created — day NOT marked, retry hourly")
+            }
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "retentionGen failed: ${e.message}", e)
         }
     }
 
