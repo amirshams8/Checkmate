@@ -437,6 +437,28 @@ object GuardianNotifier {
    }
 
    /**
+    * Fired by BootReceiver when the accessibility watchdog (AppAutomationService) is still
+    * OFF a few seconds after boot. This is a *detection*, not a fix: Android intentionally
+    * never lets an app re-enable its own accessibility service — only the user, from the
+    * Settings toggle, can do that — so a reboot that leaves it off stays off until someone
+    * turns it back on by hand. Reporting that immediately is the honest "self-heal" here:
+    * the guardian finds out the watchdog is down the moment it's detectable, same as the
+    * existing Safe Mode notice above, instead of only finding out later from a gap in status
+    * updates or an uninstall that nothing caught.
+    */
+   fun notifyAccessibilityWatchdogDisabled(context: Context) {
+       val candidateName = ConsultationProfile.candidateDisplayName()
+       val msg = "🚨 Checkmate Alert: $candidateName's accessibility watchdog is OFF after a reboot " +
+                 "at ${timeNow()} on ${dateToday()}. Android requires a person to re-enable it from " +
+                 "Settings → Accessibility — Checkmate cannot turn it back on by itself. Until it's " +
+                 "back on, the uninstall/disable watchdog is not running."
+       Log.w(TAG, "Accessibility watchdog found disabled after boot")
+     if (TelegramAlertBot.getChatId() != null) {
+         Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+       }
+   }
+
+   /**
     * Generates a fresh 6-digit guardian PIN, stores only its hash on-device
     * (UninstallGuard.storeNewPinHash), and sends the plaintext PIN to the
     * guardian's Telegram chat — the only place it's ever visible. Whoever
@@ -451,7 +473,7 @@ object GuardianNotifier {
            return
        }
        if (!UninstallGuard.canRegeneratePin()) {
-           onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingSeconds()}s before generating another")
+           onResult(false, "Wait ${UninstallGuard.regenCooldownRemainingDays()} more day(s) before generating another")
            return
        }
        val pin = UninstallGuard.generateRandomPin()

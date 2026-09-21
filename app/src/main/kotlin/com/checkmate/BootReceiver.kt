@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
@@ -18,12 +19,21 @@ import com.checkmate.workmode.WorkModeScheduleReceiver
  * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
  * reports, weekly report) are cancelled on reboot; this puts them back so
  * guardian reporting survives a restart instead of silently going quiet.
+ * ReminderService (plain foreground Service, not WorkManager) and Work
+ * Mode's schedule get the same re-arming for the same reason — this is
+ * the self-heal pass: everything on-device that a reboot silently clears
+ * gets put back the moment BOOT_COMPLETED fires.
  *
  * Also fires a one-time "device rebooted" note to the guardian when the
  * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
  * watchdog and (on some OEMs) the device admin lock entirely, which is the
  * one uninstall path this app genuinely cannot block. Surfacing it is the
- * next best thing: the guardian at least finds out it happened.
+ * next best thing: the guardian at least finds out it happened. The same
+ * applies, independent of Safe Mode, to the accessibility watchdog itself:
+ * see the ENABLED_ACCESSIBILITY_SERVICES check below — Android never lets
+ * an app re-enable its own accessibility service, so if it was off before
+ * the reboot it's still off after, and that can't be fixed from code, only
+ * reported.
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
@@ -67,5 +77,27 @@ class BootReceiver : BroadcastReceiver() {
                 GuardianNotifier.notifySafeModeBoot(context)
             }.start()
         }
+
+        // Self-heal check for the accessibility watchdog: this can only ever be a
+        // *report*, not a fix — see the class doc above for why no app, this one
+        // included, can flip its own accessibility service back on after a reboot.
+        // Reading it here still closes most of the gap in practice, since on real
+        // devices ENABLED_ACCESSIBILITY_SERVICES already reflects the post-reboot
+        // state by the time BOOT_COMPLETED fires (accessibility services are core
+        // services the OS starts before third-party BOOT_COMPLETED receivers run).
+        if (!isAccessibilityWatchdogEnabled(context) && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifyAccessibilityWatchdogDisabled(context)
+            }.start()
+        }
+    }
+
+    /** True if AppAutomationService is present in the OS's enabled-accessibility-services list. */
+    private fun isAccessibilityWatchdogEnabled(context: Context): Boolean {
+        val enabled = Settings.Secure.getString(
+            context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        val serviceId = "${context.packageName}/com.checkmate.automation.AppAutomationService"
+        return enabled.split(':').any { it.equals(serviceId, ignoreCase = true) }
     }
 }

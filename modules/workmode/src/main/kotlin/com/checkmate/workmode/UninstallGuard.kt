@@ -61,9 +61,16 @@ object UninstallGuard {
     // if the watchdog keeps re-triggering while the user sits on the screen.
     private const val ALERT_THROTTLE_MS = 20 * 1000L
 
-    // Minimum time between PIN (re)generations — stops a student from
-    // spamming "generate" to flood the guardian's Telegram.
-    private const val REGEN_COOLDOWN_MS = 5 * 60 * 1000L
+    // Minimum time between PIN (re)generations. Previously 5 minutes (just
+    // enough to stop Telegram spam); raised to a ~7-month commitment window
+    // (30-day months) so a fresh PIN request itself becomes a rare, guardian-
+    // visible event rather than something the student can casually retry.
+    // NOTE: this only gates *regeneration* of a new PIN — it does not touch
+    // UNLOCK_WINDOW_MS, the brute-force lockout below, or the remote-override
+    // path (KEY_REMOTE_OVERRIDE_UNTIL / grantRemoteOverride()), so the
+    // guardian's existing Telegram "unlock" command still works at any time
+    // even while regeneration itself is on cooldown.
+    private const val REGEN_COOLDOWN_MS = 7L * 30 * 24 * 60 * 60 * 1000L
 
     // Brute-force protection on the unlock field itself.
     private const val MAX_FAILED_ATTEMPTS = 5
@@ -246,6 +253,14 @@ object UninstallGuard {
         val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
         val remaining = REGEN_COOLDOWN_MS - (System.currentTimeMillis() - last)
         return if (remaining > 0) remaining / 1000 else 0
+    }
+
+    /** Same cooldown, in whole days — the 5-minute-scale seconds value above reads as a
+     *  meaningless huge number now that the cooldown is measured in months. */
+    fun regenCooldownRemainingDays(): Long {
+        val remainingSeconds = regenCooldownRemainingSeconds()
+        // Round up so "less than a day left" still shows as 1, not 0.
+        return (remainingSeconds + 86_399) / 86_400
     }
 
     private fun hashPin(pin: String): String {
