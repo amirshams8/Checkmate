@@ -8,6 +8,7 @@ import android.os.*
 import androidx.core.app.NotificationCompat
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.AttentionPhase
+import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.tts.CheckmateTTS
 import kotlinx.coroutines.*
 
@@ -60,6 +61,28 @@ class AttentionCycleService : Service() {
 
         fun sendResume(context: Context) =
             context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
+
+        // ── Reboot survival ──────────────────────────────────────────────────
+        // CycleState (AttentionCycleManager) lives only in memory, so a reboot
+        // loses exact elapsed time/phase along with everything else in the
+        // process. Rather than try to reconstruct that (and the media
+        // projection token, which can't survive a process death anyway —
+        // storeProjectionToken() would need a fresh user grant regardless),
+        // a killed mid-session restart just re-launches the same task from a
+        // full fresh duration. No screenshot capture on that resumed session
+        // since there's no projection token to pass — StatusReporter's other
+        // pushes (phase/timer) still work fine without it.
+        private const val KEY_ACTIVE_TASK_ID   = "attention_active_task_id"
+        private const val KEY_ACTIVE_TASK_NAME = "attention_active_task_name"
+        private const val KEY_ACTIVE_DURATION  = "attention_active_duration_min"
+
+        /** Called by BootReceiver. No-op if no session was running when the device went down. */
+        fun resumeAfterRebootIfNeeded(context: Context) {
+            val taskId = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null) ?: return
+            val taskName = CheckmatePrefs.getString(KEY_ACTIVE_TASK_NAME, "Task") ?: "Task"
+            val durationMin = CheckmatePrefs.getLong(KEY_ACTIVE_DURATION, 60L)
+            start(context, taskId, taskName, durationMin)
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -106,6 +129,15 @@ class AttentionCycleService : Service() {
         val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
         val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
         lastTaskName = taskName
+
+        // Persist just enough to relaunch this task from scratch if the process
+        // dies from under it (reboot, OOM kill) — see resumeAfterRebootIfNeeded().
+        // Cleared in onDestroy() on every normal end (DONE, explicit stop()),
+        // so it's only ever still set here if something killed the process
+        // without giving the service a chance to shut down cleanly.
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_NAME, taskName)
+        CheckmatePrefs.putLong(KEY_ACTIVE_DURATION, durationMin)
 
         // startForeground() MUST be called before getMediaProjection() on Android 14+.
         // We call it first here, then immediately store the projection token below.
@@ -260,6 +292,12 @@ class AttentionCycleService : Service() {
         cycleJob?.cancel(); scope.cancel()
         try { unregisterReceiver(controlReceiver) } catch (_: Exception) {}
         AttentionCycleManager.reset()
+        // Normal end of this session (DONE or explicit stop()) — clear the
+        // reboot-resume markers so a later reboot doesn't relaunch a task
+        // that's already finished.
+        CheckmatePrefs.remove(KEY_ACTIVE_TASK_ID)
+        CheckmatePrefs.remove(KEY_ACTIVE_TASK_NAME)
+        CheckmatePrefs.remove(KEY_ACTIVE_DURATION)
         super.onDestroy()
     }
 

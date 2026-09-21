@@ -77,6 +77,18 @@ object WorkModeManager {
     fun init(context: Context) {
         TrustedTime.refreshIfNeeded(context)
         _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
+        // BUGFIX (Work Mode notification/service didn't survive reboot): the line above
+        // correctly restores the STATE (so isEnforcing()/blocking work immediately either
+        // way), but WorkModeService itself — the foreground "Work Mode — ON" notification —
+        // is only ever started from activate(), which evaluateSchedule() below only calls
+        // when it's turning Work Mode ON from OFF. A manually/task-activated session that
+        // was already ON before the reboot left _isActive true here without ever calling
+        // activate() again, so the service (and its notification) just silently didn't come
+        // back — blocking kept working, but there was no persistent notification and no
+        // running WorkModeService until the next manual toggle or schedule boundary.
+        // startService() is idempotent (re-delivers onStartCommand to an already-running
+        // service), so it's safe to call unconditionally here.
+        if (_isActive.value) startService(context)
         evaluateSchedule(context)
     }
 

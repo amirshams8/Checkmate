@@ -9,6 +9,7 @@ import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ReminderService
 import com.checkmate.service.TelegramAlertBot
@@ -63,6 +64,14 @@ class BootReceiver : BroadcastReceiver() {
         // GapTaskManager's daily generation + escalation) silently stopped firing
         // after every reboot.
         ReminderService.start(context)
+
+        // Same problem as ReminderService above, for the focus-session timer: if a
+        // reboot lands mid-session, AttentionCycleService.KEY_ACTIVE_TASK_ID is still
+        // set (only cleared on a normal end — see that service's onDestroy), so this
+        // relaunches the same task fresh rather than leaving the student's session
+        // silently gone with no timer and no notification. No-op if no session was
+        // running when the device went down.
+        AttentionCycleService.resumeAfterRebootIfNeeded(context)
 
         // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
         // non-terminal by the process that just died (Blueprint §4). No equivalent call
