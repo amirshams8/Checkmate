@@ -16,6 +16,7 @@ import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.ExecutionOutcome
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.model.StudyTask
@@ -217,8 +218,13 @@ object GapTaskManager {
                     "concept=${created.candidate.conceptId} taskKey=${created.taskId} " +
                     "execution=${created.executionOutcome}")
                 TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis())
-                // Only burn the once-a-day gate on a real success — see PREF_LAST_ATTEMPT_MS.
-                GapTaskLedger.markGeneratedToday(todayKey)
+                // Only burn the once-a-day gate when the action really landed — see
+                // PREF_LAST_ATTEMPT_MS. A Failed execution retries on the hourly throttle.
+                if (created.executionOutcome is ExecutionOutcome.Applied) {
+                    GapTaskLedger.markGeneratedToday(todayKey)
+                } else {
+                    DebugTrail.w(TAG, "generateIfNeeded: execution was not Applied (${created.executionOutcome}) — day NOT marked")
+                }
             } else {
                 DebugTrail.w(TAG, "generateIfNeeded: NO task created this pass — day NOT marked, retry in " +
                     "${RETRY_INTERVAL_MS / 60_000L} min")

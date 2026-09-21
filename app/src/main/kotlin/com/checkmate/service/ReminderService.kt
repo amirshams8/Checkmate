@@ -163,6 +163,9 @@ class ReminderService : Service() {
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@withContext
             val body = response.body?.string() ?: return@withContext
+            // The worker route doesn't exist yet (see OVERRIDE_URL note) and answers with plain
+            // text, which used to throw JSONException every cycle — treat non-JSON as "no override".
+            if (!body.trimStart().startsWith("{")) return@withContext
             val overridden = JSONObject(body).optBoolean("override", false)
             if (overridden) UninstallGuard.grantRemoteOverride()
         }

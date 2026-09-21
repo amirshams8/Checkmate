@@ -184,6 +184,9 @@ class LearningInterventionOrchestrator(
          *  [ReplanDayLedger]'s own doc for why [TaskEscrow] alone can't provide this
          *  guard. */
         object AlreadyReplannedToday : RejectionSource()
+        /** The action executed but changed nothing (e.g. difficulty already at the requested
+         *  level) — see the walk's own BUGFIX note on why this must not end the walk. */
+        object NoOpAlreadyApplied : RejectionSource()
     }
 
     /** One candidate that was ranked but did not end up executed — see class doc's
@@ -482,6 +485,25 @@ class LearningInterventionOrchestrator(
                                 now
                             )
                             olog("candidate #$rank escrow ACQUIRED key=${route.escrowKey} — execution=$executionOutcome")
+                            // BUGFIX (no-op candidate starving every real task): an action that
+                            // returns NoOpAlreadyApplied (e.g. REDUCE_DIFFICULTY for a concept
+                            // whose difficulty is ALREADY reduced) changed nothing, yet was
+                            // returned as Created — which ends the walk. That candidate keeps
+                            // ranking near the top every day, so every lower-ranked candidate
+                            // (the actual REPAIR_CONCEPT tasks) was never reached and no task
+                            // was ever created. A no-op is now recorded as a rejection and the
+                            // walk continues to the next candidate.
+                            if (executionOutcome is ExecutionOutcome.NoOpAlreadyApplied) {
+                                rejections += CandidateRejection(
+                                    candidate = candidate,
+                                    rank = rank,
+                                    source = RejectionSource.NoOpAlreadyApplied,
+                                    detail = "${candidate.intent} for $conceptId changed nothing " +
+                                        "(already in effect) — continuing to the next candidate",
+                                    timestamp = now
+                                )
+                                return@forEachIndexed
+                            }
                             if (route.tracksGapLedger) {
                                 GapTaskLedger.recordServed(candidate, route.escrowKey, dayKey)
                             }
