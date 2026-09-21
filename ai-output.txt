@@ -10,6 +10,7 @@ import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ReminderService
 import com.checkmate.service.TelegramAlertBot
@@ -65,6 +66,14 @@ class BootReceiver : BroadcastReceiver() {
         // after every reboot.
         ReminderService.start(context)
 
+        // Same problem as ReminderService above, for the focus-session timer: if a
+        // reboot lands mid-session, AttentionCycleService.KEY_ACTIVE_TASK_ID is still
+        // set (only cleared on a normal end — see that service's onDestroy), so this
+        // relaunches the same task fresh rather than leaving the student's session
+        // silently gone with no timer and no notification. No-op if no session was
+        // running when the device went down.
+        AttentionCycleService.resumeAfterRebootIfNeeded(context)
+
         // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
         // non-terminal by the process that just died (Blueprint §4). No equivalent call
         // is needed for InterventionTriggerScheduler's periodic work here — WorkManager
@@ -104,6 +113,732 @@ class BootReceiver : BroadcastReceiver() {
 }
 
 
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/service/AttentionCycleService.kt =====
+package com.checkmate.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.*
+import androidx.core.app.NotificationCompat
+import com.checkmate.core.AttentionCycleManager
+import com.checkmate.core.AttentionPhase
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.tts.CheckmateTTS
+import kotlinx.coroutines.*
+
+class AttentionCycleService : Service() {
+
+    companion object {
+        private const val CHANNEL_ID        = "attention_cycle_channel"
+        private const val NOTIF_ID          = 42
+        const val EXTRA_TASK_ID             = "task_id"
+        const val EXTRA_TASK_NAME           = "task_name"
+        const val EXTRA_DURATION_MIN        = "duration_min"
+        // Projection token extras — passed so getMediaProjection() runs AFTER startForeground()
+        const val EXTRA_PROJECTION_CODE     = "projection_result_code"
+        const val EXTRA_PROJECTION_DATA     = "projection_data"
+        const val ACTION_PAUSE              = "com.checkmate.ATTENTION_PAUSE"
+        const val ACTION_RESUME             = "com.checkmate.ATTENTION_RESUME"
+        // Notification action buttons — these mirror what the floating attention
+        // bar offers, so a student who turns the bar off in Settings can still
+        // confirm attention / mark done / take a break from the notification.
+        const val ACTION_MARK_DONE          = "com.checkmate.ATTENTION_MARK_DONE"
+        const val ACTION_TAKE_BREAK         = "com.checkmate.ATTENTION_TAKE_BREAK"
+        const val ACTION_CONFIRM_ATTENTION  = "com.checkmate.ATTENTION_CONFIRM"
+
+        fun start(
+            context: Context,
+            taskId: String,
+            taskName: String,
+            durationMinutes: Long,
+            projectionResultCode: Int = Activity.RESULT_CANCELED,
+            projectionData: Intent?   = null
+        ) {
+            val intent = Intent(context, AttentionCycleService::class.java).apply {
+                putExtra(EXTRA_TASK_ID,          taskId)
+                putExtra(EXTRA_TASK_NAME,         taskName)
+                putExtra(EXTRA_DURATION_MIN,      durationMinutes)
+                putExtra(EXTRA_PROJECTION_CODE,   projectionResultCode)
+                putExtra(EXTRA_PROJECTION_DATA,   projectionData)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                context.startForegroundService(intent)
+            else
+                context.startService(intent)
+        }
+
+        fun stop(context: Context) =
+            context.stopService(Intent(context, AttentionCycleService::class.java))
+
+        fun sendPause(context: Context) =
+            context.sendBroadcast(Intent(ACTION_PAUSE).setPackage(context.packageName))
+
+        fun sendResume(context: Context) =
+            context.sendBroadcast(Intent(ACTION_RESUME).setPackage(context.packageName))
+
+        // ── Reboot survival ──────────────────────────────────────────────────
+        // CycleState (AttentionCycleManager) lives only in memory, so a reboot
+        // loses exact elapsed time/phase along with everything else in the
+        // process. Rather than try to reconstruct that (and the media
+        // projection token, which can't survive a process death anyway —
+        // storeProjectionToken() would need a fresh user grant regardless),
+        // a killed mid-session restart just re-launches the same task from a
+        // full fresh duration. No screenshot capture on that resumed session
+        // since there's no projection token to pass — StatusReporter's other
+        // pushes (phase/timer) still work fine without it.
+        private const val KEY_ACTIVE_TASK_ID   = "attention_active_task_id"
+        private const val KEY_ACTIVE_TASK_NAME = "attention_active_task_name"
+        private const val KEY_ACTIVE_DURATION  = "attention_active_duration_min"
+
+        /** Called by BootReceiver. No-op if no session was running when the device went down. */
+        fun resumeAfterRebootIfNeeded(context: Context) {
+            val taskId = CheckmatePrefs.getString(KEY_ACTIVE_TASK_ID, null) ?: return
+            val taskName = CheckmatePrefs.getString(KEY_ACTIVE_TASK_NAME, "Task") ?: "Task"
+            val durationMin = CheckmatePrefs.getLong(KEY_ACTIVE_DURATION, 60L)
+            start(context, taskId, taskName, durationMin)
+        }
+    }
+
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var cycleJob: Job? = null
+    private var isPaused = false
+    private var lastTaskName = "Task"
+
+    // Tracks the last elapsed-second mark at which we pushed a status+screenshot update,
+    // so we fire roughly every StatusReporter.STATUS_INTERVAL_SECONDS regardless of pauses.
+    private var lastStatusPushAt = 0L
+
+    private val controlReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_PAUSE             -> { isPaused = true;  AttentionCycleManager.pause() }
+                ACTION_RESUME            -> { isPaused = false; AttentionCycleManager.resume() }
+                ACTION_MARK_DONE         -> AttentionCycleManager.confirmDone()
+                ACTION_TAKE_BREAK        -> AttentionCycleManager.dismissPromptAndBreak()
+                ACTION_CONFIRM_ATTENTION -> AttentionCycleManager.confirmAttention()
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_PAUSE)
+            addAction(ACTION_RESUME)
+            addAction(ACTION_MARK_DONE)
+            addAction(ACTION_TAKE_BREAK)
+            addAction(ACTION_CONFIRM_ATTENTION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(controlReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(controlReceiver, filter)
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val taskId      = intent?.getStringExtra(EXTRA_TASK_ID)         ?: "task"
+        val taskName    = intent?.getStringExtra(EXTRA_TASK_NAME)       ?: "Task"
+        val durationMin = intent?.getLongExtra(EXTRA_DURATION_MIN, 60L) ?: 60L
+        lastTaskName = taskName
+
+        // Persist just enough to relaunch this task from scratch if the process
+        // dies from under it (reboot, OOM kill) — see resumeAfterRebootIfNeeded().
+        // Cleared in onDestroy() on every normal end (DONE, explicit stop()),
+        // so it's only ever still set here if something killed the process
+        // without giving the service a chance to shut down cleanly.
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_ID, taskId)
+        CheckmatePrefs.putString(KEY_ACTIVE_TASK_NAME, taskName)
+        CheckmatePrefs.putLong(KEY_ACTIVE_DURATION, durationMin)
+
+        // startForeground() MUST be called before getMediaProjection() on Android 14+.
+        // We call it first here, then immediately store the projection token below.
+        startForegroundCompat(buildNotification(initialPhaseLabel(durationMin), taskName))
+
+        // Now it is safe to call getMediaProjection() — the mediaProjection FGS type is active.
+        val projCode = intent?.getIntExtra(EXTRA_PROJECTION_CODE, Activity.RESULT_CANCELED)
+            ?: Activity.RESULT_CANCELED
+        val projData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            intent?.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+        else
+            @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_PROJECTION_DATA)
+
+        if (projCode == Activity.RESULT_OK && projData != null) {
+            ScreenCaptureManager.storeProjectionToken(applicationContext, projCode, projData)
+        }
+
+        AttentionCycleManager.start(taskId, taskName, durationMin)
+        lastStatusPushAt = 0L
+        startCycleLoop(taskName)
+        return START_NOT_STICKY
+    }
+
+    private fun initialPhaseLabel(durationMin: Long): String {
+        val pomodoro = AttentionCycleManager.currentState().pomodoroEnabled
+        return if (pomodoro) "FOCUS — 30:00" else "FOCUS — ${durationMin}:00"
+    }
+
+    private fun startCycleLoop(taskName: String) {
+        cycleJob?.cancel()
+        cycleJob = scope.launch {
+            while (isActive) {
+                if (isPaused) {
+                    val cs = AttentionCycleManager.currentState()
+                    (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                        .notify(NOTIF_ID, buildNotification("PAUSED", taskName, cs.totalSessionSeconds, cs.cycleIndex))
+                    delay(1_000)
+                    continue
+                }
+                val cs = AttentionCycleManager.tick()
+                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(NOTIF_ID, buildNotification(
+                        phaseLabel(cs.phase, cs.phaseSecondsLeft),
+                        taskName, cs.totalSessionSeconds, cs.cycleIndex, cs.needsAttentionCheck, cs.phase))
+
+                if (cs.phaseJustChanged) {
+                    when (cs.phase) {
+                        AttentionPhase.PROMPT_DONE -> CheckmateTTS.speak(
+                            this@AttentionCycleService,
+                            "30 minutes done. Mark task complete or take a break?"
+                        )
+                        AttentionPhase.SHORT_BREAK -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Take a 5 minute break."
+                        )
+                        AttentionPhase.LONG_BREAK  -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Good work. 10 minute break."
+                        )
+                        AttentionPhase.FOCUS       -> CheckmateTTS.speak(
+                            this@AttentionCycleService, "Break over. Back to focus."
+                        )
+                        AttentionPhase.PAUSED      -> {}
+                        AttentionPhase.DONE        -> {
+                            CheckmateTTS.speak(this@AttentionCycleService, "Session complete.")
+                            stopSelf(); return@launch
+                        }
+                    }
+                }
+                if (cs.needsAttentionCheck && cs.phaseSecondsLeft % 30L == 0L)
+                    CheckmateTTS.speak(this@AttentionCycleService, "Still focused? Tap the check.")
+
+                // ── Periodic status + screenshot push to guardian bot ──────────────
+                if (cs.totalSessionSeconds - lastStatusPushAt >= StatusReporter.STATUS_INTERVAL_SECONDS) {
+                    lastStatusPushAt = cs.totalSessionSeconds
+                    val snapshot = cs
+                    launch(Dispatchers.IO) {
+                        StatusReporter.pushStatus(this@AttentionCycleService, snapshot)
+                    }
+                }
+
+                delay(1_000)
+            }
+        }
+    }
+
+    private fun phaseLabel(phase: AttentionPhase, secondsLeft: Long): String {
+        val m = secondsLeft / 60; val s = secondsLeft % 60
+        val t = String.format("%d:%02d", m, s)
+        return when (phase) {
+            AttentionPhase.FOCUS        -> "FOCUS — $t"
+            AttentionPhase.SHORT_BREAK  -> "SHORT BREAK — $t"
+            AttentionPhase.LONG_BREAK   -> "LONG BREAK — $t"
+            AttentionPhase.PAUSED       -> "PAUSED — $t"
+            AttentionPhase.PROMPT_DONE  -> "MARK DONE?"
+            AttentionPhase.DONE         -> "SESSION COMPLETE"
+        }
+    }
+
+    private fun buildNotification(
+        phaseText: String, taskName: String,
+        totalSeconds: Long = 0L, cycleIndex: Int = 0, needsCheck: Boolean = false,
+        phase: AttentionPhase = AttentionPhase.FOCUS
+    ): Notification {
+        val tm = totalSeconds / 60; val ts = totalSeconds % 60
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(if (needsCheck) "ATTN: $phaseText" else phaseText)
+            .setContentText("$taskName  |  ${tm}m ${ts}s  |  Cycle $cycleIndex")
+            .setSmallIcon(android.R.drawable.ic_menu_recent_history)
+            .setOngoing(true).setOnlyAlertOnce(!needsCheck)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+
+        // Action buttons mirror the floating attention bar so the same controls
+        // are available from the notification when the overlay bar is off.
+        if (phase == AttentionPhase.PROMPT_DONE) {
+            builder.addAction(0, "✅ Mark Done", actionPendingIntent(ACTION_MARK_DONE, 1))
+            builder.addAction(0, "➡ Break",      actionPendingIntent(ACTION_TAKE_BREAK, 2))
+        } else if (needsCheck) {
+            builder.addAction(0, "✅ I'm here", actionPendingIntent(ACTION_CONFIRM_ATTENTION, 3))
+        }
+        if (phase != AttentionPhase.DONE && phase != AttentionPhase.PROMPT_DONE) {
+            val pauseLabel = if (isPaused) "▶ Resume" else "⏸ Pause"
+            val pauseAction = if (isPaused) ACTION_RESUME else ACTION_PAUSE
+            builder.addAction(0, pauseLabel, actionPendingIntent(pauseAction, 4))
+        }
+
+        return builder.build()
+    }
+
+    private fun actionPendingIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(action).setPackage(packageName)
+        return PendingIntent.getBroadcast(
+            this, requestCode, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun startForegroundCompat(n: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            startForeground(NOTIF_ID, n,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        else startForeground(NOTIF_ID, n)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Attention Cycle", NotificationManager.IMPORTANCE_HIGH)
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() {
+        cycleJob?.cancel(); scope.cancel()
+        try { unregisterReceiver(controlReceiver) } catch (_: Exception) {}
+        AttentionCycleManager.reset()
+        // Normal end of this session (DONE or explicit stop()) — clear the
+        // reboot-resume markers so a later reboot doesn't relaunch a task
+        // that's already finished.
+        CheckmatePrefs.remove(KEY_ACTIVE_TASK_ID)
+        CheckmatePrefs.remove(KEY_ACTIVE_TASK_NAME)
+        CheckmatePrefs.remove(KEY_ACTIVE_DURATION)
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+package com.checkmate.workmode
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings as AndroidSettings
+import android.telecom.TelecomManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.StudyMode
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object WorkModeManager {
+
+    private const val KEY_ACTIVE_SOURCE = "work_mode_active_source"
+    private const val SOURCE_MANUAL   = "manual"
+    private const val SOURCE_SCHEDULE = "schedule"
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown window.
+    private const val KEY_LOCKDOWN_UNTIL     = "post_skip_lockdown_until"
+    private const val DEFAULT_LOCKDOWN_MIN   = 45
+    private const val KEY_LOCKDOWN_MINUTES   = "post_skip_lockdown_minutes"
+    // Fixed default watchlist for the escalation window — deliberately broader than the
+    // permanent blocklist since it's temporary. Guardian can extend it via
+    // "escalation_watchlist" (comma-separated package names), same storage pattern as
+    // getBlockedApps()/getBlockedDomains(). Package names, not labels — matched directly
+    // against AccessibilityEvent.packageName in AppAutomationService.
+    private val DEFAULT_ESCALATION_WATCHLIST = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",   // TikTok
+        "com.snapchat.android",
+        "com.facebook.katana",
+        "com.twitter.android",
+        "com.reddit.frontpage"
+    )
+
+    // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
+    private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
+    private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
+
+    // BUGFIX (silent delay never enforced): idempotency ledger for overdue-PENDING
+    // enforcement, plus the dynamically-detected top-time-consuming app for the current
+    // overdue window. See hasAppliedOverdueEnforcement/markOverdueEnforcementApplied/
+    // retainOverdueEnforcementOnly/setOverdueTopApp for the actual logic; these two keys
+    // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
+    private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
+    private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
+
+    // LOOPHOLE FIX (adaptive app block over-blocking): guardian-extendable exemption list,
+    // same comma-separated storage idiom as "escalation_watchlist". Use this for anything
+    // that can't be resolved dynamically via PackageManager (see essentialPackages()) — e.g.
+    // a doubt-solving app, or a device-specific system app that slips past the dynamic
+    // resolution below.
+    private const val KEY_ESSENTIAL_EXTRA = "essential_apps_extra"
+
+    // Fixed exemption: kept reachable during Work Mode for doubt-solving. Not resolvable
+    // dynamically (there's no Intent category for "the doubt-solving app"), so it's hardcoded
+    // here rather than left to whatever the guardian remembers to type into
+    // essential_apps_extra. Add more fixed exemptions the same way if needed.
+    private const val CHATGPT_PKG = "com.openai.chatgpt"
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    /**
+     * Call once from CheckmateApp.onCreate and BootReceiver, after
+     * CheckmatePrefs.init()/CheckmateState.init(). Syncs the in-memory flag
+     * with whatever was persisted before this process started — previously
+     * _isActive always reset to false on a fresh process even if the
+     * student had an active session, which silently turned off app
+     * blocking until the app UI was reopened. Also immediately reconciles
+     * against the hardcoded schedule.
+     */
+    fun init(context: Context) {
+        TrustedTime.refreshIfNeeded(context)
+        _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
+        // BUGFIX (Work Mode notification/service didn't survive reboot): the line above
+        // correctly restores the STATE (so isEnforcing()/blocking work immediately either
+        // way), but WorkModeService itself — the foreground "Work Mode — ON" notification —
+        // is only ever started from activate(), which evaluateSchedule() below only calls
+        // when it's turning Work Mode ON from OFF. A manually/task-activated session that
+        // was already ON before the reboot left _isActive true here without ever calling
+        // activate() again, so the service (and its notification) just silently didn't come
+        // back — blocking kept working, but there was no persistent notification and no
+        // running WorkModeService until the next manual toggle or schedule boundary.
+        // startService() is idempotent (re-delivers onStartCommand to an already-running
+        // service), so it's safe to call unconditionally here.
+        if (_isActive.value) startService(context)
+        evaluateSchedule(context)
+    }
+
+    fun activate(context: Context, source: String = SOURCE_MANUAL) {
+        CheckmateState.setMode(context, StudyMode.STUDY)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, source)
+        _isActive.value = true
+        startService(context)
+    }
+
+    /**
+     * Turns Work Mode off. Returns true if it actually turned off.
+     *
+     * Returns false — and leaves blocking ON — if the hardcoded daily
+     * schedule (WorkModeSchedule) is currently in force and no guardian PIN
+     * unlock is active. This is what closes the "mark the task done/skip it,
+     * then browse freely until the next one" loophole during the
+     * 19:00-02:00 window: block mode isn't tied to any single task while
+     * the schedule says it should be on.
+     */
+    fun deactivate(context: Context): Boolean {
+        DistractionGuard.reset()
+        if (WorkModeSchedule.isWithinScheduledWindow() && !UninstallGuard.isUnlocked()) {
+            // Whatever session requested this deactivate (e.g. a manual task
+            // finishing) is over, but the hardcoded schedule is still in force.
+            // Hand the active-source tag back to "schedule" so evaluateSchedule()
+            // can auto-release Work Mode once the window itself ends — otherwise
+            // this stays tagged as the task's source (e.g. "manual") forever, the
+            // natural-end auto-release check never matches, and blocking silently
+            // continues past the hardcoded window until manually toggled off.
+            CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
+            return false
+        }
+        CheckmateState.setMode(context, StudyMode.NORMAL)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, "")
+        _isActive.value = false
+        context.stopService(Intent(context, WorkModeService::class.java))
+        return true
+    }
+
+    fun toggle(context: Context) {
+        if (_isActive.value) deactivate(context) else activate(context)
+    }
+
+    /**
+     * True whenever app/website blocking must be enforced right now —
+     * either a manual/task session is active, or the hardcoded 19:00-02:00
+     * window is live. AppAutomationService keys blocking decisions off
+     * this instead of the raw [isActive] flag, so the hardcoded window
+     * can't be bypassed just by never starting a task, or by the
+     * accessibility-service process restarting and losing in-memory state.
+     */
+    fun isEnforcing(): Boolean = _isActive.value || WorkModeSchedule.isWithinScheduledWindow()
+
+    /**
+     * True when Work Mode settings (Blocked Apps, Blocked Websites, Focus
+     * Cycle toggles, Guardian Telegram Chat ID) must be read-only in the UI.
+     *
+     * Locked permanently as soon as a guardian PIN exists — NOT just while
+     * a session/the hardcoded window is enforcing. Before any PIN has been
+     * generated (first launch / initial setup) these stay open so the
+     * guardian can configure them once. After that, the only way past this
+     * gate is a guardian PIN unlock — the same UninstallGuard mechanism
+     * that gates uninstall protection, so there's still exactly one PIN,
+     * and the student never sees it either way. Tying this to enforcement
+     * state alone used to leave a window (outside 19:00-02:00, no active
+     * session) where these were freely editable; that loophole is now closed.
+     */
+    // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —
+    // even a correct guardian PIN unlock doesn't reopen settings while the recent skip rate
+    // is over threshold. This is deliberate escalation, not a bug: a guardian who's just
+    // unlocked settings during a bad week should still see them locked back down once the
+    // unlock window (UNLOCK_WINDOW_MS in UninstallGuard) lapses, same as before — the new
+    // clause only matters while skipRateExceedsThreshold() is true, which requires an actual
+    // sustained skip pattern (see DEFAULT_ESCALATION_THRESHOLD), not a one-off.
+    // Recommended mitigation for the "guardian genuinely needs in during an escalation"
+    // case: UninstallGuard.grantRemoteOverride() (Telegram-command driven, see that file) —
+    // it bypasses this gate entirely rather than fighting it.
+    fun settingsLocked(): Boolean =
+        UninstallGuard.hasPinConfigured() &&
+        !UninstallGuard.hasRemoteOverride() &&
+        (!UninstallGuard.isUnlocked() || skipRateExceedsThreshold())
+
+    /**
+     * Mentor v2 (spec 3.5): reads the skip rate PsycheEngine.refreshBehaviorSummaryCache()
+     * writes into "recent_skip_rate" (a plain CheckmatePrefs bridge, same pattern as the
+     * "behavior_summary" cache — :modules:workmode has no dependency on :modules:psyche, so
+     * this avoids adding one). Threshold is configurable via "escalation_skip_threshold";
+     * defaults to DEFAULT_ESCALATION_THRESHOLD.
+     */
+    fun skipRateExceedsThreshold(): Boolean {
+        val rate = CheckmatePrefs.getString("recent_skip_rate", "0")?.toFloatOrNull() ?: 0f
+        val threshold = CheckmatePrefs.getString(KEY_ESCALATION_THRESHOLD, null)?.toFloatOrNull()
+            ?: DEFAULT_ESCALATION_THRESHOLD
+        return rate > threshold
+    }
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown.
+
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip() —
+     *  and, as of the overdue-enforcement fix, from `app`'s OverdueEnforcementCoordinator
+     *  for a badly-overdue still-PENDING task. Deliberately the same function for both:
+     *  it's the identical consequence (temporary lockdown + escalation watchlist), just
+     *  reached by two different triggers — an explicit Skip tap, or silence past
+     *  threshold. Neither caller may pair this with a TaskState change other than what
+     *  that caller already legitimately does on its own terms (markSkip marks SKIPPED
+     *  for its own reasons; the overdue path must NOT mark anything). */
+    fun startPostSkipLockdown(context: Context) {
+        val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
+            .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
+        val until = System.currentTimeMillis() + minutes * 60 * 1000L
+        CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+    }
+
+    /** True while a post-skip lockdown window is active. AppAutomationService checks this
+     *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
+     *  grace period for apps on [getEscalationWatchlist]. */
+    fun isInPostSkipLockdown(): Boolean =
+        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
+
+    /**
+     * Returns [getBlockedApps] plus a fixed distraction-prone watchlist (extendable via
+     * prefs), plus (BUGFIX, silent delay never enforced) whichever single app
+     * [setOverdueTopApp] most recently recorded as the top time-consumer during an
+     * overdue-PENDING window. That last piece is what lets this catch a student's actual
+     * procrastination target — a game, a browser tab, anything not on the fixed list —
+     * rather than only ever blocking the same static seven apps.
+     */
+    fun getEscalationWatchlist(): Set<String> {
+        val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
+        val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
+            ?.takeIf { it.isNotBlank() }
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
+    }
+
+    /**
+     * Reconciles [isActive] with the hardcoded schedule. Call on app start,
+     * boot, from the twice-daily schedule alarms (WorkModeScheduleReceiver),
+     * and periodically from the accessibility service.
+     *
+     * Only ever force-starts or force-stops sessions that IT started
+     * (tracked via [KEY_ACTIVE_SOURCE] = "schedule") — a manual task session
+     * that happens to be running is never auto-cancelled here, and a manual
+     * session that outlasts the window keeps running under student control
+     * exactly as before.
+     */
+    fun evaluateSchedule(context: Context) {
+        val inWindow = WorkModeSchedule.isWithinScheduledWindow()
+        val currentSource = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "")
+
+        if (inWindow && !_isActive.value) {
+            activate(context, source = SOURCE_SCHEDULE)
+        } else if (!inWindow && _isActive.value && currentSource == SOURCE_SCHEDULE) {
+            // Window ended naturally and nothing manual took over — release
+            // it without requiring a PIN, since this isn't a student action.
+            deactivate(context)
+        }
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
+     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
+     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
+     * that a guardian toggled on manually or that the hardcoded schedule opened,
+     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
+     * fix; nothing outside this object needed to read it.
+     */
+    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
+    /**
+     * BUGFIX (silent delay never enforced): true once overdue enforcement has already
+     * been applied for this specific task id. [InterventionTriggerWorker] calls
+     * [OverdueEnforcementGateway.applyOverdueEnforcement] every ~15-minute cycle the task
+     * stays PENDING past threshold — this is what stops that from re-running
+     * startPostSkipLockdown()/re-detecting the top app on every single cycle
+     * (09:35 apply, 09:50 no-op, 10:05 no-op, ...) instead of exactly once per overdue
+     * episode. Keyed on StudyTask.id (a fresh UUID per generated task — see StudyTask's
+     * own doc — never reused across days), not a global flag, so one overdue task doesn't
+     * suppress detection for a different one.
+     */
+    fun hasAppliedOverdueEnforcement(taskId: String): Boolean =
+        overdueEscalatedIds().contains(taskId)
+
+    /** Records that overdue enforcement has now been applied for [taskId] — call exactly
+     *  once, from the same code path that calls [startPostSkipLockdown] for this reason. */
+    fun markOverdueEnforcementApplied(taskId: String) {
+        persistOverdueEscalatedIds(overdueEscalatedIds() + taskId)
+    }
+
+    /**
+     * Drops every escalated-task id NOT in [stillPendingTaskIds]. Call from
+     * [com.checkmate.service.WorkModeTaskReconciler] on every PlanStore.todayTasks
+     * emission — that's the one place that already observes every task leaving PENDING,
+     * regardless of why (started, done, skipped, reverted back to PENDING by
+     * GapTaskManager's resolveDoneConcept path, or dropped off today's list entirely by
+     * day rollover). A task that's since been resolved has nothing left to guard against
+     * re-escalating, and if it ever legitimately becomes PENDING again later (the
+     * GapTaskManager revert case), it deserves a fresh overdue evaluation rather than
+     * being permanently suppressed by a stale flag from its last time around.
+     *
+     * Also clears the detected top-app watchlist entry once nothing is left escalated, so
+     * a stale detection from an already-resolved delay doesn't linger in
+     * [getEscalationWatchlist] indefinitely.
+     */
+    fun retainOverdueEnforcementOnly(stillPendingTaskIds: Set<String>) {
+        val current = overdueEscalatedIds()
+        val retained = current.intersect(stillPendingTaskIds)
+        if (retained != current) persistOverdueEscalatedIds(retained)
+        if (retained.isEmpty() && current.isNotEmpty()) setOverdueTopApp(null)
+    }
+
+    /** Records which app [com.checkmate.core.AppUsageTracker.getTopAppInRange] found was
+     *  eating the most time during the current overdue-PENDING window — folded into
+     *  [getEscalationWatchlist] alongside the fixed watchlist. Pass null to clear it. */
+    fun setOverdueTopApp(pkg: String?) {
+        CheckmatePrefs.putString(KEY_OVERDUE_TOP_APP, pkg ?: "")
+    }
+
+    private fun overdueEscalatedIds(): Set<String> {
+        val saved = CheckmatePrefs.getString(KEY_OVERDUE_ESCALATED_TASK_IDS, "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun persistOverdueEscalatedIds(ids: Set<String>) {
+        CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
+    }
+
+    /**
+     * LOOPHOLE FIX (adaptive app block over-blocking): packages that must never be treated
+     * as "blocked" no matter what's saved in "blocked_apps" — blocking the student's own
+     * launcher, phone/dialer, or system Settings app bricks device navigation outright
+     * (there'd be no way back to Home or Settings to even fix the block list), and ChatGPT
+     * is kept reachable for legitimate doubt-solving during study, per guardian policy.
+     *
+     * Launcher/dialer/Settings are resolved dynamically via PackageManager rather than
+     * hardcoded: exact package names for these vary across OEM skins (e.g. this device's
+     * Settings/launcher fork), and a wrong hardcoded guess would silently exempt nothing.
+     * ChatGPT has no resolvable Intent category ("the doubt-solving app" isn't a system
+     * role), so it's a fixed constant instead — add more the same way, or via
+     * "essential_apps_extra" for anything the guardian wants exempted without a rebuild.
+     */
+    fun essentialPackages(context: Context): Set<String> {
+        val pm = context.packageManager
+        val result = mutableSetOf<String>()
+
+        // Home launcher — query all resolvable launchers, not just the current default,
+        // so switching launchers later doesn't reopen this loophole.
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        try {
+            pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.let { result.add(it) }
+            pm.queryIntentActivities(homeIntent, 0).forEach { info ->
+                info.activityInfo?.packageName?.let { result.add(it) }
+            }
+        } catch (_: Exception) { /* best-effort — never let this crash the guard */ }
+
+        // Phone / dialer
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                telecom?.defaultDialerPackage?.let { result.add(it) }
+            }
+            pm.resolveActivity(Intent(Intent.ACTION_DIAL), 0)?.activityInfo?.packageName?.let { result.add(it) }
+        } catch (_: Exception) { }
+
+        // System Settings app — covers OEM forks (e.g. OnePlus/ColorOS) regardless of
+        // their actual package name, since it's resolved by intent action, not guessed.
+        try {
+            pm.resolveActivity(Intent(AndroidSettings.ACTION_SETTINGS), 0)?.activityInfo?.packageName?.let {
+                result.add(it)
+            }
+        } catch (_: Exception) { }
+
+        // Never block Checkmate's own UI.
+        result.add(context.packageName)
+
+        // Fixed doubt-solving exemption.
+        result.add(CHATGPT_PKG)
+
+        // Guardian-extendable list — same comma-separated storage pattern as
+        // "escalation_watchlist" above.
+        val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""
+        extra.split(",").map { it.trim() }.filterTo(result) { it.isNotBlank() }
+
+        return result
+    }
+
+    /**
+     * Returns package names of apps to block. Stored as comma-separated values under
+     * "blocked_apps" (via AppSelectorScreen).
+     */
+    fun getBlockedApps(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    /**
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
+     */
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun startService(context: Context) {
+        val intent = Intent(context, WorkModeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * public (was folded into the private SOURCE_* consts before this fix) so
+     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
+     * own activate() calls and compare against [activeSource]. Kept as a plain
+     * string constant to match every other source tag's storage as raw
+     * CheckmatePrefs strings.
+     */
+    const val SOURCE_TASK = "task"
+}
 
 
 //===== FILE: app/src/main/kotlin/com/checkmate/service/GuardianNotifier.kt =====
@@ -1043,5 +1778,7 @@ object UninstallGuard {
         return true
     }
 }
+
+
 
 
