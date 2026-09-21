@@ -83,6 +83,15 @@ object GapTaskManager {
     // of this install's life once it's confirmed done.
     private const val PREF_REPAIRED_LEGACY_NULL_TOPICS = "gap_task_repaired_legacy_null_topics_v1"
 
+    // BUGFIX (daily gate burned by a run that created nothing): the once-a-day gate used to
+    // be marked in a `finally`, so an empty StudentModel, an exception, or a run where every
+    // ranked candidate was rejected all locked generation out until tomorrow. The gate is now
+    // only marked when a task is actually created; failed/empty/rejected runs are instead
+    // throttled to one attempt per RETRY_INTERVAL_MS so the heavy ranking pipeline doesn't
+    // re-run on every 15-min cycle.
+    private const val PREF_LAST_ATTEMPT_MS = "gap_task_last_attempt_ms"
+    private const val RETRY_INTERVAL_MS = 60L * 60_000L
+
     // ── Daily generation ─────────────────────────────────────────────────────
 
     /**
@@ -111,6 +120,9 @@ object GapTaskManager {
     }
 
     private suspend fun generateIfNeededLocked(context: Context) {
+        Log.d(TAG, "generateIfNeeded: ENTER day=${GapTaskLedger.todayKey()} " +
+            "activeConcept=${GapTaskLedger.activeConceptId()} activeTask=${GapTaskLedger.activeTaskId()} " +
+            "lastGeneratedDay=${CheckmatePrefs.getString("gap_task_last_generated_day", null)}")
         // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
         // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
         // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
@@ -132,34 +144,89 @@ object GapTaskManager {
         createTargetedTestIfNeeded(context)
 
         val todayKey = GapTaskLedger.todayKey()
-        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+        if (GapTaskLedger.hasGeneratedToday(todayKey)) {
+            Log.d(TAG, "generateIfNeeded: gate CLOSED — a task was already generated today ($todayKey), skipping ranking pass")
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        val sinceLastAttemptMs = nowMs - CheckmatePrefs.getLong(PREF_LAST_ATTEMPT_MS, 0L)
+        if (sinceLastAttemptMs < RETRY_INTERVAL_MS) {
+            Log.d(TAG, "generateIfNeeded: THROTTLED — last attempt ${sinceLastAttemptMs / 1000}s ago " +
+                "(retry every ${RETRY_INTERVAL_MS / 1000}s), skipping")
+            return
+        }
+        CheckmatePrefs.putLong(PREF_LAST_ATTEMPT_MS, nowMs)
+        Log.d(TAG, "generateIfNeeded: ranking pass START day=$todayKey")
 
         repairLegacyNullTopicsIfNeeded(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
-            if (studentModel.concepts.isEmpty()) return
+            Log.d(TAG, "generateIfNeeded: studentModel built — concepts=${studentModel.concepts.size}")
+            if (studentModel.concepts.isEmpty()) {
+                Log.w(TAG, "generateIfNeeded: StudentModel EMPTY — nothing to rank; day NOT marked, will retry")
+                return
+            }
 
             val profile = ConsultationProfile.load()
+            Log.d(TAG, "generateIfNeeded: profile exam=${profile.examTarget} targetScore=${profile.targetScore}")
             val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
             val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
             val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+
+            // BUGFIX (covered concepts occupying the candidate cap): LearningDecisionEngine caps
+            // its output at a handful of candidates, but the covered-concept filter used to run
+            // only AFTER that cap (in the orchestrator's walk). Once enough concepts were
+            // covered, the top-N ranking could consist ENTIRELY of already-covered concepts, so
+            // every candidate was rejected AlreadyCovered and nothing was ever created again.
+            // Covered ids are now excluded before ranking so they can't consume cap slots.
+            val covered = GapTaskLedger.coveredConceptIds()
+            Log.d(TAG, "generateIfNeeded: estimates=${estimates.size} covered=${covered.size} " +
+                "coveredAmongEstimates=${estimates.count { it.conceptId in covered }}")
+            estimates.take(10).forEachIndexed { i, e ->
+                Log.d(TAG, "  estimate #${i + 1} concept=${e.conceptId} chapter=${e.chapter} topic=${e.topic} " +
+                    "mastery=${e.mastery} gain=${e.expectedGain} covered=${e.conceptId in covered}")
+            }
+
             val decisionReport = LearningDecisionEngine.decideFromReport(
-                report, studentModel, estimates, expectedScore
+                report, studentModel, estimates, expectedScore, excludedConceptIds = covered
             )
+            Log.d(TAG, "generateIfNeeded: decision report candidates=${decisionReport.candidates.size}")
+            decisionReport.candidates.forEachIndexed { i, c ->
+                Log.d(TAG, "  candidate #${i + 1} intent=${c.intent} concept=${c.conceptId} subject=${c.subject} " +
+                    "chapter=${c.chapter} topic=${c.topic} min=${c.durationMinutes} gain=${c.expectedGain} " +
+                    "prio=${c.priorityScore} covered=${c.conceptId?.let { id -> id in covered } == true}")
+            }
+
             val orchestrationResult =
                 LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+            Log.d(TAG, "generateIfNeeded: orchestrator outcome=${orchestrationResult.outcome::class.simpleName} " +
+                "rejections=${orchestrationResult.rejections.size}")
+            orchestrationResult.rejections.forEach {
+                Log.d(TAG, "  rejection rank=${it.rank} concept=${it.candidate.conceptId} " +
+                    "intent=${it.candidate.intent} source=${it.source} :: ${it.detail}")
+            }
+
             // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
             // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
             // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
             // startFromCandidate's own doc for which intents this actually applies to.
-            (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
-                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
+            val created = orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created
+            if (created != null) {
+                Log.d(TAG, "generateIfNeeded: CREATED intent=${created.candidate.intent} " +
+                    "concept=${created.candidate.conceptId} taskKey=${created.taskId} " +
+                    "execution=${created.executionOutcome}")
+                TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis())
+                // Only burn the once-a-day gate on a real success — see PREF_LAST_ATTEMPT_MS.
+                GapTaskLedger.markGeneratedToday(todayKey)
+            } else {
+                Log.w(TAG, "generateIfNeeded: NO task created this pass — day NOT marked, retry in " +
+                    "${RETRY_INTERVAL_MS / 60_000L} min")
+            }
             createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
-            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
-        } finally {
-            GapTaskLedger.markGeneratedToday(todayKey)
+            Log.e(TAG, "generateIfNeeded failed: ${e.message} — day NOT marked, retry in " +
+                "${RETRY_INTERVAL_MS / 60_000L} min", e)
         }
     }
 
@@ -644,8 +711,14 @@ object GapTaskManager {
     }
 
     private suspend fun evidencePollIfNeededLocked(context: Context) {
-        if (GapTaskLedger.isActiveEvidenceImported()) return
-        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: return
+        if (GapTaskLedger.isActiveEvidenceImported()) {
+            Log.d(TAG, "evidencePoll: active concept's evidence already imported — skip")
+            return
+        }
+        val sessionId = GapTaskLedger.activeTestmateSessionId() ?: run {
+            Log.d(TAG, "evidencePoll: no active Testmate session — skip")
+            return
+        }
 
         val outcome = try {
             TestmateApi.fetchResult(sessionId)
@@ -655,9 +728,19 @@ object GapTaskManager {
         }
         val result = when (outcome) {
             is TestmateResultOutcome.Success -> outcome.result
-            is TestmateResultOutcome.Error -> return // not submitted yet (or a real failure either way) — retry next cycle
+            is TestmateResultOutcome.Error -> {
+                // not submitted yet (or a real failure either way) — retry next cycle
+                Log.d(TAG, "evidencePoll: session=$sessionId result not available yet: $outcome")
+                return
+            }
         }
-        if (result.breakdown.isEmpty()) return // submitted but no per-question data yet — treat like not-ready
+        if (result.breakdown.isEmpty()) {
+            // submitted but no per-question data yet — treat like not-ready
+            Log.d(TAG, "evidencePoll: session=$sessionId result has empty breakdown — not ready")
+            return
+        }
+        Log.d(TAG, "evidencePoll: session=$sessionId result ready (attempted=${result.attemptedCount} " +
+            "correct=${result.correctCount}) — importing evidence")
 
         try {
             val exam = ConsultationProfile.load().examTarget
@@ -675,6 +758,7 @@ object GapTaskManager {
                 attemptCount = result.attemptedCount,
                 correctCount = result.correctCount
             )
+            Log.d(TAG, "evidencePoll: evidence imported for session=$sessionId")
         } catch (e: Exception) {
             Log.e(TAG, "evidence import failed: ${e.message}", e)
         }
@@ -722,15 +806,32 @@ days running — this is the escalated warning, not the first nudge. Rules:
 
     private suspend fun escalationCheckIfNeededLocked(context: Context) {
         val todayKey = GapTaskLedger.todayKey()
-        if (GapTaskLedger.hasEscalatedToday(todayKey)) return
+        if (GapTaskLedger.hasEscalatedToday(todayKey)) {
+            Log.d(TAG, "escalationCheck: already escalated today ($todayKey) — skip")
+            return
+        }
 
         val daysServed = GapTaskLedger.activeDaysServed()
-        if (daysServed < 2) return // day 1: normal experience, no warning
+        if (daysServed < 2) {
+            Log.d(TAG, "escalationCheck: daysServed=$daysServed (<2) — no warning yet")
+            return // day 1: normal experience, no warning
+        }
 
-        val conceptId = GapTaskLedger.activeConceptId() ?: return
-        val taskId = GapTaskLedger.activeTaskId() ?: return
-        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        val conceptId = GapTaskLedger.activeConceptId() ?: run {
+            Log.d(TAG, "escalationCheck: no active concept — skip")
+            return
+        }
+        val taskId = GapTaskLedger.activeTaskId() ?: run {
+            Log.d(TAG, "escalationCheck: concept=$conceptId has no active taskId — skip")
+            return
+        }
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: run {
+            Log.d(TAG, "escalationCheck: concept=$conceptId taskId=$taskId has no dayKey — skip")
+            return
+        }
         val task = findTask(taskId, dayKey)
+        Log.d(TAG, "escalationCheck: concept=$conceptId taskId=$taskId dayKey=$dayKey daysServed=$daysServed " +
+            "taskState=${task?.state}")
 
         if (task == null || task.state == TaskState.DONE) {
             if (task?.state == TaskState.DONE) {
@@ -758,6 +859,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
             return
         }
         if (task.state != TaskState.PENDING && task.state != TaskState.SKIPPED) {
+            Log.d(TAG, "escalationCheck: task ${task.id} is ${task.state} — not interrupting")
             return // ACTIVE/PAUSED right now — don't interrupt an in-progress session
         }
 

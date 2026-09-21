@@ -1,6 +1,7 @@
 package com.checkmate.planner.intervention
 
 import android.content.Context
+import android.util.Log
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
@@ -341,8 +342,12 @@ class LearningInterventionOrchestrator(
         report: LearningDecisionEngine.DecisionReport,
         now: Long
     ): OrchestrationResult {
-        val rejections = mutableListOf<CandidateRejection>()
+        // Logs every rejection at the moment it is recorded (see LoggingRejectionList) so
+        // "why was nothing created?" is answerable from logcat instead of being discarded.
+        val rejections: MutableList<CandidateRejection> = LoggingRejectionList()
         val dayKey = dayKeyProvider()
+        olog("executeTopCandidate: START day=$dayKey candidates=${report.candidates.size} " +
+            "activeConcept=${GapTaskLedger.activeConceptId()} activeTask=${GapTaskLedger.activeTaskId()}")
 
         // BUGFIX (duplicate task via re-ranking, part 2): resolved ONCE, before any
         // candidate is walked, so a re-rank that promotes a different concept to rank 1
@@ -376,7 +381,11 @@ class LearningInterventionOrchestrator(
                         timestamp = now
                     )
                 }
+                olog("executeTopCandidate: BLOCKED by unresolved active task ${blockingTask.id} " +
+                    "(state=${blockingTask.state}) — no candidate evaluated")
                 return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
+            } else {
+                olog("executeTopCandidate: active concept $activeConceptId has no unresolved task — not blocking")
             }
         }
 
@@ -430,6 +439,7 @@ class LearningInterventionOrchestrator(
             }
 
             val route = resolveRoute(candidate, dayKey)
+            olog("candidate #$rank intent=${candidate.intent} concept=$conceptId routed=${route != null}")
             if (route == null) {
                 rejections += CandidateRejection(
                     candidate = candidate,
@@ -471,6 +481,7 @@ class LearningInterventionOrchestrator(
                                 policyResult.action,
                                 now
                             )
+                            olog("candidate #$rank escrow ACQUIRED key=${route.escrowKey} — execution=$executionOutcome")
                             if (route.tracksGapLedger) {
                                 GapTaskLedger.recordServed(candidate, route.escrowKey, dayKey)
                             }
@@ -480,6 +491,8 @@ class LearningInterventionOrchestrator(
                             if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY) {
                                 ReplanDayLedger.markReplannedToday(dayKey)
                             }
+                            olog("executeTopCandidate: CREATED candidate #$rank intent=${candidate.intent} " +
+                                "concept=$conceptId escrowKey=${route.escrowKey}")
                             return OrchestrationResult(
                                 outcome = OrchestrationOutcome.Created(candidate, rank, route.escrowKey, executionOutcome),
                                 rejections = rejections
@@ -490,6 +503,8 @@ class LearningInterventionOrchestrator(
             }
         }
 
+        olog("executeTopCandidate: NO executable candidate — ${rejections.size} rejection(s) of " +
+            "${report.candidates.size} candidate(s)")
         return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
     }
 
@@ -548,5 +563,22 @@ class LearningInterventionOrchestrator(
             )
             return LearningInterventionOrchestrator(escrow, executor)
         }
+    }
+}
+
+private const val ORCH_TAG = "InterventionOrchestrator"
+
+/** Log.d that never throws — plain-JVM unit tests run against the stubbed android.jar where
+ *  every android.util.Log call throws "not mocked". */
+private fun olog(msg: String) {
+    try { Log.d(ORCH_TAG, msg) } catch (_: Throwable) {}
+}
+
+/** ArrayList that logs each [LearningInterventionOrchestrator.CandidateRejection] as it is added. */
+private class LoggingRejectionList : ArrayList<LearningInterventionOrchestrator.CandidateRejection>() {
+    override fun add(element: LearningInterventionOrchestrator.CandidateRejection): Boolean {
+        olog("REJECTED rank=${element.rank} concept=${element.candidate.conceptId} " +
+            "intent=${element.candidate.intent} source=${element.source} :: ${element.detail}")
+        return super.add(element)
     }
 }

@@ -190,15 +190,23 @@ object LearningDecisionEngine {
      * one Room read, so this can never silently diverge from what's already on
      * screen. Same "one Room read, N derived views" discipline
      * [ScorePredictor.predictFromReport] itself follows.
+     *
+     * [excludedConceptIds]: concepts a caller already considers finished (e.g. the gap-task
+     * ledger's covered set). They're dropped from [estimates] BEFORE the candidate pool and
+     * the [MAX_CANDIDATES] cap are applied — filtering them afterwards lets a handful of
+     * covered-but-still-weak concepts fill every slot and starve everything else.
      */
     fun decideFromReport(
         report: PerformanceAnalyzer.PerformanceReport,
         studentModel: StudentModel,
         estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
-        expectedScore: ScorePredictor.ExpectedScore
+        expectedScore: ScorePredictor.ExpectedScore,
+        excludedConceptIds: Set<String> = emptySet()
     ): DecisionReport {
         val diagnostics = diagnosticCandidates(studentModel, report)
-        val concepts = collapseIntoTargetedSets(conceptCandidates(studentModel, estimates))
+        val eligibleEstimates = if (excludedConceptIds.isEmpty()) estimates
+            else estimates.filter { it.conceptId !in excludedConceptIds }
+        val concepts = collapseIntoTargetedSets(conceptCandidates(studentModel, eligibleEstimates))
         val conceptLevel = diagnostics + concepts
         val ceiling = conceptLevel.maxOfOrNull { it.priorityScore } ?: 0.0
         val macro = macroCandidates(studentModel, report, ceiling)

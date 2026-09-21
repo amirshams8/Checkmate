@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.PlanStore
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit
 
 class ReminderService : Service() {
     companion object {
+        private const val TAG = "ReminderService"
         private const val CHANNEL_ID = "reminder_channel"
         private const val NOTIF_ID   = 55
         // Mentor v2 (spec 3.5): same Cloudflare Worker StatusReporter already pushes to.
@@ -51,6 +53,7 @@ class ReminderService : Service() {
         startForeground(NOTIF_ID, buildNotification("Monitoring tasks…"))
         scope.launch {
             while (isActive) {
+                Log.d(TAG, "cycle START")
                 // Bugfix ("old tasks not clearing at end of day"): PlanStore.todayTasks is
                 // only ever populated at process start or by a local write, so a DONE/SKIPPED
                 // task just sat there until the app restarted. Runs first each cycle so every
@@ -69,56 +72,75 @@ class ReminderService : Service() {
                             TaskSyncManager.pushTasks(carried.tasks, carried.dayKey, carried.updatedAt)
                         }
                     }
-                } catch (_: Exception) {}
-                checkPendingTasks()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "step 'cleanupCompletedIfDue' failed: ${e.message}", e)
+                }
+                step("checkPendingTasks") { checkPendingTasks() }
                 // Mentor v2 (spec 3.2): idle check-in — appends to Mentor chat + notifies if
                 // nothing's been started by the configured hour. No-ops after the first fire
                 // each day (see ProactiveMentor.idleCheckIfNeeded's day-key guard).
-                try { ProactiveMentor.idleCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("idleCheck") { ProactiveMentor.idleCheckIfNeeded(applicationContext) }
                 // "No tasks in plan == no study": once-daily check for a multi-day gap with
                 // no plan/completion, nudges the student and alerts the guardian. Same
                 // no-op-after-first-fire-per-day guard as idleCheckIfNeeded above.
-                try { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("consistencyCheck") { ProactiveMentor.consistencyCheckIfNeeded(applicationContext) }
                 // Weekly (Wednesdays only) reminder to review/mark upcoming holidays — see
                 // ProactiveMentor.holidayPromptIfNeeded's week-key guard.
-                try { ProactiveMentor.holidayPromptIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("holidayPrompt") { ProactiveMentor.holidayPromptIfNeeded(applicationContext) }
                 // Gap-task daily cadence: the ongoing trigger LearningInterventionOrchestrator's
                 // own class doc always said was still missing — runs the analysis pipeline once
                 // a day and lets the orchestrator pick up wherever GapTaskLedger left off. Also
                 // requests the P0b Testmate targeted test for whatever concept ends up active.
                 // See GapTaskManager.generateIfNeeded's own doc for the once-per-day guard.
-                try { GapTaskManager.generateIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("GapTaskManager.generateIfNeeded") { GapTaskManager.generateIfNeeded(applicationContext) }
                 // Gap-task escalation: warns the student, with escalating persuasion, when the
                 // currently-active gap concept has gone unaddressed for more than a day — see
                 // GapTaskManager.escalationCheckIfNeeded's own doc for the depth tiers.
-                try { GapTaskManager.escalationCheckIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("GapTaskManager.escalationCheck") { GapTaskManager.escalationCheckIfNeeded(applicationContext) }
                 // P0b: the actual evidence-loop return arrow — polls the active concept's
                 // Testmate targeted-test session and, once it's submitted, imports real
                 // QuestionAttempt/LearningEvent evidence instead of leaving mastery to move
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
-                try { GapTaskManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("GapTaskManager.evidencePoll") { GapTaskManager.evidencePollIfNeeded(applicationContext) }
                 // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
                 // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
                 // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and
                 // VERIFY consume GapTaskLedger's own already-imported P0b evidence (just
                 // polled/imported by the call directly above, same tick) rather than firing a
                 // second competing Testmate request. See TutorCycleManager's own class doc.
-                try { TutorCycleManager.driveActiveSession(applicationContext) } catch (_: Exception) {}
+                step("TutorCycleManager.driveActiveSession") { TutorCycleManager.driveActiveSession(applicationContext) }
                 // Retention-check evidence loop (next-session-retention-loop.txt): requests a
                 // Testmate session for any RETENTION CHECK task that doesn't have one yet —
                 // see RetentionCheckManager's own doc for why this is a separate ledger/
                 // manager from the gap-repair pair above rather than folded into it.
-                try { RetentionCheckManager.createRetentionTestsIfNeeded() } catch (_: Exception) {}
+                step("RetentionCheckManager.createRetentionTests") { RetentionCheckManager.createRetentionTestsIfNeeded() }
                 // Retention-check evidence loop, return arrow: polls any outstanding retention
                 // session and, once submitted, imports real QuestionAttempt/LearningEvent
                 // evidence — same every-cycle (not once/day) cadence as the gap-repair poll
                 // above, for the same reason (the student can submit at any time).
-                try { RetentionCheckManager.evidencePollIfNeeded(applicationContext) } catch (_: Exception) {}
+                step("RetentionCheckManager.evidencePoll") { RetentionCheckManager.evidencePollIfNeeded(applicationContext) }
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
-                try { pollRemoteOverride() } catch (_: Exception) {}
+                step("pollRemoteOverride") { pollRemoteOverride() }
+                Log.d(TAG, "cycle END — sleeping 15 min")
                 delay(15 * 60 * 1000L) // check every 15 min
             }
+        }
+    }
+
+    /** Runs one loop step, logging duration on success and the full exception on failure —
+     *  every step used to be `try { ... } catch (_: Exception) {}`, which made a failing
+     *  step (e.g. the gap-task generator) completely invisible. Cancellation still propagates. */
+    private suspend fun step(name: String, block: suspend () -> Unit) {
+        val t0 = System.currentTimeMillis()
+        try {
+            block()
+            Log.d(TAG, "step '$name' ok in ${System.currentTimeMillis() - t0}ms")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "step '$name' FAILED after ${System.currentTimeMillis() - t0}ms: ${e.message}", e)
         }
     }
 

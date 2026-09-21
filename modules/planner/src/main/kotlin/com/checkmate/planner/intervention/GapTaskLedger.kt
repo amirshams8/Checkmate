@@ -175,6 +175,17 @@ object GapTaskLedger {
     fun isCovered(conceptId: String): Boolean =
         coveredIds().contains(conceptId)
 
+    /** Snapshot of every concept id already marked covered — lets a caller (see
+     *  [com.checkmate.service.GapTaskManager.generateIfNeeded]) exclude them BEFORE ranking
+     *  so they can't fill the decision engine's candidate cap. */
+    fun coveredConceptIds(): Set<String> = coveredIds()
+
+    /** Log.d that never throws — this module's plain-JVM unit tests run against the stubbed
+     *  android.jar where every android.util.Log call throws "not mocked". */
+    private fun safeLog(msg: String) {
+        try { Log.d(TAG, msg) } catch (_: Throwable) {}
+    }
+
     /**
      * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
      * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
@@ -191,6 +202,7 @@ object GapTaskLedger {
      */
     fun markCovered(conceptId: String) {
         val updated = coveredIds() + conceptId
+        safeLog("markCovered: concept=$conceptId (covered total=${updated.size})")
         CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
         recordWarningOutcome(conceptId)
         if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
@@ -543,8 +555,22 @@ object GapTaskLedger {
             // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
             return block()
         }
+        val contended = mutex.isLocked
+        val waitStart = System.currentTimeMillis()
+        if (contended) {
+            safeLog("withLock: lock currently HELD by another call chain — waiting " +
+                "(caller thread=${Thread.currentThread().name})")
+        }
         return mutex.withLock {
-            withContext(LockOwnerElement()) { block() }
+            val waited = System.currentTimeMillis() - waitStart
+            if (contended || waited > 500L) safeLog("withLock: acquired after ${waited}ms wait")
+            val heldStart = System.currentTimeMillis()
+            try {
+                withContext(LockOwnerElement()) { block() }
+            } finally {
+                val held = System.currentTimeMillis() - heldStart
+                if (held > 3_000L) safeLog("withLock: critical section held the lock for ${held}ms (SLOW)")
+            }
         }
     }
 }
