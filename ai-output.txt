@@ -1,457 +1,3 @@
-//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/UninstallGuard.kt =====
-package com.checkmate.workmode
-
-import com.checkmate.core.CheckmatePrefs
-import java.security.MessageDigest
-import java.security.SecureRandom
-
-/**
- * UninstallGuard — the shared brain behind Checkmate's uninstall protection.
- *
- * IMPORTANT DESIGN NOTE: the guardian PIN is never typed in by hand and never
- * shown on screen. Whoever holds the phone can tap "Generate PIN", but the
- * PIN itself only ever reaches the guardian's Telegram chat — the device
- * stores only a SHA-256 hash, and the plaintext is never persisted or
- * displayed anywhere in the UI. This closes the obvious loophole where a
- * student sets their own PIN in a plaintext field: generating a new PIN is
- * harmless self-sabotage from the student's side, since they still never
- * learn what it is.
- *
- * Three cooperating pieces close the uninstall loop:
- *  1. Device Admin activation (CheckmateDeviceAdminReceiver) hides the plain
- *     "Uninstall" button on the App Info screen.
- *  2. This object holds the guardian-PIN-gated "temporary unlock" window.
- *  3. AppAutomationService (accessibility service) watches for navigation
- *     into screens that could remove/disable Checkmate and, unless
- *     currently unlocked, bounces to Home and alerts the guardian.
- *
- * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
- * those are OS-level and no on-device app can intercept them. Developer
- * Options is the one on-device path that leads there without a factory
- * reset or physical Safe Mode boot, so it's guarded too (see
- * DEV_OPTIONS_KEYWORDS below) even though it never mentions "Checkmate".
- */
-object UninstallGuard {
-
-    private const val KEY_PIN_HASH        = "guardian_pin_hash"
-    private const val KEY_UNLOCK_UNTIL    = "uninstall_unlock_until"
-    private const val KEY_LAST_ALERT      = "uninstall_last_alert_at"
-    private const val KEY_LAST_GENERATED  = "guardian_pin_last_generated"
-    private const val KEY_FAIL_COUNT      = "guardian_pin_fail_count"
-    private const val KEY_LOCKOUT_UNTIL   = "guardian_pin_lockout_until"
-
-    // Mentor v2 (spec 3.5): remote override window, independent of KEY_UNLOCK_UNTIL. A guardian
-    // can be PIN-unlocked (isUnlocked() == true) while WorkModeManager.settingsLocked() still
-    // reads locked because skipRateExceedsThreshold() is also true — that's the intended
-    // escalation behavior. This is the documented emergency bypass for that case: a guardian
-    // command relayed through the existing Telegram bot/Cloudflare worker (the same
-    // infrastructure StatusReporter already pushes to for "status"/"usage") sets this window,
-    // and WorkModeManager.settingsLocked() treats it as a full bypass of BOTH gates.
-    // NOTE: this object only stores/checks the window. The inbound half — the worker route that
-    // listens for a guardian command (e.g. "unlock") and the on-device poll that calls
-    // grantRemoteOverride() — lives at the app layer (see ReminderService.pollRemoteOverride())
-    // since :modules:workmode has no network dependency and shouldn't gain one just for this.
-    private const val KEY_REMOTE_OVERRIDE_UNTIL = "remote_override_until"
-    private const val REMOTE_OVERRIDE_WINDOW_MS = 5 * 60 * 1000L
-
-    // How long a correct PIN entry keeps the watchdog from bouncing the user,
-    // so a guardian can actually walk through the uninstall/disable flow.
-    private const val UNLOCK_WINDOW_MS = 2 * 60 * 1000L
-
-    // Don't fire a fresh Telegram alert more than once per this window even
-    // if the watchdog keeps re-triggering while the user sits on the screen.
-    private const val ALERT_THROTTLE_MS = 20 * 1000L
-
-    // Minimum time between PIN (re)generations. Previously 5 minutes (just
-    // enough to stop Telegram spam); raised to a ~7-month commitment window
-    // (30-day months) so a fresh PIN request itself becomes a rare, guardian-
-    // visible event rather than something the student can casually retry.
-    // NOTE: this only gates *regeneration* of a new PIN — it does not touch
-    // UNLOCK_WINDOW_MS, the brute-force lockout below, or the remote-override
-    // path (KEY_REMOTE_OVERRIDE_UNTIL / grantRemoteOverride()), so the
-    // guardian's existing Telegram "unlock" command still works at any time
-    // even while regeneration itself is on cooldown.
-    private const val REGEN_COOLDOWN_MS = 7L * 30 * 24 * 60 * 60 * 1000L
-
-    // Brute-force protection on the unlock field itself.
-    private const val MAX_FAILED_ATTEMPTS = 5
-    private const val LOCKOUT_MS = 10 * 60 * 1000L
-
-    // ── Repeated-disable-attempt hard lock ──────────────────────────────────
-    // AppAutomationService's touch-blocker overlay normally only holds for a fraction of a
-    // second (just long enough for GLOBAL_ACTION_HOME to take effect). If someone keeps
-    // landing back on a guarded screen (uninstall / device-admin-disable / accessibility-
-    // disable) three times in a row, that's a deliberate, repeated attempt rather than one
-    // stray tap — this escalates the response from "bounce and briefly block" to a full
-    // screen-wide touch freeze, independent of which specific guarded screen triggered it.
-    private const val KEY_CONSEC_ATTEMPTS = "guarded_screen_consecutive_attempts"
-    private const val KEY_LAST_ATTEMPT_AT = "guarded_screen_last_attempt_at"
-
-    // TEMP DEBUG INSTRUMENTATION (uninstall-guard false-trigger investigation): logcat
-    // isn't available on this setup, so mirror each detection decision into a
-    // SharedPreferences-backed ring buffer instead of Log.w — CheckmatePrefs is
-    // already readable via `adb shell run-as com.checkmate cat
-    // /data/data/com.checkmate/shared_prefs/checkmate_prefs.xml`, so this key shows
-    // up in that same pull without needing logcat at all. Remove logDebugTrail()
-    // and its call sites once the false-trigger root cause is confirmed fixed
-    // against real device evidence (debugging-approach step 9) — not meant to ship.
-    //
-    // BUGFIX (trail flooded by ambient noise): first version logged "EVENT" for
-    // every event that cleared the outer isWatchedForUninstall gate, before
-    // checking which branch actually fires. com.android.systemui throws a
-    // CONTENT_CHANGED (type=2048) every 1-4s from the status bar clock alone —
-    // that's neither a state change nor a WATCHED_PACKAGES content change, so it
-    // never reaches checkGuardedScreen(), but it was still being logged and rolled
-    // the real gesture's entry off a 25-line buffer within under a minute. Bumped
-    // to 150 lines as extra margin, and the call site was moved to only log
-    // immediately before an actual checkGuardedScreen() call (see
-    // AppAutomationService) so ambient noise stops filling the buffer at all.
-    private const val KEY_DEBUG_TRAIL = "debug_uninstall_trail"
-    private const val DEBUG_TRAIL_MAX_LINES = 150
-
-    // A gap longer than this between attempts resets the counter — this counts a *burst* of
-    // tries ("three in a row"), not a lifetime total across days/weeks.
-    private const val CONSEC_RESET_MS = 10 * 60 * 1000L
-
-    /** Consecutive guarded-screen attempts that trigger the full-screen hard lock. */
-    const val HARD_LOCK_THRESHOLD = 3
-
-    /** How long the hard lock holds the entire screen's touch input. */
-    const val HARD_LOCK_DURATION_MS = 5 * 60 * 1000L
-
-    /**
-     * Text fragments that identify a screen worth blocking, matched case-insensitively.
-     *
-     * BUGFIX (false trigger on ordinary gestures): "turn off", "app info", "downloaded
-     * apps", "installed services", and "installed apps" are common enough as generic
-     * system UI copy — a Quick Settings tile's content-description ("Turn off Wi-Fi"),
-     * a recents/task-switcher card's per-app "App info" button — that they can co-occur
-     * with Checkmate's own name simply because Checkmate is running: its persistent
-     * "Work Mode — ON" notification sits in the shade, and its own card sits in
-     * recents. Pulling down the notification shade or opening the task switcher are
-     * ordinary navigation gestures, not settings screens, so that combination isn't
-     * something this watchdog should ever be firing on.
-     *
-     * Split into two tiers so the fix is precise instead of weakening detection
-     * outright:
-     *  - [GUARD_KEYWORDS_STRICT]: phrases that only ever appear on a genuine
-     *    uninstall/disable confirmation. Safe to match on any watched surface,
-     *    including the widened [isLikelySystemSurface] prefixes (SystemUI, OEM
-     *    Settings forks) — that widening exists for exactly this tier (the
-     *    Battery/App-info "Force stop" bubble loophole).
-     *  - [GUARD_KEYWORDS_SETTINGS_ONLY]: phrases generic enough to show up outside
-     *    Settings entirely. Only matched when the window is one of the actual
-     *    Settings/OEM-Settings packages in [WATCHED_PACKAGES] — never on the
-     *    broader [isLikelySystemSurface] prefix match, which is what pulls in the
-     *    notification shade / Quick Settings / recents surfaces that caused the
-     *    false triggers.
-     */
-    val GUARD_KEYWORDS_STRICT = listOf(
-        "uninstall",
-        "force stop",
-        "disable device admin app",
-        "deactivate this device admin app",
-        "deactivate",
-        "remove admin"
-    )
-
-    val GUARD_KEYWORDS_SETTINGS_ONLY = listOf(
-        "turn off",          // accessibility-service disable toggle wording on many OEMs
-        "app info",
-        // Settings → Accessibility → "Downloaded apps" (Android 13+) / "Installed
-        // services" (older AOSP) / "Installed apps" (some OEMs) — the list screen
-        // that shows every accessibility service with its On/Off state and is the
-        // gateway a student would use to flip Checkmate's accessibility service
-        // off without ever hitting a screen that literally says "turn off". Gated
-        // the same way as everything else here: only fires when "checkmate" is
-        // also present in the visible text (targetsCheckmate), so browsing this
-        // list for an unrelated service before Checkmate is installed, or before
-        // its row is visible, isn't affected.
-        "downloaded apps",
-        "installed services",
-        "installed apps"
-    )
-
-    /** Combined view, kept for anything that wants "every guard keyword" as one list
-     *  (e.g. logging/debug tooling) — detection itself uses the two tiers above. */
-    val GUARD_KEYWORDS = GUARD_KEYWORDS_STRICT + GUARD_KEYWORDS_SETTINGS_ONLY
-
-    // Package names whose screens we watch. Settings itself, plus common
-    // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
-    val WATCHED_PACKAGES = setOf(
-        "com.android.settings",
-        "com.android.permissioncontroller",
-        "com.miui.securitycenter",
-        "com.coloros.securepay",
-        "com.oppo.securepay",
-        "com.samsung.android.settings",
-        // Samsung splits its Accessibility section into its own separate app
-        // rather than hosting it inside com.android.settings — the "Installed
-        // apps" service list (where Checkmate's accessibility toggle actually
-        // lives on One UI) runs under this package, so it needed its own entry
-        // or that screen was invisible to WATCHED_PACKAGES entirely.
-        "com.samsung.accessibility",
-        // CONFIRMED via `adb shell dumpsys window | grep mCurrentFocus` on this
-        // device: the OnePlus/ColorOS per-app Battery screen (PowerControlActivity,
-        // reached via Settings → Apps → Checkmate → Battery, with the Force stop
-        // button on it) runs under this package, not com.android.settings. Already
-        // covered by the "com.oplus." prefix in isLikelySystemSurface() below for the
-        // STATE_CHANGED path; listed here too so the CONTENT_CHANGED path also
-        // applies to it, in case that screen swaps tabs without a full window change.
-        "com.oplus.battery"
-    )
-
-    // LOOPHOLE FIX (Force Stop reachable via a Battery/App-info card that doesn't run
-    // under "com.android.settings" — e.g. a floating "app info" bubble hosted by
-    // SystemUI, or a OnePlus/ColorOS-specific Settings fork): rather than guess this
-    // device's exact package name for that surface (a wrong guess would silently
-    // exempt nothing), match by prefix against the OEM/system packages that are
-    // plausible hosts for such a screen. AppAutomationService only uses this to widen
-    // which windows get the (already name+keyword gated) guarded-screen text scan on
-    // window-open events — it does NOT change what counts as guarded. checkGuardedScreen()
-    // still requires "checkmate" + a GUARD_KEYWORDS_STRICT match (or a
-    // GUARD_KEYWORDS_SETTINGS_ONLY match gated to a real WATCHED_PACKAGES surface)
-    // before it acts, so widening which packages get scanned can't introduce a false
-    // positive on an unrelated system screen.
-    private val SYSTEM_PACKAGE_PREFIXES = listOf(
-        "com.android.systemui",
-        "com.android.settings",
-        "com.oneplus.",
-        "com.oplus.",
-        "com.coloros.",
-        "com.samsung.",
-        "com.miui.",
-        "com.xiaomi."
-    )
-
-    /** True if [pkg] looks like an OS/OEM system surface (Settings/SystemUI fork) worth
-     *  scanning for a guarded screen, even though it isn't one of the specific
-     *  [WATCHED_PACKAGES] entries above. */
-    fun isLikelySystemSurface(pkg: String): Boolean =
-        SYSTEM_PACKAGE_PREFIXES.any { pkg == it || pkg.startsWith(it) }
-
-    // Android's own "Restricted settings" verification/CAPTCHA dialog, shown
-    // on both the activate AND deactivate device-admin paths. It never
-    // mentions "Checkmate" by name (it's the OS's generic copy for ANY
-    // device-admin app), so it can't ride the targetsCheckmate gate that
-    // GUARD_KEYWORDS uses below — matched name-agnostically instead.
-    val DEVICE_ADMIN_PROMPT_KEYWORDS = listOf(
-        "activate device admin apps",
-        "deactivate device admin app"
-    )
-
-    /** True if this window is the OS-level activate/deactivate device-admin prompt (with or without the app named). */
-    fun isDeviceAdminPrompt(visibleText: String): Boolean {
-        val lower = visibleText.lowercase()
-        return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
-    }
-
-    // Developer Options rows that expose an ADB path. Enabling USB or Wireless
-    // debugging lets a student later run `adb uninstall`/`adb shell pm disable`
-    // from a computer, which bypasses the accessibility-service watchdog and
-    // the device-admin uninstall block entirely — neither of those OS-level
-    // paths ever surfaces "Checkmate" on screen, so like the device-admin
-    // prompt above this is matched name-agnostically rather than gated on
-    // targetsCheckmate. Matching on these labels means the whole Developer
-    // Options screen is guarded, not just the moment a toggle is flipped —
-    // same "block the screen outright" precedent as "app info" in GUARD_KEYWORDS.
-    val DEV_OPTIONS_KEYWORDS = listOf(
-        "usb debugging",
-        "wireless debugging",
-        "disable adb authorisation timeout",
-        "disable adb authorization timeout"
-    )
-
-    /** True if this window is a Developer Options screen exposing USB/Wireless debugging. */
-    fun isDeveloperOptionsScreen(visibleText: String): Boolean {
-        val lower = visibleText.lowercase()
-        return DEV_OPTIONS_KEYWORDS.any { lower.contains(it) }
-    }
-
-    /**
-     * Injected by CheckmateApp.onCreate so :workmode (and :automation, which
-     * calls this object) never directly references GuardianNotifier.
-     */
-    var listener: UninstallAlertListener? = null
-
-    // ── Result types ─────────────────────────────────────────────────────────
-
-    sealed class UnlockResult {
-        object Success : UnlockResult()
-        object WrongPin : UnlockResult()
-        object NoPinConfigured : UnlockResult()
-        data class LockedOut(val secondsLeft: Long, val justTriggered: Boolean) : UnlockResult()
-    }
-
-    // ── PIN generation (device-side hash only — plaintext goes to guardian) ────
-
-    fun hasPinConfigured(): Boolean = !CheckmatePrefs.getString(KEY_PIN_HASH, null).isNullOrBlank()
-
-    fun generateRandomPin(): String {
-        val n = SecureRandom().nextInt(1_000_000)
-        return n.toString().padStart(6, '0')
-    }
-
-    /** Stores only the hash. Also invalidates any active unlock window and clears lockout state. */
-    fun storeNewPinHash(pin: String) {
-        CheckmatePrefs.putString(KEY_PIN_HASH, hashPin(pin))
-        CheckmatePrefs.putLong(KEY_LAST_GENERATED, System.currentTimeMillis())
-        CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
-        CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-        CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, 0L)
-    }
-
-    fun canRegeneratePin(): Boolean {
-        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
-        return System.currentTimeMillis() - last >= REGEN_COOLDOWN_MS
-    }
-
-    fun regenCooldownRemainingSeconds(): Long {
-        val last = CheckmatePrefs.getLong(KEY_LAST_GENERATED, 0L)
-        val remaining = REGEN_COOLDOWN_MS - (System.currentTimeMillis() - last)
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    /** Same cooldown, in whole days — the 5-minute-scale seconds value above reads as a
-     *  meaningless huge number now that the cooldown is measured in months. */
-    fun regenCooldownRemainingDays(): Long {
-        val remainingSeconds = regenCooldownRemainingSeconds()
-        // Round up so "less than a day left" still shows as 1, not 0.
-        return (remainingSeconds + 86_399) / 86_400
-    }
-
-    private fun hashPin(pin: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(pin.trim().toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    // ── Unlock flow (guardian enters the PIN they received on Telegram) ────────
-
-    fun isLockedOut(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L)
-
-    fun lockoutRemainingSeconds(): Long {
-        val remaining = CheckmatePrefs.getLong(KEY_LOCKOUT_UNTIL, 0L) - System.currentTimeMillis()
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    fun unlockWithPin(pin: String): UnlockResult {
-        if (!hasPinConfigured()) return UnlockResult.NoPinConfigured
-        if (isLockedOut()) return UnlockResult.LockedOut(lockoutRemainingSeconds(), justTriggered = false)
-
-        val stored = CheckmatePrefs.getString(KEY_PIN_HASH, null)
-        return if (hashPin(pin) == stored) {
-            CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, System.currentTimeMillis() + UNLOCK_WINDOW_MS)
-            CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-            // A correct guardian PIN means this is a legitimate disable/uninstall flow, not
-            // tampering — clear the consecutive-attempt counter so it doesn't carry over into
-            // an unrelated future burst.
-            resetConsecutiveAttempts()
-            UnlockResult.Success
-        } else {
-            val fails = CheckmatePrefs.getInt(KEY_FAIL_COUNT, 0) + 1
-            if (fails >= MAX_FAILED_ATTEMPTS) {
-                CheckmatePrefs.putInt(KEY_FAIL_COUNT, 0)
-                CheckmatePrefs.putLong(KEY_LOCKOUT_UNTIL, System.currentTimeMillis() + LOCKOUT_MS)
-                UnlockResult.LockedOut(LOCKOUT_MS / 1000, justTriggered = true)
-            } else {
-                CheckmatePrefs.putInt(KEY_FAIL_COUNT, fails)
-                UnlockResult.WrongPin
-            }
-        }
-    }
-
-    fun isUnlocked(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L)
-
-    fun unlockSecondsRemaining(): Long {
-        val remaining = CheckmatePrefs.getLong(KEY_UNLOCK_UNTIL, 0L) - System.currentTimeMillis()
-        return if (remaining > 0) remaining / 1000 else 0
-    }
-
-    fun lockNow() = CheckmatePrefs.putLong(KEY_UNLOCK_UNTIL, 0L)
-
-    /** Opens the remote-override window. Call only after verifying a guardian-issued command
-     *  (see the NOTE above KEY_REMOTE_OVERRIDE_UNTIL) — this has no PIN check of its own. */
-    fun grantRemoteOverride() {
-        CheckmatePrefs.putLong(KEY_REMOTE_OVERRIDE_UNTIL, System.currentTimeMillis() + REMOTE_OVERRIDE_WINDOW_MS)
-    }
-
-    fun hasRemoteOverride(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_REMOTE_OVERRIDE_UNTIL, 0L)
-
-    // ── Screen detection (used by AppAutomationService) ─────────────────────────
-
-    /**
-     * True if this window's visible text suggests an uninstall/disable screen for
-     * Checkmate.
-     *
-     * [isKnownSettingsSurface] must be true only when the event's package is one of
-     * the actual Settings/OEM-Settings apps in [WATCHED_PACKAGES] — NOT just a
-     * broader [isLikelySystemSurface] prefix match. It gates
-     * [GUARD_KEYWORDS_SETTINGS_ONLY], whose phrasing ("app info", "turn off", ...)
-     * is common enough elsewhere (Quick Settings tiles, recents cards) to
-     * false-trigger on ordinary gestures if checked everywhere
-     * [GUARD_KEYWORDS_STRICT] is. See the doc on [GUARD_KEYWORDS_STRICT] /
-     * [GUARD_KEYWORDS_SETTINGS_ONLY] for the false-positive this fixes.
-     */
-    fun looksLikeGuardedScreen(
-        visibleText: String,
-        targetsCheckmate: Boolean,
-        isKnownSettingsSurface: Boolean
-    ): Boolean {
-        if (!targetsCheckmate) return false
-        val lower = visibleText.lowercase()
-        if (GUARD_KEYWORDS_STRICT.any { lower.contains(it) }) return true
-        return isKnownSettingsSurface && GUARD_KEYWORDS_SETTINGS_ONLY.any { lower.contains(it) }
-    }
-
-    /**
-     * Called by AppAutomationService every time a guarded screen is detected and bounced.
-     * Tracks consecutive attempts, resetting the count if the gap since the last one exceeds
-     * [CONSEC_RESET_MS] (so this measures a burst, not a lifetime total). Returns true the
-     * moment the [HARD_LOCK_THRESHOLD]-th consecutive attempt lands — the caller's signal to
-     * escalate from the normal brief touch-block to the full-screen [HARD_LOCK_DURATION_MS] lock.
-     */
-    fun recordGuardedAttempt(): Boolean {
-        val now = System.currentTimeMillis()
-        val last = CheckmatePrefs.getLong(KEY_LAST_ATTEMPT_AT, 0L)
-        val previousCount = CheckmatePrefs.getInt(KEY_CONSEC_ATTEMPTS, 0)
-        val count = if (now - last > CONSEC_RESET_MS) 1 else previousCount + 1
-        CheckmatePrefs.putInt(KEY_CONSEC_ATTEMPTS, count)
-        CheckmatePrefs.putLong(KEY_LAST_ATTEMPT_AT, now)
-        return count >= HARD_LOCK_THRESHOLD
-    }
-
-    /** Clears the consecutive-attempt counter. Called after a hard lock fires (so the next
-     *  lock requires a fresh burst) and on a successful guardian PIN unlock. */
-    fun resetConsecutiveAttempts() {
-        CheckmatePrefs.putInt(KEY_CONSEC_ATTEMPTS, 0)
-    }
-
-    /** Throttles guardian alerts so a stuck screen doesn't spam Telegram. */
-    fun shouldAlert(): Boolean {
-        val last = CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L)
-        val now = System.currentTimeMillis()
-        if (now - last < ALERT_THROTTLE_MS) return false
-        CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
-        return true
-    }
-
-    // ── TEMP debug trail (see KEY_DEBUG_TRAIL doc above) ────────────────────────
-
-    /** Appends one timestamped line to the debug trail, capped at [DEBUG_TRAIL_MAX_LINES]
-     *  (oldest dropped first) so the pref value can't grow unbounded during testing. */
-    fun logDebugTrail(line: String) {
-        val stamped = "${System.currentTimeMillis()} $line"
-        val existing = CheckmatePrefs.getString(KEY_DEBUG_TRAIL, "") ?: ""
-        val lines = (existing.split("\n").filter { it.isNotBlank() } + stamped)
-            .takeLast(DEBUG_TRAIL_MAX_LINES)
-        CheckmatePrefs.putString(KEY_DEBUG_TRAIL, lines.joinToString("\n"))
-    }
-}
-
-
 //===== FILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
 package com.checkmate.automation
 
@@ -872,7 +418,7 @@ class AppAutomationService : AccessibilityService() {
             releaseIfNotConfirmedGuarded()
             return
         }
-        val text = collectAllText(root)
+        val text = collectAllText(root, pkg)
         val lower = text.lowercase()
 
         val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
@@ -939,8 +485,36 @@ class AppAutomationService : AccessibilityService() {
         }
     }
 
-    /** Depth-first collection of all text + content-description on screen, space-joined. */
-    private fun collectAllText(root: AccessibilityNodeInfo): String {
+    /**
+     * Depth-first collection of all text + content-description on screen, space-joined.
+     *
+     * BUGFIX (false GUARDED_FIRED from a WhatsApp call screen — confirmed via
+     * debug_uninstall_trail: SCAN pkg=com.android.systemui ... matchedKeyword=uninstall
+     * textSnippet="Back Video call Voice call ... Adarsh Chaurasiya ...", i.e. a WhatsApp
+     * video-call screen, with "uninstall" nowhere in the visible 200-char snippet):
+     *
+     * checkGuardedScreen() is reached here with pkg=com.android.systemui via the
+     * isSystemUiNoise branch, which exists specifically to catch an OEM Force-Stop/App-info
+     * bubble that SystemUI itself hosts (see the LOOPHOLE FIX comment above
+     * isWatchedForUninstall). But rootInActiveWindow() at that instant doesn't necessarily
+     * return that systemui bubble's own tree — on this trail it resolved to whatever was
+     * genuinely foregrounded (the WhatsApp call UI), and/or a stale background window
+     * (ColorOS Smart Sidebar's floating/split-window support keeping an earlier Settings
+     * App-Info screen alive — real "Uninstall" text seen minutes earlier in the same
+     * trail) bled its nodes into the walk. Either way, collectAllText() was folding in
+     * text that never belonged to the systemui surface we were actually trying to
+     * classify, so "uninstall" matched against a screen the user never saw it on.
+     *
+     * Fix: only fold a node's text/contentDescription into the scan when that node's own
+     * packageName matches the package we were asked to classify (expectedPkg — the event's
+     * pkg, threaded in from checkGuardedScreen). Nodes from a different window/package are
+     * skipped (but their children are still walked, in case of embedded same-package
+     * content), so a leaked or stale node can no longer contribute text on behalf of a
+     * screen it doesn't belong to. No keyword or surface was removed — a genuine
+     * SystemUI-hosted bubble still matches normally, since its own nodes carry
+     * packageName=com.android.systemui.
+     */
+    private fun collectAllText(root: AccessibilityNodeInfo, expectedPkg: String? = null): String {
         val sb = StringBuilder()
         val stack = ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
@@ -948,8 +522,10 @@ class AppAutomationService : AccessibilityService() {
         while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
             val node = stack.removeFirst()
             visited++
-            node.text?.let { sb.append(it).append(' ') }
-            node.contentDescription?.let { sb.append(it).append(' ') }
+            if (expectedPkg == null || node.packageName?.toString() == expectedPkg) {
+                node.text?.let { sb.append(it).append(' ') }
+                node.contentDescription?.let { sb.append(it).append(' ') }
+            }
             for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
         }
         return sb.toString()
@@ -1113,3 +689,700 @@ class AppAutomationService : AccessibilityService() {
         super.onDestroy()
     }
 }
+
+
+
+
+//===== TERMUXFILE: modules/automation/src/main/kotlin/com/checkmate/automation/AppAutomationService.kt =====
+package com.checkmate.automation
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.TrustedTime
+import com.checkmate.workmode.UninstallGuard
+import com.checkmate.workmode.WorkModeManager
+import java.util.ArrayDeque
+
+class AppAutomationService : AccessibilityService() {
+
+    private val TAG      = "WA_SEND"
+    private val GUARD_TAG = "UninstallGuard"
+    private val WHATSAPP = "com.whatsapp"
+
+    // How long to freeze touch the instant a *new* watched-package screen
+    // appears, before checkGuardedScreen() has even read+classified it. This
+    // has to cover the rootInActiveWindow() binder call + collectAllText()'s
+    // node walk, which is the real source of the exploitable gap — a fast or
+    // auto-tap can beat detection itself, not just the Home transition.
+    private val PRE_CHECK_BLOCK_MS = 350L
+    // How long to hold the block once a screen IS confirmed guarded, giving
+    // GLOBAL_ACTION_HOME time to actually take effect.
+    private val POST_DETECT_BLOCK_MS = 700L
+    private val SELF_PKG get() = packageName // "com.checkmate"
+
+    // ── Browser packages whose URL bar we scan for blocked domains ────────────
+    // All major browsers expose their address bar as an accessible text node.
+    private val BROWSER_PACKAGES = setOf(
+        "com.android.chrome",           // Chrome (system on most devices)
+        "com.chrome.beta",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.focus",
+        "com.microsoft.emmx",           // Edge
+        "com.brave.browser",
+        "com.opera.browser",
+        "com.opera.mini.native",
+        "com.sec.android.app.sbrowser", // Samsung Internet
+        "com.UCMobile.intl",            // UC Browser
+        "com.duckduckgo.mobile.android",
+        "mark.via.gp",                  // Via Browser
+        "com.kiwibrowser.browser"
+    )
+
+    // Address bar view IDs per browser package.
+    // Tried in order; first non-null text match wins.
+    private val URL_BAR_IDS = mapOf(
+        "com.android.chrome"            to listOf("com.android.chrome:id/url_bar"),
+        "com.chrome.beta"               to listOf("com.chrome.beta:id/url_bar"),
+        "com.chrome.dev"                to listOf("com.chrome.dev:id/url_bar"),
+        "com.chrome.canary"             to listOf("com.chrome.canary:id/url_bar"),
+        "org.mozilla.firefox"           to listOf("org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
+                                                   "org.mozilla.firefox:id/url_bar_title"),
+        "org.mozilla.firefox_beta"      to listOf("org.mozilla.firefox_beta:id/mozac_browser_toolbar_url_view"),
+        "org.mozilla.focus"             to listOf("org.mozilla.focus:id/display_url"),
+        "com.microsoft.emmx"            to listOf("com.microsoft.emmx:id/url_bar"),
+        "com.brave.browser"             to listOf("com.brave.browser:id/url_bar"),
+        "com.opera.browser"             to listOf("com.opera.browser:id/url_field"),
+        "com.sec.android.app.sbrowser" to listOf("com.sec.android.app.sbrowser:id/location_bar_edit_text"),
+        "com.duckduckgo.mobile.android" to listOf("com.duckduckgo.mobile.android:id/omnibarTextInput")
+    )
+    // Generic fallback content-descriptions used across unknown browsers
+    private val URL_BAR_DESCRIPTIONS = listOf("Address bar", "Search or type URL", "URL", "address")
+
+    // Track last seen URL per browser package to avoid firing on every tiny content change
+    private val lastSeenUrl = mutableMapOf<String, String>()
+
+    // WhatsApp automation state
+    private var typingAttempted = false
+    private var lastWindowClass = ""
+
+    // Throttle for reconciling WorkModeManager against the hardcoded daily
+    // schedule (WorkModeSchedule) — cheap timestamp check, real work only
+    // happens at most once per 30s even though accessibility events can
+    // fire dozens of times a second.
+    private var lastScheduleCheckAt = 0L
+
+    // Last foreground package, used only to detect when a ScrollGuard-watched
+    // app leaves the foreground so its scroll session resets cleanly.
+    private var lastForegroundPkg = ""
+
+    // ── Guarded-screen touch blocker ────────────────────────────────────────
+    // checkGuardedScreen() only fires on an accessibility event (window
+    // state/content changed), and performGlobalAction(GLOBAL_ACTION_HOME)
+    // itself takes a beat to actually navigate away. In that gap the guarded
+    // screen (e.g. the accessibility service's own "Installed apps" toggle,
+    // or the uninstall confirmation) is still fully tappable — fast/repeated
+    // tapping ("brute forcing") can hit the real Disable/Uninstall button
+    // before Home takes effect. TYPE_ACCESSIBILITY_OVERLAY lets an
+    // AccessibilityService add a system-level window without the
+    // SYSTEM_ALERT_WINDOW permission; a full-screen, transparent, non-focusable
+    // instance of it still swallows every touch that lands on it, which is
+    // exactly what's needed to close that window without changing anything
+    // about how the guard screen is detected.
+    private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private var touchBlockerView: View? = null
+    private val touchBlockerHandler = Handler(Looper.getMainLooper())
+    private val removeTouchBlockerRunnable = Runnable { removeTouchBlocker() }
+
+    // Absolute timestamp (epoch ms) the current block is scheduled to release at.
+    // FIX: blockTouchesBriefly() used to unconditionally cancel+reschedule the
+    // removal for whatever duration it was called with — including PRE_CHECK_BLOCK_MS
+    // (350ms), which fires on *every* qualifying accessibility event. When
+    // GLOBAL_ACTION_HOME was triggered from checkGuardedScreen() (after arming a
+    // longer POST_DETECT_BLOCK_MS block, or the 5-minute HARD_LOCK), the guarded
+    // Settings window would keep emitting trailing CONTENT_CHANGED events while it
+    // tore down, each re-entering onAccessibilityEvent and re-calling
+    // blockTouchesBriefly(PRE_CHECK_BLOCK_MS) — silently cutting the longer block
+    // (even the 5-minute hard lock) down to 350ms. touchBlockUntil tracks the
+    // furthest-out release time requested so far; a later call can only extend it,
+    // never shorten it.
+    private var touchBlockUntil = 0L
+
+    /**
+     * Adds a full-screen, invisible, touch-swallowing overlay so nothing under it
+     * can be tapped, then auto-removes itself after [durationMs]. Safe to call
+     * repeatedly while a guarded screen keeps re-triggering the watchdog — it just
+     * extends the existing overlay's lifetime instead of stacking a second window,
+     * and (see [touchBlockUntil]) a shorter subsequent call can never cut short a
+     * longer block already in flight.
+     */
+    private fun blockTouchesBriefly(durationMs: Long = 700L) {
+        val requestedUntil = System.currentTimeMillis() + durationMs
+        if (requestedUntil <= touchBlockUntil) {
+            // A longer block (POST_DETECT_BLOCK_MS or the hard lock) is already
+            // scheduled to release later than this request would — ignore, don't
+            // shorten it.
+            return
+        }
+        touchBlockUntil = requestedUntil
+
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        if (touchBlockerView == null) {
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            val view = View(this)
+            try {
+                windowManager.addView(view, params)
+                touchBlockerView = view
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "touch blocker overlay failed to add", e)
+                touchBlockUntil = 0L
+                return
+            }
+        }
+        touchBlockerHandler.postDelayed(removeTouchBlockerRunnable, durationMs)
+    }
+
+    private fun removeTouchBlocker() {
+        touchBlockerHandler.removeCallbacks(removeTouchBlockerRunnable)
+        touchBlockUntil = 0L
+        val view = touchBlockerView ?: return
+        touchBlockerView = null
+        try {
+            windowManager.removeView(view)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "touch blocker overlay failed to remove", e)
+        }
+    }
+
+    // FIX (race that survived the WATCHED_PACKAGES/isLikelySystemSurface widening —
+    // v2, corrected): checkGuardedScreen() used to call removeTouchBlocker()
+    // unconditionally on its "not guarded" / "no root" early-exit paths. That's safe
+    // in isolation, but once isWatchedForUninstall started matching broad
+    // system-surface prefixes (com.android.systemui, com.samsung., com.miui.,
+    // etc.), a *later, unrelated* event — a status-bar update, swiping down the
+    // notification drawer, a transient system dialog — could run
+    // checkGuardedScreen(), decide it isn't guarded, and tear down an overlay a
+    // *different, still-valid* classification had armed moments earlier for the
+    // real guarded screen.
+    //
+    // A first attempt at this fix snapshotted touchBlockUntil right after arming
+    // this event's own pre-check block and only released if nothing had moved
+    // *past* that snapshot since. That's broken: if the confirmed-guarded block
+    // (POST_DETECT_BLOCK_MS or the hard lock) was already armed *before* this
+    // event's pre-check ran, the pre-check doesn't extend it (it's already
+    // further out), so the snapshot ends up numerically equal to touchBlockUntil
+    // — indistinguishable from "this is my own block" — and the notification-
+    // drawer swipe (or any other unrelated systemui event landing inside that
+    // window) would cancel the confirmed block anyway.
+    //
+    // Correct fix: track *confirmation*, not just the timestamp. guardConfirmedUntil
+    // is set only when checkGuardedScreen() itself classifies a screen as guarded
+    // (right before arming POST_DETECT_BLOCK_MS or the hard lock). The "not
+    // guarded" early-exit paths may only release the touch blocker while no
+    // confirmed-guarded block's window is currently running — regardless of which
+    // event happened to arm it or what the numbers coincidentally line up to.
+    private var guardConfirmedUntil = 0L
+
+    private fun releaseIfNotConfirmedGuarded() {
+        if (System.currentTimeMillis() >= guardConfirmedUntil) {
+            removeTouchBlocker()
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        Log.d(TAG, "=== AutomationService CONNECTED ===")
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
+
+        // ── Hardcoded schedule reconciliation ──────────────────────────────────
+        // Keeps Work Mode's forced 19:00-05:00 window (plus the extra Sun/Wed 01:00-15:10 window) enforced even if the
+        // student never starts a task, or if the process restarted mid-window
+        // and lost its in-memory isActive flag.
+        val now = System.currentTimeMillis()
+        if (now - lastScheduleCheckAt > 30_000L) {
+            lastScheduleCheckAt = now
+            TrustedTime.refreshIfNeeded(applicationContext)
+            WorkModeManager.evaluateSchedule(applicationContext)
+        }
+
+        // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
+        // Deliberately independent of Work Mode / isEnforcing() — this applies
+        // at all times, not just during study sessions, per product decision.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != lastForegroundPkg) {
+            if (lastForegroundPkg in ScrollGuard.WATCHED_PACKAGES) {
+                ScrollGuard.onAppBackgrounded(lastForegroundPkg)
+            }
+            lastForegroundPkg = pkg
+        }
+        if (pkg in ScrollGuard.WATCHED_PACKAGES && event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            if (ScrollGuard.recordScroll(this, pkg)) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            return
+        }
+
+        // ── Mentor v2 (spec 3.4): post-skip escalation lockdown ────────────────
+        // Independent of, and checked before, the normal Work Mode blocklist below:
+        // during the timed window opened by WorkModeManager.startPostSkipLockdown()
+        // (HomeViewModel.markSkip()), any app on the escalation watchlist is bounced
+        // immediately on first foreground — no 3-attempt grace period like the normal
+        // DistractionGuard flow. Still records the attempt (so the guardian alert and
+        // BehaviorLedger correlation data stay consistent), just doesn't wait for a
+        // 3rd try before acting.
+        if (WorkModeManager.isInPostSkipLockdown() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            pkg in WorkModeManager.getEscalationWatchlist()
+        ) {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+            DistractionGuard.recordAppAttempt(this, pkg)
+            return
+        }
+
+        // ── Work Mode: blocked app check ─────────────────────────────────────
+        // isEnforcing() (not the raw isActive flag) so the hardcoded window
+        // blocks apps even when no manual task session is running.
+        if (WorkModeManager.isEnforcing() &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+
+            val blockedApps = WorkModeManager.getBlockedApps()
+            if (pkg in blockedApps) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+                // Record attempt — alert guardian on 3rd
+                DistractionGuard.recordAppAttempt(this, pkg)
+                return
+            }
+        }
+
+        // ── Work Mode: blocked website check ─────────────────────────────────
+        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                checkAndBlockUrl(pkg)
+            }
+        }
+
+        // ── Uninstall / device-admin-disable / accessibility-disable watchdog ──
+        // Runs regardless of Work Mode — uninstall protection is always on.
+        //
+        // NOTE on why this now blocks on CONTENT_CHANGED too, not just
+        // STATE_CHANGED: on most OEM Settings builds, drilling from the
+        // "Accessibility" list into a specific service's detail screen (the
+        // one with the actual Disable toggle) does NOT open a new Activity —
+        // it's a fragment swap inside the same window. That transition only
+        // fires TYPE_WINDOW_CONTENT_CHANGED, never TYPE_WINDOW_STATE_CHANGED.
+        // The previous version only pre-armed the blocker on STATE_CHANGED,
+        // so that specific screen — the one that actually matters — never got
+        // the preemptive freeze; it still had to wait for checkGuardedScreen()
+        // to walk the node tree before blocking anything, which is exactly
+        // the gap a fast/repeated tap was winning.
+        //
+        // LOOPHOLE FIX (Force Stop via Battery/App-info reachable outside
+        // Settings proper — e.g. an OEM "app info" card/bubble hosted by
+        // SystemUI or a OnePlus/ColorOS fork that doesn't run under
+        // "com.android.settings"): CONTENT_CHANGED stays gated to the known
+        // WATCHED_PACKAGES set (that's the specific fragment-swap fix above,
+        // and staying gated there avoids scanning every scroll/content tick
+        // system-wide). STATE_CHANGED — which only fires on window/activity
+        // transitions, not on every content tick — is now ALSO checked for any
+        // package matching UninstallGuard.isLikelySystemSurface(), which covers
+        // SystemUI and known Settings-fork prefixes without needing to guess
+        // this device's exact package name. checkGuardedScreen() itself is
+        // unchanged: it still requires BOTH "checkmate" text AND a guard
+        // keyword (e.g. "force stop") before it acts, so this widening can't
+        // introduce false positives on ordinary system-app screens.
+        val isWatchedForUninstall =
+            pkg in UninstallGuard.WATCHED_PACKAGES || UninstallGuard.isLikelySystemSurface(pkg)
+        if (isWatchedForUninstall && !UninstallGuard.isUnlocked()) {
+            val isStateChange = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            val isKnownContentChange = pkg in UninstallGuard.WATCHED_PACKAGES &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+
+            // BUG FIX: com.android.systemui — matched via isLikelySystemSurface() for
+            // the OEM Force-Stop-bubble loophole (see the LOOPHOLE FIX comment above) —
+            // also owns the gesture-nav pill, the recents/task-switcher transition, and
+            // the nav bar itself. TYPE_WINDOW_STATE_CHANGED fires from it on essentially
+            // every ordinary app switch, so pre-arming the full-screen touch-blocking
+            // overlay on every one of those (below) turned normal gesture navigation
+            // into something that visibly froze on each swipe. This package still gets
+            // scanned — so the rare bubble case this widening exists for is still
+            // caught and shut down via the POST_DETECT_BLOCK_MS/hard-lock path inside
+            // checkGuardedScreen() itself — it just doesn't get the *preemptive* freeze
+            // other watched surfaces get, since for this package that preemption does
+            // far more harm (constant false triggers during normal use) than good (a
+            // narrower window against a fast tap on a screen that's rare to begin with).
+            val isSystemUiNoise = pkg == "com.android.systemui" || pkg.startsWith("com.android.systemui")
+
+            // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — logged ONLY right
+            // before an actual checkGuardedScreen() call, not for every event that
+            // merely clears the outer gate above. BUGFIX: the first version logged
+            // here unconditionally, so ambient com.android.systemui CONTENT_CHANGED
+            // noise (status bar clock, ~every 1-4s) flooded the ring buffer and rolled
+            // the real gesture's entry off before it could be pulled. Moving the log
+            // inside each branch makes it fire exactly when checkGuardedScreen() does.
+            if (isStateChange && isSystemUiNoise) {
+                UninstallGuard.logDebugTrail("EVENT pkg=$pkg type=${event.eventType} branch=systemUiNoise")
+                checkGuardedScreen(pkg)
+            } else if (isStateChange || isKnownContentChange) {
+                UninstallGuard.logDebugTrail(
+                    "EVENT pkg=$pkg type=${event.eventType} branch=preCheck " +
+                        "stateChange=$isStateChange contentChange=$isKnownContentChange"
+                )
+                blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
+                checkGuardedScreen(pkg)
+            }
+        }
+
+        // ── WhatsApp automation ───────────────────────────────────────────────
+        if (pkg != WHATSAPP) return
+        if (!AutomationEngine.hasPendingMessage()) return
+
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+
+        val cls = event.className?.toString() ?: ""
+        if (cls != lastWindowClass) {
+            typingAttempted = false
+            lastWindowClass = cls
+        }
+        if (typingAttempted) return
+
+        val root = rootInActiveWindow ?: run { Log.e(TAG, "root null"); return }
+        val found = tryTypeAndSend(root)
+        if (!found) {
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (!AutomationEngine.hasPendingMessage()) return@postDelayed
+                rootInActiveWindow?.let { tryTypeAndSend(it) }
+            }, 1200)
+        }
+    }
+
+    // ── Uninstall / disable watchdog ────────────────────────────────────────────
+
+    /**
+     * Scans the current window's visible text for either:
+     *  (a) "this is about Checkmate" + "this is an uninstall/force-stop/disable
+     *      screen" (looksLikeGuardedScreen — requires BOTH signals so we never
+     *      interfere with unrelated Settings browsing), or
+     *  (b) a name-agnostic OS/bypass screen that never mentions Checkmate at
+     *      all — the device-admin activate/deactivate prompt, or a Developer
+     *      Options screen exposing USB/Wireless debugging (the on-device path
+     *      to an `adb uninstall`/`adb shell pm disable` that skips this
+     *      watchdog entirely).
+     * If matched and no guardian PIN unlock is active, bounces to Home and
+     * fires a throttled guardian alert.
+     *
+     * [pkg] is the accessibility event's package — passed through so
+     * looksLikeGuardedScreen() can tell a genuine Settings/OEM-Settings window
+     * (WATCHED_PACKAGES) apart from a broader isLikelySystemSurface() prefix
+     * match (SystemUI also hosts the notification shade, Quick Settings, and
+     * recents, none of which should ever count as a "Settings surface" for the
+     * generic GUARD_KEYWORDS_SETTINGS_ONLY phrases — see UninstallGuard's doc).
+     */
+    private fun checkGuardedScreen(pkg: String) {
+        if (UninstallGuard.isUnlocked()) { removeTouchBlocker(); return }
+
+        val root = rootInActiveWindow ?: run {
+            // Can't classify without a node tree — release the pre-check
+            // block rather than leave touch frozen on a screen we never
+            // actually inspected. (Never cuts short a confirmed-guarded
+            // block — see releaseIfNotConfirmedGuarded().)
+            releaseIfNotConfirmedGuarded()
+            return
+        }
+        val text = collectAllText(root, pkg)
+        val lower = text.lowercase()
+
+        val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
+        val isKnownSettingsSurface = pkg in UninstallGuard.WATCHED_PACKAGES
+        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate, isKnownSettingsSurface)
+        val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
+        val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+
+        // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual keyword that
+        // matched (or null) is the single most useful fact for this investigation: it
+        // tells us directly whether a GUARD_KEYWORDS_SETTINGS_ONLY phrase is still
+        // leaking through somewhere, vs. a GUARD_KEYWORDS_STRICT phrase genuinely
+        // appearing on a non-Settings screen (a different bug entirely). textSnippet
+        // is capped and newline-flattened so one trail line stays one line.
+        val matchedKeyword = (UninstallGuard.GUARD_KEYWORDS_STRICT + UninstallGuard.GUARD_KEYWORDS_SETTINGS_ONLY)
+            .firstOrNull { lower.contains(it) }
+        UninstallGuard.logDebugTrail(
+            "SCAN pkg=$pkg targetsCheckmate=$targetsCheckmate isKnownSettingsSurface=$isKnownSettingsSurface " +
+                "namedGuard=$isNamedGuardedScreen devAdmin=$isDeviceAdminPrompt devOptions=$isDevOptionsScreen " +
+                "matchedKeyword=$matchedKeyword textSnippet=${text.take(200).replace("\n", " ")}"
+        )
+
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
+            // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing, or
+            // swiping down the notification drawer) — drop *our own* pre-check
+            // block immediately instead of waiting out its timer, so normal
+            // system use doesn't feel laggy. Still never cuts short a
+            // confirmed-guarded block armed by a different event.
+            releaseIfNotConfirmedGuarded()
+            return
+        }
+
+        Log.w(GUARD_TAG, "Guarded screen detected — bouncing to Home")
+
+        // Three consecutive attempts (within the burst window — see UninstallGuard's
+        // CONSEC_RESET_MS) escalate from the normal brief touch-block to a full-screen,
+        // full-duration hard lock — the same touch-swallowing overlay used everywhere else in
+        // this class, just held for HARD_LOCK_DURATION_MS instead of POST_DETECT_BLOCK_MS.
+        val hardLock = UninstallGuard.recordGuardedAttempt()
+        if (hardLock) {
+            Log.w(GUARD_TAG, "3rd consecutive disable/uninstall attempt — hard-locking touch for 5 minutes")
+            blockTouchesBriefly(UninstallGuard.HARD_LOCK_DURATION_MS)
+            UninstallGuard.resetConsecutiveAttempts() // next hard lock needs a fresh burst
+        } else {
+            // Extend/refresh the block to cover the Home transition itself — the pre-check
+            // block above was only sized for classification, not for GLOBAL_ACTION_HOME
+            // actually taking effect.
+            blockTouchesBriefly(POST_DETECT_BLOCK_MS)
+        }
+        // This screen is now CONFIRMED guarded — record how long that confirmation
+        // covers so no later "not guarded" classification from an unrelated event
+        // (e.g. a notification-drawer swipe) can tear this block down early.
+        guardConfirmedUntil = touchBlockUntil
+
+        // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual fire event,
+        // paired with matchedKeyword from the SCAN line just above it in the trail.
+        UninstallGuard.logDebugTrail("GUARDED_FIRED pkg=$pkg hardLock=$hardLock matchedKeyword=$matchedKeyword")
+
+        performGlobalAction(GLOBAL_ACTION_HOME)
+
+        if (UninstallGuard.shouldAlert()) {
+            val reason = if (hardLock) "repeated_disable_attempt_hard_lock" else "settings_screen_blocked"
+            UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, reason)
+        }
+    }
+
+    /**
+     * Depth-first collection of all text + content-description on screen, space-joined.
+     *
+     * BUGFIX (false GUARDED_FIRED from a WhatsApp call screen — confirmed via
+     * debug_uninstall_trail: SCAN pkg=com.android.systemui ... matchedKeyword=uninstall
+     * textSnippet="Back Video call Voice call ... Adarsh Chaurasiya ...", i.e. a WhatsApp
+     * video-call screen, with "uninstall" nowhere in the visible 200-char snippet):
+     *
+     * checkGuardedScreen() is reached here with pkg=com.android.systemui via the
+     * isSystemUiNoise branch, which exists specifically to catch an OEM Force-Stop/App-info
+     * bubble that SystemUI itself hosts (see the LOOPHOLE FIX comment above
+     * isWatchedForUninstall). But rootInActiveWindow() at that instant doesn't necessarily
+     * return that systemui bubble's own tree — on this trail it resolved to whatever was
+     * genuinely foregrounded (the WhatsApp call UI), and/or a stale background window
+     * (ColorOS Smart Sidebar's floating/split-window support keeping an earlier Settings
+     * App-Info screen alive — real "Uninstall" text seen minutes earlier in the same
+     * trail) bled its nodes into the walk. Either way, collectAllText() was folding in
+     * text that never belonged to the systemui surface we were actually trying to
+     * classify, so "uninstall" matched against a screen the user never saw it on.
+     *
+     * Fix: only fold a node's text/contentDescription into the scan when that node's own
+     * packageName matches the package we were asked to classify (expectedPkg — the event's
+     * pkg, threaded in from checkGuardedScreen). Nodes from a different window/package are
+     * skipped (but their children are still walked, in case of embedded same-package
+     * content), so a leaked or stale node can no longer contribute text on behalf of a
+     * screen it doesn't belong to. No keyword or surface was removed — a genuine
+     * SystemUI-hosted bubble still matches normally, since its own nodes carry
+     * packageName=com.android.systemui.
+     */
+    private fun collectAllText(root: AccessibilityNodeInfo, expectedPkg: String? = null): String {
+        val sb = StringBuilder()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var visited = 0
+        while (stack.isNotEmpty() && visited < 400) { // cap traversal — Settings trees are small
+            val node = stack.removeFirst()
+            visited++
+            if (expectedPkg == null || node.packageName?.toString() == expectedPkg) {
+                node.text?.let { sb.append(it).append(' ') }
+                node.contentDescription?.let { sb.append(it).append(' ') }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return sb.toString()
+    }
+
+    // ── URL scanning ──────────────────────────────────────────────────────────
+
+    private fun checkAndBlockUrl(browserPkg: String) {
+        val root = rootInActiveWindow ?: return
+        val url  = extractUrl(root, browserPkg) ?: return
+
+        // Debounce: only act when URL actually changes
+        if (lastSeenUrl[browserPkg] == url) return
+        lastSeenUrl[browserPkg] = url
+
+        val hostname = parseHostname(url) ?: return
+        Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
+
+        val blockedDomains = WorkModeManager.getBlockedDomains()
+        val matched = blockedDomains.firstOrNull { blocked ->
+            hostname == blocked || hostname.endsWith(".$blocked")
+        } ?: return
+
+        Log.w(TAG, "Blocked domain matched: $matched — going back")
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        // Record and potentially alert
+        DistractionGuard.recordDomainAttempt(this, matched)
+    }
+
+    /**
+     * Tries known view IDs for the browser first, then falls back to
+     * scanning all text nodes whose content-description suggests a URL bar.
+     */
+    private fun extractUrl(root: AccessibilityNodeInfo, pkg: String): String? {
+        // Try known IDs for this browser
+        val ids = URL_BAR_IDS[pkg] ?: emptyList()
+        for (id in ids) {
+            val node = root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+            val text = node?.text?.toString()?.trim()
+            if (!text.isNullOrBlank()) return text
+        }
+
+        // Generic fallback: find any node whose description sounds like an address bar
+        // and whose text looks like a URL
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val desc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            if (URL_BAR_DESCRIPTIONS.any { desc.contains(it, ignoreCase = true) }
+                && looksLikeUrl(text)) {
+                return text
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun looksLikeUrl(text: String): Boolean {
+        if (text.isBlank() || text.length < 4) return false
+        return text.contains('.') &&
+               !text.contains(' ') &&
+               (text.startsWith("http") || text.startsWith("www.") || text.matches(Regex(".*\\.[a-z]{2,}.*")))
+    }
+
+    /**
+     * Parses the registered hostname from a raw URL string.
+     * "https://www.youtube.com/watch?v=..." → "youtube.com"
+     *
+     * Strips "www." so the stored domain "youtube.com" matches both
+     * "youtube.com" and "www.youtube.com".
+     */
+    private fun parseHostname(raw: String): String? {
+        return try {
+            val withScheme = if (raw.startsWith("http")) raw else "https://$raw"
+            val host = Uri.parse(withScheme).host ?: return null
+            host.removePrefix("www.").lowercase().trim()
+        } catch (_: Exception) { null }
+    }
+
+    // ── WhatsApp typing ───────────────────────────────────────────────────────
+
+    private fun tryTypeAndSend(root: AccessibilityNodeInfo): Boolean {
+        val message = AutomationEngine.peekPendingWhatsAppMessage() ?: return false
+        Log.d(TAG, "tryTypeAndSend msg='${message.take(40)}'")
+
+        val inputNode =
+            findNodeById(root, "com.whatsapp:id/entry")
+                ?.also { Log.d(TAG, "input via id/entry") }
+            ?: findNodeById(root, "com.whatsapp:id/conversation_entry")
+                ?.also { Log.d(TAG, "input via id/conversation_entry") }
+            ?: findNodeByClass(root, "android.widget.EditText")
+                ?.also { Log.d(TAG, "input via EditText fallback") }
+
+        if (inputNode == null) { Log.e(TAG, "input field not found"); return false }
+
+        typingAttempted = true
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, message)
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        Log.d(TAG, "ACTION_SET_TEXT=$textSet")
+
+        if (!textSet) { Log.e(TAG, "SET_TEXT failed — message kept in queue"); return true }
+
+        AutomationEngine.consumePendingWhatsAppMessage()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            val freshRoot = rootInActiveWindow ?: run { Log.e(TAG, "send: root null"); return@postDelayed }
+            val sendNode =
+                findNodeById(freshRoot, "com.whatsapp:id/send")
+                    ?.also { Log.d(TAG, "send btn via id/send") }
+                ?: findNodeByDesc(freshRoot, "Send")
+                    ?.also { Log.d(TAG, "send btn via desc") }
+            sendNode?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                .also { Log.d(TAG, "send clicked: $it") }
+                ?: Log.e(TAG, "send button not found")
+        }, 500)
+
+        return true
+    }
+
+    // ── Node finders ──────────────────────────────────────────────────────────
+
+    private fun findNodeById(root: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByViewId(id)?.firstOrNull()
+
+    private fun findNodeByClass(root: AccessibilityNodeInfo, className: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.className?.toString() == className && node.isEditable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    private fun findNodeByDesc(root: AccessibilityNodeInfo, desc: String): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            if (node.contentDescription?.toString()?.contains(desc, ignoreCase = true) == true
+                && node.isClickable) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    override fun onInterrupt() {
+        Log.d(TAG, "Service interrupted")
+        removeTouchBlocker()
+    }
+
+    override fun onDestroy() {
+        removeTouchBlocker()
+        super.onDestroy()
+    }
+}
+
+
