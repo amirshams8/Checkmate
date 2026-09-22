@@ -96,14 +96,43 @@ object UninstallGuard {
     /** How long the hard lock holds the entire screen's touch input. */
     const val HARD_LOCK_DURATION_MS = 5 * 60 * 1000L
 
-    /** Text fragments that identify a screen worth blocking, matched case-insensitively. */
-    val GUARD_KEYWORDS = listOf(
+    /**
+     * Text fragments that identify a screen worth blocking, matched case-insensitively.
+     *
+     * BUGFIX (false trigger on ordinary gestures): "turn off", "app info", "downloaded
+     * apps", "installed services", and "installed apps" are common enough as generic
+     * system UI copy — a Quick Settings tile's content-description ("Turn off Wi-Fi"),
+     * a recents/task-switcher card's per-app "App info" button — that they can co-occur
+     * with Checkmate's own name simply because Checkmate is running: its persistent
+     * "Work Mode — ON" notification sits in the shade, and its own card sits in
+     * recents. Pulling down the notification shade or opening the task switcher are
+     * ordinary navigation gestures, not settings screens, so that combination isn't
+     * something this watchdog should ever be firing on.
+     *
+     * Split into two tiers so the fix is precise instead of weakening detection
+     * outright:
+     *  - [GUARD_KEYWORDS_STRICT]: phrases that only ever appear on a genuine
+     *    uninstall/disable confirmation. Safe to match on any watched surface,
+     *    including the widened [isLikelySystemSurface] prefixes (SystemUI, OEM
+     *    Settings forks) — that widening exists for exactly this tier (the
+     *    Battery/App-info "Force stop" bubble loophole).
+     *  - [GUARD_KEYWORDS_SETTINGS_ONLY]: phrases generic enough to show up outside
+     *    Settings entirely. Only matched when the window is one of the actual
+     *    Settings/OEM-Settings packages in [WATCHED_PACKAGES] — never on the
+     *    broader [isLikelySystemSurface] prefix match, which is what pulls in the
+     *    notification shade / Quick Settings / recents surfaces that caused the
+     *    false triggers.
+     */
+    val GUARD_KEYWORDS_STRICT = listOf(
         "uninstall",
         "force stop",
         "disable device admin app",
         "deactivate this device admin app",
         "deactivate",
-        "remove admin",
+        "remove admin"
+    )
+
+    val GUARD_KEYWORDS_SETTINGS_ONLY = listOf(
         "turn off",          // accessibility-service disable toggle wording on many OEMs
         "app info",
         // Settings → Accessibility → "Downloaded apps" (Android 13+) / "Installed
@@ -119,6 +148,10 @@ object UninstallGuard {
         "installed services",
         "installed apps"
     )
+
+    /** Combined view, kept for anything that wants "every guard keyword" as one list
+     *  (e.g. logging/debug tooling) — detection itself uses the two tiers above. */
+    val GUARD_KEYWORDS = GUARD_KEYWORDS_STRICT + GUARD_KEYWORDS_SETTINGS_ONLY
 
     // Package names whose screens we watch. Settings itself, plus common
     // OEM permission-controller / Settings forks (MIUI, ColorOS, One UI).
@@ -153,9 +186,10 @@ object UninstallGuard {
     // plausible hosts for such a screen. AppAutomationService only uses this to widen
     // which windows get the (already name+keyword gated) guarded-screen text scan on
     // window-open events — it does NOT change what counts as guarded. checkGuardedScreen()
-    // still requires "checkmate" + a GUARD_KEYWORDS match before it acts, so widening
-    // which packages get scanned can't introduce a false positive on an unrelated
-    // system screen.
+    // still requires "checkmate" + a GUARD_KEYWORDS_STRICT match (or a
+    // GUARD_KEYWORDS_SETTINGS_ONLY match gated to a real WATCHED_PACKAGES surface)
+    // before it acts, so widening which packages get scanned can't introduce a false
+    // positive on an unrelated system screen.
     private val SYSTEM_PACKAGE_PREFIXES = listOf(
         "com.android.systemui",
         "com.android.settings",
@@ -325,11 +359,28 @@ object UninstallGuard {
 
     // ── Screen detection (used by AppAutomationService) ─────────────────────────
 
-    /** True if this window's visible text suggests an uninstall/disable screen for Checkmate. */
-    fun looksLikeGuardedScreen(visibleText: String, targetsCheckmate: Boolean): Boolean {
+    /**
+     * True if this window's visible text suggests an uninstall/disable screen for
+     * Checkmate.
+     *
+     * [isKnownSettingsSurface] must be true only when the event's package is one of
+     * the actual Settings/OEM-Settings apps in [WATCHED_PACKAGES] — NOT just a
+     * broader [isLikelySystemSurface] prefix match. It gates
+     * [GUARD_KEYWORDS_SETTINGS_ONLY], whose phrasing ("app info", "turn off", ...)
+     * is common enough elsewhere (Quick Settings tiles, recents cards) to
+     * false-trigger on ordinary gestures if checked everywhere
+     * [GUARD_KEYWORDS_STRICT] is. See the doc on [GUARD_KEYWORDS_STRICT] /
+     * [GUARD_KEYWORDS_SETTINGS_ONLY] for the false-positive this fixes.
+     */
+    fun looksLikeGuardedScreen(
+        visibleText: String,
+        targetsCheckmate: Boolean,
+        isKnownSettingsSurface: Boolean
+    ): Boolean {
         if (!targetsCheckmate) return false
         val lower = visibleText.lowercase()
-        return GUARD_KEYWORDS.any { lower.contains(it) }
+        if (GUARD_KEYWORDS_STRICT.any { lower.contains(it) }) return true
+        return isKnownSettingsSurface && GUARD_KEYWORDS_SETTINGS_ONLY.any { lower.contains(it) }
     }
 
     /**

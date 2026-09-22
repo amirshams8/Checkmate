@@ -342,10 +342,10 @@ class AppAutomationService : AccessibilityService() {
             val isSystemUiNoise = pkg == "com.android.systemui" || pkg.startsWith("com.android.systemui")
 
             if (isStateChange && isSystemUiNoise) {
-                checkGuardedScreen()
+                checkGuardedScreen(pkg)
             } else if (isStateChange || isKnownContentChange) {
                 blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
-                checkGuardedScreen()
+                checkGuardedScreen(pkg)
             }
         }
 
@@ -386,8 +386,15 @@ class AppAutomationService : AccessibilityService() {
      *      watchdog entirely).
      * If matched and no guardian PIN unlock is active, bounces to Home and
      * fires a throttled guardian alert.
+     *
+     * [pkg] is the accessibility event's package — passed through so
+     * looksLikeGuardedScreen() can tell a genuine Settings/OEM-Settings window
+     * (WATCHED_PACKAGES) apart from a broader isLikelySystemSurface() prefix
+     * match (SystemUI also hosts the notification shade, Quick Settings, and
+     * recents, none of which should ever count as a "Settings surface" for the
+     * generic GUARD_KEYWORDS_SETTINGS_ONLY phrases — see UninstallGuard's doc).
      */
-    private fun checkGuardedScreen() {
+    private fun checkGuardedScreen(pkg: String) {
         if (UninstallGuard.isUnlocked()) { removeTouchBlocker(); return }
 
         val root = rootInActiveWindow ?: run {
@@ -402,7 +409,8 @@ class AppAutomationService : AccessibilityService() {
         val lower = text.lowercase()
 
         val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
-        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate)
+        val isKnownSettingsSurface = pkg in UninstallGuard.WATCHED_PACKAGES
+        val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate, isKnownSettingsSurface)
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
         val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
         if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
