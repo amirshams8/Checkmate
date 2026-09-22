@@ -94,8 +94,19 @@ object UninstallGuard {
     // up in that same pull without needing logcat at all. Remove logDebugTrail()
     // and its call sites once the false-trigger root cause is confirmed fixed
     // against real device evidence (debugging-approach step 9) — not meant to ship.
+    //
+    // BUGFIX (trail flooded by ambient noise): first version logged "EVENT" for
+    // every event that cleared the outer isWatchedForUninstall gate, before
+    // checking which branch actually fires. com.android.systemui throws a
+    // CONTENT_CHANGED (type=2048) every 1-4s from the status bar clock alone —
+    // that's neither a state change nor a WATCHED_PACKAGES content change, so it
+    // never reaches checkGuardedScreen(), but it was still being logged and rolled
+    // the real gesture's entry off a 25-line buffer within under a minute. Bumped
+    // to 150 lines as extra margin, and the call site was moved to only log
+    // immediately before an actual checkGuardedScreen() call (see
+    // AppAutomationService) so ambient noise stops filling the buffer at all.
     private const val KEY_DEBUG_TRAIL = "debug_uninstall_trail"
-    private const val DEBUG_TRAIL_MAX_LINES = 25
+    private const val DEBUG_TRAIL_MAX_LINES = 150
 
     // A gap longer than this between attempts resets the counter — this counts a *burst* of
     // tries ("three in a row"), not a lifetime total across days/weeks.

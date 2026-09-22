@@ -341,18 +341,21 @@ class AppAutomationService : AccessibilityService() {
             // narrower window against a fast tap on a screen that's rare to begin with).
             val isSystemUiNoise = pkg == "com.android.systemui" || pkg.startsWith("com.android.systemui")
 
-            // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — records that this
-            // event even reached the watchdog gate, before checkGuardedScreen() does
-            // its own text scan. Lets a pulled trail distinguish "never got here"
-            // from "got here, scanned, and (wrongly) decided it was guarded".
-            UninstallGuard.logDebugTrail(
-                "EVENT pkg=$pkg type=${event.eventType} isSystemUiNoise=$isSystemUiNoise " +
-                    "stateChange=$isStateChange contentChange=$isKnownContentChange"
-            )
-
+            // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — logged ONLY right
+            // before an actual checkGuardedScreen() call, not for every event that
+            // merely clears the outer gate above. BUGFIX: the first version logged
+            // here unconditionally, so ambient com.android.systemui CONTENT_CHANGED
+            // noise (status bar clock, ~every 1-4s) flooded the ring buffer and rolled
+            // the real gesture's entry off before it could be pulled. Moving the log
+            // inside each branch makes it fire exactly when checkGuardedScreen() does.
             if (isStateChange && isSystemUiNoise) {
+                UninstallGuard.logDebugTrail("EVENT pkg=$pkg type=${event.eventType} branch=systemUiNoise")
                 checkGuardedScreen(pkg)
             } else if (isStateChange || isKnownContentChange) {
+                UninstallGuard.logDebugTrail(
+                    "EVENT pkg=$pkg type=${event.eventType} branch=preCheck " +
+                        "stateChange=$isStateChange contentChange=$isKnownContentChange"
+                )
                 blockTouchesBriefly(PRE_CHECK_BLOCK_MS)
                 checkGuardedScreen(pkg)
             }
