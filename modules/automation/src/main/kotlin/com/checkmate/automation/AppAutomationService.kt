@@ -341,6 +341,15 @@ class AppAutomationService : AccessibilityService() {
             // narrower window against a fast tap on a screen that's rare to begin with).
             val isSystemUiNoise = pkg == "com.android.systemui" || pkg.startsWith("com.android.systemui")
 
+            // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — records that this
+            // event even reached the watchdog gate, before checkGuardedScreen() does
+            // its own text scan. Lets a pulled trail distinguish "never got here"
+            // from "got here, scanned, and (wrongly) decided it was guarded".
+            UninstallGuard.logDebugTrail(
+                "EVENT pkg=$pkg type=${event.eventType} isSystemUiNoise=$isSystemUiNoise " +
+                    "stateChange=$isStateChange contentChange=$isKnownContentChange"
+            )
+
             if (isStateChange && isSystemUiNoise) {
                 checkGuardedScreen(pkg)
             } else if (isStateChange || isKnownContentChange) {
@@ -413,6 +422,21 @@ class AppAutomationService : AccessibilityService() {
         val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate, isKnownSettingsSurface)
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
         val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+
+        // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual keyword that
+        // matched (or null) is the single most useful fact for this investigation: it
+        // tells us directly whether a GUARD_KEYWORDS_SETTINGS_ONLY phrase is still
+        // leaking through somewhere, vs. a GUARD_KEYWORDS_STRICT phrase genuinely
+        // appearing on a non-Settings screen (a different bug entirely). textSnippet
+        // is capped and newline-flattened so one trail line stays one line.
+        val matchedKeyword = (UninstallGuard.GUARD_KEYWORDS_STRICT + UninstallGuard.GUARD_KEYWORDS_SETTINGS_ONLY)
+            .firstOrNull { lower.contains(it) }
+        UninstallGuard.logDebugTrail(
+            "SCAN pkg=$pkg targetsCheckmate=$targetsCheckmate isKnownSettingsSurface=$isKnownSettingsSurface " +
+                "namedGuard=$isNamedGuardedScreen devAdmin=$isDeviceAdminPrompt devOptions=$isDevOptionsScreen " +
+                "matchedKeyword=$matchedKeyword textSnippet=${text.take(200).replace("\n", " ")}"
+        )
+
         if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
             // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing, or
             // swiping down the notification drawer) — drop *our own* pre-check
@@ -444,6 +468,11 @@ class AppAutomationService : AccessibilityService() {
         // covers so no later "not guarded" classification from an unrelated event
         // (e.g. a notification-drawer swipe) can tear this block down early.
         guardConfirmedUntil = touchBlockUntil
+
+        // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual fire event,
+        // paired with matchedKeyword from the SCAN line just above it in the trail.
+        UninstallGuard.logDebugTrail("GUARDED_FIRED pkg=$pkg hardLock=$hardLock matchedKeyword=$matchedKeyword")
+
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {

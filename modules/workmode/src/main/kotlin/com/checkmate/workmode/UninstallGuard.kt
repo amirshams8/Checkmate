@@ -86,6 +86,17 @@ object UninstallGuard {
     private const val KEY_CONSEC_ATTEMPTS = "guarded_screen_consecutive_attempts"
     private const val KEY_LAST_ATTEMPT_AT = "guarded_screen_last_attempt_at"
 
+    // TEMP DEBUG INSTRUMENTATION (uninstall-guard false-trigger investigation): logcat
+    // isn't available on this setup, so mirror each detection decision into a
+    // SharedPreferences-backed ring buffer instead of Log.w — CheckmatePrefs is
+    // already readable via `adb shell run-as com.checkmate cat
+    // /data/data/com.checkmate/shared_prefs/checkmate_prefs.xml`, so this key shows
+    // up in that same pull without needing logcat at all. Remove logDebugTrail()
+    // and its call sites once the false-trigger root cause is confirmed fixed
+    // against real device evidence (debugging-approach step 9) — not meant to ship.
+    private const val KEY_DEBUG_TRAIL = "debug_uninstall_trail"
+    private const val DEBUG_TRAIL_MAX_LINES = 25
+
     // A gap longer than this between attempts resets the counter — this counts a *burst* of
     // tries ("three in a row"), not a lifetime total across days/weeks.
     private const val CONSEC_RESET_MS = 10 * 60 * 1000L
@@ -413,5 +424,17 @@ object UninstallGuard {
         if (now - last < ALERT_THROTTLE_MS) return false
         CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
         return true
+    }
+
+    // ── TEMP debug trail (see KEY_DEBUG_TRAIL doc above) ────────────────────────
+
+    /** Appends one timestamped line to the debug trail, capped at [DEBUG_TRAIL_MAX_LINES]
+     *  (oldest dropped first) so the pref value can't grow unbounded during testing. */
+    fun logDebugTrail(line: String) {
+        val stamped = "${System.currentTimeMillis()} $line"
+        val existing = CheckmatePrefs.getString(KEY_DEBUG_TRAIL, "") ?: ""
+        val lines = (existing.split("\n").filter { it.isNotBlank() } + stamped)
+            .takeLast(DEBUG_TRAIL_MAX_LINES)
+        CheckmatePrefs.putString(KEY_DEBUG_TRAIL, lines.joinToString("\n"))
     }
 }
