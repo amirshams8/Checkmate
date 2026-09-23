@@ -140,10 +140,19 @@ private fun recordVisit(url: String, title: String) {
  * "$baseUrl/test/$initialSessionId" — the student's assigned Testmate
  * targeted-repair test — instead of the bare Testmate homepage. Null for the
  * plain "test_web" route (bottom-nav / manual entry), which is unchanged.
+ *
+ * [initialPath] — same idea as [initialSessionId] but for a bare Testmate
+ * route rather than a session id, e.g. "practice" for the Q-bank-practice
+ * picker (see MainScreen's "qbank_practice_web" route). Ignored when
+ * [initialSessionId] is set — a specific assigned session always wins.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun TestmateWebScreen(navController: NavController, initialSessionId: String? = null) {
+fun TestmateWebScreen(
+    navController: NavController,
+    initialSessionId: String? = null,
+    initialPath: String? = null
+) {
     val context = LocalContext.current
     // Cache of live WebView instances keyed by tab id — never read during
     // composition, only from click handlers / WebView callbacks. Reused
@@ -160,9 +169,13 @@ fun TestmateWebScreen(navController: NavController, initialSessionId: String? = 
     // with a sessionId, rather than opening the bare base URL and making the
     // student find their way to it themselves.
     val initialUrl = remember {
-        if (!baseUrl.isNullOrBlank() && !initialSessionId.isNullOrBlank())
-            "$baseUrl/test/$initialSessionId"
-        else baseUrl
+        when {
+            !baseUrl.isNullOrBlank() && !initialSessionId.isNullOrBlank() ->
+                "$baseUrl/test/$initialSessionId"
+            !baseUrl.isNullOrBlank() && !initialPath.isNullOrBlank() ->
+                "$baseUrl/${initialPath.trimStart('/')}"
+            else -> baseUrl
+        }
     }
 
     val tabs = remember {

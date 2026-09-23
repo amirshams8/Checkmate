@@ -306,6 +306,27 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                 shape    = RoundedCornerShape(14.dp),
                 color    = BgCard,
                 border   = BorderStroke(0.5.dp, White10),
+                onClick  = { navController.navigate("qbank_practice_web") }
+            ) {
+                Row(
+                    modifier          = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.LibraryBooks, null, tint = AccentAmber, modifier = Modifier.size(22.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Q-bank Practice", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text("Drill new questions or retry wrong/skipped ones", fontSize = 11.sp, color = White60)
+                    }
+                    Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                shape    = RoundedCornerShape(14.dp),
+                color    = BgCard,
+                border   = BorderStroke(0.5.dp, White10),
                 onClick  = { navController.navigate("test_results") }
             ) {
                 Row(

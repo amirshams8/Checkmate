@@ -118,6 +118,11 @@ fun MainScreen(homeViewModel: HomeViewModel, pendingNegotiation: PendingNegotiat
             // Testmate integration (Phase 6)
             composable("test_results")  { TestResultsScreen(navController) }
             composable("test_web")      { TestmateWebScreen(navController) }
+            // Q-bank practice — opens Testmate's own chapter-picker /
+            // wrong-skipped-review page (initialPath = "practice") rather
+            // than the bare Testmate homepage. See StatsScreen's "Q-bank
+            // Practice" card and TestmateWebScreen's initialPath doc.
+            composable("qbank_practice_web") { TestmateWebScreen(navController, initialPath = "practice") }
             // P0b: "Take repair test" from a TaskCard — opens straight at the
             // targeted-test session GapTaskManager.createTargetedTestIfNeeded()
             // already created, instead of landing on the bare Testmate homepage
