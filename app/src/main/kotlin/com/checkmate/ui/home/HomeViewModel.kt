@@ -295,9 +295,29 @@ class HomeViewModel : ViewModel() {
         PlanStore.updateTaskDuration(task.id, clamped)
     }
 
-    /** Removes a task the student added by mistake. Generated tasks can be removed the same way. */
+    /**
+     * Removes a task the student added by mistake. Generated tasks can be removed the same way.
+     *
+     * BUGFIX (deleted gap-repair task never resurfaces): this used to only ever touch
+     * PlanStore — GapTaskLedger's active-concept pointer (activeConceptId/activeTaskId/
+     * activeTaskDayKey, plus the P0b session/round fields) was never told the task it
+     * points at just got deleted. That left the ledger believing that concept still has an
+     * active gap-task pointing at an id that no longer exists anywhere: GapTaskManager's
+     * once-a-day generation gate was already closed for today (a task already existed), so
+     * deleting it didn't reopen it, and resolveActiveConceptState's self-heal pass no-ops
+     * once findTask() can't locate the record either — so the concept was stuck in limbo
+     * instead of coming back the next day. [GapTaskLedger.releaseIfActiveTask] clears the
+     * pointer when it matches, so the concept re-enters tomorrow's normal ranking pool.
+     *
+     * Deliberately NOT [GapTaskLedger.markCovered] — a manual delete is "not now," not "I'm
+     * done with this concept forever." Releasing the pointer only makes the concept eligible
+     * to be ranked again; it does not force it back with priority, and it does not resume
+     * any in-progress P0b round (recordServed sees the next serve as a new concept and
+     * starts a fresh round) — same caveats already called out when this fix was discussed.
+     */
     fun removeTask(task: StudyTask) {
         if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
+        GapTaskLedger.releaseIfActiveTask(task.id)
         PlanStore.removeTask(task.id)
     }
 
