@@ -5,7 +5,9 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.planner.AdaptivePlanner
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.PlannerState
+import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.SubjectConfig
+import com.checkmate.planner.model.TaskState
 
 /**
  * P0a continuation (REPLAN_DAY) — Upgrade Blueprint Phase 2.4/2.5. Production
@@ -39,9 +41,29 @@ class AdaptivePlanReplanner(private val context: Context) : PlanReplanner {
 
     override suspend fun replanToday() {
         val config = readPlannerStateFromPrefs()
-        val tasks = AdaptivePlanner.generateDailyPlan(context, config)
-        PlanStore.saveTodayTasks(tasks)
+        val generated = AdaptivePlanner.generateDailyPlan(context, config)
+
+        // Snapshot AFTER generation (it can suspend on an LLM call) so anything the student
+        // did meanwhile is still seen. saveTodayTasks REPLACES the list, so without this a
+        // replan silently wiped student-typed custom tasks, in-progress/finished work, and
+        // the active gap-repair task (leaving GapTaskLedger's pointer dangling).
+        val keep = PlanStore.getTodayTasksSnapshot_Sync().filter(::mustSurviveReplan)
+        val keepIds = keep.map { it.id }.toSet()
+        val merged = generated.filterNot { it.id in keepIds } + keep
+
+        PlanStore.saveTodayTasks(merged)
     }
+
+    /**
+     * A task survives a replan when regenerating it would lose something the planner can't
+     * recreate: student-typed ([StudyTask.isCustom]), already started/finished/skipped
+     * (state != PENDING — progress and history), or learning-engine originated
+     * ([StudyTask.learningIntent] != null — e.g. the active gap-repair task the ledger and
+     * Testmate session point at). Plain PENDING planner tasks are what a replan exists to
+     * replace.
+     */
+    private fun mustSurviveReplan(t: StudyTask): Boolean =
+        t.isCustom || t.state != TaskState.PENDING || t.learningIntent != null
 
     /**
      * Mirrors `PlannerViewModel.readIntoState()` field-for-field, including its exact
