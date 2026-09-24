@@ -45,6 +45,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   ├── OverdueEnforcementCoordinator.kt
 │   │   │   │   │   │   │   ├── ProactiveMentor.kt
 │   │   │   │   │   │   │   ├── ProfileSyncManager.kt
+│   │   │   │   │   │   │   ├── QbankDailyTaskManager.kt
 │   │   │   │   │   │   │   ├── ReminderService.kt
 │   │   │   │   │   │   │   ├── RetentionCheckManager.kt
 │   │   │   │   │   │   │   ├── ScreenCaptureManager.kt
@@ -5965,6 +5966,258 @@ object ProfileSyncManager {
 }
 
 
+//===== FILE: app/src/main/kotlin/com/checkmate/service/QbankDailyTaskManager.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.DebugTrail
+import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateDailyTargetOutcome
+import com.checkmate.testmate.TestmateQbankPracticeOutcome
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * "Daily Target of qs as per FT schedule should be scheduled on a Checkmate task —
+ * continue practice qbank via API for all 4 subjects" (chat history). The P0c
+ * bridge between Testmate's server-computed, FT-schedule-boosted daily coverage
+ * target ([TestmateApi.fetchDailyTarget], lib/daily-target-engine.ts on the
+ * Testmate side) and an actual Q-bank practice SESSION the student can tap
+ * straight into from Checkmate — one per NEET subject that has a target today.
+ *
+ * Deliberately a separate object from [GapTaskManager]: that one drives the P0b
+ * gap-REPAIR loop (POST /api/tests/targeted, WRONG_SKIPPED pool, keyed by
+ * intervention_id off GapTaskLedger's active concept). This one drives Q-bank
+ * COVERAGE practice ([TestmateApi.startQbankPractice], NEW pool, no
+ * intervention_id at all — see that route's own boundary note) off the daily
+ * per-subject breakdown instead. The two pipelines never touch the same session,
+ * same separation the Testmate side already enforces server-side.
+ *
+ * Once per calendar day (mirrors [GapTaskManager.generateIfNeeded]'s gate and its
+ * "only mark today done once something was actually decided, not on every empty/
+ * failed attempt" bugfix — an unconfigured exam target or a transient network
+ * error retries hourly via [RETRY_INTERVAL_MS] instead of locking out the rest of
+ * the day):
+ *
+ *  1. [TestmateApi.fetchDailyTarget] — GET /api/qbank/daily-target.
+ *  2. For each of the 4 NEET subjects (Physics/Chemistry/Botany/Zoology) with
+ *     `subject_breakdown[].coverage_target > 0` and no session already recorded
+ *     today, pick that subject's #1 chapter off `coverage_gaps` — already sorted
+ *     most-urgent-first server-side (soonest FT study deadline, then most
+ *     remaining questions), and already filtered to chapters with
+ *     `remaining_questions > 0` (see lib/daily-target-engine.ts's own doc), so any
+ *     entry found here is guaranteed to have real questions behind it.
+ *  3. [TestmateApi.startQbankPractice] — POST /api/qbank/practice with
+ *     `pool = NEW`, `question_count = ` that subject's coverage target.
+ *     Idempotent per chapter/pool on the Testmate side (a still-live session for
+ *     the same chapter is handed back instead of forking a duplicate), so a retry
+ *     of this same call — e.g. from [StatsScreen] re-entering the screen — is safe.
+ *  4. Persists `{subject, chapter, sessionId, testId, questionCount}` per subject
+ *     so [todaysSessions] can drive a "Continue <Subject> Q-bank practice" entry —
+ *     see StatsScreen's "Today's Q-bank Targets" card, which opens the session via
+ *     the existing `test_web/{sessionId}` route (same one P0b targeted tests use).
+ *
+ * A subject with a target but nothing in `coverage_gaps` for it (syllabus_chapters
+ * not yet seeded server-side, or that subject's bank is fully drained) is skipped
+ * for the day rather than retried every cycle — there's no chapter to send.
+ */
+object QbankDailyTaskManager {
+
+    private const val TAG = "QbankDailyTaskManager"
+
+    // Same once-a-day-gate-only-marked-on-real-outcome pattern as
+    // GapTaskManager's own PREF_LAST_ATTEMPT_MS bugfix note — see that object's
+    // class doc for why an empty/failed run must not lock out the rest of the day.
+    private const val PREF_LAST_GENERATED_DAY = "qbank_daily_last_generated_day"
+    private const val PREF_LAST_ATTEMPT_MS = "qbank_daily_last_attempt_ms"
+    private const val RETRY_INTERVAL_MS = 60L * 60_000L
+
+    private const val PREF_SESSIONS_JSON = "qbank_daily_sessions_json"
+    private const val PREF_SESSIONS_DAY = "qbank_daily_sessions_day"
+
+    // Persisted the same way GapTaskManager.PREF_TESTMATE_LAST_ERROR is — visible in
+    // Settings → Test Platform without needing adb logcat. Cleared on the next
+    // successful attempt.
+    const val PREF_LAST_ERROR = "qbank_daily_last_error"
+    const val PREF_LAST_ERROR_AT = "qbank_daily_last_error_at"
+
+    private val SUBJECTS = listOf("Physics", "Chemistry", "Botany", "Zoology")
+
+    private val dayFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    private fun todayKey(): String = dayFormat.format(Date())
+
+    data class QbankDailySession(
+        val subject: String,
+        val chapter: String,
+        val sessionId: String,
+        val testId: String,
+        val questionCount: Int
+    )
+
+    /**
+     * Today's already-created sessions, one per subject that got one — for
+     * StatsScreen to render "Continue <Subject>" entries. Empty before the first
+     * successful [generateIfNeeded] run of the day, or once a new day rolls over
+     * (the stored list is day-stamped via [PREF_SESSIONS_DAY], same guard style as
+     * TestmateWebScreen's PREF_HISTORY).
+     */
+    fun todaysSessions(): List<QbankDailySession> {
+        if (CheckmatePrefs.getString(PREF_SESSIONS_DAY, null) != todayKey()) return emptyList()
+        val raw = CheckmatePrefs.getString(PREF_SESSIONS_JSON, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map {
+                val o = arr.getJSONObject(it)
+                QbankDailySession(
+                    subject = o.optString("subject"),
+                    chapter = o.optString("chapter"),
+                    sessionId = o.optString("sessionId"),
+                    testId = o.optString("testId"),
+                    questionCount = o.optInt("questionCount")
+                )
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun saveSessions(sessions: List<QbankDailySession>) {
+        val arr = JSONArray()
+        sessions.forEach { s ->
+            arr.put(JSONObject().apply {
+                put("subject", s.subject)
+                put("chapter", s.chapter)
+                put("sessionId", s.sessionId)
+                put("testId", s.testId)
+                put("questionCount", s.questionCount)
+            })
+        }
+        CheckmatePrefs.putString(PREF_SESSIONS_JSON, arr.toString())
+        CheckmatePrefs.putString(PREF_SESSIONS_DAY, todayKey())
+    }
+
+    /**
+     * Entry point — called from [ReminderService]'s 15-min loop, and also directly
+     * from [com.checkmate.ui.stats.StatsScreen] on screen entry so a session
+     * created just now shows up without waiting for the next service cycle. Both
+     * call sites are safe to call redundantly: the day-key gate and per-subject
+     * "already have one today" check below make a repeat call a cheap no-op once
+     * today's sessions exist.
+     */
+    suspend fun generateIfNeeded(context: Context) {
+        val today = todayKey()
+        if (CheckmatePrefs.getString(PREF_LAST_GENERATED_DAY, null) == today) return
+
+        val lastAttempt = CheckmatePrefs.getLong(PREF_LAST_ATTEMPT_MS, 0L)
+        if (System.currentTimeMillis() - lastAttempt < RETRY_INTERVAL_MS) return
+        CheckmatePrefs.putLong(PREF_LAST_ATTEMPT_MS, System.currentTimeMillis())
+
+        DebugTrail.d(TAG, "generateIfNeeded: ENTER day=$today")
+
+        when (val outcome = TestmateApi.fetchDailyTarget()) {
+            is TestmateDailyTargetOutcome.Error -> {
+                DebugTrail.e(TAG, "generateIfNeeded: fetchDailyTarget failed: ${outcome.message}")
+                recordError(outcome.message)
+            }
+            is TestmateDailyTargetOutcome.Success -> {
+                val target = outcome.target
+                if (!target.configured) {
+                    // Not an error — the student just hasn't set exam_date/syllabus_deadline
+                    // on Testmate yet (POST /api/qbank/exam-target). Nothing to schedule
+                    // until they do; retry hourly rather than daily since this is cheap and
+                    // the student may configure it mid-session.
+                    DebugTrail.d(TAG, "generateIfNeeded: exam target not configured on Testmate yet — skip")
+                    return
+                }
+
+                // coverage_gaps is already sorted most-urgent-first server-side (soonest
+                // FT study deadline, then most remaining) — taking the first match per
+                // subject is exactly "that subject's #1 gap", no re-sorting needed here.
+                val topGapChapterBySubject: Map<String, String> = (target.coverageGaps ?: emptyList())
+                    .groupBy { it.subject }
+                    .mapValues { (_, gaps) -> gaps.first().chapter }
+
+                val existing = todaysSessions().associateBy { it.subject }.toMutableMap()
+                var anyCreated = false
+                var lastFailure: String? = null
+
+                for (subject in SUBJECTS) {
+                    if (existing.containsKey(subject)) continue // already have today's session
+
+                    val subjectCoverage = target.subjectBreakdown.find { it.subject == subject }
+                    if (subjectCoverage == null || subjectCoverage.coverageTarget <= 0) continue
+
+                    val chapter = topGapChapterBySubject[subject]
+                    if (chapter == null) {
+                        DebugTrail.d(TAG, "generateIfNeeded: no coverage_gaps chapter for $subject yet — skipping")
+                        continue
+                    }
+
+                    when (val practiceOutcome = TestmateApi.startQbankPractice(
+                        chapter = chapter,
+                        questionCount = subjectCoverage.coverageTarget
+                    )) {
+                        is TestmateQbankPracticeOutcome.Success -> {
+                            val r = practiceOutcome.result
+                            existing[subject] = QbankDailySession(
+                                subject = subject,
+                                chapter = chapter,
+                                sessionId = r.sessionId,
+                                testId = r.testId,
+                                questionCount = r.questionCount
+                            )
+                            anyCreated = true
+                            DebugTrail.d(
+                                TAG,
+                                "generateIfNeeded: $subject -> chapter=$chapter session=${r.sessionId} " +
+                                    "q=${r.questionCount} reused=${r.reused}"
+                            )
+                        }
+                        is TestmateQbankPracticeOutcome.Error -> {
+                            lastFailure = "$subject: ${practiceOutcome.message}"
+                            DebugTrail.e(
+                                TAG,
+                                "generateIfNeeded: startQbankPractice failed for $subject/$chapter: ${practiceOutcome.message}"
+                            )
+                        }
+                    }
+                }
+
+                if (anyCreated) {
+                    saveSessions(existing.values.toList())
+                }
+                if (lastFailure != null) {
+                    recordError(lastFailure)
+                } else {
+                    clearError()
+                }
+                // Mark today's gate done once every subject either got a session or was
+                // legitimately skipped (no target, or no coverage_gaps chapter yet) — a
+                // real Testmate error with NOTHING created leaves the gate open so the
+                // hourly retry (above) tries again instead of waiting until tomorrow.
+                if (anyCreated || lastFailure == null) {
+                    CheckmatePrefs.putString(PREF_LAST_GENERATED_DAY, today)
+                }
+            }
+        }
+    }
+
+    private fun recordError(message: String) {
+        CheckmatePrefs.putString(PREF_LAST_ERROR, message)
+        CheckmatePrefs.putLong(PREF_LAST_ERROR_AT, System.currentTimeMillis())
+    }
+
+    private fun clearError() {
+        CheckmatePrefs.remove(PREF_LAST_ERROR)
+        CheckmatePrefs.remove(PREF_LAST_ERROR_AT)
+    }
+}
+
+
 //===== FILE: app/src/main/kotlin/com/checkmate/service/ReminderService.kt =====
 package com.checkmate.service
 
@@ -6072,6 +6325,14 @@ class ReminderService : Service() {
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
                 step("GapTaskManager.evidencePoll") { GapTaskManager.evidencePollIfNeeded(applicationContext) }
+                // Q-bank daily-target bridge (FT-schedule-boosted, see chat history "Daily
+                // Target of qs as per ft schedule... scheduled on checkmate task continue
+                // practice qbank via api for all 4 subjects"): turns Testmate's per-subject
+                // GET /api/qbank/daily-target coverage target into an actual POST
+                // /api/qbank/practice session per subject, once/day — see
+                // QbankDailyTaskManager's own class doc. Independent of the GapTaskManager
+                // P0b gap-REPAIR pipeline above; the two never touch the same session.
+                step("QbankDailyTaskManager.generateIfNeeded") { QbankDailyTaskManager.generateIfNeeded(applicationContext) }
                 // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
                 // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
                 // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and
@@ -14042,6 +14303,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.OutcomeProvenance
+import com.checkmate.service.QbankDailyTaskManager
 import com.checkmate.ui.theme.*
 import java.util.Calendar
 import kotlin.math.roundToInt
@@ -14054,6 +14316,17 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
     LaunchedEffect(Unit) { vm.loadAppUsage(context) }
     // Step 14: separate effect, same reasoning as loadAppUsage above — needs Context.
     LaunchedEffect(Unit) { vm.loadInterventionStats(context) }
+
+    // Q-bank daily targets (FT-schedule-boosted) — see QbankDailyTaskManager's own
+    // class doc. Runs generateIfNeeded on screen entry (not just waiting for
+    // ReminderService's next 15-min cycle) so a session created just now shows up
+    // immediately; the object's own once-per-day/hourly-retry gate makes repeat
+    // calls here (e.g. re-entering this screen) cheap no-ops.
+    var qbankSessions by remember { mutableStateOf(QbankDailyTaskManager.todaysSessions()) }
+    LaunchedEffect(Unit) {
+        QbankDailyTaskManager.generateIfNeeded(context)
+        qbankSessions = QbankDailyTaskManager.todaysSessions()
+    }
 
     Column(
         modifier            = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState()),
@@ -14341,6 +14614,42 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                         Text("Drill new questions or retry wrong/skipped ones", fontSize = 11.sp, color = White60)
                     }
                     Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                }
+            }
+            // ── Today's Q-bank Targets (FT-boosted, one session per subject) ──
+            if (qbankSessions.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    shape    = RoundedCornerShape(14.dp),
+                    color    = BgCard,
+                    border   = BorderStroke(0.5.dp, White10)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Today's Q-bank Targets", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text(
+                            "FT-schedule-boosted coverage — tap a subject to continue",
+                            fontSize = 11.sp, color = White60
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        qbankSessions.forEach { s ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { navController.navigate("test_web/${s.sessionId}") }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.LibraryBooks, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("${s.subject} — ${s.chapter}", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = White90)
+                                    Text("${s.questionCount} questions", fontSize = 11.sp, color = White60)
+                                }
+                                Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -38943,6 +39252,222 @@ object TestmateApi {
         }
     }
 
+    // ── P0c: Q-bank daily-target bridge (FT-schedule-boosted coverage) ─────────
+
+    /**
+     * GET /api/qbank/daily-target — Testmate's self-correcting per-subject
+     * coverage/repair/retention breakdown for today, FT-schedule-boosted (see
+     * lib/daily-target-engine.ts's own doc). Safe to call repeatedly; each call
+     * re-derives from current server state rather than reading a cached number.
+     * Feeds [com.checkmate.service.QbankDailyTaskManager], which turns
+     * [TestmateDailyTarget.subjectBreakdown]'s per-subject targets into actual
+     * [startQbankPractice] sessions.
+     */
+    suspend fun fetchDailyTarget(): TestmateDailyTargetOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateDailyTargetOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateDailyTargetOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+
+        val req = Request.Builder()
+            .url("$base/api/qbank/daily-target")
+            .addHeader("Authorization", "Bearer $authToken")
+            .get()
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "GET /api/qbank/daily-target HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateDailyTargetOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            TestmateDailyTargetOutcome.Success(parseDailyTarget(JSONObject(bodyStr)))
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDailyTarget failed: ${e.message}")
+            TestmateDailyTargetOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    /**
+     * POST /api/qbank/practice — the Q-bank COVERAGE-practice sibling of
+     * [createTargetedTest]. See that route's own doc for the NEW/WRONG_SKIPPED pool
+     * split and why this deliberately never sends/receives an intervention_id (a
+     * qbank_practice session must stay structurally invisible to the
+     * [GapTaskManager] repair pipeline). Idempotent per chapter/topic/pool — the
+     * route hands back a still-live session for the same three instead of forking
+     * a duplicate (see [TestmateQbankPractice.reused]), so
+     * [com.checkmate.service.QbankDailyTaskManager] can call this again the same
+     * day without risk.
+     *
+     * [pool] only accepts [TestmateQuestionPool.NEW] (coverage drilling — the
+     * daily-target use case) or [TestmateQuestionPool.WRONG_SKIPPED] (retry a
+     * chapter's past Q-bank misses) — WRONG/SKIPPED alone aren't valid here, unlike
+     * [createTargetedTest]'s pool. [questionCount] omitted/null lets the server
+     * apply its own default (20 for NEW; uncapped for WRONG_SKIPPED).
+     */
+    suspend fun startQbankPractice(
+        chapter: String,
+        topic: String? = null,
+        pool: TestmateQuestionPool = TestmateQuestionPool.NEW,
+        questionCount: Int? = null,
+        durationSeconds: Int? = null
+    ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateQbankPracticeOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+        if (chapter.isBlank()) {
+            return@withContext TestmateQbankPracticeOutcome.Error("chapter is required for Q-bank practice.")
+        }
+        if (pool != TestmateQuestionPool.NEW && pool != TestmateQuestionPool.WRONG_SKIPPED) {
+            return@withContext TestmateQbankPracticeOutcome.Error(
+                "startQbankPractice only supports NEW or WRONG_SKIPPED pools."
+            )
+        }
+
+        val payload = JSONObject().apply {
+            put("chapter", chapter)
+            // Same "null"-string guard as createTargetedTest's topic — see that
+            // function's own BUGFIX comment.
+            topic?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }?.let { put("topic", it) }
+            put("pool", pool.name)
+            questionCount?.let { put("question_count", it) }
+            durationSeconds?.let { put("duration_seconds", it) }
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+
+        val req = Request.Builder()
+            .url("$base/api/qbank/practice")
+            .addHeader("Authorization", "Bearer $authToken")
+            .post(body)
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "POST /api/qbank/practice HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateQbankPracticeOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            val json = JSONObject(bodyStr)
+            val test = json.optJSONObject("test")
+            val session = json.optJSONObject("session")
+            if (test == null || session == null) {
+                return@withContext TestmateQbankPracticeOutcome.Error("Testmate response missing test/session.")
+            }
+            TestmateQbankPracticeOutcome.Success(
+                TestmateQbankPractice(
+                    testId = test.optString("id"),
+                    sessionId = session.optString("id"),
+                    questionCount = json.optInt("question_count", questionCount ?: 0),
+                    reused = json.optBoolean("reused", false)
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "startQbankPractice failed: ${e.message}")
+            TestmateQbankPracticeOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    private fun parseDailyTarget(json: JSONObject): TestmateDailyTarget {
+        fun subjectBreakdown(): List<TestmateSubjectCoverage> {
+            val arr = json.optJSONArray("subject_breakdown") ?: return emptyList()
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateSubjectCoverage(
+                    subject = o.optString("subject"),
+                    total = o.optInt("total", 0),
+                    completed = o.optInt("completed", 0),
+                    remaining = o.optInt("remaining", 0),
+                    coverageTarget = o.optInt("coverage_target", 0)
+                )
+            }
+        }
+
+        fun coverageGaps(): List<TestmateCoverageGap>? {
+            val arr = json.optJSONArray("coverage_gaps") ?: return null
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateCoverageGap(
+                    chapter = o.optString("chapter"),
+                    subject = o.optString("subject"),
+                    totalQuestions = o.optInt("total_questions", 0),
+                    remainingQuestions = o.optInt("remaining_questions", 0),
+                    nextTest = optStringOrNull(o, "next_test"),
+                    nextTestDate = optStringOrNull(o, "next_test_date"),
+                    nextStudyDeadline = optStringOrNull(o, "next_study_deadline"),
+                    daysUntilStudyDeadline = if (o.isNull("days_until_study_deadline")) null else o.optInt("days_until_study_deadline"),
+                    urgency = o.optDouble("urgency", 0.0)
+                )
+            }
+        }
+
+        fun upcomingTests(): List<TestmateUpcomingFt> {
+            val arr = json.optJSONArray("upcoming_tests") ?: return emptyList()
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                fun strings(key: String): List<String> {
+                    val a = o.optJSONArray(key) ?: return emptyList()
+                    return (0 until a.length()).map { a.getString(it) }
+                }
+                TestmateUpcomingFt(
+                    name = o.optString("name"),
+                    testDate = o.optString("test_date"),
+                    studyDeadline = o.optString("study_deadline"),
+                    studyDeadlineIsCustom = o.optBoolean("study_deadline_is_custom", false),
+                    daysUntilTest = o.optInt("days_until_test", 0),
+                    daysUntilStudyDeadline = o.optInt("days_until_study_deadline", 0),
+                    chapters = strings("chapters"),
+                    chaptersWithoutQuestions = strings("chapters_without_questions"),
+                    remainingInScope = o.optInt("remaining_in_scope", 0),
+                    cumulativeRemaining = o.optInt("cumulative_remaining", 0),
+                    requiredPerDay = o.optDouble("required_per_day", 0.0)
+                )
+            }
+        }
+
+        fun ftPressure(): TestmateFtPressure? {
+            val o = json.optJSONObject("ft_pressure") ?: return null
+            return TestmateFtPressure(
+                applied = o.optBoolean("applied", false),
+                globalRate = o.optDouble("global_rate", 0.0),
+                ftRate = o.optDouble("ft_rate", 0.0),
+                baseTarget = o.optInt("base_target", 0),
+                boostedTarget = o.optInt("boosted_target", 0),
+                boost = o.optInt("boost", 0),
+                bindingTest = optStringOrNull(o, "binding_test")
+            )
+        }
+
+        val todayTargetObj = json.optJSONObject("today_target")
+        return TestmateDailyTarget(
+            configured = json.optBoolean("configured", false),
+            examDate = optStringOrNull(json, "exam_date"),
+            syllabusDeadline = optStringOrNull(json, "syllabus_deadline"),
+            deadlineSource = optStringOrNull(json, "deadline_source"),
+            daysLeft = if (json.isNull("days_left")) null else json.optInt("days_left"),
+            totalQuestions = json.optInt("total_questions", 0),
+            completedQuestions = json.optInt("completed_questions", 0),
+            remainingQuestions = json.optInt("remaining_questions", 0),
+            todayCoverageTarget = todayTargetObj?.optInt("coverage", 0) ?: 0,
+            todayRepairTarget = todayTargetObj?.optInt("repair", 0) ?: 0,
+            todayRetentionTarget = todayTargetObj?.optInt("retention", 0) ?: 0,
+            todayTotalTarget = todayTargetObj?.optInt("total", 0) ?: 0,
+            subjectBreakdown = subjectBreakdown(),
+            todayCompleted = json.optInt("today_completed", 0),
+            capacityCapped = json.optBoolean("capacity_capped", false),
+            upcomingTests = upcomingTests(),
+            coverageGaps = coverageGaps(),
+            ftPressure = ftPressure(),
+            computedAt = json.optString("computed_at")
+        )
+    }
+
     private fun errorMessageFor(code: Int, bodyStr: String): String = when (code) {
         401, 403 -> "Testmate rejected the token — check Settings → Test Platform."
         404      -> "No result found for that session ID."
@@ -39146,6 +39671,113 @@ data class TestmateTargetedTest(
 sealed class TestmateTargetedTestOutcome {
     data class Success(val test: TestmateTargetedTest) : TestmateTargetedTestOutcome()
     data class Error(val message: String) : TestmateTargetedTestOutcome()
+}
+
+// ── P0c: Q-bank daily-target bridge (FT-schedule-boosted coverage) ───────────
+// Mirrors GET /api/qbank/daily-target's DailyTargetBreakdown shape
+// (lib/daily-target-engine.ts) closely enough for QbankDailyTaskManager to act on
+// it — NOT a 1:1 field mirror (e.g. `today_target`'s four numbers are flattened
+// onto [TestmateDailyTarget] directly rather than nested, since nothing here needs
+// the nested shape). Field naming intentionally drops the server's snake_case for
+// Kotlin camelCase, same as every other model in this file.
+
+data class TestmateSubjectCoverage(
+    val subject: String,
+    val total: Int,
+    val completed: Int,
+    val remaining: Int,
+    val coverageTarget: Int
+)
+
+/** One chapter still needing questions, most urgent (soonest FT study deadline,
+ *  then most remaining) first — server-sorted, see daily-target-engine.ts's own
+ *  doc. [subject] lets [QbankDailyTaskManager] pick "this subject's #1 gap"
+ *  without re-deriving the urgency ordering client-side. */
+data class TestmateCoverageGap(
+    val chapter: String,
+    val subject: String,
+    val totalQuestions: Int,
+    val remainingQuestions: Int,
+    val nextTest: String?,
+    val nextTestDate: String?,
+    val nextStudyDeadline: String?,
+    val daysUntilStudyDeadline: Int?,
+    val urgency: Double
+)
+
+data class TestmateUpcomingFt(
+    val name: String,
+    val testDate: String,
+    val studyDeadline: String,
+    val studyDeadlineIsCustom: Boolean,
+    val daysUntilTest: Int,
+    val daysUntilStudyDeadline: Int,
+    val chapters: List<String>,
+    val chaptersWithoutQuestions: List<String>,
+    val remainingInScope: Int,
+    val cumulativeRemaining: Int,
+    val requiredPerDay: Double
+)
+
+data class TestmateFtPressure(
+    val applied: Boolean,
+    val globalRate: Double,
+    val ftRate: Double,
+    val baseTarget: Int,
+    val boostedTarget: Int,
+    val boost: Int,
+    val bindingTest: String?
+)
+
+data class TestmateDailyTarget(
+    val configured: Boolean,
+    val examDate: String?,
+    val syllabusDeadline: String?,
+    val deadlineSource: String?,
+    val daysLeft: Int?,
+    val totalQuestions: Int,
+    val completedQuestions: Int,
+    val remainingQuestions: Int,
+    val todayCoverageTarget: Int,
+    val todayRepairTarget: Int,
+    val todayRetentionTarget: Int,
+    val todayTotalTarget: Int,
+    /** Physics/Chemistry/Botany/Zoology (+ 'Unclassified'), server display order. */
+    val subjectBreakdown: List<TestmateSubjectCoverage>,
+    val todayCompleted: Int,
+    val capacityCapped: Boolean,
+    val upcomingTests: List<TestmateUpcomingFt>,
+    /** Null when syllabus_chapters isn't seeded server-side — [QbankDailyTaskManager]
+     *  treats that as "nothing to target yet" for every subject, not an error. */
+    val coverageGaps: List<TestmateCoverageGap>?,
+    val ftPressure: TestmateFtPressure?,
+    val computedAt: String
+)
+
+sealed class TestmateDailyTargetOutcome {
+    data class Success(val target: TestmateDailyTarget) : TestmateDailyTargetOutcome()
+    data class Error(val message: String) : TestmateDailyTargetOutcome()
+}
+
+/**
+ * Result of [TestmateApi.startQbankPractice] — the COVERAGE-practice sibling of
+ * [TestmateTargetedTest]. Deliberately has no `interventionId` field: see
+ * app/api/qbank/practice/route.ts's own doc for why a qbank_practice session must
+ * stay structurally invisible to the intervention_id-keyed repair pipeline.
+ */
+data class TestmateQbankPractice(
+    val testId: String,
+    val sessionId: String,
+    val questionCount: Int,
+    /** True when an existing live session for the same chapter/topic/pool was
+     *  handed back instead of a new one being created — see that route's
+     *  idempotency note. */
+    val reused: Boolean
+)
+
+sealed class TestmateQbankPracticeOutcome {
+    data class Success(val result: TestmateQbankPractice) : TestmateQbankPracticeOutcome()
+    data class Error(val message: String) : TestmateQbankPracticeOutcome()
 }
 
 
