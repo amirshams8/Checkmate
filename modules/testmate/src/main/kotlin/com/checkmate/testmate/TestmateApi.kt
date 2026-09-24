@@ -246,6 +246,222 @@ object TestmateApi {
         }
     }
 
+    // ── P0c: Q-bank daily-target bridge (FT-schedule-boosted coverage) ─────────
+
+    /**
+     * GET /api/qbank/daily-target — Testmate's self-correcting per-subject
+     * coverage/repair/retention breakdown for today, FT-schedule-boosted (see
+     * lib/daily-target-engine.ts's own doc). Safe to call repeatedly; each call
+     * re-derives from current server state rather than reading a cached number.
+     * Feeds [com.checkmate.service.QbankDailyTaskManager], which turns
+     * [TestmateDailyTarget.subjectBreakdown]'s per-subject targets into actual
+     * [startQbankPractice] sessions.
+     */
+    suspend fun fetchDailyTarget(): TestmateDailyTargetOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateDailyTargetOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateDailyTargetOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+
+        val req = Request.Builder()
+            .url("$base/api/qbank/daily-target")
+            .addHeader("Authorization", "Bearer $authToken")
+            .get()
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "GET /api/qbank/daily-target HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateDailyTargetOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            TestmateDailyTargetOutcome.Success(parseDailyTarget(JSONObject(bodyStr)))
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchDailyTarget failed: ${e.message}")
+            TestmateDailyTargetOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    /**
+     * POST /api/qbank/practice — the Q-bank COVERAGE-practice sibling of
+     * [createTargetedTest]. See that route's own doc for the NEW/WRONG_SKIPPED pool
+     * split and why this deliberately never sends/receives an intervention_id (a
+     * qbank_practice session must stay structurally invisible to the
+     * [GapTaskManager] repair pipeline). Idempotent per chapter/topic/pool — the
+     * route hands back a still-live session for the same three instead of forking
+     * a duplicate (see [TestmateQbankPractice.reused]), so
+     * [com.checkmate.service.QbankDailyTaskManager] can call this again the same
+     * day without risk.
+     *
+     * [pool] only accepts [TestmateQuestionPool.NEW] (coverage drilling — the
+     * daily-target use case) or [TestmateQuestionPool.WRONG_SKIPPED] (retry a
+     * chapter's past Q-bank misses) — WRONG/SKIPPED alone aren't valid here, unlike
+     * [createTargetedTest]'s pool. [questionCount] omitted/null lets the server
+     * apply its own default (20 for NEW; uncapped for WRONG_SKIPPED).
+     */
+    suspend fun startQbankPractice(
+        chapter: String,
+        topic: String? = null,
+        pool: TestmateQuestionPool = TestmateQuestionPool.NEW,
+        questionCount: Int? = null,
+        durationSeconds: Int? = null
+    ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
+            "Set the Testmate base URL in Settings → Test Platform first."
+        )
+        val authToken = token() ?: return@withContext TestmateQbankPracticeOutcome.Error(
+            "Set the Testmate access token in Settings → Test Platform first."
+        )
+        if (chapter.isBlank()) {
+            return@withContext TestmateQbankPracticeOutcome.Error("chapter is required for Q-bank practice.")
+        }
+        if (pool != TestmateQuestionPool.NEW && pool != TestmateQuestionPool.WRONG_SKIPPED) {
+            return@withContext TestmateQbankPracticeOutcome.Error(
+                "startQbankPractice only supports NEW or WRONG_SKIPPED pools."
+            )
+        }
+
+        val payload = JSONObject().apply {
+            put("chapter", chapter)
+            // Same "null"-string guard as createTargetedTest's topic — see that
+            // function's own BUGFIX comment.
+            topic?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }?.let { put("topic", it) }
+            put("pool", pool.name)
+            questionCount?.let { put("question_count", it) }
+            durationSeconds?.let { put("duration_seconds", it) }
+        }
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+
+        val req = Request.Builder()
+            .url("$base/api/qbank/practice")
+            .addHeader("Authorization", "Bearer $authToken")
+            .post(body)
+            .build()
+
+        try {
+            val resp = client.newCall(req).execute()
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) {
+                Log.e(TAG, "POST /api/qbank/practice HTTP ${resp.code} body=$bodyStr")
+                return@withContext TestmateQbankPracticeOutcome.Error(errorMessageFor(resp.code, bodyStr))
+            }
+            val json = JSONObject(bodyStr)
+            val test = json.optJSONObject("test")
+            val session = json.optJSONObject("session")
+            if (test == null || session == null) {
+                return@withContext TestmateQbankPracticeOutcome.Error("Testmate response missing test/session.")
+            }
+            TestmateQbankPracticeOutcome.Success(
+                TestmateQbankPractice(
+                    testId = test.optString("id"),
+                    sessionId = session.optString("id"),
+                    questionCount = json.optInt("question_count", questionCount ?: 0),
+                    reused = json.optBoolean("reused", false)
+                )
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "startQbankPractice failed: ${e.message}")
+            TestmateQbankPracticeOutcome.Error("Couldn't reach Testmate: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    private fun parseDailyTarget(json: JSONObject): TestmateDailyTarget {
+        fun subjectBreakdown(): List<TestmateSubjectCoverage> {
+            val arr = json.optJSONArray("subject_breakdown") ?: return emptyList()
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateSubjectCoverage(
+                    subject = o.optString("subject"),
+                    total = o.optInt("total", 0),
+                    completed = o.optInt("completed", 0),
+                    remaining = o.optInt("remaining", 0),
+                    coverageTarget = o.optInt("coverage_target", 0)
+                )
+            }
+        }
+
+        fun coverageGaps(): List<TestmateCoverageGap>? {
+            val arr = json.optJSONArray("coverage_gaps") ?: return null
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                TestmateCoverageGap(
+                    chapter = o.optString("chapter"),
+                    subject = o.optString("subject"),
+                    totalQuestions = o.optInt("total_questions", 0),
+                    remainingQuestions = o.optInt("remaining_questions", 0),
+                    nextTest = optStringOrNull(o, "next_test"),
+                    nextTestDate = optStringOrNull(o, "next_test_date"),
+                    nextStudyDeadline = optStringOrNull(o, "next_study_deadline"),
+                    daysUntilStudyDeadline = if (o.isNull("days_until_study_deadline")) null else o.optInt("days_until_study_deadline"),
+                    urgency = o.optDouble("urgency", 0.0)
+                )
+            }
+        }
+
+        fun upcomingTests(): List<TestmateUpcomingFt> {
+            val arr = json.optJSONArray("upcoming_tests") ?: return emptyList()
+            return (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                fun strings(key: String): List<String> {
+                    val a = o.optJSONArray(key) ?: return emptyList()
+                    return (0 until a.length()).map { a.getString(it) }
+                }
+                TestmateUpcomingFt(
+                    name = o.optString("name"),
+                    testDate = o.optString("test_date"),
+                    studyDeadline = o.optString("study_deadline"),
+                    studyDeadlineIsCustom = o.optBoolean("study_deadline_is_custom", false),
+                    daysUntilTest = o.optInt("days_until_test", 0),
+                    daysUntilStudyDeadline = o.optInt("days_until_study_deadline", 0),
+                    chapters = strings("chapters"),
+                    chaptersWithoutQuestions = strings("chapters_without_questions"),
+                    remainingInScope = o.optInt("remaining_in_scope", 0),
+                    cumulativeRemaining = o.optInt("cumulative_remaining", 0),
+                    requiredPerDay = o.optDouble("required_per_day", 0.0)
+                )
+            }
+        }
+
+        fun ftPressure(): TestmateFtPressure? {
+            val o = json.optJSONObject("ft_pressure") ?: return null
+            return TestmateFtPressure(
+                applied = o.optBoolean("applied", false),
+                globalRate = o.optDouble("global_rate", 0.0),
+                ftRate = o.optDouble("ft_rate", 0.0),
+                baseTarget = o.optInt("base_target", 0),
+                boostedTarget = o.optInt("boosted_target", 0),
+                boost = o.optInt("boost", 0),
+                bindingTest = optStringOrNull(o, "binding_test")
+            )
+        }
+
+        val todayTargetObj = json.optJSONObject("today_target")
+        return TestmateDailyTarget(
+            configured = json.optBoolean("configured", false),
+            examDate = optStringOrNull(json, "exam_date"),
+            syllabusDeadline = optStringOrNull(json, "syllabus_deadline"),
+            deadlineSource = optStringOrNull(json, "deadline_source"),
+            daysLeft = if (json.isNull("days_left")) null else json.optInt("days_left"),
+            totalQuestions = json.optInt("total_questions", 0),
+            completedQuestions = json.optInt("completed_questions", 0),
+            remainingQuestions = json.optInt("remaining_questions", 0),
+            todayCoverageTarget = todayTargetObj?.optInt("coverage", 0) ?: 0,
+            todayRepairTarget = todayTargetObj?.optInt("repair", 0) ?: 0,
+            todayRetentionTarget = todayTargetObj?.optInt("retention", 0) ?: 0,
+            todayTotalTarget = todayTargetObj?.optInt("total", 0) ?: 0,
+            subjectBreakdown = subjectBreakdown(),
+            todayCompleted = json.optInt("today_completed", 0),
+            capacityCapped = json.optBoolean("capacity_capped", false),
+            upcomingTests = upcomingTests(),
+            coverageGaps = coverageGaps(),
+            ftPressure = ftPressure(),
+            computedAt = json.optString("computed_at")
+        )
+    }
+
     private fun errorMessageFor(code: Int, bodyStr: String): String = when (code) {
         401, 403 -> "Testmate rejected the token — check Settings → Test Platform."
         404      -> "No result found for that session ID."

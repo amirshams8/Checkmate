@@ -104,6 +104,14 @@ class ReminderService : Service() {
                 // only off the task's DONE flag. Deliberately every cycle, not once/day — see
                 // GapTaskManager.evidencePollIfNeeded's own doc.
                 step("GapTaskManager.evidencePoll") { GapTaskManager.evidencePollIfNeeded(applicationContext) }
+                // Q-bank daily-target bridge (FT-schedule-boosted, see chat history "Daily
+                // Target of qs as per ft schedule... scheduled on checkmate task continue
+                // practice qbank via api for all 4 subjects"): turns Testmate's per-subject
+                // GET /api/qbank/daily-target coverage target into an actual POST
+                // /api/qbank/practice session per subject, once/day — see
+                // QbankDailyTaskManager's own class doc. Independent of the GapTaskManager
+                // P0b gap-REPAIR pipeline above; the two never touch the same session.
+                step("QbankDailyTaskManager.generateIfNeeded") { QbankDailyTaskManager.generateIfNeeded(applicationContext) }
                 // Phase 3 (adaptive tutor state machine) execution bridge: drives whatever
                 // DIAGNOSE/EXPLAIN/PRACTICE/VERIFY session is currently active — DIAGNOSE and
                 // EXPLAIN auto-advance immediately (no external evidence needed), PRACTICE and

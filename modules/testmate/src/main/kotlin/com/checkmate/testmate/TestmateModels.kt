@@ -114,3 +114,110 @@ sealed class TestmateTargetedTestOutcome {
     data class Success(val test: TestmateTargetedTest) : TestmateTargetedTestOutcome()
     data class Error(val message: String) : TestmateTargetedTestOutcome()
 }
+
+// ── P0c: Q-bank daily-target bridge (FT-schedule-boosted coverage) ───────────
+// Mirrors GET /api/qbank/daily-target's DailyTargetBreakdown shape
+// (lib/daily-target-engine.ts) closely enough for QbankDailyTaskManager to act on
+// it — NOT a 1:1 field mirror (e.g. `today_target`'s four numbers are flattened
+// onto [TestmateDailyTarget] directly rather than nested, since nothing here needs
+// the nested shape). Field naming intentionally drops the server's snake_case for
+// Kotlin camelCase, same as every other model in this file.
+
+data class TestmateSubjectCoverage(
+    val subject: String,
+    val total: Int,
+    val completed: Int,
+    val remaining: Int,
+    val coverageTarget: Int
+)
+
+/** One chapter still needing questions, most urgent (soonest FT study deadline,
+ *  then most remaining) first — server-sorted, see daily-target-engine.ts's own
+ *  doc. [subject] lets [QbankDailyTaskManager] pick "this subject's #1 gap"
+ *  without re-deriving the urgency ordering client-side. */
+data class TestmateCoverageGap(
+    val chapter: String,
+    val subject: String,
+    val totalQuestions: Int,
+    val remainingQuestions: Int,
+    val nextTest: String?,
+    val nextTestDate: String?,
+    val nextStudyDeadline: String?,
+    val daysUntilStudyDeadline: Int?,
+    val urgency: Double
+)
+
+data class TestmateUpcomingFt(
+    val name: String,
+    val testDate: String,
+    val studyDeadline: String,
+    val studyDeadlineIsCustom: Boolean,
+    val daysUntilTest: Int,
+    val daysUntilStudyDeadline: Int,
+    val chapters: List<String>,
+    val chaptersWithoutQuestions: List<String>,
+    val remainingInScope: Int,
+    val cumulativeRemaining: Int,
+    val requiredPerDay: Double
+)
+
+data class TestmateFtPressure(
+    val applied: Boolean,
+    val globalRate: Double,
+    val ftRate: Double,
+    val baseTarget: Int,
+    val boostedTarget: Int,
+    val boost: Int,
+    val bindingTest: String?
+)
+
+data class TestmateDailyTarget(
+    val configured: Boolean,
+    val examDate: String?,
+    val syllabusDeadline: String?,
+    val deadlineSource: String?,
+    val daysLeft: Int?,
+    val totalQuestions: Int,
+    val completedQuestions: Int,
+    val remainingQuestions: Int,
+    val todayCoverageTarget: Int,
+    val todayRepairTarget: Int,
+    val todayRetentionTarget: Int,
+    val todayTotalTarget: Int,
+    /** Physics/Chemistry/Botany/Zoology (+ 'Unclassified'), server display order. */
+    val subjectBreakdown: List<TestmateSubjectCoverage>,
+    val todayCompleted: Int,
+    val capacityCapped: Boolean,
+    val upcomingTests: List<TestmateUpcomingFt>,
+    /** Null when syllabus_chapters isn't seeded server-side — [QbankDailyTaskManager]
+     *  treats that as "nothing to target yet" for every subject, not an error. */
+    val coverageGaps: List<TestmateCoverageGap>?,
+    val ftPressure: TestmateFtPressure?,
+    val computedAt: String
+)
+
+sealed class TestmateDailyTargetOutcome {
+    data class Success(val target: TestmateDailyTarget) : TestmateDailyTargetOutcome()
+    data class Error(val message: String) : TestmateDailyTargetOutcome()
+}
+
+/**
+ * Result of [TestmateApi.startQbankPractice] — the COVERAGE-practice sibling of
+ * [TestmateTargetedTest]. Deliberately has no `interventionId` field: see
+ * app/api/qbank/practice/route.ts's own doc for why a qbank_practice session must
+ * stay structurally invisible to the intervention_id-keyed repair pipeline.
+ */
+data class TestmateQbankPractice(
+    val testId: String,
+    val sessionId: String,
+    val questionCount: Int,
+    /** True when an existing live session for the same chapter/topic/pool was
+     *  handed back instead of a new one being created — see that route's
+     *  idempotency note. */
+    val reused: Boolean
+)
+
+sealed class TestmateQbankPracticeOutcome {
+    data class Success(val result: TestmateQbankPractice) : TestmateQbankPracticeOutcome()
+    data class Error(val message: String) : TestmateQbankPracticeOutcome()
+}

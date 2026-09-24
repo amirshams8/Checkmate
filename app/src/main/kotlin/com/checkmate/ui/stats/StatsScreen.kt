@@ -20,6 +20,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.OutcomeProvenance
+import com.checkmate.service.QbankDailyTaskManager
 import com.checkmate.ui.theme.*
 import java.util.Calendar
 import kotlin.math.roundToInt
@@ -32,6 +33,17 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
     LaunchedEffect(Unit) { vm.loadAppUsage(context) }
     // Step 14: separate effect, same reasoning as loadAppUsage above — needs Context.
     LaunchedEffect(Unit) { vm.loadInterventionStats(context) }
+
+    // Q-bank daily targets (FT-schedule-boosted) — see QbankDailyTaskManager's own
+    // class doc. Runs generateIfNeeded on screen entry (not just waiting for
+    // ReminderService's next 15-min cycle) so a session created just now shows up
+    // immediately; the object's own once-per-day/hourly-retry gate makes repeat
+    // calls here (e.g. re-entering this screen) cheap no-ops.
+    var qbankSessions by remember { mutableStateOf(QbankDailyTaskManager.todaysSessions()) }
+    LaunchedEffect(Unit) {
+        QbankDailyTaskManager.generateIfNeeded(context)
+        qbankSessions = QbankDailyTaskManager.todaysSessions()
+    }
 
     Column(
         modifier            = Modifier.fillMaxSize().background(BgDark).verticalScroll(rememberScrollState()),
@@ -319,6 +331,42 @@ fun StatsScreen(navController: NavController? = null, vm: StatsViewModel = viewM
                         Text("Drill new questions or retry wrong/skipped ones", fontSize = 11.sp, color = White60)
                     }
                     Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                }
+            }
+            // ── Today's Q-bank Targets (FT-boosted, one session per subject) ──
+            if (qbankSessions.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    shape    = RoundedCornerShape(14.dp),
+                    color    = BgCard,
+                    border   = BorderStroke(0.5.dp, White10)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Today's Q-bank Targets", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = White90)
+                        Text(
+                            "FT-schedule-boosted coverage — tap a subject to continue",
+                            fontSize = 11.sp, color = White60
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        qbankSessions.forEach { s ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { navController.navigate("test_web/${s.sessionId}") }
+                                    .padding(vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.LibraryBooks, null, tint = AccentAmber, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("${s.subject} — ${s.chapter}", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = White90)
+                                    Text("${s.questionCount} questions", fontSize = 11.sp, color = White60)
+                                }
+                                Icon(Icons.Default.ChevronRight, null, tint = White30, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
