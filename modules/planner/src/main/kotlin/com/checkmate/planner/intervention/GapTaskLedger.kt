@@ -175,17 +175,6 @@ object GapTaskLedger {
     fun isCovered(conceptId: String): Boolean =
         coveredIds().contains(conceptId)
 
-    /** Snapshot of every concept id already marked covered — lets a caller (see
-     *  [com.checkmate.service.GapTaskManager.generateIfNeeded]) exclude them BEFORE ranking
-     *  so they can't fill the decision engine's candidate cap. */
-    fun coveredConceptIds(): Set<String> = coveredIds()
-
-    /** Log.d that never throws — this module's plain-JVM unit tests run against the stubbed
-     *  android.jar where every android.util.Log call throws "not mocked". */
-    private fun safeLog(msg: String) {
-        com.checkmate.core.DebugTrail.d(TAG, msg)
-    }
-
     /**
      * Marks [conceptId] covered — call this ONLY once [com.checkmate.service.GapTaskManager]
      * has confirmed the concept is genuinely finished: its gap-task's own `TaskState` reached
@@ -202,43 +191,11 @@ object GapTaskLedger {
      */
     fun markCovered(conceptId: String) {
         val updated = coveredIds() + conceptId
-        safeLog("markCovered: concept=$conceptId (covered total=${updated.size})")
         CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
         recordWarningOutcome(conceptId)
         if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
             clearActive()
         }
-        bumpVersion()
-    }
-
-    /**
-     * BUGFIX (deleted gap-repair task never resurfaces): called by
-     * [com.checkmate.ui.home.HomeViewModel.removeTask] when the task a student manually
-     * deletes is this ledger's own active gap-repair task. Before this existed, nothing
-     * ever told the ledger a manual delete had happened — [activeConceptId]/[activeTaskId]/
-     * [activeTaskDayKey] kept pointing at a task id that no longer existed in any persisted
-     * day's plan, which left the concept stuck: [com.checkmate.service.GapTaskManager]'s
-     * once-a-day generation gate was already closed for today (a task already existed before
-     * the delete), so deleting it didn't reopen it, and the self-heal pass
-     * (`resolveActiveConceptState`) no-ops once `findTask()` can't locate the record either —
-     * so nothing else in the system was ever going to clear this pointer on its own.
-     *
-     * Deliberately NOT [markCovered] — a manual delete means "not now," not "I'm done with
-     * this concept forever." This only clears the active pointer (concept id, task id, day
-     * key, streak, and every P0b session/round field — same fields [clearActive] already
-     * resets for the covered case) so the concept goes back into the NEXT day's ranking pool
-     * as an ordinary candidate once [com.checkmate.service.GapTaskManager]'s once-a-day gate
-     * resets — it is not forced back with priority, and any in-progress P0b round is not
-     * resumed: the next [recordServed] call sees this as a new concept and starts a fresh
-     * round, same as any other freshly-served concept.
-     *
-     * No-ops if [taskId] doesn't match the currently active task, so deleting an unrelated
-     * (non-gap, e.g. custom or AI-generated) task never touches this ledger at all.
-     */
-    fun releaseIfActiveTask(taskId: String) {
-        if (activeTaskId() != taskId) return
-        safeLog("releaseIfActiveTask: releasing concept=${activeConceptId()} task=$taskId (NOT marked covered)")
-        clearActive()
         bumpVersion()
     }
 
@@ -586,22 +543,8 @@ object GapTaskLedger {
             // withLock calling into executeTopCandidate's) — run inline, don't deadlock.
             return block()
         }
-        val contended = mutex.isLocked
-        val waitStart = System.currentTimeMillis()
-        if (contended) {
-            safeLog("withLock: lock currently HELD by another call chain — waiting " +
-                "(caller thread=${Thread.currentThread().name})")
-        }
         return mutex.withLock {
-            val waited = System.currentTimeMillis() - waitStart
-            if (contended || waited > 500L) safeLog("withLock: acquired after ${waited}ms wait")
-            val heldStart = System.currentTimeMillis()
-            try {
-                withContext(LockOwnerElement()) { block() }
-            } finally {
-                val held = System.currentTimeMillis() - heldStart
-                if (held > 3_000L) safeLog("withLock: critical section held the lock for ${held}ms (SLOW)")
-            }
+            withContext(LockOwnerElement()) { block() }
         }
     }
 }
