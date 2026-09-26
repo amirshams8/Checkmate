@@ -88,8 +88,17 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
     // this one (StudyTask) -> String? function). state.activeRetentionSessions is keyed by
     // taskId (see HomeViewModel.loadRetentionSessions) since — unlike the single active gap
     // concept above — several retention checks can have their own live session at once.
+    //
+    // FIX (Tasks tab wiring): same reuse, one more time, for QbankDailyTaskManager's daily
+    // coverage-practice sessions — state.activeQbankSessions is keyed by taskId exactly the
+    // same way (see HomeViewModel.loadQbankSessions), so a Q-bank task's card now falls
+    // through to it once the gap-repair and retention checks above have both missed. This
+    // is the only HomeScreen-side change the Q-bank fix needed: the existing generic "Take
+    // test" button/deep-link (test_web/{sessionId}) below already works for these tasks
+    // with zero new UI plumbing once repairSessionFor() can find their session id.
     fun repairSessionFor(task: StudyTask): String? =
-        if (task.id == activeTaskId) activeSessionId else state.activeRetentionSessions[task.id]
+        if (task.id == activeTaskId) activeSessionId
+        else state.activeRetentionSessions[task.id] ?: state.activeQbankSessions[task.id]
 
     var showAddTaskDialog by remember { mutableStateOf(false) }
     var editingTask        by remember { mutableStateOf<StudyTask?>(null) }

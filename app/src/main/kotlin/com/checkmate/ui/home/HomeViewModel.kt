@@ -24,6 +24,7 @@ import com.checkmate.service.FloatingAttentionService
 import com.checkmate.service.GapTaskManager
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ProactiveMentor
+import com.checkmate.service.QbankDailyTaskManager
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.TaskSyncManager
 import com.checkmate.workmode.WorkModeManager
@@ -58,7 +59,13 @@ data class HomeState(
     // why this is keyed by taskId instead of one active-session field. Only entries whose
     // session has actually been created are included (a task still waiting on
     // RetentionCheckManager.createRetentionTestsIfNeeded has no sessionId yet).
-    val activeRetentionSessions: Map<String, String> = emptyMap()
+    val activeRetentionSessions: Map<String, String> = emptyMap(),
+    // FIX (Tasks tab wiring): QbankDailyTaskManager's daily coverage-practice sessions,
+    // keyed by the StudyTask.id it now creates via PlanStore.createTask() — same
+    // "several independent sessions, no single active slot" shape as
+    // activeRetentionSessions above (one per subject with a target today), populated by
+    // [loadQbankSessions] the same way that field is populated by [loadRetentionSessions].
+    val activeQbankSessions: Map<String, String> = emptyMap()
 )
 
 class HomeViewModel : ViewModel() {
@@ -76,6 +83,7 @@ class HomeViewModel : ViewModel() {
         _state.update { it.copy(syncEnabled = TaskSyncManager.isEnabled()) }
         loadTodayPlan(); loadStreak(); loadPsycheMessage(); loadGapTaskSession()
         loadRetentionSessions()
+        loadQbankSessions()
         pullSync()
     }
 
@@ -178,6 +186,29 @@ class HomeViewModel : ViewModel() {
                     .mapNotNull { entry -> entry.testmateSessionId?.let { entry.taskId to it } }
                     .toMap()
                 _state.update { it.copy(activeRetentionSessions = sessions) }
+            }
+        }
+    }
+
+    /**
+     * FIX (Tasks tab wiring): same "CheckmatePrefs write has no observable of its own, so
+     * collect the object's version counter and re-snapshot into Compose state" shape
+     * [loadRetentionSessions] uses for RetentionTaskLedger, applied to
+     * [QbankDailyTaskManager] instead. That object's generateIfNeeded() runs from
+     * ReminderService's background loop (and from StatsScreen re-entry), entirely outside
+     * Compose, so without this collector HomeScreen would never notice a daily Q-bank
+     * coverage session — and the StudyTask card it now creates via PlanStore.createTask()
+     * — becoming available. Only sessions that already have a taskId are included (a
+     * session persisted before this fix, back when taskId didn't exist yet, has nothing
+     * for a task card to key off of — see QbankDailySession.taskId's own doc).
+     */
+    private fun loadQbankSessions() {
+        viewModelScope.launch {
+            QbankDailyTaskManager.version.collect {
+                val sessions = QbankDailyTaskManager.todaysSessions()
+                    .mapNotNull { session -> session.taskId?.let { it to session.sessionId } }
+                    .toMap()
+                _state.update { it.copy(activeQbankSessions = sessions) }
             }
         }
     }

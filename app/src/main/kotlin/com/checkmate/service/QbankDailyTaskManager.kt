@@ -3,9 +3,16 @@ package com.checkmate.service
 import android.content.Context
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.DebugTrail
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateDailyTargetOutcome
 import com.checkmate.testmate.TestmateQbankPracticeOutcome
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -47,10 +54,20 @@ import java.util.Locale
  *     Idempotent per chapter/pool on the Testmate side (a still-live session for
  *     the same chapter is handed back instead of forking a duplicate), so a retry
  *     of this same call — e.g. from [StatsScreen] re-entering the screen — is safe.
- *  4. Persists `{subject, chapter, sessionId, testId, questionCount}` per subject
- *     so [todaysSessions] can drive a "Continue <Subject> Q-bank practice" entry —
- *     see StatsScreen's "Today's Q-bank Targets" card, which opens the session via
- *     the existing `test_web/{sessionId}` route (same one P0b targeted tests use).
+ *  4. Persists `{subject, chapter, sessionId, testId, questionCount, taskId}` per
+ *     subject so [todaysSessions] can drive a "Continue <Subject> Q-bank practice"
+ *     entry — see StatsScreen's "Today's Q-bank Targets" card, which opens the
+ *     session via the existing `test_web/{sessionId}` route (same one P0b targeted
+ *     tests use).
+ *  5. FIX (Tasks tab wiring): also creates a real [StudyTask] via
+ *     [PlanStore.createTask] for the session — mirrors [GapTaskManager]/
+ *     [RetentionCheckManager]'s own direct-StudyTask pattern (a plain PlanStore
+ *     write, no LearningInterventionOrchestrator negotiation needed since there's
+ *     no repair/escalation logic attached to a Q-bank coverage session). Until now
+ *     this object only ever wrote to [PREF_SESSIONS_JSON] and was read solely by
+ *     [StatsScreen]'s "Today's Q-bank Targets" card — [todaysSessions] was never
+ *     wired into [PlanStore], so the daily Q-bank target never showed up on the
+ *     Home tasks tab at all. Not a regression, a missing wire.
  *
  * A subject with a target but nothing in `coverage_gaps` for it (syllabus_chapters
  * not yet seeded server-side, or that subject's bank is fully drained) is skipped
@@ -78,15 +95,34 @@ object QbankDailyTaskManager {
 
     private val SUBJECTS = listOf("Physics", "Chemistry", "Botany", "Zoology")
 
+    // Roughly NEET MCQ pacing (~1 min/question) — same reasoning
+    // RetentionCheckManager.RETENTION_QUESTION_COUNT's own duration note applies
+    // (a fixed, honest estimate rather than a real timer): this only sizes the
+    // StudyTask card on Home, it does not gate or clock the Testmate session
+    // itself. Floored so a tiny coverage_target still reads as a real task.
+    private const val MINUTES_PER_QUESTION = 1
+    private const val MIN_TASK_MINUTES = 10
+
     private val dayFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
     private fun todayKey(): String = dayFormat.format(Date())
+
+    // Same reactive-change-signal shape as GapTaskLedger.version/
+    // RetentionTaskLedger.version — this object's writes happen from
+    // ReminderService's background loop (and from StatsScreen re-entry), with no
+    // observable of their own otherwise; HomeViewModel needs to notice a session
+    // (and its StudyTask) becoming available the same way it already does for
+    // those two ledgers.
+    private val _version = MutableStateFlow(0L)
+    val version: StateFlow<Long> = _version.asStateFlow()
+    private fun bumpVersion() { _version.update { it + 1 } }
 
     data class QbankDailySession(
         val subject: String,
         val chapter: String,
         val sessionId: String,
         val testId: String,
-        val questionCount: Int
+        val questionCount: Int,
+        val taskId: String? = null // null only for sessions persisted before this fix; see StatsScreen's own fallback
     )
 
     /**
@@ -108,7 +144,8 @@ object QbankDailyTaskManager {
                     chapter = o.optString("chapter"),
                     sessionId = o.optString("sessionId"),
                     testId = o.optString("testId"),
-                    questionCount = o.optInt("questionCount")
+                    questionCount = o.optInt("questionCount"),
+                    taskId = o.optString("taskId", "").takeIf { it.isNotBlank() }
                 )
             }
         } catch (_: Exception) {
@@ -125,10 +162,12 @@ object QbankDailyTaskManager {
                 put("sessionId", s.sessionId)
                 put("testId", s.testId)
                 put("questionCount", s.questionCount)
+                put("taskId", s.taskId ?: "")
             })
         }
         CheckmatePrefs.putString(PREF_SESSIONS_JSON, arr.toString())
         CheckmatePrefs.putString(PREF_SESSIONS_DAY, todayKey())
+        bumpVersion()
     }
 
     /**
@@ -194,18 +233,35 @@ object QbankDailyTaskManager {
                     )) {
                         is TestmateQbankPracticeOutcome.Success -> {
                             val r = practiceOutcome.result
+
+                            // FIX (Tasks tab): create the actual StudyTask now, same
+                            // direct-PlanStore.createTask() pattern GapTaskManager/
+                            // RetentionCheckManager use for their own Testmate-backed
+                            // sessions — no orchestrator/escrow negotiation needed here,
+                            // this isn't a repair candidate competing for the single
+                            // gap-repair slot, it's a plain coverage-practice task.
+                            val task = StudyTask(
+                                subject = subject,
+                                topic = "Q-bank: $chapter",
+                                durationMinutes = (r.questionCount * MINUTES_PER_QUESTION)
+                                    .coerceAtLeast(MIN_TASK_MINUTES),
+                                taskType = TaskType.PRACTICE
+                            )
+                            PlanStore.createTask(task)
+
                             existing[subject] = QbankDailySession(
                                 subject = subject,
                                 chapter = chapter,
                                 sessionId = r.sessionId,
                                 testId = r.testId,
-                                questionCount = r.questionCount
+                                questionCount = r.questionCount,
+                                taskId = task.id
                             )
                             anyCreated = true
                             DebugTrail.d(
                                 TAG,
                                 "generateIfNeeded: $subject -> chapter=$chapter session=${r.sessionId} " +
-                                    "q=${r.questionCount} reused=${r.reused}"
+                                    "q=${r.questionCount} reused=${r.reused} task=${task.id}"
                             )
                         }
                         is TestmateQbankPracticeOutcome.Error -> {
