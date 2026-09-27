@@ -2,6 +2,7 @@ package com.checkmate.service
  
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.DebugTrail
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.llm.LlmGateway
@@ -176,7 +177,7 @@ object GapTaskManager {
                 ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
             createTargetedTestIfNeeded()
         } catch (e: Exception) {
-            Log.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+            DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
             GapTaskLedger.markGeneratedToday(todayKey)
         }
@@ -197,23 +198,23 @@ object GapTaskManager {
         // Logging each branch so the next repro run pinpoints the actual break instead of
         // requiring another guess-and-rebuild cycle.
         val conceptId = GapTaskLedger.activeConceptId() ?: run {
-            Log.d(TAG, "resolveActiveConceptState: no active concept — no-op")
+            DebugTrail.d(TAG, "resolveActiveConceptState: no active concept — no-op")
             return
         }
         val taskId = GapTaskLedger.activeTaskId() ?: run {
-            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId has no active taskId — no-op")
+            DebugTrail.d(TAG, "resolveActiveConceptState: concept=$conceptId has no active taskId — no-op")
             return
         }
         val dayKey = GapTaskLedger.activeTaskDayKey() ?: run {
-            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId has no dayKey — no-op")
+            DebugTrail.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId has no dayKey — no-op")
             return
         }
         val task = findTask(taskId, dayKey) ?: run {
-            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId dayKey=$dayKey — " +
+            DebugTrail.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId dayKey=$dayKey — " +
                 "task not found in PlanStore.todayTasks or loadDay($dayKey) — no-op")
             return
         }
-        Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
+        DebugTrail.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
         if (task.state == TaskState.DONE) {
             resolveDoneConcept(context, conceptId, dayKey)
         } else if (
@@ -249,7 +250,7 @@ object GapTaskManager {
             // DONE-but-still-below-mastery case): the student never took the associated
             // Testmate test, so whatever session is on file (if any) is still valid and
             // unsubmitted — nothing to reset.
-            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was ${task.state} on " +
+            DebugTrail.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was ${task.state} on " +
                 "$dayKey (not today=${GapTaskLedger.todayKey()}) — re-surfacing a fresh copy in today's list")
             val freshTask = task.copy(
                 id = java.util.UUID.randomUUID().toString(),
@@ -291,13 +292,13 @@ object GapTaskManager {
             val db = LearningDatabase.getInstance(context)
             val questionsFixed = withContext(Dispatchers.IO) { db.questionDao().repairLiteralNullTopics() }
             val conceptsFixed = withContext(Dispatchers.IO) { db.conceptDao().repairLiteralNullTopics() }
-            Log.d(TAG, "repairLegacyNullTopicsIfNeeded: fixed $questionsFixed question row(s), " +
+            DebugTrail.d(TAG, "repairLegacyNullTopicsIfNeeded: fixed $questionsFixed question row(s), " +
                 "$conceptsFixed concept row(s) with literal topic=\"null\"")
             CheckmatePrefs.putBoolean(PREF_REPAIRED_LEGACY_NULL_TOPICS, true)
         } catch (e: Exception) {
             // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
             // runs again on the next generateIfNeeded call instead of silently giving up.
-            Log.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
+            DebugTrail.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
         }
     }
 
@@ -363,7 +364,7 @@ object GapTaskManager {
             if (sessionId == null) {
                 // Genuinely nothing to check yet — no targeted test was ever requested for
                 // this concept (round 1, no session on file). Covering is correct here.
-                Log.d(TAG, "resolveDoneConcept: concept=$conceptId no session ever created " +
+                DebugTrail.d(TAG, "resolveDoneConcept: concept=$conceptId no session ever created " +
                     "(round=$round) — nothing to check, covering")
                 GapTaskLedger.markCovered(conceptId)
                 return
@@ -382,11 +383,11 @@ object GapTaskManager {
             // function again on their own next pass, so this concept won't get stuck.
             val taskId = GapTaskLedger.activeTaskId()
             if (taskId == null) {
-                Log.w(TAG, "resolveDoneConcept: concept=$conceptId evidence not imported and " +
+                DebugTrail.w(TAG, "resolveDoneConcept: concept=$conceptId evidence not imported and " +
                     "no activeTaskId to revert — leaving as-is for next pass")
                 return
             }
-            Log.d(TAG, "resolveDoneConcept: concept=$conceptId evidence NOT imported yet " +
+            DebugTrail.d(TAG, "resolveDoneConcept: concept=$conceptId evidence NOT imported yet " +
                 "(round=$round, sessionId=$sessionId) — deferring resolution instead of " +
                 "covering (see BUGFIX note), reverting taskId=$taskId (dayKey=$dayKey) to PENDING")
             // BUGFIX: was PlanStore.markTask(taskId, PENDING) — today-list-only, silently
@@ -396,7 +397,7 @@ object GapTaskManager {
             // of silently trusted.
             val reverted = PlanStore.markTaskInDay(dayKey, taskId, TaskState.PENDING)
             if (!reverted) {
-                Log.w(TAG, "resolveDoneConcept: concept=$conceptId taskId=$taskId dayKey=$dayKey " +
+                DebugTrail.w(TAG, "resolveDoneConcept: concept=$conceptId taskId=$taskId dayKey=$dayKey " +
                     "— revert-to-PENDING found no matching task in plan_$dayKey either; " +
                     "AlreadyActive guard may still see this as DONE next run")
             }
@@ -409,7 +410,7 @@ object GapTaskManager {
                     .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
+            DebugTrail.e(TAG, "resolveDoneConcept mastery lookup failed for concept=$conceptId: ${e.message}", e)
             return // retry this check on the next generateIfNeeded run rather than guessing
         }
 
@@ -418,7 +419,7 @@ object GapTaskManager {
             // already confirmed imported for this round, so a missing row here means the
             // recomputed mastery likely landed under a different conceptId, not that
             // there's nothing left to check. Treat as unresolved, not done.
-            Log.w(TAG, "resolveDoneConcept: concept=$conceptId has evidence imported but NO " +
+            DebugTrail.w(TAG, "resolveDoneConcept: concept=$conceptId has evidence imported but NO " +
                 "mastery row — likely conceptId drift (see BUGFIX doc). Treating as unresolved " +
                 "instead of covering.")
             GapTaskLedger.resetForNextRound()
@@ -435,7 +436,7 @@ object GapTaskManager {
         } else if (mastery.mastery >= MasteryEngine.MASTERY_THRESHOLD) {
             GapTaskLedger.markCovered(conceptId)
         } else {
-            Log.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
+            DebugTrail.d(TAG, "resolveDoneConcept: concept=$conceptId still below mastery threshold " +
                 "(${mastery.mastery}) after evidence — requesting another targeted retest round")
             GapTaskLedger.resetForNextRound()
             // BUGFIX (Branch B never reverted DONE task): same gap as above — mastery below
@@ -489,12 +490,12 @@ object GapTaskManager {
         // DIAGNOSTIC: makes the guard's decision visible — was there already a session on
         // file (and if so which round), or did this genuinely start from a clean slate, and
         // has it already been re-verified against the server today.
-        Log.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
+        DebugTrail.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId existingSession=$existingSession " +
             "round=${GapTaskLedger.activeTestmateRound()} evidenceImported=${GapTaskLedger.isActiveEvidenceImported()} " +
             "checkedDay=${GapTaskLedger.activeTestmateSessionCheckedDay()} todayKey=$todayKey")
         if (existingSession != null && GapTaskLedger.activeTestmateSessionCheckedDay() == todayKey) return
         val chapter = GapTaskLedger.activeChapter() ?: run {
-            Log.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
+            DebugTrail.w(TAG, "createTargetedTestIfNeeded: no chapter recorded for concept=$conceptId, skipping")
             return
         }
         val topic = GapTaskLedger.activeTopic()
@@ -513,7 +514,7 @@ object GapTaskManager {
         val resolution = ConceptWeightage.resolveWeightage(exam, subject, chapter, topic ?: chapter)
         val canonicalChapter = resolution.matchedKey ?: chapter
         if (canonicalChapter != chapter) {
-            Log.d(TAG, "createTargetedTestIfNeeded: chapter '$chapter' resolves internally to " +
+            DebugTrail.d(TAG, "createTargetedTestIfNeeded: chapter '$chapter' resolves internally to " +
                 "'$canonicalChapter' (method=${resolution.method}) — sending raw label to Testmate, see BUGFIX")
         }
 
@@ -558,7 +559,7 @@ object GapTaskManager {
         val round = GapTaskLedger.activeTestmateRound()
         val interventionId = if (round <= 1) conceptId else "$conceptId-r$round"
         if (round > 1) {
-            Log.d(TAG, "createTargetedTestIfNeeded: round=$round for concept=$conceptId — " +
+            DebugTrail.d(TAG, "createTargetedTestIfNeeded: round=$round for concept=$conceptId — " +
                 "using intervention_id=$interventionId so Testmate issues a fresh session " +
                 "instead of replaying round 1's completed one")
         }
@@ -572,7 +573,7 @@ object GapTaskManager {
                 pool = TestmateQuestionPool.WRONG_SKIPPED
             )
         } catch (e: Exception) {
-            Log.e(TAG, "createTargetedTest threw: ${e.message}", e)
+            DebugTrail.e(TAG, "createTargetedTest threw: ${e.message}", e)
             recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
             return
         }
@@ -586,16 +587,16 @@ object GapTaskManager {
                 // this function's own BUGFIX doc) or this is a genuinely first-time create.
                 if (outcome.test.sessionId != existingSession) {
                     GapTaskLedger.recordTestmateSession(outcome.test.testId, outcome.test.sessionId)
-                    Log.d(TAG, "targeted test refreshed: concept=$conceptId session=${outcome.test.sessionId} " +
+                    DebugTrail.d(TAG, "targeted test refreshed: concept=$conceptId session=${outcome.test.sessionId} " +
                         "(was $existingSession)")
                 } else {
-                    Log.d(TAG, "targeted test re-verified unchanged: concept=$conceptId session=${outcome.test.sessionId}")
+                    DebugTrail.d(TAG, "targeted test re-verified unchanged: concept=$conceptId session=${outcome.test.sessionId}")
                 }
                 GapTaskLedger.markActiveTestmateSessionChecked(todayKey)
                 clearTestmateError()
             }
             is TestmateTargetedTestOutcome.Error -> {
-                Log.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
+                DebugTrail.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
                 recordTestmateError(outcome.message)
             }
         }
@@ -639,7 +640,7 @@ object GapTaskManager {
         val outcome = try {
             TestmateApi.fetchResult(sessionId)
         } catch (e: Exception) {
-            Log.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
+            DebugTrail.w(TAG, "evidencePollIfNeeded fetch threw: ${e.message}")
             return
         }
         val result = when (outcome) {
@@ -665,7 +666,7 @@ object GapTaskManager {
                 correctCount = result.correctCount
             )
         } catch (e: Exception) {
-            Log.e(TAG, "evidence import failed: ${e.message}", e)
+            DebugTrail.e(TAG, "evidence import failed: ${e.message}", e)
         }
     }
 
@@ -754,7 +755,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         val message = try {
             buildEscalationMessage(tier, daysServed)
         } catch (e: Exception) {
-            Log.e(TAG, "escalation message build failed: ${e.message}", e)
+            DebugTrail.e(TAG, "escalation message build failed: ${e.message}", e)
             GapTaskLedger.markEscalatedToday(todayKey)
             return
         }
@@ -763,7 +764,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
         MentorNotifier.notify(context, message)
         GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
         GapTaskLedger.markEscalatedToday(todayKey)
-        Log.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+        DebugTrail.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
     }
 
     private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {

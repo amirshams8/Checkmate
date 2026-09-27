@@ -9,6 +9,7 @@ import com.checkmate.core.AppUsageTracker
 import com.checkmate.core.AttentionCycleManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.DebugTrail
 import com.checkmate.core.TodayContext
 import com.checkmate.core.tts.CheckmateTTS
 import com.checkmate.planner.FreeSlotCalculator
@@ -157,12 +158,20 @@ class HomeViewModel : ViewModel() {
      * try again, not a broken screen.
      */
     fun forceCheckGapTask(context: Context) {
+        // DIAGNOSTIC (button-appears-no-op investigation): this line alone answers
+        // "did the tap even reach the ViewModel" via the persisted debug_trail pref
+        // (see DebugTrail's own doc — some OEM builds, ColorOS/OPPO included, drop
+        // third-party Log output from plain `adb logcat`, which is exactly why this
+        // whole pipeline switched to the CheckmatePrefs-backed trail instead of raw
+        // logcat for anything gap-task-related).
+        DebugTrail.d("HomeViewModel", "forceCheckGapTask: tapped, checkingGapTask=${_state.value.checkingGapTask}")
         if (_state.value.checkingGapTask) return
         _state.update { it.copy(checkingGapTask = true) }
         viewModelScope.launch {
             try {
                 GapTaskManager.forceGenerateNow(context)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                DebugTrail.e("HomeViewModel", "forceCheckGapTask: forceGenerateNow threw", e)
             } finally {
                 _state.update { it.copy(checkingGapTask = false) }
             }
