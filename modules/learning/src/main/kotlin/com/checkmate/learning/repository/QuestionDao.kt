@@ -54,6 +54,27 @@ interface QuestionDao {
     @Query("UPDATE questions SET topic = NULL WHERE topic = 'null'")
     suspend fun repairLiteralNullTopics(): Int
 
+    // BUGFIX (exam=null concept-identity fork, one-time data repair): rows written
+    // before TestResultNormalizer's report.exam-null fallback (see that class's own
+    // doc) have `exam` set to a real SQL NULL whenever Testmate's report title
+    // carried no parseable "(EXAM)" suffix (see TestReportParser.TITLE_EXAM_SUFFIX).
+    // MasteryEngine.recomputeAll re-derives KnowledgeGraph.conceptId from each
+    // attempt's own Question.exam on every run (`q?.exam ?: "unknown"`), so a
+    // null-exam row doesn't just miss a field — it permanently forks the SAME real
+    // concept into a second "unknown-<chapter>-<topic>" identity, split away from
+    // its correctly-tagged "<exam>-<chapter>-<topic>" twin. Confirmed live via
+    // debug_trail: "unknown-motion-in-a-plane..." and "neet-motion-in-a-plane..."
+    // both ranking as separate REDUCE_DIFFICULTY candidates for what is really one
+    // topic, each independently reaching AlreadyCovered/NoOpAlreadyApplied and
+    // starving every one of LearningDecisionEngine's 5 ranked candidate slots with
+    // duplicates — no genuinely actionable REPAIR_CONCEPT for the real gap was ever
+    // reachable. This repairs the already-written rows so the next
+    // MasteryEngine.recomputeAll re-merges them under the single correct conceptId.
+    // Returns the number of rows fixed — see
+    // GapTaskManager.repairLegacyNullExamIfNeeded, this repair's one-time caller.
+    @Query("UPDATE questions SET exam = :exam WHERE exam IS NULL")
+    suspend fun repairNullExam(exam: String): Int
+
     // NEW (external-report pathway): questions from a report Checkmate parsed
     // locally but that was never actually taken on Testmate (tagged with a
     // non-"testmate_report" source at import — see TestResultNormalizer's

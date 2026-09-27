@@ -2,6 +2,7 @@ package com.checkmate.learning.testmate
 
 import android.content.Context
 import android.util.Log
+import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.analytics.ScoredQuestionFact
 import com.checkmate.learning.analytics.SubjectScore
 import com.checkmate.learning.analytics.SubjectScoreCalculator
@@ -188,7 +189,22 @@ object TestResultNormalizer {
                 Question(
                     id = questionId,
                     source = source,
-                    exam = report.exam,
+                    // BUGFIX (exam=null concept-identity fork): report.exam is null
+                    // whenever TestReportParser found no parseable "(EXAM)" suffix on
+                    // the report title (see TestReportParser.TITLE_EXAM_SUFFIX).
+                    // Persisting that null onto every Question here used to
+                    // permanently fork the concept's conceptId into a second
+                    // "unknown-..." identity the next time MasteryEngine.recomputeAll
+                    // grouped attempts by `q?.exam ?: "unknown"` (see that class's own
+                    // doc) — confirmed live via debug_trail, splitting real concepts
+                    // like "Motion in a Plane" into an "unknown-" and a "neet-"
+                    // identity that independently starved every ranked candidate slot.
+                    // Falling back to the student's own declared exam target — the
+                    // SAME fallback GapTaskManager.evidencePollIfNeeded and
+                    // RetentionCheckManager.evidencePollIfNeeded already use for the
+                    // P0b evidence-import path — keeps every question tied to one real
+                    // exam identity instead of a parse-failure sentinel.
+                    exam = report.exam ?: ConsultationProfile.load().examTarget,
                     chapter = q.chapter,
                     topic = q.topic,
                     correctOption = q.correctOption,

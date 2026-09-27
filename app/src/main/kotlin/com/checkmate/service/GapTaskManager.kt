@@ -83,6 +83,11 @@ object GapTaskManager {
     // of this install's life once it's confirmed done.
     private const val PREF_REPAIRED_LEGACY_NULL_TOPICS = "gap_task_repaired_legacy_null_topics_v1"
 
+    // BUGFIX (exam=null concept-identity fork, one-time data repair): once-ever guard
+    // for repairLegacyNullExamIfNeeded — see QuestionDao.repairNullExam's own doc for
+    // the mechanism this closes.
+    private const val PREF_REPAIRED_LEGACY_NULL_EXAM = "gap_task_repaired_legacy_null_exam_v1"
+
     // ── Daily generation ─────────────────────────────────────────────────────
 
     /**
@@ -155,6 +160,7 @@ object GapTaskManager {
         if (!force && GapTaskLedger.hasGeneratedToday(todayKey)) return
 
         repairLegacyNullTopicsIfNeeded(context)
+        repairLegacyNullExamIfNeeded(context)
 
         try {
             val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
@@ -299,6 +305,41 @@ object GapTaskManager {
             // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
             // runs again on the next generateIfNeeded call instead of silently giving up.
             DebugTrail.e(TAG, "repairLegacyNullTopicsIfNeeded failed: ${e.message}", e)
+        }
+    }
+
+    /**
+     * BUGFIX (exam=null concept-identity fork, one-time data repair): see
+     * QuestionDao.repairNullExam's own doc for the mechanism. A null-exam Question
+     * row keeps re-forking its concept into a permanent "unknown-..." duplicate on
+     * every MasteryEngine.recomputeAll call, which is exactly what was starving
+     * every LearningDecisionEngine ranking pass down to dead-end AlreadyCovered /
+     * NoOpAlreadyApplied candidates (confirmed live via debug_trail: 5-of-5
+     * candidates rejected every single forceGenerateNow call, with
+     * "unknown-motion-in-a-plane..." and "neet-motion-in-a-plane..." both ranking
+     * for what is really one topic). Repairs the rows, then forces one
+     * MasteryEngine.recomputeAll so the forked identities merge back under the
+     * single correctly-tagged conceptId immediately, rather than waiting for the
+     * next real import to happen to touch the same chapter/topic.
+     */
+    private suspend fun repairLegacyNullExamIfNeeded(context: Context) {
+        if (CheckmatePrefs.getBoolean(PREF_REPAIRED_LEGACY_NULL_EXAM, false)) return
+        try {
+            val examTarget = ConsultationProfile.load().examTarget
+            val db = LearningDatabase.getInstance(context)
+            val questionsFixed = withContext(Dispatchers.IO) { db.questionDao().repairNullExam(examTarget) }
+            DebugTrail.d(TAG, "repairLegacyNullExamIfNeeded: fixed $questionsFixed question row(s) " +
+                "with null exam -> \"$examTarget\"")
+            if (questionsFixed > 0) {
+                val recomputed = withContext(Dispatchers.IO) { MasteryEngine.recomputeAll(context) }
+                DebugTrail.d(TAG, "repairLegacyNullExamIfNeeded: recomputed ${recomputed.size} " +
+                    "concept(s) after merge")
+            }
+            CheckmatePrefs.putBoolean(PREF_REPAIRED_LEGACY_NULL_EXAM, true)
+        } catch (e: Exception) {
+            // Non-fatal and safe to retry tomorrow — leaving the flag unset means this just
+            // runs again on the next generateIfNeeded call instead of silently giving up.
+            DebugTrail.e(TAG, "repairLegacyNullExamIfNeeded failed: ${e.message}", e)
         }
     }
 
