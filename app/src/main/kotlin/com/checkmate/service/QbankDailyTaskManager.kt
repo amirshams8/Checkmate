@@ -46,9 +46,11 @@ import java.util.Locale
  *     `subject_breakdown[].coverage_target > 0` and no session already recorded
  *     today, pick that subject's #1 chapter off `coverage_gaps` — already sorted
  *     most-urgent-first server-side (soonest FT study deadline, then most
- *     remaining questions), and already filtered to chapters with
- *     `remaining_questions > 0` (see lib/daily-target-engine.ts's own doc), so any
- *     entry found here is guaranteed to have real questions behind it.
+ *     remaining questions), and filtered to chapters with `remaining_questions > 0`
+ *     (see lib/daily-target-engine.ts's own doc) — but `remaining_questions` there
+ *     is a TARGET count, not proof real question rows exist. See the BUGFIX in
+ *     step 2's own code below (`unseededChapters`) for why a coverage_gaps entry is
+ *     NOT, on its own, guaranteed to have real questions behind it.
  *  3. [TestmateApi.startQbankPractice] — POST /api/qbank/practice with
  *     `pool = NEW`, `question_count = ` that subject's coverage target.
  *     Idempotent per chapter/pool on the Testmate side (a still-live session for
@@ -207,9 +209,37 @@ object QbankDailyTaskManager {
                 // coverage_gaps is already sorted most-urgent-first server-side (soonest
                 // FT study deadline, then most remaining) — taking the first match per
                 // subject is exactly "that subject's #1 gap", no re-sorting needed here.
+                //
+                // BUGFIX (unseeded chapters getting scheduled): coverage_gaps' own
+                // remainingQuestions is a TARGET count (how many the syllabus/FT schedule
+                // says should be asked), not a signal that real question rows actually
+                // exist for that chapter — this object's own earlier doc comment ("already
+                // filtered ... to chapters with remaining_questions > 0") was true of that
+                // target count but was wrongly read as "therefore has content." Confirmed
+                // live: Structure of Atom, and Redox/Electrochemistry the day before, each
+                // got a session + StudyTask created despite having zero seeded qbank rows —
+                // coverage_gaps.first() was trusted with no cross-check against content
+                // availability at all. The SAME daily-target payload already carries that
+                // signal on a different field — TestmateUpcomingFt.chaptersWithoutQuestions
+                // (chapters_without_questions), scoped per upcoming FT — it was just never
+                // read here. Union it across every upcoming test and walk each subject's
+                // (already urgency-sorted) gap list past any chapter in that set instead of
+                // blindly taking .first() — the same "known-empty, skip silently" pattern
+                // QBankSelector.selectTodayQuestions already established for the equivalent
+                // local-DB case (empty qbankPoolByChapter result), just applied here against
+                // the server's own signal instead of a local query.
+                val unseededChapters: Set<String> = target.upcomingTests
+                    .flatMap { it.chaptersWithoutQuestions }
+                    .map { it.trim().lowercase() }
+                    .toSet()
+
                 val topGapChapterBySubject: Map<String, String> = (target.coverageGaps ?: emptyList())
                     .groupBy { it.subject }
-                    .mapValues { (_, gaps) -> gaps.first().chapter }
+                    .mapNotNull { (subject, gaps) ->
+                        gaps.firstOrNull { it.chapter.trim().lowercase() !in unseededChapters }
+                            ?.let { subject to it.chapter }
+                    }
+                    .toMap()
 
                 val existing = todaysSessions().associateBy { it.subject }.toMutableMap()
                 var anyCreated = false
@@ -223,7 +253,12 @@ object QbankDailyTaskManager {
 
                     val chapter = topGapChapterBySubject[subject]
                     if (chapter == null) {
-                        DebugTrail.d(TAG, "generateIfNeeded: no coverage_gaps chapter for $subject yet — skipping")
+                        // Covers two cases now: no coverage_gaps entry for this subject at
+                        // all, OR every entry this subject has is in unseededChapters (see
+                        // BUGFIX above) — both mean "nothing schedulable today," logged the
+                        // same way since either legitimately skips the subject rather than
+                        // retrying every cycle.
+                        DebugTrail.d(TAG, "generateIfNeeded: no seeded coverage_gaps chapter for $subject yet — skipping")
                         continue
                     }
 
