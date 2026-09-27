@@ -65,7 +65,11 @@ data class HomeState(
     // "several independent sessions, no single active slot" shape as
     // activeRetentionSessions above (one per subject with a target today), populated by
     // [loadQbankSessions] the same way that field is populated by [loadRetentionSessions].
-    val activeQbankSessions: Map<String, String> = emptyMap()
+    val activeQbankSessions: Map<String, String> = emptyMap(),
+    // BUGFIX (repair tasks not generating every day): true only while a manual
+    // "Check for repair task" tap (HomeHeader's force-check icon) is in flight — see
+    // [forceCheckGapTask]. Mirrors [syncing]'s own brief-spinner pattern.
+    val checkingGapTask:     Boolean        = false
 )
 
 class HomeViewModel : ViewModel() {
@@ -138,6 +142,31 @@ class HomeViewModel : ViewModel() {
             if (remote != null) PlanStore.saveTodayTasks(remote)
             _state.update { it.copy(syncing = false) }
         }.start()
+    }
+
+    /**
+     * Manual override for HomeHeader's "Check for repair task" icon — see
+     * [GapTaskManager.forceGenerateNow]'s own doc for why this exists (background loop
+     * killed by Doze/battery optimization, or today's automatic attempt ran before there
+     * was anything to rank). Brief spinner via [HomeState.checkingGapTask], same shape as
+     * [syncNow]'s [HomeState.syncing]. No separate result plumbing needed: whether this
+     * surfaces a task (fresh generation) or nothing changes (concept still legitimately
+     * active/unresolved, or nothing to rank), the existing GapTaskLedger.version and
+     * PlanStore.todayTasks collectors already update `state` reactively once this returns.
+     * Best-effort like every other GapTaskManager call site — a failure here just means
+     * try again, not a broken screen.
+     */
+    fun forceCheckGapTask(context: Context) {
+        if (_state.value.checkingGapTask) return
+        _state.update { it.copy(checkingGapTask = true) }
+        viewModelScope.launch {
+            try {
+                GapTaskManager.forceGenerateNow(context)
+            } catch (_: Exception) {
+            } finally {
+                _state.update { it.copy(checkingGapTask = false) }
+            }
+        }
     }
 
     private fun loadStreak() {

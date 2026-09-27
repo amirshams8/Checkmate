@@ -113,12 +113,14 @@ fun HomeScreen(navController: NavController, vm: HomeViewModel) {
         ) {
             item {
                 HomeHeader(
-                    completedCount = state.completedToday,
-                    totalCount     = state.tasks.size,
-                    streakDays     = state.streakDays,
-                    syncEnabled    = state.syncEnabled,
-                    syncing        = state.syncing,
-                    onSync         = { vm.syncNow() }
+                    completedCount   = state.completedToday,
+                    totalCount       = state.tasks.size,
+                    streakDays       = state.streakDays,
+                    syncEnabled      = state.syncEnabled,
+                    syncing          = state.syncing,
+                    onSync           = { vm.syncNow() },
+                    checkingGapTask  = state.checkingGapTask,
+                    onCheckGapTask   = { vm.forceCheckGapTask(context) }
                 )
             }
             item { DayProgressBar(completed = state.completedToday, total = state.tasks.size) }
@@ -869,7 +871,15 @@ private fun HomeHeader(
     streakDays:     Int,
     syncEnabled:    Boolean = false,
     syncing:        Boolean = false,
-    onSync:         () -> Unit = {}
+    onSync:         () -> Unit = {},
+    // BUGFIX (repair tasks not generating every day): manual override for when the
+    // automatic 15-min ReminderService loop hasn't produced a repair task (killed by
+    // Doze/battery optimization, or today's one attempt ran before there was anything to
+    // rank yet) — see GapTaskManager.forceGenerateNow's own doc. Always visible (unlike
+    // the sync icon, which only shows once Task Sync is enabled) since every install has
+    // gap-repair tasks in play regardless of sync setup.
+    checkingGapTask: Boolean = false,
+    onCheckGapTask:  () -> Unit = {}
 ) {
     Row(
         modifier              = Modifier.fillMaxWidth(),
@@ -881,6 +891,21 @@ private fun HomeHeader(
             Text("$completedCount of $totalCount tasks done", fontSize = 14.sp, color = White60)
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // BUGFIX (repair tasks not generating every day): manual "check now" for the
+            // gap-repair pipeline — see this function's own param doc and
+            // GapTaskManager.forceGenerateNow's doc for why the automatic loop can miss a
+            // day. Same spinner-while-in-flight shape as the sync icon right next to it.
+            IconButton(onClick = onCheckGapTask, enabled = !checkingGapTask, modifier = Modifier.size(32.dp)) {
+                if (checkingGapTask) {
+                    CircularProgressIndicator(
+                        modifier    = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color       = AccentGreen
+                    )
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = "Check for repair task", tint = White60, modifier = Modifier.size(18.dp))
+                }
+            }
             // Task Sync (two-device): only shown once a sync code is set in Settings →
             // TASK SYNC. Pulls the other device's copy of today's plan on tap — auto-sync
             // already pushes on every local change and pulls once on screen open, this is

@@ -106,10 +106,30 @@ object GapTaskManager {
      * See [GapTaskLedger.withLock]'s own doc for the concrete failure this closes.
      */
     suspend fun generateIfNeeded(context: Context) = GapTaskLedger.withLock {
-        generateIfNeededLocked(context)
+        generateIfNeededLocked(context, force = false)
     }
 
-    private suspend fun generateIfNeededLocked(context: Context) {
+    /**
+     * Manual override for Home's "Check for repair task" button — bypasses
+     * [GapTaskLedger.hasGeneratedToday]'s once-a-day gate and re-runs the exact same
+     * ranking pass [generateIfNeeded] runs automatically. Exists because the automatic
+     * path only ever fires from [com.checkmate.service.ReminderService]'s 15-min
+     * background loop (or the completion-flow call in [com.checkmate.ui.home.HomeViewModel
+     * .confirmCompletion]) — if that loop gets killed by Doze/battery optimization for a
+     * stretch, or today's one attempt ran before the StudentModel had anything to rank yet,
+     * the student is otherwise stuck waiting for tomorrow with no way to ask "check again
+     * right now." Runs through the SAME [generateIfNeededLocked] body (including
+     * [resolveActiveConceptState]/[createTargetedTestIfNeeded] and the AlreadyActive/
+     * AlreadyCovered guards in [LearningInterventionOrchestrator]) — forcing only skips the
+     * once-a-day gate itself, never any of the correctness checks downstream of it, so this
+     * still correctly refuses to create a second task for a concept that's already active
+     * and unresolved.
+     */
+    suspend fun forceGenerateNow(context: Context) = GapTaskLedger.withLock {
+        generateIfNeededLocked(context, force = true)
+    }
+
+    private suspend fun generateIfNeededLocked(context: Context, force: Boolean = false) {
         // BUGFIX (round-advance blocked by once-a-day gate): resolveActiveConceptState
         // (and everything downstream of it — resolveDoneConcept's resetForNextRound, and
         // createTargetedTestIfNeeded requesting the NEXT round's session) must run every
@@ -131,7 +151,7 @@ object GapTaskManager {
         createTargetedTestIfNeeded()
 
         val todayKey = GapTaskLedger.todayKey()
-        if (GapTaskLedger.hasGeneratedToday(todayKey)) return
+        if (!force && GapTaskLedger.hasGeneratedToday(todayKey)) return
 
         repairLegacyNullTopicsIfNeeded(context)
 
@@ -196,22 +216,40 @@ object GapTaskManager {
         Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId state=${task.state}")
         if (task.state == TaskState.DONE) {
             resolveDoneConcept(context, conceptId, dayKey)
-        } else if (task.state == TaskState.SKIPPED && dayKey != GapTaskLedger.todayKey()) {
-            // "Retry in place": a SKIPPED task from a stale prior day never gets another
-            // chance to surface — PlanStore only ever exposes today's dayKey's list to the
-            // Task tab (HomeViewModel reads PlanStore.todayTasks exclusively), so once the
-            // day rolls over, the task itself becomes permanently unreachable through the
-            // UI while GapTaskLedger's active pointer still points straight at it — nothing
-            // else in this class handles that state, so it would otherwise sit blocking
-            // AlreadyActive forever. Re-serves the SAME task (same concept/subject/topic/
-            // duration/rationale/conceptId — not a new intervention) as a fresh PENDING
-            // entry in today's list, giving the student another shot at exactly what they
-            // skipped. Deliberately does NOT touch the P0b test/session/round fields (see
+        } else if (
+            (task.state == TaskState.SKIPPED || task.state == TaskState.PENDING) &&
+            dayKey != GapTaskLedger.todayKey()
+        ) {
+            // "Retry in place": a SKIPPED (or simply never-touched PENDING) task from a
+            // stale prior day never gets another chance to surface — PlanStore only ever
+            // exposes today's dayKey's list to the Task tab (HomeViewModel reads
+            // PlanStore.todayTasks exclusively), so once the day rolls over, the task
+            // itself becomes permanently invisible in the UI while GapTaskLedger's active
+            // pointer still points straight at it — nothing else in this class handles
+            // that state, so it would otherwise sit blocking AlreadyActive forever with
+            // NOTHING shown to the student to act on.
+            //
+            // BUGFIX (repair task silently stops showing up): originally only the SKIPPED
+            // case was re-surfaced here — a student who simply never opened/started/
+            // skipped yesterday's repair task (left it sitting PENDING) hit neither this
+            // branch nor the DONE branch above, so resolveActiveConceptState no-op'd,
+            // LearningInterventionOrchestrator's AlreadyActive guard correctly refused to
+            // create a new one for the same still-unresolved concept (see that class's own
+            // doc), and the ledger's active concept simply had no visible task anywhere —
+            // "repair tasks not generating every day" was actually this: the system was
+            // deliberately NOT creating a duplicate, but nothing carried the existing one
+            // forward either, so the student saw an empty slot instead of the same task
+            // they hadn't finished. PENDING now gets the exact same treatment as SKIPPED.
+            //
+            // Re-serves the SAME task (same concept/subject/topic/duration/rationale/
+            // conceptId — not a new intervention) as a fresh PENDING entry in today's
+            // list, giving the student another shot at exactly what they left unfinished.
+            // Deliberately does NOT touch the P0b test/session/round fields (see
             // GapTaskLedger.resetForNextRound's own doc for why those are reserved for the
             // DONE-but-still-below-mastery case): the student never took the associated
             // Testmate test, so whatever session is on file (if any) is still valid and
             // unsubmitted — nothing to reset.
-            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was SKIPPED on " +
+            Log.d(TAG, "resolveActiveConceptState: concept=$conceptId taskId=$taskId was ${task.state} on " +
                 "$dayKey (not today=${GapTaskLedger.todayKey()}) — re-surfacing a fresh copy in today's list")
             val freshTask = task.copy(
                 id = java.util.UUID.randomUUID().toString(),
