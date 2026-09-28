@@ -259,8 +259,20 @@ object QbankDailyTaskManager {
                 val topGapChapterBySubject: Map<String, String> = (target.coverageGaps ?: emptyList())
                     .groupBy { it.subject }
                     .mapNotNull { (subject, gaps) ->
-                        gaps.firstOrNull { it.chapter.trim().lowercase() !in unseededChapters }
-                            ?.let { subject to it.chapter }
+                        // BUGFIX (practice 422 "No unattempted questions left"): also skip a
+                        // chapter with nothing drawable — coverage_gaps counts imported test
+                        // papers (tag_source = 'manual'/'untagged') as coverage, but Q-bank
+                        // practice only draws 'coaching_module' rows, and
+                        // chapters_without_questions above only flags chapters with ZERO rows of
+                        // any source. Confirmed live: Zoology's #1 gap "Body Fluids and
+                        // Circulation" passed the unseeded check, then Testmate refused to build
+                        // the test. The server's own doc on remaining_coaching_module_questions
+                        // says callers should pick the first gap with this > 0. null (older
+                        // server) = unknown, so it isn't filtered.
+                        gaps.firstOrNull {
+                            it.chapter.trim().lowercase() !in unseededChapters &&
+                                (it.remainingCoachingModuleQuestions ?: 1) > 0
+                        }?.let { subject to it.chapter }
                     }
                     .toMap()
 

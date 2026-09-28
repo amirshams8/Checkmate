@@ -144,7 +144,15 @@ data class TestmateCoverageGap(
     val nextTestDate: String?,
     val nextStudyDeadline: String?,
     val daysUntilStudyDeadline: Int?,
-    val urgency: Double
+    val urgency: Double,
+    // Of remainingQuestions, how many app/api/qbank/practice's 'NEW' pool can actually
+    // draw (tag_source = 'coaching_module' only — see daily-target-engine.ts's
+    // CoverageGap.remaining_coaching_module_questions doc). remainingQuestions counts
+    // every non-copy tag_source (imported test papers included), so a chapter can show
+    // coverage debt while nothing in it is practisable — practice then 422s "No
+    // unattempted questions left". null = the server didn't send the field (older
+    // Testmate deploy); callers treat null as "unknown, don't filter".
+    val remainingCoachingModuleQuestions: Int? = null
 )
 
 data class TestmateUpcomingFt(

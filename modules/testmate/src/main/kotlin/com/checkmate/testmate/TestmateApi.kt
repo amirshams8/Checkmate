@@ -396,7 +396,10 @@ object TestmateApi {
                     nextTestDate = optStringOrNull(o, "next_test_date"),
                     nextStudyDeadline = optStringOrNull(o, "next_study_deadline"),
                     daysUntilStudyDeadline = if (o.isNull("days_until_study_deadline")) null else o.optInt("days_until_study_deadline"),
-                    urgency = o.optDouble("urgency", 0.0)
+                    urgency = o.optDouble("urgency", 0.0),
+                    remainingCoachingModuleQuestions =
+                        if (o.has("remaining_coaching_module_questions") && !o.isNull("remaining_coaching_module_questions"))
+                            o.optInt("remaining_coaching_module_questions") else null
                 )
             }
         }
