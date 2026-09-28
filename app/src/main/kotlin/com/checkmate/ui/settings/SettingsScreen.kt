@@ -40,6 +40,7 @@ import com.checkmate.workmode.WorkModeManager
 import com.checkmate.workmode.WorkModeSchedule
 import java.util.Calendar
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 // ── Guardian lock gate for Work Mode settings ─────────────────────────────────
 //
@@ -1058,6 +1059,9 @@ private fun relativeTimeAgo(epochMillis: Long): String {
 
 @Composable
 private fun TestmateSettings() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var baseUrl by remember {
         mutableStateOf(CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, "") ?: "")
     }
@@ -1149,6 +1153,45 @@ private fun TestmateSettings() {
         }
         HorizontalDivider(color = White10)
     }
+
+    // Manual trigger for QbankDailyTaskManager.forceGenerateNow — added for debugging
+    // "only Chemistry ever gets a Q-bank task" style reports without waiting for
+    // tomorrow's day-rollover or the hourly retry throttle. Bypasses both of
+    // generateIfNeeded's gates (see that function's own doc) but still runs every
+    // correctness check downstream — a subject that already has a session today is
+    // still skipped, exactly like the automatic path. Tap this, then pull
+    // debug_trail (DebugTrail.d/e lines tagged "QbankDailyTaskManager") to see which
+    // subjects were skipped and why — "no seeded coverage_gaps chapter for $subject
+    // yet" vs. a real startQbankPractice error vs. subjectCoverage null/<=0.
+    var qbankForceRunning by remember { mutableStateOf(false) }
+    var qbankForceResult by remember { mutableStateOf<String?>(null) }
+    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+        Button(
+            onClick = {
+                qbankForceRunning = true
+                qbankForceResult = null
+                scope.launch {
+                    QbankDailyTaskManager.forceGenerateNow(context)
+                    val sessions = QbankDailyTaskManager.todaysSessions()
+                    qbankForceResult = if (sessions.isEmpty()) {
+                        "No subject got a session — check debug_trail for the skip reason per subject."
+                    } else {
+                        "Today's sessions: " + sessions.joinToString(", ") { "${it.subject} (${it.chapter})" }
+                    }
+                    qbankLastError = CheckmatePrefs.getString(QbankDailyTaskManager.PREF_LAST_ERROR, null)
+                    qbankLastErrorAt = CheckmatePrefs.getLong(QbankDailyTaskManager.PREF_LAST_ERROR_AT, 0L)
+                    qbankForceRunning = false
+                }
+            },
+            enabled = !qbankForceRunning
+        ) {
+            Text(if (qbankForceRunning) "Refreshing…" else "Force refresh Q-bank targets")
+        }
+        qbankForceResult?.let {
+            Text(it, fontSize = 11.sp, color = White60, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+    HorizontalDivider(color = White10)
 
     Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text("Testmate Base URL", fontSize = 12.sp, color = White60,

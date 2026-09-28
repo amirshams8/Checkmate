@@ -180,15 +180,38 @@ object QbankDailyTaskManager {
      * "already have one today" check below make a repeat call a cheap no-op once
      * today's sessions exist.
      */
-    suspend fun generateIfNeeded(context: Context) {
+    /**
+     * Entry point — called from [ReminderService]'s 15-min loop, and also directly
+     * from [com.checkmate.ui.stats.StatsScreen] on screen entry so a session
+     * created just now shows up without waiting for the next service cycle. Both
+     * call sites are safe to call redundantly: the day-key gate and per-subject
+     * "already have one today" check below make a repeat call a cheap no-op once
+     * today's sessions exist.
+     */
+    suspend fun generateIfNeeded(context: Context) = generateIfNeededInternal(context, force = false)
+
+    /**
+     * Manual override for Settings → Test Platform's "Force refresh Q-bank targets"
+     * button — same shape as [GapTaskManager.forceGenerateNow]: bypasses the
+     * once-a-day gate AND [RETRY_INTERVAL_MS]'s hourly throttle so a student (or a
+     * debugging session) doesn't have to wait for tomorrow's day-rollover, or for an
+     * hour to pass, to see a fresh [DebugTrail] run of this exact pipeline. Runs
+     * through the SAME [generateIfNeededInternal] body — including the per-subject
+     * `existing.containsKey` skip and the unseeded-chapters guard further down — so
+     * forcing never re-creates a session for a subject that already has one today; it
+     * only re-attempts subjects that were skipped or failed.
+     */
+    suspend fun forceGenerateNow(context: Context) = generateIfNeededInternal(context, force = true)
+
+    private suspend fun generateIfNeededInternal(context: Context, force: Boolean) {
         val today = todayKey()
-        if (CheckmatePrefs.getString(PREF_LAST_GENERATED_DAY, null) == today) return
+        if (!force && CheckmatePrefs.getString(PREF_LAST_GENERATED_DAY, null) == today) return
 
         val lastAttempt = CheckmatePrefs.getLong(PREF_LAST_ATTEMPT_MS, 0L)
-        if (System.currentTimeMillis() - lastAttempt < RETRY_INTERVAL_MS) return
+        if (!force && System.currentTimeMillis() - lastAttempt < RETRY_INTERVAL_MS) return
         CheckmatePrefs.putLong(PREF_LAST_ATTEMPT_MS, System.currentTimeMillis())
 
-        DebugTrail.d(TAG, "generateIfNeeded: ENTER day=$today")
+        DebugTrail.d(TAG, "generateIfNeeded: ENTER day=$today force=$force")
 
         when (val outcome = TestmateApi.fetchDailyTarget()) {
             is TestmateDailyTargetOutcome.Error -> {
