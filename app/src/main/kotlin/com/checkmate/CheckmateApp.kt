@@ -2,6 +2,7 @@ package com.checkmate
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.tts.CheckmateTTS
@@ -24,6 +25,7 @@ import com.checkmate.service.ReminderService
 import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.StudyStateSyncManager
 import com.checkmate.service.WorkModeTaskReconciler
+import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.ScrollGuard
@@ -36,6 +38,22 @@ class CheckmateApp : Application() {
     override fun onCreate() {
         super.onCreate()
         CheckmatePrefs.init(this)
+
+        // BUGFIX (Force Stop still reachable for ~30s after a restart — v2): the first
+        // fix armed BootGapGuard from BootReceiver, but BOOT_COMPLETED is delivered only
+        // after this method (and the heavy synchronous init below) has finished — i.e. at
+        // about the same moment the accessibility service connects, so the guard had
+        // effectively no window to cover. Arming it here, first thing after prefs are
+        // readable and before any of the slow init below, starts it as early as this
+        // process can. It runs on its own threads, so the main thread being busy in this
+        // method doesn't stall it. Only arms within a fresh-boot window, so ordinary
+        // process restarts mid-day are untouched. try/catch so it can never break startup.
+        try {
+            BootGapGuard.startIfFreshBoot(this)
+        } catch (e: Exception) {
+            Log.w("CheckmateApp", "BootGapGuard failed to start", e)
+        }
+
         CheckmateState.init(this)
         CheckmateTTS.init(this)
         // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):

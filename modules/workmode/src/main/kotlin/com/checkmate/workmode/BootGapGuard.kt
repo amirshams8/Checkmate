@@ -8,7 +8,7 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
@@ -53,6 +53,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * cover — BootReceiver already reports that case — and blocking Settings would only stop
  * the guardian from turning it back on.
  *
+ * v2 (guard still had no effective window): it used to be armed from BootReceiver only.
+ * BOOT_COMPLETED is delivered after CheckmateApp.onCreate()'s heavy synchronous init, i.e.
+ * about when the accessibility service itself connects, so [start] usually found the
+ * service already connected (or ran too late to matter). It is now armed from
+ * CheckmateApp.onCreate() via [startIfFreshBoot], before that init, and all of its
+ * reaction (overlay, Home bounce) runs on its own HandlerThread instead of the main
+ * looper, which is blocked during that init.
+ *
  * Requirements / limits (nothing here can lift these):
  *  - Usage Access must be granted; without it foreground detection is impossible and the
  *    guard skips itself (logged to the debug trail).
@@ -78,6 +86,10 @@ object BootGapGuard {
     private const val INITIAL_LOOKBACK_CAP_MS = 5 * 60 * 1000L
     private const val EVENT_OVERLAP_MS = 1_000L
 
+    // startIfFreshBoot() only arms while the device has been up less than this. Generous
+    // because the process may not spawn until the user has typed their lock-screen PIN.
+    private const val FRESH_BOOT_WINDOW_MS = 10 * 60 * 1000L
+
     // Same reason string AppAutomationService uses, so GuardianNotifier's existing
     // message applies unchanged.
     private const val ALERT_REASON = "settings_screen_blocked"
@@ -90,23 +102,35 @@ object BootGapGuard {
     private val running = AtomicBoolean(false)
     private val pendingAlert = AtomicBoolean(false)
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    // Own thread for overlay + Home bounce: the main looper is blocked by Application.onCreate
+    // during exactly the window this guard exists for. Created in start().
+    @Volatile private var uiHandler: Handler? = null
 
-    // Main-thread only.
+    // uiHandler's thread only.
     private var overlayView: View? = null
     private var overlayWindowManager: WindowManager? = null
     private val removeOverlayRunnable = Runnable { removeOverlay() }
 
     /**
-     * Call from BootReceiver on BOOT_COMPLETED. No-op if already running, if the
+     * Call from CheckmateApp.onCreate(): arms the guard only if the device booted recently
+     * (see [FRESH_BOOT_WINDOW_MS]); otherwise a plain mid-day process restart does nothing.
+     */
+    fun startIfFreshBoot(context: Context) {
+        if (SystemClock.elapsedRealtime() > FRESH_BOOT_WINDOW_MS) return
+        start(context)
+    }
+
+    /**
+     * Call from BootReceiver on BOOT_COMPLETED (and via [startIfFreshBoot]). No-op if already running, if the
      * accessibility service has already connected, or if the guard can't work on this
      * device right now (logged via [UninstallGuard.logDebugTrail]).
      */
     fun start(context: Context) {
         val app = context.applicationContext
 
+        val sinceBoot = SystemClock.elapsedRealtime()
         if (accessibilityConnected) {
-            UninstallGuard.logDebugTrail("BOOT_GAP_SKIP reason=accessibility_already_connected")
+            UninstallGuard.logDebugTrail("BOOT_GAP_SKIP reason=accessibility_already_connected sinceBootMs=$sinceBoot")
             return
         }
         if (!isWatchdogEnabledInSettings(app)) {
@@ -119,7 +143,10 @@ object BootGapGuard {
         }
         if (!running.compareAndSet(false, true)) return
 
-        UninstallGuard.logDebugTrail("BOOT_GAP_START overlayPermission=${Settings.canDrawOverlays(app)}")
+        ensureUiHandler()
+        UninstallGuard.logDebugTrail(
+            "BOOT_GAP_START sinceBootMs=$sinceBoot overlayPermission=${Settings.canDrawOverlays(app)}"
+        )
         Thread({ runLoop(app) }, "BootGapGuard").apply { isDaemon = true }.start()
     }
 
@@ -129,7 +156,10 @@ object BootGapGuard {
      */
     fun onAccessibilityConnected(context: Context) {
         accessibilityConnected = true
-        mainHandler.post { removeOverlay() }
+        UninstallGuard.logDebugTrail(
+            "BOOT_GAP_CONNECTED sinceBootMs=${SystemClock.elapsedRealtime()} guardRunning=${running.get()}"
+        )
+        uiHandler?.post { removeOverlay() }
         flushPendingAlert(context.applicationContext)
     }
 
@@ -171,7 +201,7 @@ object BootGapGuard {
         } finally {
             running.set(false)
             UninstallGuard.logDebugTrail("BOOT_GAP_END reason=$endReason")
-            mainHandler.post { removeOverlay() }
+            uiHandler?.post { removeOverlay() }
             // If the accessibility service connected, onAccessibilityConnected() already
             // flushed. On timeout / error nobody else will, so do it here.
             if (endReason != "accessibility_connected") flushPendingAlert(app)
@@ -216,10 +246,11 @@ object BootGapGuard {
         val canOverlay = Settings.canDrawOverlays(app)
         UninstallGuard.logDebugTrail("BOOT_GAP_FIRED pkg=$pkg overlay=$canOverlay")
 
-        if (canOverlay) mainHandler.post { showOverlay(app) }
+        val ui = ensureUiHandler()
+        if (canOverlay) ui.post { showOverlay(app) }
         // Small delay so the overlay window exists before the Home start (matters for
         // background-activity-start rules on newer Android versions).
-        mainHandler.postDelayed({ goHome(app) }, HOME_DELAY_MS)
+        ui.postDelayed({ goHome(app) }, HOME_DELAY_MS)
     }
 
     private fun goHome(app: Context) {
@@ -253,8 +284,8 @@ object BootGapGuard {
                 overlayView = view
                 overlayWindowManager = wm
             }
-            mainHandler.removeCallbacks(removeOverlayRunnable)
-            mainHandler.postDelayed(removeOverlayRunnable, BLOCK_MS)
+            uiHandler?.removeCallbacks(removeOverlayRunnable)
+            uiHandler?.postDelayed(removeOverlayRunnable, BLOCK_MS)
         } catch (e: Exception) {
             Log.w(TAG, "boot-gap overlay failed", e)
             UninstallGuard.logDebugTrail("BOOT_GAP_OVERLAY_FAILED ${e.javaClass.simpleName}")
@@ -262,7 +293,7 @@ object BootGapGuard {
     }
 
     private fun removeOverlay() {
-        mainHandler.removeCallbacks(removeOverlayRunnable)
+        uiHandler?.removeCallbacks(removeOverlayRunnable)
         val view = overlayView ?: return
         val wm = overlayWindowManager
         overlayView = null
@@ -271,6 +302,15 @@ object BootGapGuard {
             wm?.removeView(view)
         } catch (e: Exception) {
             Log.w(TAG, "boot-gap overlay failed to remove", e)
+        }
+    }
+
+    private fun ensureUiHandler(): Handler {
+        uiHandler?.let { return it }
+        synchronized(this) {
+            uiHandler?.let { return it }
+            val t = HandlerThread("BootGapGuard-ui").apply { isDaemon = true; start() }
+            return Handler(t.looper).also { uiHandler = it }
         }
     }
 
