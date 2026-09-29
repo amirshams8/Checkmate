@@ -387,6 +387,7 @@ class HomeViewModel : ViewModel() {
     fun removeTask(task: StudyTask) {
         if (task.state == TaskState.ACTIVE || task.state == TaskState.PAUSED) return
         GapTaskLedger.releaseIfActiveTask(task.id)
+        QbankDailyTaskManager.releaseIfSessionTask(task.id)
         PlanStore.removeTask(task.id)
     }
 

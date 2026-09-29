@@ -173,6 +173,28 @@ object QbankDailyTaskManager {
     }
 
     /**
+     * BUGFIX (delete-then-regenerate stuck no-op): deleting a "Q-bank: <chapter>"
+     * StudyTask via the Home X button used to leave that subject's entry in
+     * [PREF_SESSIONS_JSON] untouched — [generateIfNeededInternal]'s
+     * `existing.containsKey(subject)` check then kept treating the subject as
+     * "already has a session today" for the rest of the day, so even a
+     * force-refresh right after deleting couldn't create a new one for it.
+     * Confirmed live: after deleting the Physics task and forcing a refresh, no
+     * new session was created for Physics. Mirrors
+     * [GapTaskLedger.releaseIfActiveTask]'s own shape — called from
+     * [HomeViewModel.removeTask] alongside it, whenever the removed task matches a
+     * stored session's taskId, so deleting really does make the subject eligible
+     * again the same day instead of only from tomorrow.
+     */
+    fun releaseIfSessionTask(taskId: String) {
+        val sessions = todaysSessions()
+        val match = sessions.firstOrNull { it.taskId == taskId } ?: return
+        DebugTrail.d(TAG, "releaseIfSessionTask: releasing subject=${match.subject} " +
+            "chapter=${match.chapter} task=$taskId")
+        saveSessions(sessions.filterNot { it.taskId == taskId })
+    }
+
+    /**
      * Entry point — called from [ReminderService]'s 15-min loop, and also directly
      * from [com.checkmate.ui.stats.StatsScreen] on screen entry so a session
      * created just now shows up without waiting for the next service cycle. Both
