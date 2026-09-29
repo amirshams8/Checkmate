@@ -509,7 +509,7 @@ Rules:
         val dayOfYear = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
         sorted.take(maxTasks).forEachIndexed { idx: Int, subj: SubjectConfig ->
             val weakest = weakestBySubject.entries
-                .firstOrNull { it.key.equals(subj.name, ignoreCase = true) }
+                .firstOrNull { it.key.trim().equals(subj.name.trim(), ignoreCase = true) }
                 ?.value
                 ?.takeIf { it.retentionDecision != RetentionDecisionSnapshot.MOVE_ON }
 
@@ -536,13 +536,22 @@ Rules:
                 }
                 "$action: $label" to reason
             } else {
-                val topTopics = PYQWeightage.getTopTopics(config.examType, subj.name, 6)
+                // BUGFIX (placeholder titles like "Botany Chapter 5" / "Physics  Chapter 4"):
+                // PYQWeightage's NEET table is keyed exactly "Physics"/"Chemistry"/"Biology",
+                // but the student's subjects are typed free-form and NEET is studied as
+                // Physics/Chemistry/Botany/Zoology. An exact-match lookup therefore missed
+                // "Botany"/"Zoology" outright, and anything with a trailing space or different
+                // case ("Physics ", "zoology"), and fell to the numbered placeholder — the
+                // double space in "Physics  Chapter 4" is the trailing space in the name.
+                val cleanName = subj.name.trim()
+                val weightKey = resolveWeightageSubject(config.examType, cleanName)
+                val topTopics = PYQWeightage.getTopTopics(config.examType, weightKey, 6)
                 val t = if (topTopics.isNotEmpty()) {
                     val picked = topTopics[(dayOfYear + idx) % topTopics.size]
                     if (daysLeft < 30) "Revision: ${picked.first}" else picked.first
                 } else {
-                    if (daysLeft < 30) "Revision: ${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
-                    else "${subj.name} Chapter ${(dayOfYear + idx) % 10 + 1}"
+                    if (daysLeft < 30) "Revision: $cleanName Chapter ${(dayOfYear + idx) % 10 + 1}"
+                    else "$cleanName Chapter ${(dayOfYear + idx) % 10 + 1}"
                 }
                 t to ""
             }
@@ -556,6 +565,22 @@ Rules:
             ))
         }
         return tasks
+    }
+
+    /**
+     * Maps a student-typed subject name onto the key PYQWeightage actually stores for
+     * [exam]: trimmed, case-insensitive, and NEET's "Botany"/"Zoology" fall back to the
+     * combined "Biology" table (see ExamSyllabus/PYQWeightage — Biology is one 360-mark
+     * block there, not split). Returns the trimmed input unchanged when nothing matches, so
+     * the caller's existing "no data" fallback still applies.
+     */
+    private fun resolveWeightageSubject(exam: String, name: String): String {
+        val keys = PYQWeightage.data[exam]?.keys ?: return name
+        keys.firstOrNull { it.equals(name, ignoreCase = true) }?.let { return it }
+        if (name.equals("Botany", ignoreCase = true) || name.equals("Zoology", ignoreCase = true)) {
+            keys.firstOrNull { it.equals("Biology", ignoreCase = true) }?.let { return it }
+        }
+        return name
     }
 
     private fun daysUntilExam(dateStr: String): Int {

@@ -9,10 +9,12 @@ import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateDailyTargetOutcome
 import com.checkmate.testmate.TestmateQbankPracticeOutcome
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -223,11 +225,27 @@ object QbankDailyTaskManager {
      * forcing never re-creates a session for a subject that already has one today; it
      * only re-attempts subjects that were skipped or failed.
      */
-    suspend fun forceGenerateNow(context: Context) = generateIfNeededInternal(context, force = true)
+    // BUGFIX (forced run dies silently): Settings launches this from a composable
+    // rememberCoroutineScope, which is cancelled the moment the student leaves the
+    // screen. Confirmed live (16:57:32): "ENTER force=true" was logged and then NOTHING
+    // — no fetch error, no per-subject line — while the student had already moved on to
+    // Home. Same signature at 12:32:50/12:32:57. NonCancellable lets a manual force run
+    // finish (it is bounded by the Testmate client's own timeouts).
+    suspend fun forceGenerateNow(context: Context) =
+        withContext(NonCancellable) { generateIfNeededInternal(context, force = true) }
 
     private suspend fun generateIfNeededInternal(context: Context, force: Boolean) {
         val today = todayKey()
-        if (!force && CheckmatePrefs.getString(PREF_LAST_GENERATED_DAY, null) == today) return
+        // BUGFIX (day gate hides orphaned sessions): once anything was generated today,
+        // PREF_LAST_GENERATED_DAY made every automatic 15-min cycle return in 0ms (see
+        // trail: "QbankDailyTaskManager.generateIfNeeded ok in 0ms" all afternoon), so the
+        // orphaned-session release below could only ever run from the manual force. A
+        // session whose task is gone from today's plan must reopen the gate (the hourly
+        // RETRY_INTERVAL_MS throttle below still applies).
+        val liveIds = PlanStore.todayTasks.value.map { it.id }.toSet()
+        val hasOrphanedSession = todaysSessions().any { it.taskId != null && it.taskId !in liveIds }
+        if (!force && !hasOrphanedSession &&
+            CheckmatePrefs.getString(PREF_LAST_GENERATED_DAY, null) == today) return
 
         val lastAttempt = CheckmatePrefs.getLong(PREF_LAST_ATTEMPT_MS, 0L)
         if (!force && System.currentTimeMillis() - lastAttempt < RETRY_INTERVAL_MS) return
@@ -242,6 +260,8 @@ object QbankDailyTaskManager {
             }
             is TestmateDailyTargetOutcome.Success -> {
                 val target = outcome.target
+                DebugTrail.d(TAG, "generateIfNeeded: target fetched configured=${target.configured} " +
+                    "gaps=${target.coverageGaps?.size ?: 0} sessionsToday=${todaysSessions().size}")
                 if (!target.configured) {
                     // Not an error — the student just hasn't set exam_date/syllabus_deadline
                     // on Testmate yet (POST /api/qbank/exam-target). Nothing to schedule
@@ -322,7 +342,11 @@ object QbankDailyTaskManager {
                 var lastFailure: String? = null
 
                 for (subject in SUBJECTS) {
-                    if (existing.containsKey(subject)) continue // already have today's session
+                    if (existing.containsKey(subject)) {
+                        // Was silent — made "why no Physics task?" unanswerable from the trail.
+                        DebugTrail.d(TAG, "generateIfNeeded: $subject already has a live session today — skipping")
+                        continue // already have today's session
+                    }
 
                     val subjectCoverage = target.subjectBreakdown.find { it.subject == subject }
                     if (subjectCoverage == null || subjectCoverage.coverageTarget <= 0) continue
