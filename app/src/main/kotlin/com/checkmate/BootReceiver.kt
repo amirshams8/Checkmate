@@ -118,11 +118,6 @@ class BootReceiver : BroadcastReceiver() {
     }
 
     /** True if AppAutomationService is present in the OS's enabled-accessibility-services list. */
-    private fun isAccessibilityWatchdogEnabled(context: Context): Boolean {
-        val enabled = Settings.Secure.getString(
-            context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
-        val serviceId = "${context.packageName}/com.checkmate.automation.AppAutomationService"
-        return enabled.split(':').any { it.equals(serviceId, ignoreCase = true) }
-    }
+    private fun isAccessibilityWatchdogEnabled(context: Context): Boolean =
+        com.checkmate.workmode.BootGapGuard.isAccessibilityServiceEnabled(context)
 }

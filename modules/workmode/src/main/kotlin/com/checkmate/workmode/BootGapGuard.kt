@@ -322,14 +322,35 @@ object BootGapGuard {
 
     // ── Preconditions ────────────────────────────────────────────────────────
 
-    /** True if AppAutomationService is in the OS's enabled-accessibility-services list
-     *  (same check BootReceiver uses for its own watchdog-disabled report). */
+    /** True if AppAutomationService is in the OS's enabled-accessibility-services list.
+     *  Tolerant of how the entry is written (see [isAccessibilityServiceEnabled]). */
     private fun isWatchdogEnabledInSettings(app: Context): Boolean {
+        val raw = Settings.Secure.getString(
+            app.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        )
+        val ok = isAccessibilityServiceEnabled(app)
+        if (!ok) {
+            // Raw value goes in the trail so a false negative is visible next pull.
+            UninstallGuard.logDebugTrail("BOOT_GAP_ENABLED_RAW value=${raw ?: "null"}")
+        }
+        return ok
+    }
+
+    /**
+     * Compares by parsed ComponentName rather than string equality: some OEM builds store
+     * the short form ("com.checkmate/.automation.AppAutomationService") instead of the full
+     * class name, which made the old equals() check report a live service as disabled.
+     * Shared with BootReceiver.
+     */
+    fun isAccessibilityServiceEnabled(context: Context): Boolean {
+        val app = context.applicationContext
         val enabled = Settings.Secure.getString(
             app.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-        val serviceId = "${app.packageName}/$ACCESSIBILITY_SERVICE_CLASS"
-        return enabled.split(':').any { it.equals(serviceId, ignoreCase = true) }
+        return enabled.split(':').any { entry ->
+            val cn = android.content.ComponentName.unflattenFromString(entry.trim())
+            cn != null && cn.packageName == app.packageName && cn.className == ACCESSIBILITY_SERVICE_CLASS
+        }
     }
 
     private fun hasUsageAccess(app: Context): Boolean {
