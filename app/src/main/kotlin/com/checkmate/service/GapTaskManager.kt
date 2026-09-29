@@ -13,6 +13,7 @@ import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.RetentionDecisionSnapshot
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.learning.tutor.TutorSessionLedger
@@ -170,9 +171,29 @@ object GapTaskManager {
             val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
             val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
             val expectedScore = ScorePredictor.predictFromReport(report, studentModel, profile.targetScore)
+            // BUGFIX (covered concepts starve repair ranking): decideFromReport keeps only
+            // the top 5 candidates, and the orchestrator's AlreadyCovered filter runs AFTER
+            // that cap. Confirmed live (12:26-12:33 trail): 3 of the 5 slots were
+            // AlreadyCovered concepts, 1 was a NoOpAlreadyApplied REDUCE_DIFFICULTY and 1 a
+            // guarded REPLAN_DAY, so no still-open concept ever reached the walk.
+            // decideFromReport already has excludedConceptIds for exactly this ("filtering
+            // them afterwards lets covered-but-still-weak concepts fill every slot") but
+            // no caller passed it. Retention-eligible covered concepts (REVIEW at high
+            // mastery -> SCHEDULE_RETENTION_TEST) stay in: the orchestrator deliberately
+            // exempts that intent from the covered filter.
+            val excludedCovered = GapTaskLedger.coveredConceptIds().filterNot { id ->
+                val c = studentModel.concepts[id]
+                c != null && c.retentionDecision == RetentionDecisionSnapshot.REVIEW &&
+                    c.mastery >= MasteryEngine.MASTERY_THRESHOLD
+            }.toSet()
+            DebugTrail.d(TAG, "generateIfNeeded: excluding ${excludedCovered.size} covered concept(s) " +
+                "from ranking before the top-5 cap")
             val decisionReport = LearningDecisionEngine.decideFromReport(
-                report, studentModel, estimates, expectedScore
+                report, studentModel, estimates, expectedScore,
+                excludedConceptIds = excludedCovered
             )
+            DebugTrail.d(TAG, "generateIfNeeded: ranked candidates = " +
+                decisionReport.candidates.joinToString { "${it.intent}:${it.conceptId}" })
             val orchestrationResult =
                 LearningInterventionOrchestrator.from(context)
                     .executeTopCandidate(decisionReport, excludeReplanDay = force)

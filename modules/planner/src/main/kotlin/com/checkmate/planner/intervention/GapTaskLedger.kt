@@ -227,6 +227,11 @@ object GapTaskLedger {
         bumpVersion()
     }
 
+    /** Read-only view of the covered set for callers that must drop these concepts from
+     *  ranking BEFORE the candidate cap (see LearningDecisionEngine.decideFromReport's
+     *  excludedConceptIds) — [isCovered] alone only works one concept at a time. */
+    fun coveredConceptIds(): Set<String> = coveredIds()
+
     private fun coveredIds(): Set<String> =
         CheckmatePrefs.getString(KEY_COVERED_CONCEPT_IDS, null)
             ?.split(",")
