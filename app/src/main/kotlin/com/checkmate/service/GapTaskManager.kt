@@ -174,7 +174,8 @@ object GapTaskManager {
                 report, studentModel, estimates, expectedScore
             )
             val orchestrationResult =
-                LearningInterventionOrchestrator.from(context).executeTopCandidate(decisionReport)
+                LearningInterventionOrchestrator.from(context)
+                    .executeTopCandidate(decisionReport, bypassReplanGuard = force)
             // Phase 3 execution bridge: only a genuinely NEW task (Created) means a fresh
             // teaching cycle is starting for this candidate — see TutorSessionLedger.start's
             // own "terminal session is free, non-terminal is AlreadyActive" semantics, and

@@ -336,14 +336,18 @@ class LearningInterventionOrchestrator(
      */
     suspend fun executeTopCandidate(
         report: LearningDecisionEngine.DecisionReport,
-        now: Long = System.currentTimeMillis()
+        now: Long = System.currentTimeMillis(),
+        // BUGFIX (forced repair run can't refill an emptied plan): only the manual
+        // "Check for repair task" path passes true. See the guard below.
+        bypassReplanGuard: Boolean = false
     ): OrchestrationResult = GapTaskLedger.withLock {
-        executeTopCandidateLocked(report, now)
+        executeTopCandidateLocked(report, now, bypassReplanGuard)
     }
 
     private suspend fun executeTopCandidateLocked(
         report: LearningDecisionEngine.DecisionReport,
-        now: Long
+        now: Long,
+        bypassReplanGuard: Boolean = false
     ): OrchestrationResult {
         // Logs every rejection at the moment it is recorded (see LoggingRejectionList) so
         // "why was nothing created?" is answerable from logcat instead of being discarded.
@@ -438,7 +442,18 @@ class LearningInterventionOrchestrator(
 
             // P0a continuation: REPLAN_DAY's own once-a-day guard — see ReplanDayLedger's
             // doc on why escrow alone can't provide this.
+            //
+            // BUGFIX (forced repair run can't refill an emptied plan): a manual force
+            // (Home's "Check for repair task") now skips this guard. Confirmed live: after
+            // the plan was cleared, every force-tap rejected REPLAN_DAY with
+            // AlreadyReplannedToday, and it is the only candidate able to refill a whole
+            // day. The guard exists so an AUTOMATIC second replan can't wipe progress;
+            // AdaptivePlanReplanner.mustSurviveReplan already keeps custom, non-PENDING and
+            // learning-engine tasks, and a deliberate tap is the student's own call.
+            // markReplannedToday still runs after a forced replan, so automatic runs stay
+            // guarded for the rest of the day.
             if (candidate.intent == LearningDecisionEngine.LearningInterventionIntent.REPLAN_DAY &&
+                !bypassReplanGuard &&
                 ReplanDayLedger.hasReplannedToday(dayKey)
             ) {
                 rejections += CandidateRejection(
