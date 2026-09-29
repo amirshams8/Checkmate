@@ -1,197 +1,3 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/CheckmateApp.kt =====
-package com.checkmate
-
-import android.app.Application
-import android.content.Context
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CheckmateState
-import com.checkmate.core.tts.CheckmateTTS
-import com.checkmate.planner.intervention.InterventionGuardianBridge
-import com.checkmate.planner.intervention.InterventionGuardianGateway
-import com.checkmate.planner.intervention.InterventionNotificationBridge
-import com.checkmate.planner.intervention.InterventionReconciliation
-import com.checkmate.planner.intervention.InterventionTriggerScheduler
-import com.checkmate.planner.intervention.OverdueEnforcementBridge
-import com.checkmate.planner.model.StudyTask
-import com.checkmate.psyche.BehaviorLedger
-import com.checkmate.service.BehaviorLedgerSyncManager
-import com.checkmate.service.DayHistorySyncManager
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.InterventionNotifier
-import com.checkmate.service.OutcomeLedgerSyncManager
-import com.checkmate.service.OverdueEnforcementCoordinator
-import com.checkmate.service.ProactiveMentor
-import com.checkmate.service.ReminderService
-import com.checkmate.service.ScreenCaptureManager
-import com.checkmate.service.StudyStateSyncManager
-import com.checkmate.service.WorkModeTaskReconciler
-import com.checkmate.workmode.BootGapGuard
-import com.checkmate.workmode.DistractionGuard
-import com.checkmate.workmode.DistractionListener
-import com.checkmate.workmode.ScrollGuard
-import com.checkmate.workmode.UninstallAlertListener
-import com.checkmate.workmode.UninstallGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeScheduleReceiver
-
-class CheckmateApp : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        CheckmatePrefs.init(this)
-
-        // BUGFIX (Force Stop still reachable for ~30s after a restart — v2): the first
-        // fix armed BootGapGuard from BootReceiver, but BOOT_COMPLETED is delivered only
-        // after this method (and the heavy synchronous init below) has finished — i.e. at
-        // about the same moment the accessibility service connects, so the guard had
-        // effectively no window to cover. Arming it here, first thing after prefs are
-        // readable and before any of the slow init below, starts it as early as this
-        // process can. It runs on its own threads, so the main thread being busy in this
-        // method doesn't stall it. Only arms within a fresh-boot window, so ordinary
-        // process restarts mid-day are untouched. try/catch so it can never break startup.
-        try {
-            BootGapGuard.startIfFreshBoot(this)
-        } catch (e: Exception) {
-            Log.w("CheckmateApp", "BootGapGuard failed to start", e)
-        }
-
-        CheckmateState.init(this)
-        CheckmateTTS.init(this)
-        // Upgrade Blueprint Phase 0 item #3 ("Confirm Room is single source of truth"):
-        // opens BehaviorDatabase, imports any pre-upgrade CheckmatePrefs event history
-        // into it once, and loads the in-memory read cache — see BehaviorLedger.init()'s
-        // own doc for why this runs synchronously here, same as CheckmatePrefs.init()
-        // right above. Must run before anything below can call BehaviorLedger or
-        // PsycheEngine (WorkModeManager.init() does, via the skip-rate check).
-        BehaviorLedger.init(this)
-
-        // Reconcile Work Mode with the hardcoded daily schedule (usual
-        // 19:00-05:00 window every day, plus an extra 01:00-15:10 window on
-        // Sunday/Wednesday) and re-arm the four daily boundary alarms
-        // (AlarmManager repeating alarms don't survive a reboot, hence also
-        // doing this in BootReceiver). This must run after
-        // CheckmateState.init() above.
-        WorkModeManager.init(this)
-        // BUGFIX: notification-panel "Start" and cross-device task sync never
-        // activated WorkMode — see WorkModeTaskReconciler's own doc. Must run after
-        // WorkModeManager.init(this) immediately above, same ordering requirement as
-        // every other WorkModeManager-dependent call in this method.
-        WorkModeTaskReconciler.start(this)
-        // BUGFIX (silent delay never enforced): wires the overdue-PENDING enforcement
-        // gateway InterventionTriggerWorker calls into — see OverdueEnforcementCoordinator
-        // and OverdueEnforcementGateway's own docs. Same settable-gateway pattern as
-        // InterventionNotificationBridge.gateway / InterventionGuardianBridge.gateway just
-        // below; grouped with the WorkMode wiring above instead since this one specifically
-        // depends on WorkModeManager being initialized first.
-        OverdueEnforcementBridge.gateway = OverdueEnforcementCoordinator
-        WorkModeScheduleReceiver.scheduleDailyAlarms(this)
-        GuardianNotifier.scheduleEndOfDaySummary(this)
-        // Every 30 min: pushes an app-usage Telegram alert + caches it in the
-        // worker's KV for the on-demand "usage" command (see worker.js).
-        GuardianNotifier.scheduleUsageReports(this)
-        // Weekly (Sunday 20:00): builds and delivers PsycheEngine's weekly
-        // guardian report via WhatsApp + Telegram. Previously never
-        // scheduled anywhere, which is why the weekly report never sent.
-        GuardianNotifier.scheduleWeeklyReport(this)
-        // ScreenshotSharer.pruneOldScreenshots() removed — ScreenshotSharer deleted
-
-        // Previously missing — nothing anywhere in the app called
-        // ReminderService.start(), so its 15-min loop (checkPendingTasks,
-        // ProactiveMentor.idleCheckIfNeeded/consistencyCheckIfNeeded/
-        // holidayPromptIfNeeded, and GapTaskManager.generateIfNeeded/
-        // escalationCheckIfNeeded) never ran on a fresh install/process start.
-        // Mirrors the other always-on schedulers above (WorkModeManager,
-        // GuardianNotifier) that get armed unconditionally from here; also
-        // re-armed from BootReceiver since a plain Service doesn't survive
-        // reboot the way InterventionTriggerScheduler's WorkManager job does.
-        ReminderService.start(this)
-
-        // Proactive Execution Engine (step 9, Blueprint §16): wire the notification gateway
-        // BEFORE scheduling the periodic trigger evaluation below, so there's no window
-        // where a worker run could find InterventionNotificationBridge.gateway still null
-        // and silently fall back to the deterministic path when a notification was actually
-        // intended. InterventionNotifier is `app`'s implementation — the only module that
-        // can see both Android's NotificationManager and psyche's ContextBuilder at once
-        // (see InterventionNotificationGateway's doc for why planner can't be this itself).
-        InterventionNotificationBridge.gateway = InterventionNotifier
-
-        // Fixes a gap flagged in ActionExecutor's own comment: a resolved REQUEST_GUARDIAN
-        // intent always resolved the transaction, but nothing downstream ever notified
-        // anyone. Same settable-listener seam as InterventionNotificationBridge just above —
-        // GuardianNotifier already knows how to reach the guardian (WhatsApp + Telegram);
-        // this just gives the intervention pipeline a way to call it without planner
-        // depending on `app` directly.
-        InterventionGuardianBridge.gateway = object : InterventionGuardianGateway {
-            override fun notifyGuardianRequested(context: Context, task: StudyTask, transactionId: String) {
-                GuardianNotifier.notifyInterventionGuardianRequest(context, task.subject, task.topic)
-            }
-        }
-
-        // Proactive Execution Engine (step 7): periodic deterministic trigger evaluation
-        // (WorkManager, not AlarmManager — it reschedules itself after reboot, so unlike
-        // the AlarmManager schedules above it needs no BootReceiver re-arming), plus a
-        // one-shot sweep for any InterventionTransaction left non-terminal by a killed
-        // process (Blueprint §4) — same fire-and-forget-at-startup pattern as the
-        // reconciliation call added to BootReceiver below.
-        InterventionTriggerScheduler.schedulePeriodicEvaluation(this)
-        InterventionReconciliation.runAtStartup(this)
-
-        // Step 12 wiring: reinstall-recovery restore for the Outcome Ledger, mirroring
-        // the profile pull pattern (ProfileSyncManager.pullProfileIfLocalEmpty) but at
-        // app startup rather than lazily on a specific screen open — there's no single
-        // "ledger screen" whose open would naturally trigger this the way Planner/
-        // ConsultationProfile do for the profile pull. No-op if the local ledger table
-        // already has rows, or if no sync_code is configured — see
-        // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
-        OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
-
-        // "Sync everything" pass: same reinstall-recovery restore, same startup call
-        // site, for the behavior event ledger (BehaviorDatabase — see
-        // BehaviorLedgerSyncManager's own doc for why this is a separate table/sync
-        // manager from the Outcome Ledger above rather than merged into it). No-op if
-        // local rows already exist or no sync_code is configured.
-        BehaviorLedgerSyncManager.pullLedgerIfLocalEmpty(this)
-
-        // Same "sync everything" pass for the two synchronous-OkHttp managers
-        // (StudyStateSyncManager / DayHistorySyncManager — see their own docs).
-        // Backgrounded explicitly, unlike the two calls just above: those two own
-        // an internal IO-scoped coroutine and return immediately regardless of
-        // caller thread, these two block on client.newCall().execute() directly,
-        // and Application.onCreate() itself runs on the main thread.
-        Thread {
-            StudyStateSyncManager.pullStateIfEmpty()
-            DayHistorySyncManager.pullMissingDays()
-        }.start()
-
-        // Wire real screenshot capture via MediaProjection into DistractionGuard
-        // (and ScrollGuard, which reuses the same listener/pipeline for its
-        // "scroll" kind — see ScrollGuard.kt)
-        val distractionListener = object : DistractionListener {
-            override fun onAlertThresholdReached(context: Context, kind: String, target: String) {
-                Thread {
-                    val uri = ScreenCaptureManager.capture(context)
-                    GuardianNotifier.notifyDistractionAlert(context, kind, target, uri)
-                }.start()
-                // Mentor v2 (spec 3.2): also logs into Mentor's persisted chat, independent of
-                // the guardian-facing alert above — this is student-facing, not parent-facing.
-                ProactiveMentor.onDistractionThreshold(this@CheckmateApp, kind, target)
-            }
-        }
-        DistractionGuard.listener = distractionListener
-        ScrollGuard.listener = distractionListener
-
-        // Wire uninstall/disable-screen alerts from :automation's AppAutomationService
-        // (via :workmode's UninstallGuard) into GuardianNotifier.
-        UninstallGuard.listener = object : UninstallAlertListener {
-            override fun onGuardedScreenBlocked(context: Context, reason: String) {
-                Thread {
-                    GuardianNotifier.notifyUninstallAttempt(context, reason)
-                }.start()
-            }
-        }
-    }
-}
-
 //===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/BootGapGuard.kt =====
 package com.checkmate.workmode
 
@@ -517,14 +323,35 @@ object BootGapGuard {
 
     // ── Preconditions ────────────────────────────────────────────────────────
 
-    /** True if AppAutomationService is in the OS's enabled-accessibility-services list
-     *  (same check BootReceiver uses for its own watchdog-disabled report). */
+    /** True if AppAutomationService is in the OS's enabled-accessibility-services list.
+     *  Tolerant of how the entry is written (see [isAccessibilityServiceEnabled]). */
     private fun isWatchdogEnabledInSettings(app: Context): Boolean {
+        val raw = Settings.Secure.getString(
+            app.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        )
+        val ok = isAccessibilityServiceEnabled(app)
+        if (!ok) {
+            // Raw value goes in the trail so a false negative is visible next pull.
+            UninstallGuard.logDebugTrail("BOOT_GAP_ENABLED_RAW value=${raw ?: "null"}")
+        }
+        return ok
+    }
+
+    /**
+     * Compares by parsed ComponentName rather than string equality: some OEM builds store
+     * the short form ("com.checkmate/.automation.AppAutomationService") instead of the full
+     * class name, which made the old equals() check report a live service as disabled.
+     * Shared with BootReceiver.
+     */
+    fun isAccessibilityServiceEnabled(context: Context): Boolean {
+        val app = context.applicationContext
         val enabled = Settings.Secure.getString(
             app.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-        val serviceId = "${app.packageName}/$ACCESSIBILITY_SERVICE_CLASS"
-        return enabled.split(':').any { it.equals(serviceId, ignoreCase = true) }
+        return enabled.split(':').any { entry ->
+            val cn = android.content.ComponentName.unflattenFromString(entry.trim())
+            cn != null && cn.packageName == app.packageName && cn.className == ACCESSIBILITY_SERVICE_CLASS
+        }
     }
 
     private fun hasUsageAccess(app: Context): Boolean {
@@ -541,4 +368,130 @@ object BootGapGuard {
         }
         return mode == AppOpsManager.MODE_ALLOWED
     }
+}
+
+
+//===== FILE: app/src/main/kotlin/com/checkmate/BootReceiver.kt =====
+package com.checkmate
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.planner.intervention.InterventionReconciliation
+import com.checkmate.service.AttentionCycleService
+import com.checkmate.service.GuardianNotifier
+import com.checkmate.service.ReminderService
+import com.checkmate.service.TelegramAlertBot
+import com.checkmate.workmode.BootGapGuard
+import com.checkmate.workmode.WorkModeManager
+import com.checkmate.workmode.WorkModeScheduleReceiver
+
+/**
+ * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
+ * reports, weekly report) are cancelled on reboot; this puts them back so
+ * guardian reporting survives a restart instead of silently going quiet.
+ * ReminderService (plain foreground Service, not WorkManager) and Work
+ * Mode's schedule get the same re-arming for the same reason — this is
+ * the self-heal pass: everything on-device that a reboot silently clears
+ * gets put back the moment BOOT_COMPLETED fires.
+ *
+ * Also fires a one-time "device rebooted" note to the guardian when the
+ * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
+ * watchdog and (on some OEMs) the device admin lock entirely, which is the
+ * one uninstall path this app genuinely cannot block. Surfacing it is the
+ * next best thing: the guardian at least finds out it happened. The same
+ * applies, independent of Safe Mode, to the accessibility watchdog itself:
+ * see the ENABLED_ACCESSIBILITY_SERVICES check below — Android never lets
+ * an app re-enable its own accessibility service, so if it was off before
+ * the reboot it's still off after, and that can't be fixed from code, only
+ * reported.
+ */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        CheckmatePrefs.init(context)
+        CheckmateState.init(context)
+
+        // BUGFIX (Force Stop reachable for up to ~30s after a restart): UninstallGuard is
+        // enforced entirely by AppAutomationService, and Android binds accessibility
+        // services late after boot, so until its onServiceConnected() runs nothing stops
+        // someone opening Settings → Battery → App usage → Checkmate → Force stop.
+        // BootGapGuard covers exactly that window (foreground-package polling + Home
+        // bounce) and stands down the moment the accessibility service connects. Kept
+        // first and try/catch-wrapped so nothing later in this receiver can keep it from
+        // arming, and it can never take the rest of the boot self-heal down with it.
+        try {
+            BootGapGuard.start(context)
+        } catch (e: Exception) {
+            Log.w("BootReceiver", "BootGapGuard failed to start", e)
+        }
+
+        GuardianNotifier.scheduleEndOfDaySummary(context)
+        GuardianNotifier.scheduleUsageReports(context)
+        // Previously missing — the weekly report alarm was never scheduled
+        // anywhere, including here, which was part of why it never fired.
+        GuardianNotifier.scheduleWeeklyReport(context)
+
+        // Re-arm Work Mode's hardcoded schedule: reconcile immediately (in
+        // case the reboot landed mid-window) and re-register the four daily
+        // boundary alarms, since AlarmManager repeating alarms are cleared
+        // on reboot just like the guardian-reporting ones above.
+        WorkModeManager.init(context)
+        WorkModeScheduleReceiver.scheduleDailyAlarms(context)
+        Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
+
+        // Previously missing — ReminderService is a plain foreground Service, not
+        // WorkManager, so (like the AlarmManager schedules above, unlike
+        // InterventionTriggerScheduler's periodic work) it does not survive a reboot
+        // on its own. Nothing was restarting it here, which meant the entire 15-min
+        // loop (checkPendingTasks, ProactiveMentor's idle/consistency/holiday checks,
+        // GapTaskManager's daily generation + escalation) silently stopped firing
+        // after every reboot.
+        ReminderService.start(context)
+
+        // Same problem as ReminderService above, for the focus-session timer: if a
+        // reboot lands mid-session, AttentionCycleService.KEY_ACTIVE_TASK_ID is still
+        // set (only cleared on a normal end — see that service's onDestroy), so this
+        // relaunches the same task fresh rather than leaving the student's session
+        // silently gone with no timer and no notification. No-op if no session was
+        // running when the device went down.
+        AttentionCycleService.resumeAfterRebootIfNeeded(context)
+
+        // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
+        // non-terminal by the process that just died (Blueprint §4). No equivalent call
+        // is needed for InterventionTriggerScheduler's periodic work here — WorkManager
+        // persists and reschedules that itself after reboot, unlike the AlarmManager
+        // schedules above.
+        InterventionReconciliation.runAtStartup(context)
+
+        val inSafeMode = context.packageManager.isSafeMode
+        if (inSafeMode && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifySafeModeBoot(context)
+            }.start()
+        }
+
+        // Self-heal check for the accessibility watchdog: this can only ever be a
+        // *report*, not a fix — see the class doc above for why no app, this one
+        // included, can flip its own accessibility service back on after a reboot.
+        // Reading it here still closes most of the gap in practice, since on real
+        // devices ENABLED_ACCESSIBILITY_SERVICES already reflects the post-reboot
+        // state by the time BOOT_COMPLETED fires (accessibility services are core
+        // services the OS starts before third-party BOOT_COMPLETED receivers run).
+        if (!isAccessibilityWatchdogEnabled(context) && TelegramAlertBot.getChatId() != null) {
+            Thread {
+                GuardianNotifier.notifyAccessibilityWatchdogDisabled(context)
+            }.start()
+        }
+    }
+
+    /** True if AppAutomationService is present in the OS's enabled-accessibility-services list. */
+    private fun isAccessibilityWatchdogEnabled(context: Context): Boolean =
+        com.checkmate.workmode.BootGapGuard.isAccessibilityServiceEnabled(context)
 }
