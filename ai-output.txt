@@ -80,10 +80,10 @@ object BootGapGuard {
     // The user-observed gap is ~30s; 4x that is generous margin without leaving Settings
     // blocked indefinitely if the accessibility service never connects.
     private const val MAX_GAP_MS = 120_000L
-    private const val POLL_INTERVAL_MS = 300L
+    private const val POLL_INTERVAL_MS = 100L
     private const val REFIRE_INTERVAL_MS = 1_000L
     private const val BLOCK_MS = 1_500L
-    private const val HOME_DELAY_MS = 60L
+    private const val HOME_DELAY_MS = 20L
     private const val INITIAL_LOOKBACK_CAP_MS = 5 * 60 * 1000L
     private const val EVENT_OVERLAP_MS = 1_000L
 
@@ -99,6 +99,10 @@ object BootGapGuard {
     // start() never resets it — if the accessibility service connected before
     // BootReceiver ran, the guard must see that and stand down.
     @Volatile private var accessibilityConnected = false
+
+    // runLoop thread only: timestamp (wall clock) of the most recent foreground event seen.
+    // Lets BOOT_GAP_FIRED report how old the event already was when we noticed it.
+    private var lastForegroundEventTs = 0L
 
     private val running = AtomicBoolean(false)
     private val pendingAlert = AtomicBoolean(false)
@@ -230,7 +234,10 @@ object BootGapGuard {
                 // ACTIVITY_RESUMED/ACTIVITY_PAUSED and have the same values (1/2); using
                 // them keeps this compiling at minSdk 26.
                 when (e.eventType) {
-                    UsageEvents.Event.MOVE_TO_FOREGROUND -> result = e.packageName
+                    UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                        result = e.packageName
+                        lastForegroundEventTs = e.timeStamp
+                    }
                     UsageEvents.Event.MOVE_TO_BACKGROUND -> if (result == e.packageName) result = null
                 }
             }
@@ -245,21 +252,29 @@ object BootGapGuard {
     private fun fire(app: Context, pkg: String) {
         pendingAlert.set(true)
         val canOverlay = Settings.canDrawOverlays(app)
-        UninstallGuard.logDebugTrail("BOOT_GAP_FIRED pkg=$pkg overlay=$canOverlay")
+        val firedAt = SystemClock.elapsedRealtime()
+        // eventAgeMs = how long ago the OS recorded the foreground change. Large here means
+        // UsageStats reporting/poll lag (detection is the slow part); small here means the
+        // lag is in the reaction, see reactionMs in BOOT_GAP_HOME_SENT.
+        val eventAgeMs = System.currentTimeMillis() - lastForegroundEventTs
+        UninstallGuard.logDebugTrail("BOOT_GAP_FIRED pkg=$pkg overlay=$canOverlay eventAgeMs=$eventAgeMs")
 
         val ui = ensureUiHandler()
         if (canOverlay) ui.post { showOverlay(app) }
         // Small delay so the overlay window exists before the Home start (matters for
         // background-activity-start rules on newer Android versions).
-        ui.postDelayed({ goHome(app) }, HOME_DELAY_MS)
+        ui.postDelayed({ goHome(app, firedAt) }, HOME_DELAY_MS)
     }
 
-    private fun goHome(app: Context) {
+    private fun goHome(app: Context, firedAt: Long) {
         try {
             app.startActivity(
                 Intent(Intent.ACTION_MAIN)
                     .addCategory(Intent.CATEGORY_HOME)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            UninstallGuard.logDebugTrail(
+                "BOOT_GAP_HOME_SENT reactionMs=${SystemClock.elapsedRealtime() - firedAt}"
             )
         } catch (e: Exception) {
             Log.w(TAG, "home bounce failed", e)
@@ -368,130 +383,4 @@ object BootGapGuard {
         }
         return mode == AppOpsManager.MODE_ALLOWED
     }
-}
-
-
-//===== FILE: app/src/main/kotlin/com/checkmate/BootReceiver.kt =====
-package com.checkmate
-
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.os.Build
-import android.provider.Settings
-import android.util.Log
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.CheckmateState
-import com.checkmate.planner.intervention.InterventionReconciliation
-import com.checkmate.service.AttentionCycleService
-import com.checkmate.service.GuardianNotifier
-import com.checkmate.service.ReminderService
-import com.checkmate.service.TelegramAlertBot
-import com.checkmate.workmode.BootGapGuard
-import com.checkmate.workmode.WorkModeManager
-import com.checkmate.workmode.WorkModeScheduleReceiver
-
-/**
- * BootReceiver — AlarmManager's repeating alarms (EOD summary, 30-min usage
- * reports, weekly report) are cancelled on reboot; this puts them back so
- * guardian reporting survives a restart instead of silently going quiet.
- * ReminderService (plain foreground Service, not WorkManager) and Work
- * Mode's schedule get the same re-arming for the same reason — this is
- * the self-heal pass: everything on-device that a reboot silently clears
- * gets put back the moment BOOT_COMPLETED fires.
- *
- * Also fires a one-time "device rebooted" note to the guardian when the
- * reboot landed in Safe Mode — Safe Mode disables Checkmate's accessibility
- * watchdog and (on some OEMs) the device admin lock entirely, which is the
- * one uninstall path this app genuinely cannot block. Surfacing it is the
- * next best thing: the guardian at least finds out it happened. The same
- * applies, independent of Safe Mode, to the accessibility watchdog itself:
- * see the ENABLED_ACCESSIBILITY_SERVICES check below — Android never lets
- * an app re-enable its own accessibility service, so if it was off before
- * the reboot it's still off after, and that can't be fixed from code, only
- * reported.
- */
-class BootReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
-
-        CheckmatePrefs.init(context)
-        CheckmateState.init(context)
-
-        // BUGFIX (Force Stop reachable for up to ~30s after a restart): UninstallGuard is
-        // enforced entirely by AppAutomationService, and Android binds accessibility
-        // services late after boot, so until its onServiceConnected() runs nothing stops
-        // someone opening Settings → Battery → App usage → Checkmate → Force stop.
-        // BootGapGuard covers exactly that window (foreground-package polling + Home
-        // bounce) and stands down the moment the accessibility service connects. Kept
-        // first and try/catch-wrapped so nothing later in this receiver can keep it from
-        // arming, and it can never take the rest of the boot self-heal down with it.
-        try {
-            BootGapGuard.start(context)
-        } catch (e: Exception) {
-            Log.w("BootReceiver", "BootGapGuard failed to start", e)
-        }
-
-        GuardianNotifier.scheduleEndOfDaySummary(context)
-        GuardianNotifier.scheduleUsageReports(context)
-        // Previously missing — the weekly report alarm was never scheduled
-        // anywhere, including here, which was part of why it never fired.
-        GuardianNotifier.scheduleWeeklyReport(context)
-
-        // Re-arm Work Mode's hardcoded schedule: reconcile immediately (in
-        // case the reboot landed mid-window) and re-register the four daily
-        // boundary alarms, since AlarmManager repeating alarms are cleared
-        // on reboot just like the guardian-reporting ones above.
-        WorkModeManager.init(context)
-        WorkModeScheduleReceiver.scheduleDailyAlarms(context)
-        Log.d("BootReceiver", "Guardian alarms + Work Mode schedule rescheduled after boot")
-
-        // Previously missing — ReminderService is a plain foreground Service, not
-        // WorkManager, so (like the AlarmManager schedules above, unlike
-        // InterventionTriggerScheduler's periodic work) it does not survive a reboot
-        // on its own. Nothing was restarting it here, which meant the entire 15-min
-        // loop (checkPendingTasks, ProactiveMentor's idle/consistency/holiday checks,
-        // GapTaskManager's daily generation + escalation) silently stopped firing
-        // after every reboot.
-        ReminderService.start(context)
-
-        // Same problem as ReminderService above, for the focus-session timer: if a
-        // reboot lands mid-session, AttentionCycleService.KEY_ACTIVE_TASK_ID is still
-        // set (only cleared on a normal end — see that service's onDestroy), so this
-        // relaunches the same task fresh rather than leaving the student's session
-        // silently gone with no timer and no notification. No-op if no session was
-        // running when the device went down.
-        AttentionCycleService.resumeAfterRebootIfNeeded(context)
-
-        // Proactive Execution Engine (step 7): sweep any InterventionTransaction left
-        // non-terminal by the process that just died (Blueprint §4). No equivalent call
-        // is needed for InterventionTriggerScheduler's periodic work here — WorkManager
-        // persists and reschedules that itself after reboot, unlike the AlarmManager
-        // schedules above.
-        InterventionReconciliation.runAtStartup(context)
-
-        val inSafeMode = context.packageManager.isSafeMode
-        if (inSafeMode && TelegramAlertBot.getChatId() != null) {
-            Thread {
-                GuardianNotifier.notifySafeModeBoot(context)
-            }.start()
-        }
-
-        // Self-heal check for the accessibility watchdog: this can only ever be a
-        // *report*, not a fix — see the class doc above for why no app, this one
-        // included, can flip its own accessibility service back on after a reboot.
-        // Reading it here still closes most of the gap in practice, since on real
-        // devices ENABLED_ACCESSIBILITY_SERVICES already reflects the post-reboot
-        // state by the time BOOT_COMPLETED fires (accessibility services are core
-        // services the OS starts before third-party BOOT_COMPLETED receivers run).
-        if (!isAccessibilityWatchdogEnabled(context) && TelegramAlertBot.getChatId() != null) {
-            Thread {
-                GuardianNotifier.notifyAccessibilityWatchdogDisabled(context)
-            }.start()
-        }
-    }
-
-    /** True if AppAutomationService is present in the OS's enabled-accessibility-services list. */
-    private fun isAccessibilityWatchdogEnabled(context: Context): Boolean =
-        com.checkmate.workmode.BootGapGuard.isAccessibilityServiceEnabled(context)
 }
