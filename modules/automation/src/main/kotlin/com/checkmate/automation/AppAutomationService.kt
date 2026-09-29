@@ -12,6 +12,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.TrustedTime
@@ -217,6 +218,12 @@ class AppAutomationService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
+        // BUGFIX (post-restart Force Stop loophole): this is the moment the normal
+        // UninstallGuard watchdog goes live after a reboot. Tells BootGapGuard (which
+        // covers the window before this point via foreground-package polling) that its
+        // job is done, and lets it flush the deferred guardian alert now that WhatsApp
+        // automation can actually complete.
+        BootGapGuard.onAccessibilityConnected(applicationContext)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {

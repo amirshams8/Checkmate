@@ -13,6 +13,7 @@ import com.checkmate.service.AttentionCycleService
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.ReminderService
 import com.checkmate.service.TelegramAlertBot
+import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.WorkModeManager
 import com.checkmate.workmode.WorkModeScheduleReceiver
 
@@ -42,6 +43,21 @@ class BootReceiver : BroadcastReceiver() {
 
         CheckmatePrefs.init(context)
         CheckmateState.init(context)
+
+        // BUGFIX (Force Stop reachable for up to ~30s after a restart): UninstallGuard is
+        // enforced entirely by AppAutomationService, and Android binds accessibility
+        // services late after boot, so until its onServiceConnected() runs nothing stops
+        // someone opening Settings → Battery → App usage → Checkmate → Force stop.
+        // BootGapGuard covers exactly that window (foreground-package polling + Home
+        // bounce) and stands down the moment the accessibility service connects. Kept
+        // first and try/catch-wrapped so nothing later in this receiver can keep it from
+        // arming, and it can never take the rest of the boot self-heal down with it.
+        try {
+            BootGapGuard.start(context)
+        } catch (e: Exception) {
+            Log.w("BootReceiver", "BootGapGuard failed to start", e)
+        }
+
         GuardianNotifier.scheduleEndOfDaySummary(context)
         GuardianNotifier.scheduleUsageReports(context)
         // Previously missing — the weekly report alarm was never scheduled
