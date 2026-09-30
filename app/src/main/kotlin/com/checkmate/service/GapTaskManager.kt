@@ -672,7 +672,8 @@ object GapTaskManager {
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
                 pool = TestmateQuestionPool.WRONG_SKIPPED,
-                externalQuestions = externalQuestions
+                externalQuestions = externalQuestions,
+                exam = exam // same label already resolved above; lands in the test title as "(NEET-2027)"
             )
         } catch (e: Exception) {
             DebugTrail.e(TAG, "createTargetedTest threw: ${e.message}", e)

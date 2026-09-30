@@ -168,7 +168,13 @@ object TestmateApi {
         // this REPLACES server-side selection entirely; [questionCount]/[pool] are
         // still sent for logging consistency but have no effect on which questions
         // come back.
-        externalQuestions: List<TestmateExternalQuestion> = emptyList()
+        externalQuestions: List<TestmateExternalQuestion> = emptyList(),
+        // NEW: exam label (e.g. "NEET-2027") the route appends to the generated test's
+        // title as " (NEET-2027)", so the repair/retention report.md carries the same
+        // trailing exam suffix an uploaded FT's does — see TestReportParser.TITLE_EXAM_SUFFIX
+        // and app/api/tests/targeted/route.ts's `exam` note. Null/blank = omitted from the
+        // payload (old title, unchanged).
+        exam: String? = null
     ): TestmateTargetedTestOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateTargetedTestOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -196,6 +202,7 @@ object TestmateApi {
                 ?.let { put("topic", it) }
             put("question_count", questionCount)
             put("pool", pool.name)
+            exam?.trim()?.takeIf { it.isNotEmpty() }?.let { put("exam", it) }
             if (externalQuestions.isNotEmpty()) {
                 put("external_questions", JSONArray().apply {
                     externalQuestions.forEach { eq ->

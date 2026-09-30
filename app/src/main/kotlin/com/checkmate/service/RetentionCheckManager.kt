@@ -66,6 +66,8 @@ object RetentionCheckManager {
      */
     suspend fun createRetentionTestsIfNeeded(context: Context) {
         val pending = RetentionTaskLedger.pendingSessionCreation()
+        // Exam label for the generated test's title ("(NEET-2027)") — see TestmateApi.createTargetedTest's `exam`.
+        val exam = ConsultationProfile.load().examTarget
         DebugTrail.d(TAG, "createRetentionTestsIfNeeded: ${pending.size} task(s) awaiting a Testmate session")
         for (session in pending) {
             val chapter = session.chapter?.takeIf { it.isNotBlank() }
@@ -102,7 +104,8 @@ object RetentionCheckManager {
                     topic = topic,
                     questionCount = RETENTION_QUESTION_COUNT,
                     pool = RETENTION_POOL,
-                    externalQuestions = externalQuestions
+                    externalQuestions = externalQuestions,
+                    exam = exam
                 )
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
