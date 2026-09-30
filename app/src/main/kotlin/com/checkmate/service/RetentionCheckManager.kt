@@ -64,7 +64,7 @@ object RetentionCheckManager {
      * a retry of an already-created session is naturally idempotent via Testmate's own
      * intervention_id de-dupe (see [TestmateApi.createTargetedTest]'s own doc).
      */
-    suspend fun createRetentionTestsIfNeeded() {
+    suspend fun createRetentionTestsIfNeeded(context: Context) {
         val pending = RetentionTaskLedger.pendingSessionCreation()
         DebugTrail.d(TAG, "createRetentionTestsIfNeeded: ${pending.size} task(s) awaiting a Testmate session")
         for (session in pending) {
@@ -80,13 +80,29 @@ object RetentionCheckManager {
             val topic = session.topic?.takeIf { it != chapter }
 
             val interventionId = "retention-${session.taskId}"
+
+            // BUGFIX (external-report pathway never wired): same gap as
+            // GapTaskManager.createTargetedTestIfNeeded — a concept whose report was
+            // imported as "External / not on Testmate" has no Testmate-side history, so
+            // the by-chapter lookup 422s. Sent capped at RETENTION_QUESTION_COUNT because
+            // the server ignores questionCount when external_questions is present, and a
+            // retention check is meant to stay a short probe. Empty = not an external
+            // concept, request unchanged.
+            val externalQuestions = try {
+                GapTaskManager.loadExternalQuestions(context, chapter, topic, limit = RETENTION_QUESTION_COUNT)
+            } catch (e: Exception) {
+                DebugTrail.e(TAG, "loadExternalQuestions failed for taskId=${session.taskId}: ${e.message}", e)
+                emptyList()
+            }
+
             val outcome = try {
                 TestmateApi.createTargetedTest(
                     interventionId = interventionId,
                     chapter = chapter,
                     topic = topic,
                     questionCount = RETENTION_QUESTION_COUNT,
-                    pool = RETENTION_POOL
+                    pool = RETENTION_POOL,
+                    externalQuestions = externalQuestions
                 )
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)

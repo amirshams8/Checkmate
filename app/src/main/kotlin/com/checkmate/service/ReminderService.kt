@@ -123,7 +123,7 @@ class ReminderService : Service() {
                 // Testmate session for any RETENTION CHECK task that doesn't have one yet —
                 // see RetentionCheckManager's own doc for why this is a separate ledger/
                 // manager from the gap-repair pair above rather than folded into it.
-                step("RetentionCheckManager.createRetentionTests") { RetentionCheckManager.createRetentionTestsIfNeeded() }
+                step("RetentionCheckManager.createRetentionTests") { RetentionCheckManager.createRetentionTestsIfNeeded(applicationContext) }
                 // Retention-check evidence loop, return arrow: polls any outstanding retention
                 // session and, once submitted, imports real QuestionAttempt/LearningEvent
                 // evidence — same every-cycle (not once/day) cadence as the gap-repair poll

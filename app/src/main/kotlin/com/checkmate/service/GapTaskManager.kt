@@ -13,6 +13,7 @@ import com.checkmate.learning.analytics.ScorePredictor
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.model.QuestionSource
 import com.checkmate.learning.model.RetentionDecisionSnapshot
 import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
@@ -24,6 +25,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.testmate.TestmateApi
+import com.checkmate.testmate.TestmateExternalQuestion
 import com.checkmate.testmate.TestmateQuestionPool
 import com.checkmate.testmate.TestmateResultOutcome
 import com.checkmate.testmate.TestmateTargetedTestOutcome
@@ -155,7 +157,7 @@ object GapTaskManager {
         // stays gated since ranking a brand-new task is the genuinely expensive, once-a-day
         // part.
         resolveActiveConceptState(context)
-        createTargetedTestIfNeeded()
+        createTargetedTestIfNeeded(context)
 
         val todayKey = GapTaskLedger.todayKey()
         if (!force && GapTaskLedger.hasGeneratedToday(todayKey)) return
@@ -203,7 +205,7 @@ object GapTaskManager {
             // startFromCandidate's own doc for which intents this actually applies to.
             (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
                 ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
-            createTargetedTestIfNeeded()
+            createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
@@ -563,7 +565,7 @@ object GapTaskManager {
      * day, even when the round never advances because the student hasn't finished the stale
      * test yet — without hammering the endpoint every 15 minutes for an unchanged session.
      */
-    private suspend fun createTargetedTestIfNeeded() {
+    private suspend fun createTargetedTestIfNeeded(context: Context) {
         val conceptId = GapTaskLedger.activeConceptId() ?: return
         val existingSession = GapTaskLedger.activeTestmateSessionId()
         val todayKey = GapTaskLedger.todayKey()
@@ -644,13 +646,33 @@ object GapTaskManager {
                 "instead of replaying round 1's completed one")
         }
 
+        // BUGFIX (external-report pathway never wired): a report imported via "External /
+        // not on Testmate" (source = QuestionSource.EXTERNAL_REPORT) was never taken on
+        // Testmate, so POST /api/tests/targeted has no `responses` history to look up by
+        // chapter and answered 422 "No questions available for chapter ... yet." Every
+        // piece of the pathway existed (route.ts `external_questions`, TestmateApi's
+        // externalQuestions param, TestmateExternalQuestion) except the one call that
+        // actually filled it in. Empty list = not an external concept (or nothing open
+        // left locally), so the request stays byte-for-byte what it was before.
+        val externalQuestions = try {
+            loadExternalQuestions(context, chapter, topicForApi)
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "loadExternalQuestions failed for concept=$conceptId: ${e.message}", e)
+            emptyList()
+        }
+        if (externalQuestions.isNotEmpty()) {
+            DebugTrail.d(TAG, "createTargetedTestIfNeeded: concept=$conceptId sending " +
+                "${externalQuestions.size} external-report question(s) for chapter '$chapter'")
+        }
+
         val outcome = try {
             TestmateApi.createTargetedTest(
                 interventionId = interventionId,
                 chapter = chapter,
                 topic = topicForApi,
                 questionCount = TARGETED_TEST_QUESTION_COUNT, // 0 = uncapped, see constant's doc
-                pool = TestmateQuestionPool.WRONG_SKIPPED
+                pool = TestmateQuestionPool.WRONG_SKIPPED,
+                externalQuestions = externalQuestions
             )
         } catch (e: Exception) {
             DebugTrail.e(TAG, "createTargetedTest threw: ${e.message}", e)
@@ -680,6 +702,78 @@ object GapTaskManager {
                 recordTestmateError(outcome.message)
             }
         }
+    }
+
+    /**
+     * Local equivalent of the lookup Testmate's `/api/tests/targeted` does server-side for a
+     * test that WAS taken on Testmate: every question of this chapter/topic that is still
+     * wrong or skipped, read from Checkmate's own Room data instead. Only questions imported
+     * with [QuestionSource.EXTERNAL_REPORT] are ever returned, so a concept whose report
+     * was a genuine Testmate session yields an empty list and keeps using the server-side
+     * path untouched. Shared with [RetentionCheckManager] so both callers agree on what
+     * "still open" means.
+     *
+     * Why this is NOT just QuestionDao.getExternalWrongOrSkipped: that query INNER JOINs
+     * question_attempts, and TestResultNormalizer deliberately writes NO attempt
+     * row for a skipped question (only Question + LearningEvent) — so it can only ever
+     * return WRONG questions, despite its name. A skipped question has no attempts at all.
+     *
+     * "Still open" = the most recent attempt, across every copy of that question text
+     * Checkmate has ever stored, was wrong — or no copy has ever been attempted (skipped and
+     * never retested). The same-text grouping matters because a targeted retest comes back
+     * as brand-new rows ([TargetedTestEvidenceImporter], `testmate_targeted-{session}-q{n}`)
+     * with no link to the external original; without it, every later round would re-serve
+     * questions the student already got right on the retest.
+     *
+     * [limit] null = every open question (repair tests are uncapped, see
+     * [TARGETED_TEST_QUESTION_COUNT]); a positive value caps it (retention probes).
+     */
+    internal suspend fun loadExternalQuestions(
+        context: Context,
+        chapter: String,
+        topic: String?,
+        limit: Int? = null
+    ): List<TestmateExternalQuestion> = withContext(Dispatchers.IO) {
+        val db = LearningDatabase.getInstance(context)
+        val studentId = LearningIds.LOCAL_STUDENT_ID
+        val inChapter = db.questionDao().getByChapter(chapter)
+        if (inChapter.none { it.source == QuestionSource.EXTERNAL_REPORT }) return@withContext emptyList()
+
+        fun norm(t: String?): String = t.orEmpty().trim().replace(Regex("\\s+"), " ").lowercase()
+
+        // Latest attempt per question text, over ALL sources in the chapter (external
+        // original + any testmate_targeted retest copies of it).
+        val latestByText = HashMap<String, Pair<Long, Boolean>>()
+        for (q in inChapter) {
+            val key = norm(q.questionText)
+            if (key.isEmpty()) continue
+            for (a in db.questionAttemptDao().getByQuestion(q.id)) {
+                if (a.studentId != studentId) continue
+                val prev = latestByText[key]
+                if (prev == null || a.timestamp >= prev.first) latestByText[key] = a.timestamp to a.correct
+            }
+        }
+
+        val seen = HashSet<String>()
+        val open = ArrayList<TestmateExternalQuestion>()
+        for (q in inChapter) {
+            if (q.source != QuestionSource.EXTERNAL_REPORT) continue
+            // Same "only filter by topic when one was recorded" rule as the server route.
+            if (topic != null && q.topic != topic) continue
+            val text = q.questionText?.takeIf { it.isNotBlank() } ?: continue
+            val key = norm(text)
+            if (latestByText[key]?.second == true) continue // already answered correctly since
+            if (!seen.add(key)) continue                    // same question imported twice
+            open.add(
+                TestmateExternalQuestion(
+                    questionText = text,
+                    options = q.options,
+                    correctOption = q.correctOption,
+                    explanation = q.explanation
+                )
+            )
+        }
+        if (limit != null && limit > 0) open.take(limit) else open
     }
 
     /** Persists the failure so it survives past logcat's buffer — see [PREF_TESTMATE_LAST_ERROR]. */
@@ -822,7 +916,7 @@ days running — this is the escalated warning, not the first nudge. Rules:
                 // it here too closes that gap the same way generateIfNeeded already does;
                 // it's a no-op whenever resolveDoneConcept covered the concept outright or
                 // deferred it back to PENDING, since both leave no active concept id.
-                createTargetedTestIfNeeded()
+                createTargetedTestIfNeeded(context)
             }
             GapTaskLedger.markEscalatedToday(todayKey)
             return
