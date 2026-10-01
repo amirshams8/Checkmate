@@ -83,4 +83,12 @@ interface MasteryDao {
     // without pulling every row for students with a large mastery table.
     @Query("SELECT * FROM concept_mastery WHERE studentId = :studentId AND mastery < :threshold")
     suspend fun getBelowMastery(studentId: String, threshold: Double): List<ConceptMastery>
+
+    // BUGFIX (orphaned mastery rows double-count / double-rank a concept): recomputeAll only
+    // ever upserts, so a concept whose id changed (e.g. the exam=null -> "unknown-..." fork
+    // repaired by repairNullExam, or a chapter-string re-key) kept its OLD mastery row forever
+    // with zero attempts pointing at it. StudentModelBuilder reads every row, so each orphan
+    // showed up as a second, stale candidate for the same chapter and inflated totalAttempts.
+    @Query("DELETE FROM concept_mastery WHERE studentId = :studentId AND conceptId IN (:conceptIds)")
+    suspend fun deleteByConceptIds(studentId: String, conceptIds: List<String>): Int
 }

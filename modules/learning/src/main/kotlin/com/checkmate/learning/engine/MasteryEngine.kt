@@ -112,6 +112,18 @@ object MasteryEngine {
 
         db.conceptDao().upsertAll(concepts)
         db.masteryDao().upsertAll(results)
+
+        // BUGFIX (orphaned mastery rows): drop mastery rows for this student whose concept no
+        // longer has any attempt behind it (see MasteryDao.deleteByConceptIds). Attempts are
+        // the source of truth, so a row outside `grouped` is stale by definition. Concept rows
+        // are left alone — syllabus-seeded ones legitimately exist without attempts. Chunked to
+        // stay under SQLite's bound-variable limit.
+        val liveIds = grouped.keys
+        val orphanIds = db.masteryDao().getAll(studentId).map { it.conceptId }.filter { it !in liveIds }
+        if (orphanIds.isNotEmpty()) {
+            orphanIds.chunked(500).forEach { db.masteryDao().deleteByConceptIds(studentId, it) }
+            Log.d(TAG, "Removed ${orphanIds.size} orphaned mastery row(s): ${orphanIds.joinToString()}")
+        }
         Log.d(TAG, "Recomputed mastery for ${results.size} concept(s), student=$studentId")
         return results
     }
@@ -195,7 +207,19 @@ object MasteryEngine {
         coverageScore?.let { components.add(W_COVERAGE to it) }
 
         val weightSum = components.sumOf { it.first }
-        return components.sumOf { it.first * it.second } / weightSum
+        val blended = components.sumOf { it.first * it.second } / weightSum
+        // BUGFIX (sub-threshold accuracy read as "mastered"): retention is ~1.0 right after a
+        // test and speed is 1.0 under 60s, so those two terms lift ~79% accuracy over
+        // MASTERY_THRESHOLD (confirmed live: Cell Cycle at recent 0.80 / lifetime 0.79 scored
+        // 0.837 while FT-2D flagged it as a weak chapter). A concept can't count as mastered
+        // while recent accuracy is itself below the bar; the blend still orders concepts
+        // beneath it. Capped just under the threshold rather than set to accuracy so the
+        // retention/speed terms keep contributing to ranking.
+        return if (recentAccuracy < MASTERY_THRESHOLD) {
+            blended.coerceAtMost(MASTERY_THRESHOLD - 0.01)
+        } else {
+            blended
+        }
     }
 
     /**
