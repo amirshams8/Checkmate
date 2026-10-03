@@ -16,6 +16,7 @@ import com.checkmate.planner.model.StudyTask
 import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.service.BehaviorLedgerSyncManager
 import com.checkmate.service.DayHistorySyncManager
+import com.checkmate.service.GatewaySyncScheduler
 import com.checkmate.service.GuardianNotifier
 import com.checkmate.service.InterventionNotifier
 import com.checkmate.service.OutcomeLedgerSyncManager
@@ -143,6 +144,11 @@ class CheckmateApp : Application() {
         // already has rows, or if no sync_code is configured — see
         // OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty's own doc.
         OutcomeLedgerSyncManager.pullLedgerIfLocalEmpty(this)
+
+        // Checkmate MCP gateway: periodic + startup push of the read-projection snapshots
+        // (student model, outcome ledger, today's plan) to Testmate's gateway. No-op until a
+        // Testmate base URL + token are configured; never blocks startup (WorkManager).
+        GatewaySyncScheduler.schedule(this)
 
         // "Sync everything" pass: same reinstall-recovery restore, same startup call
         // site, for the behavior event ledger (BehaviorDatabase — see
