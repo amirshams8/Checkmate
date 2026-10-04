@@ -4458,9 +4458,13 @@ import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.StudentModel
+import com.checkmate.learning.repository.LearningDatabase
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.InterventionDatabase
+import com.checkmate.planner.model.TaskState
+import com.checkmate.psyche.BehaviorLedger
+import com.checkmate.psyche.db.BehaviorDatabase
 import com.checkmate.testmate.TestmateApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -4471,6 +4475,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -4483,10 +4490,14 @@ import java.util.concurrent.TimeUnit
  * Testmate side only ever reads those stored snapshots — it never reaches into this phone,
  * and keeps answering (with a freshness stamp) while the phone is offline.
  *
- * What is deliberately NOT pushed: the raw behavior event ledger, screen/app-usage data,
- * profile/consultation text, API keys, anything outside the three snapshots below. The
- * server re-normalizes every field it accepts, so this file is the first filter, not the
- * only one.
+ * Six snapshots: student_model, interventions, today_plan, plus knowledge_graph (the seeded
+ * prerequisite edges, re-sent at most once a day unless they change), behavior (AGGREGATE
+ * numbers only) and task_history (the last two weeks of saved daily plans).
+ *
+ * What is deliberately NOT pushed: the raw behavior event ledger (only counts derived from
+ * it), which app distracted the student, screen/app-usage data, profile/consultation text,
+ * API keys, anything outside the snapshots below. The server re-normalizes every field it
+ * accepts, so this file is the first filter, not the only one.
  *
  * Fire-and-forget background sync: a periodic WorkManager job (network required) plus one
  * immediate run at app start. Each snapshot is pushed independently — one failing (e.g. an
@@ -4496,6 +4507,16 @@ object GatewaySync {
 
     private const val TAG = "GatewaySync"
     private const val MAX_INTERVENTIONS = 300
+    private const val MAX_GRAPH_EDGES = 4000
+    private const val MAX_GRAPH_NODES = 1500
+    private const val HISTORY_DAYS = 14
+    private const val MAX_TASKS_PER_DAY = 80
+    // The prerequisite graph is seeded once and rarely changes: skip re-sending an identical
+    // payload for this long (any change goes out on the next sync regardless).
+    private const val GRAPH_RESEND_MS = 24L * 60 * 60 * 1000
+    private const val PREF_GRAPH_HASH = "gateway_kg_hash"
+    private const val PREF_GRAPH_PUSHED_MS = "gateway_kg_pushed_ms"
+    private const val DAY_MS = 24L * 60 * 60 * 1000
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -4505,7 +4526,7 @@ object GatewaySync {
 
     enum class PushResult { OK, SKIPPED_NOT_CONFIGURED, REJECTED, RETRYABLE_FAILURE }
 
-    /** Pushes all three snapshots. Returns the worst outcome so the Worker can decide to retry. */
+    /** Pushes every snapshot. Returns the worst outcome so the Worker can decide to retry. */
     suspend fun pushAll(context: Context): PushResult = withContext(Dispatchers.IO) {
         val base = baseUrl()
         val token = token()
@@ -4513,14 +4534,18 @@ object GatewaySync {
 
         // `map` is inline, so the suspend builders are legal here (a lambda stored in a
         // listOf(...) is NOT a suspend lambda — that was the compile error).
-        val results = listOf("student_model", "interventions", "today_plan").map { kind ->
+        val kinds = listOf("student_model", "interventions", "today_plan", "knowledge_graph", "behavior", "task_history")
+        val results = kinds.map { kind ->
             try {
                 val payload = when (kind) {
                     "student_model" -> buildStudentModel(context)
                     "interventions" -> buildInterventions(context)
-                    else -> buildTodayPlan()
+                    "today_plan" -> buildTodayPlan()
+                    "knowledge_graph" -> buildKnowledgeGraph(context)
+                    "behavior" -> buildBehavior(context)
+                    else -> buildTaskHistory()
                 }
-                push(base, token, kind, payload)
+                if (kind == "knowledge_graph") pushKnowledgeGraph(base, token, payload) else push(base, token, kind, payload)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -4692,6 +4717,127 @@ object GatewaySync {
             put("completion_percent", PlanStore.getTodayCompletionPercent())
             put("tasks", tasks)
         }
+    }
+
+    // ── knowledge_graph (prerequisite edges) ──────────────────────────────────
+    private suspend fun buildKnowledgeGraph(context: Context): JSONObject {
+        val db = LearningDatabase.getInstance(context)
+        val edges = db.conceptDependencyDao().getAll().take(MAX_GRAPH_EDGES)
+        val ids = edges.flatMap { listOf(it.conceptId, it.prerequisiteConceptId) }.distinct().take(MAX_GRAPH_NODES)
+        // chunked: SQLite caps the number of bound variables in one IN (...) query.
+        val concepts = ids.chunked(400).flatMap { db.conceptDao().getByIds(it) }
+        val known = concepts.map { it.id }.toSet()
+
+        val nodes = JSONArray()
+        for (c in concepts) {
+            nodes.put(
+                JSONObject().apply {
+                    putStr("concept_id", c.id)
+                    putStr("subject", c.subject)
+                    putStr("chapter", c.chapter)
+                    putStr("topic", c.topic)
+                }
+            )
+        }
+        val edgeArr = JSONArray()
+        for (e in edges) {
+            if (e.conceptId in known && e.prerequisiteConceptId in known) {
+                edgeArr.put(JSONObject().put("concept_id", e.conceptId).put("prerequisite_id", e.prerequisiteConceptId))
+            }
+        }
+        return JSONObject().put("nodes", nodes).put("edges", edgeArr)
+    }
+
+    /** Skips an unchanged graph for [GRAPH_RESEND_MS]; records the hash only after a successful push. */
+    private fun pushKnowledgeGraph(base: String, token: String, payload: JSONObject): PushResult {
+        val hash = payload.toString().hashCode().toString()
+        val lastHash = CheckmatePrefs.getString(PREF_GRAPH_HASH, null)
+        val lastPushed = CheckmatePrefs.getLong(PREF_GRAPH_PUSHED_MS, 0L)
+        if (hash == lastHash && System.currentTimeMillis() - lastPushed < GRAPH_RESEND_MS) return PushResult.OK
+        val result = push(base, token, "knowledge_graph", payload)
+        if (result == PushResult.OK) {
+            CheckmatePrefs.putString(PREF_GRAPH_HASH, hash)
+            CheckmatePrefs.putLong(PREF_GRAPH_PUSHED_MS, System.currentTimeMillis())
+        }
+        return result
+    }
+
+    // ── behavior (aggregates only: counts and rates, never individual events) ──
+    private suspend fun buildBehavior(context: Context): JSONObject {
+        val snap = BehaviorLedger.getSnapshot()
+        val events = BehaviorDatabase.getInstance(context).behaviorEventDao().getAll()
+        val now = System.currentTimeMillis()
+        fun count(state: String, days: Int) = events.count { it.state == state && it.timestamp > now - days * DAY_MS }
+
+        val patterns = JSONArray()
+        for (p in snap.subjectPatterns) {
+            patterns.put(JSONObject().putStr("subject", p.subject).putStr("task_type", p.taskType).put("occurrences", p.occurrences))
+        }
+        return JSONObject().apply {
+            put("streak_days", snap.streakDays)
+            put("consecutive_missed_days", PlanStore.getConsecutiveMissedDays())
+            put("week_completion_percent", PlanStore.getWeekCompletionPercent())
+            put("recent_skip_rate_percent", snap.recentSkipRatePercent)
+            put("total_skips_7d", snap.totalSkips7d)
+            put("today_completed", snap.todayCompleted.size)
+            put(
+                "attention",
+                JSONObject()
+                    .put("checks_passed", snap.attentionChecksPassed)
+                    .put("checks_missed", snap.attentionChecksMissed)
+                    .put("avg_focus_minutes", snap.avgFocusMinutes)
+            )
+            put("skip_patterns", patterns)
+            put(
+                "ledger",
+                JSONObject()
+                    .put("events", events.size)
+                    .put("done_7d", count("DONE", 7))
+                    .put("skipped_7d", count("SKIPPED", 7))
+                    .put("done_30d", count("DONE", 30))
+                    .put("skipped_30d", count("SKIPPED", 30))
+                    .put("focus_minutes_7d", events.filter { it.state == "DONE" && it.timestamp > now - 7 * DAY_MS }.sumOf { it.focusMinutes })
+            )
+        }
+    }
+
+    // ── task_history (saved daily plans, newest first, today included) ────────
+    private fun buildTaskHistory(): JSONObject {
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val cal = Calendar.getInstance()
+        val days = JSONArray()
+        repeat(HISTORY_DAYS) {
+            val tasks = PlanStore.loadDay(PlanStore.keyForDay(cal))
+            val rows = JSONArray()
+            tasks.take(MAX_TASKS_PER_DAY).forEach { t ->
+                rows.put(
+                    JSONObject().apply {
+                        putStr("id", t.id)
+                        putStr("subject", t.subject)
+                        putStr("topic", t.topic)
+                        put("task_type", t.taskType.name)
+                        put("state", t.state.name)
+                        put("duration_minutes", t.durationMinutes)
+                        put("focus_minutes", t.focusMinutes)
+                        putStr("learning_intent", t.learningIntent)
+                        putStr("completed_status", t.completedStatus)
+                    }
+                )
+            }
+            days.put(
+                JSONObject().apply {
+                    put("date", fmt.format(cal.time))
+                    put("planned", tasks.size)
+                    put("done", tasks.count { it.state == TaskState.DONE })
+                    put("skipped", tasks.count { it.state == TaskState.SKIPPED })
+                    put("unfinished", tasks.count { it.state != TaskState.DONE && it.state != TaskState.SKIPPED })
+                    put("focus_minutes", tasks.sumOf { it.focusMinutes })
+                    put("tasks", rows)
+                }
+            )
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return JSONObject().put("days", days)
     }
 }
 
@@ -24254,6 +24400,11 @@ interface ConceptDependencyDao {
 
     @Query("SELECT conceptId FROM concept_dependencies WHERE prerequisiteConceptId = :prerequisiteConceptId")
     suspend fun getDependents(prerequisiteConceptId: String): List<String>
+
+    // Read-only, no schema change. Used by GatewaySync to push the prerequisite graph to the
+    // MCP gateway's knowledge_graph projection (the graph is a few hundred edges at most).
+    @Query("SELECT * FROM concept_dependencies")
+    suspend fun getAll(): List<ConceptDependency>
 }
 
 
