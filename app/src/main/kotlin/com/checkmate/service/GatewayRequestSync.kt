@@ -7,8 +7,13 @@ import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.FreeSlotCalculator
+import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.intervention.PolicyValidator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +25,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
+import java.util.Calendar
 import java.util.concurrent.TimeUnit
 
 /**
@@ -39,11 +45,17 @@ import java.util.concurrent.TimeUnit
  * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
  * refusal is reported back with the real reason so the AI can see why.
  *
- * SUPPORTED: `request_repair`, and `create_task` with task_type repair or qbank_practice.
+ * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
+ * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
+ * `schedule_task` (move a PENDING task in today's plan to a start time, see [decideScheduleTask]).
+ * `study` and `schedule_task` do not go through the learning-intervention orchestrator, so they
+ * carry their own guards, all enforced HERE on the phone no matter what the server sent: today
+ * only, 10..120 minutes, inside the student's study window, never over a blocked slot or
+ * another unfinished task, at most [MAX_AI_TASKS_PER_DAY] AI-created tasks a day, and no
+ * duplicate of a task that is still open.
  * NOT SUPPORTED (reported as rejected, with a message): `dismiss_task` (no policy action exists
  * to remove a task from outside the app), `create_task` for retention/revision (those must go
- * through RetentionTaskLedger's session loop), and any due_date other than today (a
- * CreateTaskRequest only plans today).
+ * through RetentionTaskLedger's session loop), and any due_date other than today.
  *
  * Runs from [GatewaySyncWorker] after the snapshot push (every ~30 min and at app start), so a
  * request is picked up within one sync interval, not instantly.
@@ -61,6 +73,15 @@ object GatewayRequestSync {
     const val DEFAULT_REPAIR_MINUTES = 30
     const val MINUTES_PER_QUESTION = 1
     const val MAX_TASK_MINUTES = 90
+
+    /** Plain study blocks and rescheduling (not question-target tasks). */
+    const val MIN_STUDY_MINUTES = 10
+    const val MAX_STUDY_MINUTES = 120
+    const val DEFAULT_STUDY_MINUTES = 45
+    const val MAX_AI_TASKS_PER_DAY = 3
+    /** Stored in StudyTask.rationale so AI-created tasks can be counted (and told apart) later. */
+    private const val AI_TASK_MARKER = "Requested by an AI assistant"
+    private val HHMM = Regex("""^([01]\d|2[0-3]):[0-5]\d$""")
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -115,6 +136,7 @@ object GatewayRequestSync {
             reason = req.reason
         )
         "create_task" -> decideCreateTask(context, req)
+        "schedule_task" -> decideScheduleTask(req)
         "dismiss_task" -> Decision(
             false,
             "Checkmate does not allow tasks to be dismissed from outside the app.",
@@ -129,6 +151,7 @@ object GatewayRequestSync {
         if (due != null && due != LocalDate.now().toString()) {
             return Decision(false, "Checkmate only plans today; a task for $due can't be scheduled.", "UNSUPPORTED_DUE_DATE")
         }
+        if (p.optStr("task_type") == "study") return decideCreateStudyTask(req)
         val minutes = if (p.has("target_questions") && !p.isNull("target_questions")) {
             (p.optInt("target_questions", 10) * MINUTES_PER_QUESTION)
                 .coerceIn(PolicyValidator.MIN_DURATION_MINUTES, MAX_TASK_MINUTES)
@@ -144,6 +167,137 @@ object GatewayRequestSync {
                 "UNSUPPORTED_TASK_TYPE"
             )
         }
+    }
+
+    // ── plain study tasks and rescheduling (phone-side guards, see class doc) ───────
+
+    private fun decideCreateStudyTask(req: Pending): Decision {
+        val p = req.payload
+        val subject = p.optStr("subject") ?: return Decision(false, "The request has no subject.", "MALFORMED")
+        val topic = p.optStr("topic") ?: return Decision(false, "The request has no topic.", "MALFORMED")
+        val minutes = p.optInt("duration_minutes", DEFAULT_STUDY_MINUTES)
+        if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+            return Decision(false, "A study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).", "DURATION_OUT_OF_RANGE")
+        }
+        val taskType = when (p.optStr("study_type")) {
+            "LECTURE" -> TaskType.LECTURE
+            "REVISION" -> TaskType.REVISION
+            "READING" -> TaskType.READING
+            else -> TaskType.PRACTICE
+        }
+
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        if (today.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
+            return Decision(false, "Already $MAX_AI_TASKS_PER_DAY AI-requested tasks today; Checkmate won't add more until tomorrow.", "DAILY_AI_TASK_LIMIT")
+        }
+        val open = today.any {
+            it.state != TaskState.DONE && it.state != TaskState.SKIPPED &&
+                norm(it.subject) == norm(subject) && norm(it.topic) == norm(topic)
+        }
+        if (open) return Decision(false, "Today's plan already has an open task for $subject: $topic.", "ALREADY_PLANNED")
+
+        val requested = p.optStr("scheduled_start_time")
+        val start: String? = if (requested != null) {
+            slotProblem(requested, minutes, ignoreTaskId = null)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+            requested
+        } else {
+            firstFreeStartFromNow(minutes, ignoreTaskId = null)
+        }
+
+        val task = StudyTask(
+            subject = subject,
+            topic = topic,
+            durationMinutes = minutes,
+            isCustom = true, // student-visible like a typed task, so a replan keeps it and its duration stays editable
+            taskType = taskType,
+            scheduledStartTime = start,
+            rationale = "$AI_TASK_MARKER: ${req.reason}".take(300)
+        )
+        PlanStore.addCustomTask(task)
+        val where = when {
+            requested != null -> "at $requested"
+            start != null -> "at $start (first free slot)"
+            else -> "unscheduled (no free ${minutes}-minute slot left today)"
+        }
+        return Decision(true, "Added $subject: $topic ($minutes min) to today's plan $where.", "ALLOW", task.id)
+    }
+
+    private fun decideScheduleTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val start = p.optStr("scheduled_start_time") ?: return Decision(false, "The request has no start time.", "MALFORMED")
+        if (!HHMM.matches(start)) return Decision(false, "'$start' is not a valid HH:mm time.", "INVALID_TIME")
+
+        val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be moved.", "TASK_NOT_PENDING")
+        }
+
+        val requestedMinutes = if (p.has("duration_minutes") && !p.isNull("duration_minutes")) p.optInt("duration_minutes", 0) else null
+        if (requestedMinutes != null) {
+            if (requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
+            }
+            if (task.learningIntent != null && requestedMinutes != task.durationMinutes) {
+                return Decision(false, "Checkmate sized this repair task itself; ask only for a new time, not a new length.", "DURATION_LOCKED")
+            }
+        }
+        val minutes = requestedMinutes ?: task.durationMinutes
+
+        if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
+            return Decision(false, "That task is already scheduled for $start.", "NO_OP_ALREADY_APPLIED")
+        }
+        slotProblem(start, minutes, ignoreTaskId = task.id)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+
+        PlanStore.updateTaskScheduleAndDuration(task.id, start, minutes)
+        return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.", "ALLOW", task.id)
+    }
+
+    private fun nowMinute(): Int {
+        val c = Calendar.getInstance()
+        return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
+    }
+
+    /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
+    private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+        // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
+        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
+        val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
+        val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
+        val occupied = PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+            if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
+            val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
+            s to (s + t.durationMinutes)
+        }
+        return FreeSlotCalculator.subtractOccupied(free, occupied)
+    }
+
+    /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
+    private fun freeSlotsFromNow(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+        val now = nowMinute()
+        return freeSlotsToday(ignoreTaskId).mapNotNull {
+            val s = maxOf(it.startMinute, now)
+            if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
+        }
+    }
+
+    private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
+        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
+
+    /** Null when [startHHmm] for [minutes] is allowed today; otherwise a message the AI can act on. */
+    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?): String? {
+        if (!HHMM.matches(startHHmm)) return "'$startHHmm' is not a valid HH:mm time."
+        val start = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return "'$startHHmm' is not a valid HH:mm time."
+        val now = nowMinute()
+        if (start <= now) {
+            return "$startHHmm is not ahead of the current time (${FreeSlotCalculator.formatMinutes(now)}); choose a later time today."
+        }
+        val end = start + minutes
+        if (freeSlotsToday(ignoreTaskId).any { start >= it.startMinute && end <= it.endMinute }) return null
+        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
+        return "$startHHmm-${FreeSlotCalculator.formatMinutes(end)} is outside the student's study window or overlaps a blocked slot or another task. " +
+            (if (suggestion != null) "First free $minutes-minute slot today starts at $suggestion." else "There is no free $minutes-minute slot left today.")
     }
 
     /**
