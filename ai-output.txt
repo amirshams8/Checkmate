@@ -468,6 +468,532 @@ object GatewaySyncScheduler {
     }
 }
 
+//===== FILE: app/src/main/kotlin/com/checkmate/service/GatewayRequestSync.kt =====
+package com.checkmate.service
+
+import android.content.Context
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.student.StudentModelBuilder
+import com.checkmate.planner.FreeSlotCalculator
+import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.intervention.PolicyValidator
+import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
+import com.checkmate.planner.model.TaskType
+import com.checkmate.testmate.TestmateApi
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.time.LocalDate
+import java.util.Calendar
+import java.util.concurrent.TimeUnit
+
+/**
+ * Checkmate MCP gateway — request queue, phone side (FINAL_PLAN Phase 3, "controlled writes").
+ *
+ * An external AI holding a `checkmate:plan` token can only QUEUE a request on Testmate
+ * (`gateway_requests`). This pulls those requests (`GET /api/gateway/requests`, same base URL
+ * + device token as [GatewaySync]), runs each through the SAME path Checkmate's own learning
+ * engine uses, and reports the verdict back (`POST /api/gateway/requests/{id}`):
+ *
+ * ```
+ * request -> CandidateIntervention -> LearningInterventionOrchestrator.executeTopCandidate
+ *         -> LearningInterventionMapper -> PolicyValidator -> TaskEscrow -> ActionExecutor
+ * ```
+ *
+ * "AI recommends, code decides": nothing here writes a task directly. Every existing guard
+ * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
+ * refusal is reported back with the real reason so the AI can see why.
+ *
+ * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
+ * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
+ * `schedule_task` (move a PENDING task in today's plan to a start time, see [decideScheduleTask]).
+ * `study` and `schedule_task` do not go through the learning-intervention orchestrator, so they
+ * carry their own guards, all enforced HERE on the phone no matter what the server sent: today
+ * only, 10..120 minutes, inside the student's study window, never over a blocked slot or
+ * another unfinished task, at most [MAX_AI_TASKS_PER_DAY] AI-created tasks a day, and no
+ * duplicate of a task that is still open.
+ * NOT SUPPORTED (reported as rejected, with a message): `dismiss_task` (no policy action exists
+ * to remove a task from outside the app), `create_task` for retention/revision (those must go
+ * through RetentionTaskLedger's session loop), and any due_date other than today.
+ *
+ * Runs from [GatewaySyncWorker] after the snapshot push (every ~30 min and at app start), so a
+ * request is picked up within one sync interval, not instantly.
+ */
+object GatewayRequestSync {
+
+    private const val TAG = "GatewayRequestSync"
+    private const val KEY_HANDLED = "gateway_request_results"
+    private const val MAX_HANDLED = 20
+    private const val MAX_MESSAGE = 280
+
+    /** Judgment calls, not syllabus facts: a repair with no question target gets 30 minutes; a
+     *  task with a question target gets 1 minute per question (NEET pace), clamped to
+     *  [PolicyValidator.MIN_DURATION_MINUTES]..[MAX_TASK_MINUTES]. */
+    const val DEFAULT_REPAIR_MINUTES = 30
+    const val MINUTES_PER_QUESTION = 1
+    const val MAX_TASK_MINUTES = 90
+
+    /** Plain study blocks and rescheduling (not question-target tasks). */
+    const val MIN_STUDY_MINUTES = 10
+    const val MAX_STUDY_MINUTES = 120
+    const val DEFAULT_STUDY_MINUTES = 45
+    const val MAX_AI_TASKS_PER_DAY = 3
+    /** Stored in StudyTask.rationale so AI-created tasks can be counted (and told apart) later. */
+    private const val AI_TASK_MARKER = "Requested by an AI assistant"
+    private val HHMM = Regex("""^([01]\d|2[0-3]):[0-5]\d$""")
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    private data class Pending(val id: String, val kind: String, val payload: JSONObject, val reason: String)
+
+    data class Decision(
+        val accepted: Boolean,
+        val message: String,
+        val policyDecision: String,
+        val taskId: String? = null
+    )
+
+    /** Pulls, decides and reports every pending request. Returns how many were reported. */
+    suspend fun processPending(context: Context): Int = withContext(Dispatchers.IO) {
+        val base = baseUrl() ?: return@withContext 0
+        val token = token() ?: return@withContext 0
+        val pending = pull(base, token) ?: return@withContext 0
+        if (pending.isEmpty()) return@withContext 0
+
+        var reported = 0
+        for (req in pending) {
+            // A request already decided on a previous run whose report never reached the server
+            // is re-reported as-is. It must NOT be run again: that could create a second task.
+            val decision = handled(req.id) ?: try {
+                decide(context, req).also { remember(req.id, it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "request ${req.id} (${req.kind}) failed: ${e.message}", e)
+                Decision(false, "Checkmate hit an internal error handling this request.", "INTERNAL_ERROR")
+                    .also { remember(req.id, it) }
+            }
+            if (report(base, token, req.id, decision)) reported += 1
+        }
+        reported
+    }
+
+    // ── decisions ───────────────────────────────────────────────────────────────
+    private suspend fun decide(context: Context, req: Pending): Decision = when (req.kind) {
+        "request_repair" -> runCandidate(
+            context = context,
+            chapter = req.payload.optStr("chapter"),
+            subject = req.payload.optStr("subject"),
+            topic = req.payload.optStr("topic"),
+            concept = req.payload.optStr("concept"),
+            minutes = DEFAULT_REPAIR_MINUTES,
+            chapterLevelOnly = false,
+            reason = req.reason
+        )
+        "create_task" -> decideCreateTask(context, req)
+        "schedule_task" -> decideScheduleTask(req)
+        "dismiss_task" -> Decision(
+            false,
+            "Checkmate does not allow tasks to be dismissed from outside the app.",
+            "UNSUPPORTED_KIND"
+        )
+        else -> Decision(false, "Unknown request kind.", "UNSUPPORTED_KIND")
+    }
+
+    private suspend fun decideCreateTask(context: Context, req: Pending): Decision {
+        val p = req.payload
+        val due = p.optStr("due_date")
+        if (due != null && due != LocalDate.now().toString()) {
+            return Decision(false, "Checkmate only plans today; a task for $due can't be scheduled.", "UNSUPPORTED_DUE_DATE")
+        }
+        if (p.optStr("task_type") == "study") return decideCreateStudyTask(req)
+        val minutes = if (p.has("target_questions") && !p.isNull("target_questions")) {
+            (p.optInt("target_questions", 10) * MINUTES_PER_QUESTION)
+                .coerceIn(PolicyValidator.MIN_DURATION_MINUTES, MAX_TASK_MINUTES)
+        } else {
+            DEFAULT_REPAIR_MINUTES
+        }
+        return when (val type = p.optStr("task_type")) {
+            "repair" -> runCandidate(context, p.optStr("chapter"), p.optStr("subject"), null, null, minutes, false, req.reason)
+            "qbank_practice" -> runCandidate(context, p.optStr("chapter"), p.optStr("subject"), null, null, minutes, true, req.reason)
+            else -> Decision(
+                false,
+                "Checkmate can't create '$type' tasks from outside the app; retention and revision checks are scheduled by its own engine.",
+                "UNSUPPORTED_TASK_TYPE"
+            )
+        }
+    }
+
+    // ── plain study tasks and rescheduling (phone-side guards, see class doc) ───────
+
+    private fun decideCreateStudyTask(req: Pending): Decision {
+        val p = req.payload
+        val subject = p.optStr("subject") ?: return Decision(false, "The request has no subject.", "MALFORMED")
+        val topic = p.optStr("topic") ?: return Decision(false, "The request has no topic.", "MALFORMED")
+        val minutes = p.optInt("duration_minutes", DEFAULT_STUDY_MINUTES)
+        if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+            return Decision(false, "A study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).", "DURATION_OUT_OF_RANGE")
+        }
+        val taskType = when (p.optStr("study_type")) {
+            "LECTURE" -> TaskType.LECTURE
+            "REVISION" -> TaskType.REVISION
+            "READING" -> TaskType.READING
+            else -> TaskType.PRACTICE
+        }
+
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        if (today.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
+            return Decision(false, "Already $MAX_AI_TASKS_PER_DAY AI-requested tasks today; Checkmate won't add more until tomorrow.", "DAILY_AI_TASK_LIMIT")
+        }
+        val open = today.any {
+            it.state != TaskState.DONE && it.state != TaskState.SKIPPED &&
+                norm(it.subject) == norm(subject) && norm(it.topic) == norm(topic)
+        }
+        if (open) return Decision(false, "Today's plan already has an open task for $subject: $topic.", "ALREADY_PLANNED")
+
+        val requested = p.optStr("scheduled_start_time")
+        val start: String? = if (requested != null) {
+            slotProblem(requested, minutes, ignoreTaskId = null)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+            requested
+        } else {
+            firstFreeStartFromNow(minutes, ignoreTaskId = null)
+        }
+
+        val task = StudyTask(
+            subject = subject,
+            topic = topic,
+            durationMinutes = minutes,
+            isCustom = true, // student-visible like a typed task, so a replan keeps it and its duration stays editable
+            taskType = taskType,
+            scheduledStartTime = start,
+            rationale = "$AI_TASK_MARKER: ${req.reason}".take(300)
+        )
+        PlanStore.addCustomTask(task)
+        val where = when {
+            requested != null -> "at $requested"
+            start != null -> "at $start (first free slot)"
+            else -> "unscheduled (no free ${minutes}-minute slot left today)"
+        }
+        return Decision(true, "Added $subject: $topic ($minutes min) to today's plan $where.", "ALLOW", task.id)
+    }
+
+    private fun decideScheduleTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val start = p.optStr("scheduled_start_time") ?: return Decision(false, "The request has no start time.", "MALFORMED")
+        if (!HHMM.matches(start)) return Decision(false, "'$start' is not a valid HH:mm time.", "INVALID_TIME")
+
+        val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be moved.", "TASK_NOT_PENDING")
+        }
+
+        val requestedMinutes = if (p.has("duration_minutes") && !p.isNull("duration_minutes")) p.optInt("duration_minutes", 0) else null
+        if (requestedMinutes != null) {
+            if (requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
+            }
+            if (task.learningIntent != null && requestedMinutes != task.durationMinutes) {
+                return Decision(false, "Checkmate sized this repair task itself; ask only for a new time, not a new length.", "DURATION_LOCKED")
+            }
+        }
+        val minutes = requestedMinutes ?: task.durationMinutes
+
+        if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
+            return Decision(false, "That task is already scheduled for $start.", "NO_OP_ALREADY_APPLIED")
+        }
+        slotProblem(start, minutes, ignoreTaskId = task.id)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+
+        PlanStore.updateTaskScheduleAndDuration(task.id, start, minutes)
+        return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.", "ALLOW", task.id)
+    }
+
+    private fun nowMinute(): Int {
+        val c = Calendar.getInstance()
+        return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
+    }
+
+    /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
+    private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+        // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
+        val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
+        val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
+        val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
+        val occupied = PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+            if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
+            val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
+            s to (s + t.durationMinutes)
+        }
+        return FreeSlotCalculator.subtractOccupied(free, occupied)
+    }
+
+    /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
+    private fun freeSlotsFromNow(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+        val now = nowMinute()
+        return freeSlotsToday(ignoreTaskId).mapNotNull {
+            val s = maxOf(it.startMinute, now)
+            if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
+        }
+    }
+
+    private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
+        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
+
+    /** Null when [startHHmm] for [minutes] is allowed today; otherwise a message the AI can act on. */
+    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?): String? {
+        if (!HHMM.matches(startHHmm)) return "'$startHHmm' is not a valid HH:mm time."
+        val start = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return "'$startHHmm' is not a valid HH:mm time."
+        val now = nowMinute()
+        if (start <= now) {
+            return "$startHHmm is not ahead of the current time (${FreeSlotCalculator.formatMinutes(now)}); choose a later time today."
+        }
+        val end = start + minutes
+        if (freeSlotsToday(ignoreTaskId).any { start >= it.startMinute && end <= it.endMinute }) return null
+        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
+        return "$startHHmm-${FreeSlotCalculator.formatMinutes(end)} is outside the student's study window or overlaps a blocked slot or another task. " +
+            (if (suggestion != null) "First free $minutes-minute slot today starts at $suggestion." else "There is no free $minutes-minute slot left today.")
+    }
+
+    /**
+     * Builds one [LearningDecisionEngine.CandidateIntervention] and hands it to the orchestrator
+     * as a single-candidate report. With a matching concept it is REPAIR_CONCEPT, which enters
+     * GapTaskLedger and so gets the normal Testmate session/evidence loop; otherwise it is the
+     * chapter-level ASSIGN_TARGETED_SET (no concept id, so no ledger tracking, same as the
+     * engine's own chapter-level candidates).
+     */
+    private suspend fun runCandidate(
+        context: Context,
+        chapter: String?,
+        subject: String?,
+        topic: String?,
+        concept: String?,
+        minutes: Int,
+        chapterLevelOnly: Boolean,
+        reason: String
+    ): Decision {
+        if (chapter.isNullOrBlank()) return Decision(false, "The request has no chapter.", "MALFORMED")
+
+        val model = StudentModelBuilder.build(context)
+        val inChapter = model.concepts.values.filter { sameChapter(it.chapter, chapter) }
+
+        val resolvedSubject = subject?.takeIf { it.isNotBlank() }
+            ?: inChapter.firstNotNullOfOrNull { it.subject?.takeIf { s -> s.isNotBlank() } }
+            ?: return Decision(
+                false,
+                "Checkmate can't tell which subject '$chapter' belongs to.",
+                "SUBJECT_UNKNOWN"
+            )
+
+        // Weakest concept in the chapter unless the request named one (matched by topic/concept name).
+        val wanted = concept ?: topic
+        val matched = if (chapterLevelOnly) null else {
+            wanted?.let { w -> inChapter.firstOrNull { norm(it.topic) == norm(w) || norm(it.conceptId) == norm(w) } }
+                ?: inChapter.minByOrNull { it.mastery }
+        }
+
+        val candidate = LearningDecisionEngine.CandidateIntervention(
+            intent = if (matched != null) {
+                LearningDecisionEngine.LearningInterventionIntent.REPAIR_CONCEPT
+            } else {
+                LearningDecisionEngine.LearningInterventionIntent.ASSIGN_TARGETED_SET
+            },
+            conceptId = matched?.conceptId,
+            subject = resolvedSubject,
+            chapter = matched?.chapter ?: chapter,
+            topic = matched?.topic ?: topic,
+            durationMinutes = minutes,
+            expectedGain = 0.0,
+            priorityScore = 0.0,
+            rationale = "Requested by an AI assistant: $reason"
+        )
+
+        val now = System.currentTimeMillis()
+        val report = LearningDecisionEngine.DecisionReport(
+            studentId = LearningIds.LOCAL_STUDENT_ID,
+            examType = ConsultationProfile.load().examTarget,
+            generatedAt = now,
+            candidates = listOf(candidate)
+        )
+        val result = LearningInterventionOrchestrator.from(context)
+            .executeTopCandidate(report, now, excludeReplanDay = true)
+        return toDecision(result)
+    }
+
+    private fun toDecision(result: LearningInterventionOrchestrator.OrchestrationResult): Decision =
+        when (val outcome = result.outcome) {
+            is LearningInterventionOrchestrator.OrchestrationOutcome.Created ->
+                Decision(true, "Task created on the phone.", "ALLOW", outcome.taskId)
+            is LearningInterventionOrchestrator.OrchestrationOutcome.NoExecutableCandidate -> {
+                val first = result.rejections.firstOrNull()
+                Decision(false, first?.detail ?: "No task was created.", sourceName(first?.source))
+            }
+        }
+
+    private fun sourceName(source: LearningInterventionOrchestrator.RejectionSource?): String = when (source) {
+        null -> "NONE"
+        is LearningInterventionOrchestrator.RejectionSource.NotMappable -> "NOT_MAPPABLE"
+        is LearningInterventionOrchestrator.RejectionSource.PolicyRejected -> "POLICY_${source.reason.name}"
+        is LearningInterventionOrchestrator.RejectionSource.TaskIdCollision -> "TASK_ID_COLLISION"
+        is LearningInterventionOrchestrator.RejectionSource.AlreadyCovered -> "ALREADY_COVERED"
+        is LearningInterventionOrchestrator.RejectionSource.AlreadyActive -> "ALREADY_ACTIVE"
+        is LearningInterventionOrchestrator.RejectionSource.AlreadyReplannedToday -> "ALREADY_REPLANNED_TODAY"
+        is LearningInterventionOrchestrator.RejectionSource.NoOpAlreadyApplied -> "NO_OP_ALREADY_APPLIED"
+    }
+
+    // ── name matching (mirrors lib/ft-schedule.ts normalizeChapter on the server) ──
+    private fun norm(s: String?): String =
+        s.orEmpty().lowercase().replace("&", "and").replace(Regex("[^a-z0-9]+"), "")
+
+    /** Equal after normalizing, or one is a leading part of the other (>= 8 chars so short
+     *  names only ever match exactly). The server sends Testmate's canonical chapter name;
+     *  the phone's concept rows carry whatever the report used. */
+    private fun sameChapter(a: String?, b: String?): Boolean {
+        val x = norm(a)
+        val y = norm(b)
+        if (x.isEmpty() || y.isEmpty()) return false
+        if (x == y) return true
+        val (short, long) = if (x.length <= y.length) x to y else y to x
+        return short.length >= 8 && long.startsWith(short)
+    }
+
+    // ── HTTP ────────────────────────────────────────────────────────────────────
+    private fun pull(base: String, token: String): List<Pending>? {
+        val request = Request.Builder()
+            .url("$base/api/gateway/requests")
+            .addHeader("Authorization", "Bearer $token")
+            .get()
+            .build()
+        return try {
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "pull: HTTP ${resp.code}")
+                    return null
+                }
+                val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("requests") ?: return emptyList()
+                (0 until arr.length()).mapNotNull { i ->
+                    val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                    val id = o.optString("request_id", "")
+                    if (id.isBlank()) return@mapNotNull null
+                    Pending(
+                        id = id,
+                        kind = o.optString("kind", ""),
+                        payload = o.optJSONObject("payload") ?: JSONObject(),
+                        reason = o.optString("reason", "")
+                    )
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "pull failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun report(base: String, token: String, id: String, d: Decision): Boolean {
+        val body = JSONObject().apply {
+            put("status", if (d.accepted) "accepted" else "rejected")
+            put(
+                "result",
+                JSONObject().apply {
+                    put("message", d.message.take(MAX_MESSAGE))
+                    put("policy_decision", d.policyDecision)
+                    d.taskId?.let { put("task_id", it) }
+                }
+            )
+        }.toString().toRequestBody("application/json".toMediaType())
+        val request = Request.Builder()
+            .url("$base/api/gateway/requests/$id")
+            .addHeader("Authorization", "Bearer $token")
+            .post(body)
+            .build()
+        return try {
+            client.newCall(request).execute().use { resp ->
+                Log.d(TAG, "report $id: HTTP ${resp.code}")
+                resp.isSuccessful
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "report $id failed: ${e.message}")
+            false
+        }
+    }
+
+    // ── idempotency memory (last few decisions, so a lost report is re-sent, never re-run) ──
+    private fun handled(id: String): Decision? {
+        val arr = loadHandled()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.optString("id") == id) {
+                return Decision(
+                    accepted = o.optBoolean("accepted"),
+                    message = o.optString("message"),
+                    policyDecision = o.optString("policy"),
+                    taskId = o.optString("task_id").takeIf { it.isNotBlank() }
+                )
+            }
+        }
+        return null
+    }
+
+    private fun remember(id: String, d: Decision) {
+        val old = loadHandled()
+        val kept = JSONArray()
+        val start = maxOf(0, old.length() - (MAX_HANDLED - 1))
+        for (i in start until old.length()) kept.put(old.get(i))
+        kept.put(
+            JSONObject()
+                .put("id", id)
+                .put("accepted", d.accepted)
+                .put("message", d.message)
+                .put("policy", d.policyDecision)
+                .put("task_id", d.taskId ?: "")
+        )
+        CheckmatePrefs.putString(KEY_HANDLED, kept.toString())
+    }
+
+    private fun loadHandled(): JSONArray = try {
+        JSONArray(CheckmatePrefs.getString(KEY_HANDLED, null) ?: "[]")
+    } catch (_: Exception) {
+        JSONArray()
+    }
+
+    // ── config (same prefs + allow-list as GatewaySync / TestmateApi) ──
+    private fun baseUrl(): String? {
+        val saved = CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
+            ?.takeIf { it.isNotBlank() } ?: return null
+        if (!TestmateApi.isAllowedBaseUrl(saved)) {
+            Log.w(TAG, "Stored Testmate base URL failed the allow-list check — not syncing requests")
+            return null
+        }
+        return saved
+    }
+
+    private fun token(): String? =
+        CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
+
+    private fun JSONObject.optStr(key: String): String? =
+        if (has(key) && !isNull(key)) optString(key).trim().takeIf { it.isNotBlank() && it != "null" } else null
+}
+
 //===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/graph/ConceptDependency.kt =====
 package com.checkmate.learning.graph
 
@@ -523,43 +1049,60 @@ interface ConceptDependencyDao {
 
 //===== TERMUXFILE: Testmate/db/migrations/020_gateway_history.sql =====
 -- 020_gateway_history.sql
--- 1) Allow the three new projection kinds (knowledge_graph, behavior, task_history).
---    Drops whatever CHECK constraint currently restricts gateway_projection.kind (its name
---    is not known here), then re-adds one that lists all six kinds.
--- 2) Daily mastery rollups for checkmate_get_mastery_trends.
--- Assumes user_id is a uuid, like gateway_requests in 019 — check against 018/019.
+-- Daily mastery rollups for checkmate_get_mastery_trends.
+-- (gateway_projection.kind has no CHECK constraint in 018, so the new projection kinds
+-- knowledge_graph / behavior / task_history need no schema change.)
+-- Run once in the Supabase SQL editor. Safe to re-run.
+
+create table if not exists gateway_mastery_history (
+  user_id          uuid        not null references auth.users(id) on delete cascade,
+  day              date        not null,
+  generated_at     timestamptz not null,
+  concepts_tracked integer     not null default 0,
+  concepts_weak    integer     not null default 0,
+  average_mastery  double precision,
+  by_subject       jsonb       not null default '[]'::jsonb,
+  primary key (user_id, day)
+);
+
+-- Service role only (RLS on, no policies), same posture as the other gateway tables.
+alter table gateway_mastery_history enable row level security;
+
+//===== TERMUXFILE: Testmate/db/migrations/021_gateway_task_requests.sql =====
+-- 021_gateway_task_requests.sql
+-- Lets gateway_requests.kind hold the new 'schedule_task' kind (create_task gained the 'study'
+-- task type, which lives inside payload and needs no schema change).
+-- 019's constraint name isn't known here, so any CHECK on gateway_requests that mentions
+-- "kind" (and not "status") is dropped and replaced. Safe to re-run.
 
 DO $$
 DECLARE c record;
 BEGIN
+  IF to_regclass('public.gateway_requests') IS NULL THEN
+    RAISE NOTICE 'gateway_requests does not exist; run 019 first';
+    RETURN;
+  END IF;
+
   FOR c IN
     SELECT conname
     FROM pg_constraint
-    WHERE conrelid = 'public.gateway_projection'::regclass
+    WHERE conrelid = 'public.gateway_requests'::regclass
       AND contype = 'c'
       AND pg_get_constraintdef(oid) ILIKE '%kind%'
+      AND pg_get_constraintdef(oid) NOT ILIKE '%status%'
   LOOP
-    EXECUTE format('ALTER TABLE public.gateway_projection DROP CONSTRAINT %I', c.conname);
+    EXECUTE format('ALTER TABLE public.gateway_requests DROP CONSTRAINT %I', c.conname);
   END LOOP;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.gateway_requests'::regclass AND conname = 'gateway_requests_kind_check'
+  ) THEN
+    ALTER TABLE public.gateway_requests
+      ADD CONSTRAINT gateway_requests_kind_check
+      CHECK (kind IN ('request_repair', 'create_task', 'schedule_task', 'dismiss_task'));
+  END IF;
 END $$;
-
-ALTER TABLE public.gateway_projection
-  ADD CONSTRAINT gateway_projection_kind_check
-  CHECK (kind IN ('student_model', 'interventions', 'today_plan', 'knowledge_graph', 'behavior', 'task_history'));
-
-CREATE TABLE IF NOT EXISTS public.gateway_mastery_history (
-  user_id          uuid        NOT NULL,
-  day              date        NOT NULL,
-  generated_at     timestamptz NOT NULL,
-  concepts_tracked integer     NOT NULL DEFAULT 0,
-  concepts_weak    integer     NOT NULL DEFAULT 0,
-  average_mastery  double precision,
-  by_subject       jsonb       NOT NULL DEFAULT '[]'::jsonb,
-  PRIMARY KEY (user_id, day)
-);
-
--- Server-side only (service role bypasses RLS); no policies means no direct client access.
-ALTER TABLE public.gateway_mastery_history ENABLE ROW LEVEL SECURITY;
 
 //===== TERMUXFILE: Testmate/lib/gateway/types.ts =====
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -943,6 +1486,426 @@ export async function projectionStatus(sb: SupabaseClient, userId: string) {
     received_at: r.received_at,
     schema_version: r.schema_version
   }));
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/requests.ts =====
+import { createHash } from 'crypto';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { chapterMatches } from './chapter-match';
+import { getSubjectByChapter } from './evidence';
+import { ToolInputError } from './types';
+import type { GatewayPrincipal } from './types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request queue (FINAL_PLAN Phase 3 / "Writes: V2").
+//
+// The gateway NEVER changes mastery, attempts, tasks or tests. A tool call from an
+// external AI only appends a bounded, validated row to gateway_requests. Checkmate on the
+// phone pulls pending rows, applies its own policy layer, and reports accepted/rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// dismiss_task stays in the list only so old rows still type-check; no tool creates it any more
+// and the phone always rejects it.
+export const REQUEST_KINDS = ['request_repair', 'create_task', 'schedule_task', 'dismiss_task'] as const;
+export type RequestKind = (typeof REQUEST_KINDS)[number];
+export const TASK_TYPES = ['repair', 'retention', 'qbank_practice', 'revision', 'study'] as const;
+export const STUDY_TYPES = ['LECTURE', 'PRACTICE', 'REVISION', 'READING'] as const;
+export const MIN_STUDY_MINUTES = 10;
+export const MAX_STUDY_MINUTES = 120;
+const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+export const REQUEST_STATUSES = ['pending', 'claimed', 'accepted', 'rejected', 'expired', 'cancelled'] as const;
+
+export const MAX_OPEN_REQUESTS = 5; // pending + claimed, per student
+export const MAX_REQUESTS_PER_DAY = 20; // created in the last 24h, per student
+const TTL_MS = 24 * 3_600_000;
+const STALE_CLAIM_MS = 10 * 60_000; // a claim the phone never answered becomes claimable again
+const TABLE = 'gateway_requests';
+const OPEN: string[] = ['pending', 'claimed'];
+
+/** Error with an HTTP status, for the device-facing routes. */
+export class RequestError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// ── Input hygiene ────────────────────────────────────────────────────────────
+// Everything below arrives from a model, so it is treated as untrusted data: bounded,
+// control characters stripped, unknown fields ignored.
+function cleanText(v: unknown, field: string, opts: { min?: number; max: number; required?: boolean }): string | undefined {
+  if (v === undefined || v === null || v === '') {
+    if (opts.required) throw new ToolInputError(`${field} is required.`);
+    return undefined;
+  }
+  if (typeof v !== 'string') throw new ToolInputError(`${field} must be a string.`);
+  const t = v.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) {
+    if (opts.required) throw new ToolInputError(`${field} is required.`);
+    return undefined;
+  }
+  if (opts.min && t.length < opts.min) throw new ToolInputError(`${field} must be at least ${opts.min} characters.`);
+  if (t.length > opts.max) throw new ToolInputError(`${field} must be at most ${opts.max} characters.`);
+  return t;
+}
+
+async function canonicalChapter(sb: SupabaseClient, raw: string): Promise<{ chapter: string; subject: string | null }> {
+  const known = await getSubjectByChapter(sb);
+  if (known.size === 0) return { chapter: raw, subject: null }; // syllabus not seeded: nothing to check against
+  const names = Array.from(known.keys());
+  const exact = names.filter((n) => n.trim().toLowerCase() === raw.trim().toLowerCase());
+  const hits = exact.length > 0 ? exact : names.filter((n) => chapterMatches(n, raw));
+  if (hits.length === 1) return { chapter: hits[0], subject: known.get(hits[0]) ?? null };
+  if (hits.length === 0) {
+    throw new ToolInputError(`Unknown chapter "${raw}". Use a chapter name from checkmate_get_qbank_progress.`);
+  }
+  throw new ToolInputError(`"${raw}" matches ${hits.length} chapters; use the full name. Matches: ${hits.slice(0, 5).join(' | ')}`);
+}
+
+function validDueDate(v: unknown): string | undefined {
+  const s = cleanText(v, 'due_date', { max: 10 });
+  if (!s) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(`${s}T00:00:00Z`))) {
+    throw new ToolInputError('due_date must be a real date in YYYY-MM-DD format.');
+  }
+  const day = Date.parse(`${s}T00:00:00Z`);
+  const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T00:00:00Z');
+  if (day < today - 86_400_000 || day > today + 14 * 86_400_000) {
+    throw new ToolInputError('due_date must be within the next 14 days.');
+  }
+  return s;
+}
+
+function validTime(v: unknown, field: string, required: boolean): string | undefined {
+  const s = cleanText(v, field, { max: 5, required });
+  if (!s) return undefined;
+  if (!HHMM_RE.test(s)) throw new ToolInputError(`${field} must be a 24-hour HH:mm time like 18:30.`);
+  return s;
+}
+
+function validMinutes(v: unknown, field: string): number | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < MIN_STUDY_MINUTES || n > MAX_STUDY_MINUTES) {
+    throw new ToolInputError(`${field} must be a whole number of minutes from ${MIN_STUDY_MINUTES} to ${MAX_STUDY_MINUTES}.`);
+  }
+  return n;
+}
+
+export async function normalizeRequest(
+  sb: SupabaseClient,
+  kind: RequestKind,
+  args: Record<string, unknown>
+): Promise<{ payload: Record<string, unknown>; reason: string }> {
+  const reason = cleanText(args.reason, 'reason', { min: 10, max: 500, required: true })!;
+
+  if (kind === 'request_repair') {
+    const { chapter, subject } = await canonicalChapter(sb, cleanText(args.chapter, 'chapter', { max: 200, required: true })!);
+    return {
+      payload: {
+        chapter,
+        subject,
+        topic: cleanText(args.topic, 'topic', { max: 200 }) ?? null,
+        concept: cleanText(args.concept, 'concept', { max: 200 }) ?? null
+      },
+      reason
+    };
+  }
+
+  if (kind === 'schedule_task') {
+    return {
+      payload: {
+        task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })!,
+        scheduled_start_time: validTime(args.scheduled_start_time, 'scheduled_start_time', true)!,
+        duration_minutes: validMinutes(args.duration_minutes, 'duration_minutes') ?? null
+      },
+      reason
+    };
+  }
+
+  if (kind === 'create_task') {
+    const taskType = cleanText(args.task_type, 'task_type', { max: 30, required: true })!;
+    if (!(TASK_TYPES as readonly string[]).includes(taskType)) {
+      throw new ToolInputError(`task_type must be one of: ${TASK_TYPES.join(', ')}`);
+    }
+    if (taskType === 'study') {
+      // A plain study block (lecture / practice / revision / reading) with no question target.
+      // The chapter is optional context; subject and topic are what the plan shows.
+      const studyType = (cleanText(args.study_type, 'study_type', { max: 20 }) ?? 'PRACTICE').toUpperCase();
+      if (!(STUDY_TYPES as readonly string[]).includes(studyType)) {
+        throw new ToolInputError(`study_type must be one of: ${STUDY_TYPES.join(', ')}`);
+      }
+      const chapterRaw = cleanText(args.chapter, 'chapter', { max: 200 });
+      const resolved = chapterRaw ? await canonicalChapter(sb, chapterRaw) : null;
+      const subject = cleanText(args.subject, 'subject', { max: 60 }) ?? resolved?.subject ?? null;
+      if (!subject) throw new ToolInputError('subject is required for a study task (or give a chapter Checkmate can map to a subject).');
+      return {
+        payload: {
+          task_type: 'study',
+          study_type: studyType,
+          subject,
+          topic: cleanText(args.topic, 'topic', { max: 200, required: true })!,
+          chapter: resolved?.chapter ?? null,
+          duration_minutes: validMinutes(args.duration_minutes, 'duration_minutes') ?? 45,
+          scheduled_start_time: validTime(args.scheduled_start_time, 'scheduled_start_time', false) ?? null,
+          due_date: validDueDate(args.due_date) ?? null
+        },
+        reason
+      };
+    }
+    const { chapter, subject } = await canonicalChapter(sb, cleanText(args.chapter, 'chapter', { max: 200, required: true })!);
+    let target = 10;
+    if (args.target_questions !== undefined && args.target_questions !== null) {
+      const n = Number(args.target_questions);
+      if (!Number.isInteger(n) || n < 1 || n > 50) throw new ToolInputError('target_questions must be a whole number from 1 to 50.');
+      target = n;
+    }
+    return {
+      payload: {
+        task_type: taskType,
+        chapter,
+        subject,
+        title: cleanText(args.title, 'title', { max: 120 }) ?? null,
+        target_questions: target,
+        due_date: validDueDate(args.due_date) ?? null
+      },
+      reason
+    };
+  }
+
+  // dismiss_task
+  return { payload: { task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })! }, reason };
+}
+
+// payload keys are always built in a fixed order above, so this is deterministic.
+export function dedupeKey(kind: RequestKind, payload: Record<string, unknown>): string {
+  return createHash('sha256').update(`${kind}|${JSON.stringify(payload)}`).digest('hex');
+}
+
+// ── Views (what leaves the server; never user_id / token_id) ─────────────────
+function view(row: any) {
+  return {
+    request_id: row.id,
+    kind: row.kind,
+    status: row.status,
+    payload: row.payload,
+    reason: row.reason,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    resolved_at: row.resolved_at ?? null,
+    result: row.result ?? null
+  };
+}
+
+const COLS = 'id, kind, status, payload, reason, created_at, expires_at, claimed_at, resolved_at, result';
+
+async function expireStale(sb: SupabaseClient, userId: string): Promise<void> {
+  const { error } = await sb
+    .from(TABLE)
+    .update({ status: 'expired', resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('status', 'pending')
+    .lt('expires_at', new Date().toISOString());
+  if (error) console.error('[gateway/requests] expire failed:', error.message);
+}
+
+async function countRows(sb: SupabaseClient, userId: string, build: (q: any) => any): Promise<number> {
+  const { count, error } = await build(sb.from(TABLE).select('id', { count: 'exact', head: true }).eq('user_id', userId));
+  if (error) throw error;
+  return count ?? 0;
+}
+
+// ── AI-facing operations (called from gateway tools) ─────────────────────────
+export async function createRequest(
+  sb: SupabaseClient,
+  principal: GatewayPrincipal,
+  kind: RequestKind,
+  args: Record<string, unknown>
+) {
+  const userId = principal.userId;
+  const { payload, reason } = await normalizeRequest(sb, kind, args);
+  const key = dedupeKey(kind, payload);
+  await expireStale(sb, userId);
+
+  const open = await countRows(sb, userId, (q) => q.in('status', OPEN));
+  if (open >= MAX_OPEN_REQUESTS) {
+    throw new ToolInputError(
+      `There are already ${open} open requests (limit ${MAX_OPEN_REQUESTS}). Wait for Checkmate to answer them, or cancel some with checkmate_cancel_request.`
+    );
+  }
+  const today = await countRows(sb, userId, (q) => q.gte('created_at', new Date(Date.now() - 86_400_000).toISOString()));
+  if (today >= MAX_REQUESTS_PER_DAY) {
+    throw new ToolInputError(`Daily request limit reached (${MAX_REQUESTS_PER_DAY} per 24h). Try again later.`);
+  }
+
+  const { data, error } = await sb
+    .from(TABLE)
+    .insert({
+      user_id: userId,
+      token_id: principal.tokenId,
+      kind,
+      payload,
+      reason,
+      dedupe_key: key,
+      expires_at: new Date(Date.now() + TTL_MS).toISOString()
+    })
+    .select(COLS)
+    .single();
+
+  if (error) {
+    if ((error as any).code === '23505') {
+      const { data: existing } = await sb
+        .from(TABLE)
+        .select(COLS)
+        .eq('user_id', userId)
+        .eq('dedupe_key', key)
+        .in('status', OPEN)
+        .maybeSingle();
+      if (existing) {
+        return { ...view(existing), duplicate: true, note: 'An identical request is already open, so nothing new was queued.' };
+      }
+    }
+    throw error;
+  }
+  return {
+    ...view(data),
+    note:
+      "Queued only. Nothing has changed yet: Checkmate on the student's phone checks it against its own policy and may accept or reject it. Use checkmate_get_requests to see the outcome (the phone must be online)."
+  };
+}
+
+export async function getRequests(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  await expireStale(sb, userId);
+  const id = cleanText(args.request_id, 'request_id', { max: 64 });
+  if (id) {
+    const { data, error } = await sb.from(TABLE).select(COLS).eq('user_id', userId).eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!data) throw new ToolInputError('No request with that id.');
+    return { request: view(data) };
+  }
+  const status = cleanText(args.status, 'status', { max: 20 });
+  if (status && !(REQUEST_STATUSES as readonly string[]).includes(status)) {
+    throw new ToolInputError(`status must be one of: ${REQUEST_STATUSES.join(', ')}`);
+  }
+  const days = Math.min(30, Math.max(1, Math.trunc(Number(args.days) || 7)));
+  const limit = Math.min(30, Math.max(1, Math.trunc(Number(args.limit) || 10)));
+  let q: any = sb
+    .from(TABLE)
+    .select(COLS)
+    .eq('user_id', userId)
+    .gte('created_at', new Date(Date.now() - days * 86_400_000).toISOString())
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (status) q = q.eq('status', status);
+  const { data, error } = await q;
+  if (error) throw error;
+  return { window_days: days, requests: (data ?? []).map(view) };
+}
+
+export async function cancelRequest(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const id = cleanText(args.request_id, 'request_id', { max: 64, required: true })!;
+  const { data, error } = await sb
+    .from(TABLE)
+    .update({ status: 'cancelled', resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('id', id)
+    .eq('status', 'pending')
+    .select(COLS)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return { request: view(data), note: 'Cancelled before Checkmate picked it up.' };
+
+  const { data: row } = await sb.from(TABLE).select('status').eq('user_id', userId).eq('id', id).maybeSingle();
+  if (!row) throw new ToolInputError('No request with that id.');
+  throw new ToolInputError(`Only a pending request can be cancelled; this one is already ${row.status}.`);
+}
+
+// ── Device-facing operations (Checkmate Android, device-token auth) ──────────
+export async function claimPendingRequests(sb: SupabaseClient, userId: string, limit = 10) {
+  await expireStale(sb, userId);
+  const nowIso = new Date().toISOString();
+  const staleIso = new Date(Date.now() - STALE_CLAIM_MS).toISOString();
+
+  const { data: pend, error: e1 } = await sb
+    .from(TABLE)
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'pending')
+    .gt('expires_at', nowIso)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (e1) throw e1;
+  const { data: stale, error: e2 } = await sb
+    .from(TABLE)
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'claimed')
+    .lt('claimed_at', staleIso)
+    .gt('expires_at', nowIso)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (e2) throw e2;
+
+  const claimed: any[] = [];
+  // The status guard in each update makes a claim atomic per row: two phones racing for the
+  // same row can't both win.
+  for (const [ids, from] of [
+    [(pend ?? []).map((r: any) => r.id), 'pending'],
+    [(stale ?? []).map((r: any) => r.id), 'claimed']
+  ] as [string[], string][]) {
+    if (ids.length === 0) continue;
+    const { data, error } = await sb
+      .from(TABLE)
+      .update({ status: 'claimed', claimed_at: nowIso })
+      .eq('user_id', userId)
+      .eq('status', from)
+      .in('id', ids)
+      .select(COLS);
+    if (error) throw error;
+    claimed.push(...(data ?? []));
+  }
+  claimed.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  return {
+    requests: claimed.slice(0, limit).map((r) => ({
+      request_id: r.id,
+      kind: r.kind,
+      payload: r.payload,
+      reason: r.reason,
+      created_at: r.created_at,
+      expires_at: r.expires_at
+    }))
+  };
+}
+
+export async function resolveRequest(sb: SupabaseClient, userId: string, id: string, body: any) {
+  const status = body?.status;
+  if (status !== 'accepted' && status !== 'rejected') throw new RequestError("status must be 'accepted' or 'rejected'", 400);
+  const r = body?.result && typeof body.result === 'object' ? body.result : {};
+  const short = (v: unknown, max: number) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+  const result = {
+    message: short(r.message, 300),
+    policy_decision: short(r.policy_decision, 60),
+    task_id: short(r.task_id, 100),
+    intervention_id: short(r.intervention_id, 100)
+  };
+
+  const { data, error } = await sb
+    .from(TABLE)
+    .update({ status, result, resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('id', id)
+    .eq('status', 'claimed')
+    .select(COLS)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return { request: view(data) };
+
+  const { data: row, error: e2 } = await sb.from(TABLE).select(COLS).eq('user_id', userId).eq('id', id).maybeSingle();
+  if (e2) throw e2;
+  if (!row) throw new RequestError('No request with that id.', 404);
+  if (row.status === status) return { request: view(row) }; // a retried report is not an error
+  throw new RequestError(`Request is ${row.status}; only a claimed request can be resolved.`, 409);
 }
 
 //===== TERMUXFILE: Testmate/lib/gateway/tools-extra.ts =====
@@ -1588,7 +2551,7 @@ import {
   questionLevelMastery,
   upcomingTestsView
 } from './tools-lib';
-import { cancelRequest, createRequest, getRequests, REQUEST_STATUSES, TASK_TYPES } from './requests';
+import { REQUEST_STATUSES, STUDY_TYPES, TASK_TYPES, cancelRequest, createRequest, getRequests } from './requests';
 import { Scope, ToolContext, ToolDef } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1961,16 +2924,31 @@ export function buildTools(): ToolDef[] {
       async (a, c) => createRequest(c.supabase, c.principal, 'request_repair', a)),
 
     requestTool('create_task', 'Request a study task',
-      "Ask Checkmate to add a study task to the student's plan. Queues a request only; Checkmate decides. Call it only when the student asked for it, and check checkmate_get_today_plan first.",
+      "Ask Checkmate to add a task to TODAY's plan. Queues a request only; the student's phone checks it and may reject it, and the outcome comes back through checkmate_get_requests (the phone picks requests up within about 30 minutes). Call it only when the student asked for it, and look at checkmate_get_today_plan first. task_type 'study' is a plain study block: give subject, topic, study_type, duration_minutes and optionally scheduled_start_time (HH:mm, today, inside the student's study window, not overlapping a blocked slot or another task); without a time Checkmate places it in the first free slot. Other task types (repair, qbank_practice) are chapter-based question tasks. retention and revision are decided by Checkmate itself and will be rejected.",
       schema({
-        task_type: { type: 'string', enum: [...TASK_TYPES], description: 'repair | retention | qbank_practice | revision' },
-        chapter: S('Chapter the task is about.'),
-        title: S('Optional short title (max 120 chars).'),
-        target_questions: I('How many questions (default 10, max 50).', 1, 50),
-        due_date: S('Optional YYYY-MM-DD within the next 14 days.'),
+        task_type: { type: 'string', enum: [...TASK_TYPES], description: "study (a plain study block) | repair | qbank_practice | retention | revision. Prefer study, repair or qbank_practice." },
+        subject: S("Subject (study tasks). Optional if chapter maps to one."),
+        topic: S('What to study (study tasks). Short, e.g. "Newton\'s laws numericals".'),
+        study_type: { type: 'string', enum: [...STUDY_TYPES], description: 'LECTURE | PRACTICE | REVISION | READING (study tasks, default PRACTICE).' },
+        duration_minutes: I('Length in minutes (study tasks): 10 to 120, default 45.', 10, 120),
+        scheduled_start_time: S('Optional start time today, 24-hour HH:mm (study tasks).'),
+        chapter: S('Chapter the task is about (required for repair / qbank_practice, optional context for study).'),
+        title: S('Optional short title for repair / qbank_practice tasks (max 120 chars).'),
+        target_questions: I('How many questions for repair / qbank_practice (default 10, max 50).', 1, 50),
+        due_date: S("Optional YYYY-MM-DD. Checkmate only plans today, so any other day is rejected."),
         reason: REASON
-      }, ['task_type', 'chapter', 'reason']),
+      }, ['task_type', 'reason']),
       async (a, c) => createRequest(c.supabase, c.principal, 'create_task', a)),
+
+    requestTool('schedule_task', 'Request a new time for a task',
+      "Ask Checkmate to move a task that is already in TODAY's plan to a start time (and optionally change its length). Get task_id from checkmate_get_today_plan or checkmate_get_pending_tasks. Only pending tasks can be moved, the time must still be ahead today, inside the student's study window and free of blocked slots and other tasks; if it isn't, the rejection message names the first free slot. Queues a request only; call it only when the student asked for it.",
+      schema({
+        task_id: S('Task id from checkmate_get_today_plan.'),
+        scheduled_start_time: S('New start time today, 24-hour HH:mm.'),
+        duration_minutes: I('Optional new length in minutes (10 to 120). Not allowed for Checkmate-generated repair tasks.', 10, 120),
+        reason: REASON
+      }, ['task_id', 'scheduled_start_time', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'schedule_task', a)),
 
     requestTool('cancel_request', 'Cancel a pending request',
       'Cancel a request that Checkmate has not picked up yet. Requests already claimed, accepted or rejected cannot be cancelled.',
@@ -2061,14 +3039,14 @@ const MODERN_VERSION = '2026-07-28';
 const ALL_VERSIONS = [MODERN_VERSION, ...SUPPORTED_VERSIONS];
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
 const META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
-const SERVER_INFO = { name: 'checkmate-gateway', title: 'Checkmate Learning Gateway', version: '1.4.0' };
+const SERVER_INFO = { name: 'checkmate-gateway', title: 'Checkmate Learning Gateway', version: '1.5.0' };
 const INSTRUCTIONS =
   "Access to one student's learning data from Checkmate (planner/mastery) and Testmate (tests, Q-bank). All data tools are read-only. " +
   'Start with checkmate_get_student_snapshot, or checkmate_get_context(purpose=...) for a task-specific bundle. ' +
   'Question-level tools return the real questions, the student\'s answers, correct answers and explanations — use them to ground any diagnosis ' +
   'instead of guessing from counts. Data may be stale if the phone has not synced (see freshness fields). ' +
   'This gateway cannot change learning data. A token with the checkmate:plan scope additionally gets request tools ' +
-  '(checkmate_request_repair, checkmate_create_task) that only QUEUE a request: the student\'s Checkmate app ' +
+  '(checkmate_request_repair, checkmate_create_task, checkmate_schedule_task) that only QUEUE a request: the student\'s Checkmate app ' +
   'decides whether to accept it. Only make a request when the student has asked for it in this conversation. ' +
   'A token with the checkmate:behavior scope also gets aggregate behavior, attention and adherence summaries (never individual events).';
 
