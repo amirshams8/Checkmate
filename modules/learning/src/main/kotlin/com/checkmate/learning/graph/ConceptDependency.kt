@@ -43,4 +43,9 @@ interface ConceptDependencyDao {
 
     @Query("SELECT conceptId FROM concept_dependencies WHERE prerequisiteConceptId = :prerequisiteConceptId")
     suspend fun getDependents(prerequisiteConceptId: String): List<String>
+
+    // Read-only, no schema change. Used by GatewaySync to push the prerequisite graph to the
+    // MCP gateway's knowledge_graph projection (the graph is a few hundred edges at most).
+    @Query("SELECT * FROM concept_dependencies")
+    suspend fun getAll(): List<ConceptDependency>
 }
