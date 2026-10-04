@@ -1,422 +1,3365 @@
-//===== FILE: app/src/main/kotlin/com/checkmate/service/GatewaySyncManager.kt =====
-package com.checkmate.service
+//===== TERMUXFILE: Testmate/lib/gateway/chapter-match.ts =====
+// Forgiving chapter-name matching for gateway filters.
+//
+// Testmate tags chapters with long, sometimes inconsistent names, e.g.
+//   "Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"
+//   "Cell : The Unit of Life"  vs  "Cell: The Unit of Life"
+// An exact-string filter makes a short, natural name like "Biomolecules-II" silently match
+// nothing. These helpers keep exact matching as the first choice and add two safe fallbacks:
+//   1. case / whitespace / colon-spacing differences are ignored;
+//   2. the wanted name may be a leading part of the stored name, but only when it ends at a
+//      word boundary (end, space or "("), so "Biomolecules" does NOT match "Biomolecules-II".
 
-import android.content.Context
-import android.util.Log
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
-import androidx.work.CoroutineWorker
-import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.WorkManager
-import androidx.work.WorkerParameters
-import com.checkmate.core.CheckmatePrefs
-import com.checkmate.core.ConsultationProfile
-import com.checkmate.learning.engine.MasteryEngine
-import com.checkmate.learning.model.StudentModel
-import com.checkmate.learning.student.StudentModelBuilder
-import com.checkmate.planner.PlanStore
-import com.checkmate.planner.intervention.InterventionDatabase
-import com.checkmate.testmate.TestmateApi
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+export function normalizeChapter(s: string | null | undefined): string {
+  return (s ?? '')
+    .toLowerCase()
+    .replace(/\s*:\s*/g, ': ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function chapterMatches(actual: string | null | undefined, wanted: string | null | undefined): boolean {
+  const a = normalizeChapter(actual);
+  const w = normalizeChapter(wanted);
+  if (!a || !w) return false;
+  if (a === w) return true;
+  if (!a.startsWith(w)) return false;
+  const next = a.charAt(w.length);
+  return next === ' ' || next === '(';
+}
+
+// SQL LIKE pattern for the same idea (used where the filter has to run inside Supabase).
+// Callers MUST still post-filter with chapterMatches(): LIKE cannot express the word-boundary
+// rule, and the colon-spacing wildcard is deliberately loose.
+export function chapterLikePattern(wanted: string): string {
+  const escaped = wanted.trim().replace(/[\\%_]/g, (m) => '\\' + m);
+  return escaped.replace(/\s*:\s*/g, '%:%') + '%';
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/evidence.ts =====
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { canonicalQuestionId } from '@/lib/retention';
+import type { GeneratedFrom } from '@/lib/test-origin';
+import { chapterLikePattern, chapterMatches } from './chapter-match';
+import { ToolInputError } from './types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Learning Evidence layer (FINAL_PLAN: question-level evidence is core to v1).
+//
+// Everything here is question-centric: the actual question, the student's answer, the
+// right answer, the explanation, WHY the question was in front of them (provenance /
+// purpose), and what happened. Nothing returns a raw table row — rows are reshaped into
+// semantic objects, so the Room/Supabase schema can evolve without breaking AI clients.
+//
+// Attempts are always resolved to the CANONICAL question (origin_question_id ?? id, same
+// rule as lib/retention.ts) so a question copied into three Q-bank / repair tests reads as
+// one question with one history, not three.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHUNK_SIZE = 150;
+
+export const QUESTION_SELECT =
+  'id, test_id, question_number, question_text, question_image_url, question_data, options, option_images, correct_answer, marks, negative_marks, chapter, topic, difficulty, question_type, explanation, origin_question_id, tag_source';
+
+export type Provenance = 'full_test' | 'qbank_practice' | 'targeted_repair' | 'retention_check' | 'coaching_bank';
+export type AttemptStatus = 'CORRECT' | 'WRONG' | 'SKIPPED' | 'UNSCORED';
+export type SourceFilter = 'all' | Provenance;
+export const SOURCE_VALUES: SourceFilter[] = [
+  'all',
+  'full_test',
+  'qbank_practice',
+  'targeted_repair',
+  'retention_check',
+  'coaching_bank'
+];
+
+function chunk<T>(arr: T[], size = CHUNK_SIZE): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/** `.in()` in URL-safe batches (same defense as app/api/tests/targeted — see its BUGFIX note). */
+async function selectIn(
+  sb: SupabaseClient,
+  table: string,
+  select: string,
+  column: string,
+  ids: string[],
+  opts: { paged?: boolean; decorate?: (q: any) => any } = {}
+): Promise<any[]> {
+  const out: any[] = [];
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  for (const batch of chunk(unique)) {
+    if (!opts.paged) {
+      let q: any = sb.from(table).select(select).in(column, batch);
+      if (opts.decorate) q = opts.decorate(q);
+      const { data, error } = await q;
+      if (error) throw error;
+      out.push(...(data ?? []));
+      continue;
+    }
+    // PostgREST caps one response at 1000 rows — page through with a stable order.
+    for (let from = 0; ; from += 1000) {
+      let q: any = sb.from(table).select(select).in(column, batch).order('id', { ascending: true }).range(from, from + 999);
+      if (opts.decorate) q = opts.decorate(q);
+      const { data, error } = await q;
+      if (error) throw error;
+      const rows = data ?? [];
+      out.push(...rows);
+      if (rows.length < 1000) break;
+    }
+  }
+  return out;
+}
+
+export function provenanceOf(generatedFrom: unknown, sessionInterventionId?: string | null): Provenance {
+  const gf = (generatedFrom && typeof generatedFrom === 'object' ? generatedFrom : null) as GeneratedFrom | null;
+  const interventionId = gf?.intervention_id ?? sessionInterventionId ?? null;
+  if (gf?.kind === 'qbank_practice') return 'qbank_practice';
+  if (gf?.kind === 'coaching_bank') return 'coaching_bank';
+  if (interventionId) return interventionId.startsWith('retention-') ? 'retention_check' : 'targeted_repair';
+  if (gf?.kind === 'targeted_repair') return 'targeted_repair';
+  return 'full_test';
+}
+
+export function statusOf(selected: string | null | undefined, isCorrect: boolean | null | undefined): AttemptStatus {
+  if (selected === null || selected === undefined || selected === '') return 'SKIPPED';
+  if (isCorrect === true) return 'CORRECT';
+  if (isCorrect === false) return 'WRONG';
+  return 'UNSCORED';
+}
+
+// ── Time helpers (the student is in India; "today" for Q-bank means their local day) ──
+function offsetMinutes(): number {
+  const raw = process.env.GATEWAY_TZ_OFFSET || '+05:30';
+  const m = /^([+-])(\d{2}):(\d{2})$/.exec(raw);
+  if (!m) return 330;
+  return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+}
+export function localDateString(at = new Date()): string {
+  return new Date(at.getTime() + offsetMinutes() * 60_000).toISOString().slice(0, 10);
+}
+function localDayBounds(date: string): { start: string; end: string } {
+  const off = process.env.GATEWAY_TZ_OFFSET || '+05:30';
+  const start = new Date(`${date}T00:00:00${off}`);
+  return { start: start.toISOString(), end: new Date(start.getTime() + 86_400_000).toISOString() };
+}
+function sinceFromDays(days: number): string {
+  return new Date(Date.now() - days * 86_400_000).toISOString();
+}
+
+// ── Public shapes ────────────────────────────────────────────────────────────
+export function shapeQuestion(q: any) {
+  return {
+    question_id: q.id as string,
+    canonical_question_id: canonicalQuestionId(q) as string,
+    question_number: q.question_number ?? null,
+    question_text: q.question_text ?? null,
+    question_image_url: q.question_image_url ?? null,
+    question_data: q.question_data ?? null,
+    options: q.options ?? null,
+    option_images: q.option_images ?? null,
+    question_type: q.question_type ?? null,
+    chapter: q.chapter ?? null,
+    topic: q.topic ?? null,
+    difficulty: q.difficulty ?? null,
+    marks: q.marks ?? null,
+    negative_marks: q.negative_marks ?? null,
+    correct_answer: q.correct_answer ?? null,
+    explanation: q.explanation ?? null
+  };
+}
+
+export function compactQuestion(q: any) {
+  return {
+    question_id: q.id as string,
+    canonical_question_id: canonicalQuestionId(q) as string,
+    chapter: q.chapter ?? null,
+    topic: q.topic ?? null,
+    question_type: q.question_type ?? null
+  };
+}
+
+export interface Attempt {
+  response_id: string;
+  session_id: string;
+  question: any;
+  canonical_id: string;
+  status: AttemptStatus;
+  selected_answer: string | null;
+  answered_at: string | null;
+  time_spent_seconds: number | null;
+  provenance: Provenance;
+  test_id: string | null;
+  test_title: string | null;
+  intervention_id: string | null;
+  skip_kind?: 'left_blank' | 'never_opened';
+}
+
+export function shapeAttempt(a: Attempt) {
+  return {
+    status: a.status,
+    selected_answer: a.selected_answer,
+    answered_at: a.answered_at,
+    time_spent_seconds: a.time_spent_seconds,
+    provenance: a.provenance,
+    test_title: a.test_title,
+    session_id: a.session_id,
+    intervention_id: a.intervention_id,
+    ...(a.skip_kind ? { skip_kind: a.skip_kind } : {})
+  };
+}
+
+export function summarizeHistory(group: Attempt[]) {
+  const wrong = group.filter((a) => a.status === 'WRONG').length;
+  const skipped = group.filter((a) => a.status === 'SKIPPED').length;
+  const correct = group.filter((a) => a.status === 'CORRECT').length;
+  const lastCorrect = group.find((a) => a.status === 'CORRECT');
+  const lastWrong = group.find((a) => a.status === 'WRONG');
+  return {
+    attempts: group.length,
+    correct,
+    wrong,
+    skipped,
+    last_correct_at: lastCorrect?.answered_at ?? null,
+    last_wrong_at: lastWrong?.answered_at ?? null
+  };
+}
+
+export function groupByCanonical(attempts: Attempt[]): Map<string, Attempt[]> {
+  const map = new Map<string, Attempt[]>();
+  for (const a of attempts) {
+    const g = map.get(a.canonical_id);
+    if (g) g.push(a);
+    else map.set(a.canonical_id, [a]);
+  }
+  const ts = (a: Attempt) => (a.answered_at ? new Date(a.answered_at).getTime() : 0);
+  for (const g of Array.from(map.values())) g.sort((x, y) => ts(y) - ts(x));
+  return map;
+}
+
+// ── Loading ──────────────────────────────────────────────────────────────────
+export async function getSubjectByChapter(sb: SupabaseClient): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const { data, error } = await sb.from('syllabus_chapters').select('chapter, subject');
+  if (error) return map; // best-effort, same as lib/daily-target-engine.ts
+  for (const r of data ?? []) if (r.chapter && r.subject && !map.has(r.chapter)) map.set(r.chapter, r.subject);
+  return map;
+}
+
+/** Every response this student gave since `sinceIso`, enriched with question + provenance. */
+export async function loadAttempts(
+  sb: SupabaseClient,
+  userId: string,
+  opts: { sinceIso?: string; maxRows?: number } = {}
+): Promise<Attempt[]> {
+  const maxRows = opts.maxRows ?? 4000;
+  const rows: any[] = [];
+  for (let from = 0; rows.length < maxRows; from += 1000) {
+    let q: any = sb
+      .from('responses')
+      .select('id, session_id, question_id, selected_answer, is_correct, answered_at, time_spent_seconds')
+      .eq('user_id', userId)
+      .order('answered_at', { ascending: false })
+      .range(from, from + 999);
+    if (opts.sinceIso) q = q.gte('answered_at', opts.sinceIso);
+    const { data, error } = await q;
+    if (error) throw error;
+    const page = data ?? [];
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  return enrichResponses(sb, rows);
+}
+
+async function enrichResponses(sb: SupabaseClient, rows: any[]): Promise<Attempt[]> {
+  if (rows.length === 0) return [];
+  const [sessions, questions] = await Promise.all([
+    selectIn(sb, 'test_sessions', 'id, test_id, intervention_id', 'id', rows.map((r) => r.session_id)),
+    selectIn(sb, 'questions', QUESTION_SELECT, 'id', rows.map((r) => r.question_id))
+  ]);
+  const sessionById = new Map(sessions.map((s) => [s.id as string, s]));
+  const questionById = new Map(questions.map((q) => [q.id as string, q]));
+  const tests = await selectIn(
+    sb,
+    'tests',
+    'id, title, generated_from, created_at',
+    'id',
+    sessions.map((s) => s.test_id as string)
+  );
+  const testById = new Map(tests.map((t) => [t.id as string, t]));
+
+  const out: Attempt[] = [];
+  for (const r of rows) {
+    const q = questionById.get(r.question_id);
+    if (!q) continue;
+    const s = sessionById.get(r.session_id);
+    const t = s ? testById.get(s.test_id) : undefined;
+    out.push({
+      response_id: r.id,
+      session_id: r.session_id,
+      question: q,
+      canonical_id: canonicalQuestionId(q),
+      status: statusOf(r.selected_answer, r.is_correct),
+      selected_answer: r.selected_answer ?? null,
+      answered_at: r.answered_at ?? null,
+      time_spent_seconds: typeof r.time_spent_seconds === 'number' ? r.time_spent_seconds : null,
+      provenance: provenanceOf(t?.generated_from, s?.intervention_id),
+      test_id: s?.test_id ?? null,
+      test_title: t?.title ?? null,
+      intervention_id: s?.intervention_id ?? (t?.generated_from as any)?.intervention_id ?? null
+    });
+  }
+  return out;
+}
 
 /**
- * Checkmate MCP gateway — read-projection push (FINAL_PLAN "Option C — hybrid").
- *
- * Checkmate stays the source of truth for the student model, the intervention history and
- * today's plan. This pushes curated SNAPSHOTS of those three things to Testmate's
- * `PUT /api/gateway/projection`, using the SAME base URL + device token the rest of
- * Checkmate already uses for Testmate (Settings -> Test Platform). The MCP gateway on the
- * Testmate side only ever reads those stored snapshots — it never reaches into this phone,
- * and keeps answering (with a freshness stamp) while the phone is offline.
- *
- * What is deliberately NOT pushed: the raw behavior event ledger, screen/app-usage data,
- * profile/consultation text, API keys, anything outside the three snapshots below. The
- * server re-normalizes every field it accepts, so this file is the first filter, not the
- * only one.
- *
- * Fire-and-forget background sync: a periodic WorkManager job (network required) plus one
- * immediate run at app start. Each snapshot is pushed independently — one failing (e.g. an
- * empty student model on a fresh install) never blocks the others.
+ * Questions in a SUBMITTED session that have no response row at all — the student never
+ * opened them. scoring.ts counts these as skipped (`!response || !selected`), but they
+ * leave no `responses` trail, so left_blank-only logic (lib/qbank-review.ts's KNOWN
+ * LIMITATION) misses them. Bounded to the most recent submitted sessions.
  */
-object GatewaySync {
+async function loadNeverOpened(
+  sb: SupabaseClient,
+  userId: string,
+  sinceIso: string,
+  maxSessions = 25
+): Promise<Attempt[]> {
+  const { data: parts, error } = await sb
+    .from('session_participants')
+    .select('session_id, submitted_at')
+    .eq('user_id', userId)
+    .not('submitted_at', 'is', null)
+    .gte('submitted_at', sinceIso)
+    .order('submitted_at', { ascending: false })
+    .limit(maxSessions);
+  if (error) throw error;
+  if (!parts || parts.length === 0) return [];
 
-    private const val TAG = "GatewaySync"
-    private const val MAX_INTERVENTIONS = 300
+  const sessionIds = parts.map((p: any) => p.session_id as string);
+  const sessions = await selectIn(sb, 'test_sessions', 'id, test_id, intervention_id', 'id', sessionIds);
+  const testIds = sessions.map((s) => s.test_id as string);
+  const [tests, questions, responded] = await Promise.all([
+    selectIn(sb, 'tests', 'id, title, generated_from', 'id', testIds),
+    selectIn(sb, 'questions', QUESTION_SELECT, 'test_id', testIds, { paged: true }),
+    selectIn(sb, 'responses', 'id, session_id, question_id', 'session_id', sessionIds, {
+      paged: true,
+      decorate: (q) => q.eq('user_id', userId)
+    })
+  ]);
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+  const testById = new Map(tests.map((t) => [t.id as string, t]));
+  const respondedBySession = new Map<string, Set<string>>();
+  for (const r of responded) {
+    const set = respondedBySession.get(r.session_id) ?? new Set<string>();
+    set.add(r.question_id);
+    respondedBySession.set(r.session_id, set);
+  }
+  const questionsByTest = new Map<string, any[]>();
+  for (const q of questions) {
+    const arr = questionsByTest.get(q.test_id) ?? [];
+    arr.push(q);
+    questionsByTest.set(q.test_id, arr);
+  }
+  const submittedAt = new Map(parts.map((p: any) => [p.session_id as string, p.submitted_at as string]));
 
-    enum class PushResult { OK, SKIPPED_NOT_CONFIGURED, REJECTED, RETRYABLE_FAILURE }
-
-    /** Pushes all three snapshots. Returns the worst outcome so the Worker can decide to retry. */
-    suspend fun pushAll(context: Context): PushResult = withContext(Dispatchers.IO) {
-        val base = baseUrl()
-        val token = token()
-        if (base == null || token == null) return@withContext PushResult.SKIPPED_NOT_CONFIGURED
-
-        // `map` is inline, so the suspend builders are legal here (a lambda stored in a
-        // listOf(...) is NOT a suspend lambda — that was the compile error).
-        val results = listOf("student_model", "interventions", "today_plan").map { kind ->
-            try {
-                val payload = when (kind) {
-                    "student_model" -> buildStudentModel(context)
-                    "interventions" -> buildInterventions(context)
-                    else -> buildTodayPlan()
-                }
-                push(base, token, kind, payload)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.w(TAG, "push $kind failed to build/send: ${e.message}")
-                PushResult.RETRYABLE_FAILURE
-            }
-        }
-        when {
-            PushResult.REJECTED in results -> PushResult.REJECTED
-            PushResult.RETRYABLE_FAILURE in results -> PushResult.RETRYABLE_FAILURE
-            else -> PushResult.OK
-        }
+  const out: Attempt[] = [];
+  for (const s of sessions) {
+    const t = testById.get(s.test_id);
+    const seen = respondedBySession.get(s.id) ?? new Set<string>();
+    for (const q of questionsByTest.get(s.test_id) ?? []) {
+      if (seen.has(q.id)) continue;
+      out.push({
+        response_id: `never_opened:${s.id}:${q.id}`,
+        session_id: s.id,
+        question: q,
+        canonical_id: canonicalQuestionId(q),
+        status: 'SKIPPED',
+        selected_answer: null,
+        answered_at: submittedAt.get(s.id) ?? null,
+        time_spent_seconds: null,
+        provenance: provenanceOf(t?.generated_from, s.intervention_id),
+        test_id: s.test_id,
+        test_title: t?.title ?? null,
+        intervention_id: s.intervention_id ?? (t?.generated_from as any)?.intervention_id ?? null,
+        skip_kind: 'never_opened'
+      });
     }
-
-    // ── config (same prefs + allow-list as TestmateApi; never accepts an arbitrary host) ──
-    private fun baseUrl(): String? {
-        val saved = CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
-            ?.takeIf { it.isNotBlank() } ?: return null
-        if (!TestmateApi.isAllowedBaseUrl(saved)) {
-            Log.w(TAG, "Stored Testmate base URL failed the allow-list check — not syncing")
-            return null
-        }
-        return saved
-    }
-
-    private fun token(): String? =
-        CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
-
-    private fun push(base: String, token: String, kind: String, payload: JSONObject): PushResult {
-        payload.put("generated_ms", System.currentTimeMillis())
-        val body = payload.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder()
-            .url("$base/api/gateway/projection?kind=$kind")
-            .addHeader("Authorization", "Bearer $token")
-            .put(body)
-            .build()
-        client.newCall(request).execute().use { resp ->
-            Log.d(TAG, "push $kind: HTTP ${resp.code}")
-            return when {
-                resp.isSuccessful -> PushResult.OK
-                // 400/401/403/413: retrying the identical payload/credentials can't succeed.
-                resp.code in 400..499 && resp.code != 408 && resp.code != 429 -> PushResult.REJECTED
-                else -> PushResult.RETRYABLE_FAILURE
-            }
-        }
-    }
-
-    // org.json throws on NaN/Infinity — skip non-finite numbers instead of failing the whole push.
-    private fun JSONObject.putNum(key: String, v: Double?): JSONObject {
-        if (v != null && v.isFinite()) put(key, v)
-        return this
-    }
-
-    private fun JSONObject.putStr(key: String, v: String?): JSONObject {
-        if (!v.isNullOrBlank() && v != "null") put(key, v)
-        return this
-    }
-
-    // ── student_model ─────────────────────────────────────────────────────────
-    private suspend fun buildStudentModel(context: Context): JSONObject {
-        val model: StudentModel = StudentModelBuilder.build(context)
-        val root = JSONObject()
-        root.putStr("exam", runCatching { ConsultationProfile.load().examTarget }.getOrNull())
-        root.put("model_version", model.modelVersion)
-        root.put(
-            "overall",
-            JSONObject().apply {
-                put("concepts_tracked", model.overall.conceptsTracked)
-                put("concepts_mastered", model.overall.conceptsMastered)
-                put("concepts_weak", model.overall.conceptsWeak)
-                putNum("average_mastery", model.overall.averageMastery)
-                put("total_attempts", model.overall.totalAttempts)
-                put("unresolved_error_count", model.overall.unresolvedErrorCount)
-            }
-        )
-
-        val concepts = JSONArray()
-        for (c in model.concepts.values) {
-            val issues = JSONArray()
-            for (p in c.prerequisiteIssues) {
-                issues.put(JSONObject().putStr("subject", p.subject).putStr("chapter", p.chapter).putStr("topic", p.topic))
-            }
-            concepts.put(
-                JSONObject().apply {
-                    putStr("concept_id", c.conceptId)
-                    putStr("subject", c.subject)
-                    putStr("chapter", c.chapter)
-                    putStr("topic", c.topic)
-                    putNum("mastery", c.mastery)
-                    putNum("forgetting_risk", c.forgettingRisk)
-                    put("retention_decision", c.retentionDecision.name)
-                    put("attempt_count", c.attemptCount)
-                    putNum("recent_accuracy", c.recentAccuracy)
-                    putNum("lifetime_accuracy", c.lifetimeAccuracy)
-                    put("error_count", c.errorCount)
-                    c.lastSeen?.let { put("last_seen_ms", it) }
-                    put("weak", c.mastery < MasteryEngine.MASTERY_THRESHOLD)
-                    put("prerequisite_issues", issues)
-                }
-            )
-        }
-        root.put("concepts", concepts)
-
-        val errors = JSONArray()
-        for (e in model.unresolvedErrors) {
-            val concept = model.concepts[e.conceptId]
-            errors.put(
-                JSONObject().apply {
-                    putStr("concept_id", e.conceptId)
-                    putStr("subject", concept?.subject)
-                    putStr("chapter", concept?.chapter)
-                    putStr("topic", concept?.topic)
-                    putStr("error_type", e.errorType)
-                    put("occurrences", e.occurrences)
-                    put("first_seen_ms", e.firstSeen)
-                    put("last_seen_ms", e.lastSeen)
-                }
-            )
-        }
-        root.put("unresolved_errors", errors)
-        return root
-    }
-
-    // ── interventions (Outcome Ledger) ────────────────────────────────────────
-    private suspend fun buildInterventions(context: Context): JSONObject {
-        val all = InterventionDatabase.getInstance(context).outcomeLedgerDao().getAll()
-        val entries = JSONArray()
-        all.sortedByDescending { it.resolvedAt }.take(MAX_INTERVENTIONS).forEach { e ->
-            entries.put(
-                JSONObject().apply {
-                    putStr("transaction_id", e.transactionId)
-                    putStr("task_id", e.taskId)
-                    put("trigger_type", e.triggerType.name)
-                    put("terminal_state", e.terminalState.name)
-                    put("provenance", e.provenance.name)
-                    put("attempt_count", e.attemptCount)
-                    put("resolved_ms", e.resolvedAt)
-                    putStr("outcome", e.outcome)
-                    putStr("failure_reason", e.failureReason)
-                }
-            )
-        }
-        return JSONObject().put("entries", entries)
-    }
-
-    // ── today_plan ────────────────────────────────────────────────────────────
-    private fun buildTodayPlan(): JSONObject {
-        val tasks = JSONArray()
-        PlanStore.getTodayTasksSnapshot_Sync().forEach { t ->
-            tasks.put(
-                JSONObject().apply {
-                    putStr("id", t.id)
-                    putStr("subject", t.subject)
-                    putStr("topic", t.topic)
-                    put("duration_minutes", t.durationMinutes)
-                    put("state", t.state.name)
-                    put("task_type", t.taskType.name)
-                    putStr("scheduled_start_time", t.scheduledStartTime)
-                    putStr("completed_status", t.completedStatus)
-                    putStr("learning_intent", t.learningIntent)
-                    putStr("concept_id", t.conceptId)
-                    putStr("rationale", t.rationale)
-                    put("focus_minutes", t.focusMinutes)
-                }
-            )
-        }
-        return JSONObject().apply {
-            putStr("day_key", PlanStore.currentDayKey())
-            put("completion_percent", PlanStore.getTodayCompletionPercent())
-            put("tasks", tasks)
-        }
-    }
+  }
+  return out;
 }
 
-/** WorkManager entry point. Network-constrained; only retries failures that could succeed on retry. */
-class GatewaySyncWorker(
-    context: Context,
-    params: WorkerParameters
-) : CoroutineWorker(context, params) {
+// ── Filters shared by the list tools ─────────────────────────────────────────
+export interface AttemptFilters {
+  days: number;
+  subject?: string;
+  chapter?: string;
+  topic?: string;
+  source: SourceFilter;
+}
 
-    override suspend fun doWork(): Result =
-        when (GatewaySync.pushAll(applicationContext)) {
-            GatewaySync.PushResult.RETRYABLE_FAILURE -> if (runAttemptCount < 3) Result.retry() else Result.success()
-            // Not configured / rejected: nothing to gain from retrying; the next periodic run re-checks.
-            else -> Result.success()
+export function clampInt(v: unknown, def: number, min: number, max: number): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.floor(v) : def;
+  return Math.min(max, Math.max(min, n));
+}
+function optString(v: unknown, name: string): string | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v !== 'string') throw new ToolInputError(`${name} must be a string`);
+  return v.trim() || undefined;
+}
+export function parseFilters(args: Record<string, unknown>, defaultDays = 60): AttemptFilters {
+  const source = (optString(args.source, 'source') ?? 'all') as SourceFilter;
+  if (!SOURCE_VALUES.includes(source)) {
+    throw new ToolInputError(`source must be one of: ${SOURCE_VALUES.join(', ')}`);
+  }
+  return {
+    days: clampInt(args.days, defaultDays, 1, 365),
+    subject: optString(args.subject, 'subject'),
+    chapter: optString(args.chapter, 'chapter'),
+    topic: optString(args.topic, 'topic'),
+    source
+  };
+}
+
+function applyFilters(attempts: Attempt[], f: AttemptFilters, subjectByChapter: Map<string, string>): Attempt[] {
+  return attempts.filter((a) => {
+    if (f.source !== 'all' && a.provenance !== f.source) return false;
+    if (f.chapter && !chapterMatches(a.question.chapter, f.chapter)) return false;
+    if (f.topic && a.question.topic !== f.topic) return false;
+    if (f.subject) {
+      const subj = a.question.chapter ? subjectByChapter.get(a.question.chapter) : undefined;
+      if (!subj || subj.toLowerCase() !== f.subject.toLowerCase()) return false;
+    }
+    return true;
+  });
+}
+
+// ── Tool: wrong / skipped questions ──────────────────────────────────────────
+export async function getWrongOrSkippedQuestions(
+  sb: SupabaseClient,
+  userId: string,
+  kind: 'WRONG' | 'SKIPPED',
+  args: Record<string, unknown>
+) {
+  const f = parseFilters(args);
+  const limit = clampInt(args.limit, 20, 1, 50);
+  const includeResolved = args.include_resolved === true;
+  const minTimes = clampInt(args.min_times, 1, 1, 50);
+  const since = sinceFromDays(f.days);
+
+  const subjectByChapter = f.subject ? await getSubjectByChapter(sb) : new Map<string, string>();
+  const attempts = applyFilters(await loadAttempts(sb, userId, { sinceIso: since }), f, subjectByChapter);
+
+  let combined = attempts;
+  if (kind === 'SKIPPED' && (f.source === 'all' || f.source === 'full_test' || f.source === 'qbank_practice')) {
+    const neverOpened = applyFilters(await loadNeverOpened(sb, userId, since), f, subjectByChapter);
+    combined = attempts.concat(neverOpened);
+  }
+
+  const groups = groupByCanonical(combined);
+  const items: any[] = [];
+  for (const [, group] of Array.from(groups.entries())) {
+    const latest = group[0];
+    const hist = summarizeHistory(group);
+    const times = kind === 'WRONG' ? hist.wrong : hist.skipped;
+    const qualifies = includeResolved ? times > 0 : latest.status === kind;
+    if (!qualifies || times < minTimes) continue;
+    items.push({
+      question: shapeQuestion(latest.question),
+      latest_attempt: shapeAttempt(latest),
+      times_wrong: hist.wrong,
+      times_skipped: hist.skipped,
+      history: hist,
+      still_unresolved: latest.status !== 'CORRECT'
+    });
+  }
+
+  const ts = (x: any) => (x.latest_attempt.answered_at ? new Date(x.latest_attempt.answered_at).getTime() : 0);
+  items.sort((a, b) => {
+    const ta = kind === 'WRONG' ? a.times_wrong : a.times_skipped;
+    const tb = kind === 'WRONG' ? b.times_wrong : b.times_skipped;
+    return tb - ta || ts(b) - ts(a);
+  });
+
+  return {
+    kind,
+    window_days: f.days,
+    filters: { subject: f.subject ?? null, chapter: f.chapter ?? null, topic: f.topic ?? null, source: f.source },
+    note:
+      kind === 'SKIPPED'
+        ? "skip_kind 'left_blank' = opened but unanswered; 'never_opened' = in a submitted test but never visited."
+        : undefined,
+    total_matching: items.length,
+    returned: Math.min(items.length, limit),
+    questions: items.slice(0, limit)
+  };
+}
+
+// ── Tool: recent attempts (compact stream, no explanations) ──────────────────
+export async function getRecentAttempts(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const f = parseFilters(args, 14);
+  const limit = clampInt(args.limit, 30, 1, 100);
+  const result = (optString(args.result, 'result') ?? 'all').toLowerCase();
+  if (!['all', 'correct', 'wrong', 'skipped'].includes(result)) {
+    throw new ToolInputError('result must be one of: all, correct, wrong, skipped');
+  }
+  const subjectByChapter = f.subject ? await getSubjectByChapter(sb) : new Map<string, string>();
+  let attempts = applyFilters(await loadAttempts(sb, userId, { sinceIso: sinceFromDays(f.days), maxRows: 2000 }), f, subjectByChapter);
+  if (result !== 'all') attempts = attempts.filter((a) => a.status === result.toUpperCase());
+
+  const counts = { correct: 0, wrong: 0, skipped: 0 };
+  for (const a of attempts) {
+    if (a.status === 'CORRECT') counts.correct += 1;
+    else if (a.status === 'WRONG') counts.wrong += 1;
+    else if (a.status === 'SKIPPED') counts.skipped += 1;
+  }
+  return {
+    window_days: f.days,
+    filters: { subject: f.subject ?? null, chapter: f.chapter ?? null, topic: f.topic ?? null, source: f.source, result },
+    totals: counts,
+    note: 'Compact stream. Use checkmate_get_question_context / checkmate_get_wrong_questions for the question text and explanation.',
+    attempts: attempts.slice(0, limit).map((a) => ({
+      ...compactQuestion(a.question),
+      ...shapeAttempt(a)
+    }))
+  };
+}
+
+// ── Sessions (Q-bank / tests) ────────────────────────────────────────────────
+async function loadSessionDetail(sb: SupabaseClient, userId: string, sessionId: string) {
+  const { data: session, error } = await sb
+    .from('test_sessions')
+    .select('id, test_id, mode, status, intervention_id, server_start_time')
+    .eq('id', sessionId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!session) throw new ToolInputError('session_id not found');
+
+  const { data: participant } = await sb
+    .from('session_participants')
+    .select('submitted_at')
+    .eq('session_id', sessionId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (!participant) throw new ToolInputError('session_id not found'); // not this student's session
+
+  const [{ data: test }, questions, { data: responses }] = await Promise.all([
+    sb.from('tests').select('id, title, generated_from, duration_seconds, total_marks, created_at').eq('id', session.test_id).maybeSingle(),
+    selectIn(sb, 'questions', QUESTION_SELECT, 'test_id', [session.test_id], { paged: true }),
+    sb
+      .from('responses')
+      .select('question_id, selected_answer, is_correct, answered_at, time_spent_seconds')
+      .eq('session_id', sessionId)
+      .eq('user_id', userId)
+  ]);
+  questions.sort((a, b) => (a.question_number ?? 0) - (b.question_number ?? 0));
+  const respByQ = new Map((responses ?? []).map((r: any) => [r.question_id as string, r]));
+  const submitted = !!participant.submitted_at;
+
+  const rows = questions.map((q) => {
+    const r: any = respByQ.get(q.id);
+    let status: AttemptStatus | 'UNANSWERED';
+    if (!r) status = submitted ? 'SKIPPED' : 'UNANSWERED';
+    else status = statusOf(r.selected_answer, r.is_correct);
+    return { q, r, status };
+  });
+  return { session, test, submitted, submitted_at: participant.submitted_at as string | null, rows };
+}
+
+function questionWithOutcome(row: { q: any; r: any; status: string }, full = true) {
+  return {
+    ...(full ? shapeQuestion(row.q) : compactQuestion(row.q)),
+    status: row.status,
+    selected_answer: row.r?.selected_answer ?? null,
+    answered_at: row.r?.answered_at ?? null,
+    time_spent_seconds: typeof row.r?.time_spent_seconds === 'number' ? row.r.time_spent_seconds : null
+  };
+}
+
+function tally(rows: { status: string }[]) {
+  const t = { correct: 0, wrong: 0, skipped: 0, unanswered: 0, unscored: 0 };
+  for (const r of rows) {
+    if (r.status === 'CORRECT') t.correct += 1;
+    else if (r.status === 'WRONG') t.wrong += 1;
+    else if (r.status === 'SKIPPED') t.skipped += 1;
+    else if (r.status === 'UNANSWERED') t.unanswered += 1;
+    else t.unscored += 1;
+  }
+  return t;
+}
+
+export async function getQbankSession(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const sessionId = optString(args.session_id, 'session_id');
+  if (!sessionId) throw new ToolInputError('session_id is required');
+  const d = await loadSessionDetail(sb, userId, sessionId);
+  const prov = provenanceOf(d.test?.generated_from, d.session.intervention_id);
+  const gf = (d.test?.generated_from ?? {}) as GeneratedFrom;
+  return {
+    session_id: d.session.id,
+    test_id: d.session.test_id,
+    title: d.test?.title ?? null,
+    provenance: prov,
+    purpose: purposeOf(prov, gf),
+    chapter: gf.chapter ?? null,
+    topic: gf.topic ?? null,
+    pool: gf.pool ?? null,
+    intervention_id: d.session.intervention_id ?? gf.intervention_id ?? null,
+    session_status: d.session.status,
+    submitted: d.submitted,
+    submitted_at: d.submitted_at,
+    totals: tally(d.rows),
+    questions: d.rows.map((r) => questionWithOutcome(r))
+  };
+}
+
+function purposeOf(prov: Provenance, gf: GeneratedFrom): string {
+  if (prov === 'qbank_practice') return gf.pool === 'WRONG_SKIPPED' ? 'qbank_retry_of_misses' : 'coverage';
+  if (prov === 'targeted_repair') return 'repair';
+  if (prov === 'retention_check') return 'retention';
+  if (prov === 'coaching_bank') return 'coaching_bank';
+  return 'full_test';
+}
+
+// ── Tool: today's Q-bank ─────────────────────────────────────────────────────
+export async function getTodayQbank(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const date = optString(args.date, 'date') ?? localDateString();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new ToolInputError('date must be YYYY-MM-DD');
+  const { start, end } = localDayBounds(date);
+
+  const { data: tests, error } = await sb
+    .from('tests')
+    .select('id, title, generated_from, created_at')
+    .eq('owner_user_id', userId)
+    .eq('generated_from->>kind', 'qbank_practice')
+    .gte('created_at', start)
+    .lt('created_at', end)
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  if (!tests || tests.length === 0) {
+    return {
+      date,
+      sessions: [],
+      note: 'No Q-bank practice session has been started for this date. Use checkmate_get_daily_target for what Testmate wants done today.'
+    };
+  }
+
+  const testIds = tests.map((t: any) => t.id as string);
+  const sessions = await selectIn(sb, 'test_sessions', 'id, test_id, status, server_start_time', 'test_id', testIds);
+  const latestByTest = new Map<string, any>();
+  for (const s of sessions.sort((a, b) => String(b.server_start_time).localeCompare(String(a.server_start_time)))) {
+    if (!latestByTest.has(s.test_id)) latestByTest.set(s.test_id, s);
+  }
+  const sessionIds = Array.from(latestByTest.values()).map((s) => s.id as string);
+  const [questions, responses, parts] = await Promise.all([
+    selectIn(sb, 'questions', QUESTION_SELECT, 'test_id', testIds, { paged: true }),
+    selectIn(sb, 'responses', 'session_id, question_id, selected_answer, is_correct, answered_at, time_spent_seconds', 'session_id', sessionIds, {
+      paged: true,
+      decorate: (q) => q.eq('user_id', userId)
+    }),
+    selectIn(sb, 'session_participants', 'session_id, submitted_at', 'session_id', sessionIds, {
+      decorate: (q) => q.eq('user_id', userId)
+    })
+  ]);
+  const submittedBySession = new Map(parts.map((p) => [p.session_id as string, !!p.submitted_at]));
+  const respKey = (sid: string, qid: string) => `${sid}:${qid}`;
+  const respMap = new Map(responses.map((r) => [respKey(r.session_id, r.question_id), r]));
+
+  const out = tests.map((t: any) => {
+    const s = latestByTest.get(t.id);
+    const gf = (t.generated_from ?? {}) as GeneratedFrom;
+    const qs = questions.filter((q) => q.test_id === t.id).sort((a, b) => (a.question_number ?? 0) - (b.question_number ?? 0));
+    const submitted = s ? submittedBySession.get(s.id) === true : false;
+    const rows = qs.map((q) => {
+      const r = s ? respMap.get(respKey(s.id, q.id)) : undefined;
+      const status = !r ? (submitted ? 'SKIPPED' : 'UNANSWERED') : statusOf(r.selected_answer, r.is_correct);
+      return { q, r, status };
+    });
+    return {
+      session_id: s?.id ?? null,
+      test_id: t.id,
+      title: t.title,
+      created_at: t.created_at,
+      chapter: gf.chapter ?? null,
+      topic: gf.topic ?? null,
+      purpose: purposeOf('qbank_practice', gf),
+      pool: gf.pool ?? null,
+      session_status: s?.status ?? null,
+      submitted,
+      totals: tally(rows),
+      questions: rows.map((r) => questionWithOutcome(r))
+    };
+  });
+  return { date, sessions: out };
+}
+
+// ── Tasks → questions → outcomes (repair + retention checks) ─────────────────
+async function loadTaskTests(sb: SupabaseClient, userId: string, wanted: Provenance, days: number) {
+  const { data: tests, error } = await sb
+    .from('tests')
+    .select('id, title, generated_from, created_at')
+    .eq('owner_user_id', userId)
+    .not('generated_from', 'is', null)
+    .gte('created_at', sinceFromDays(days))
+    .order('created_at', { ascending: false })
+    .limit(300);
+  if (error) throw error;
+  return (tests ?? []).filter((t: any) => provenanceOf(t.generated_from) === wanted);
+}
+
+async function taskGroups(
+  sb: SupabaseClient,
+  userId: string,
+  wanted: 'targeted_repair' | 'retention_check',
+  args: Record<string, unknown>,
+  extraReason?: (chapter: string | null, topic: string | null) => unknown
+) {
+  const interventionFilter = optString(args.intervention_id, 'intervention_id');
+  const sessionFilter = optString(args.session_id, 'session_id');
+  // Looking one specific task up by id should not be cut off by the default 60-day window.
+  const days = clampInt(args.days, interventionFilter || sessionFilter ? 365 : 60, 1, 365);
+  const limit = clampInt(args.limit, 10, 1, 30);
+  const chapter = optString(args.chapter, 'chapter');
+  const onlyOpen = args.only_unresolved === true;
+
+  let tests = await loadTaskTests(sb, userId, wanted, days);
+  if (chapter) tests = tests.filter((t: any) => chapterMatches(t.generated_from?.chapter ?? null, chapter));
+  if (interventionFilter) {
+    // intervention_id lives on tests.generated_from, or only on the session for older rows.
+    const { data: sRows, error: sErr } = await sb.from('test_sessions').select('test_id').eq('intervention_id', interventionFilter);
+    if (sErr) throw sErr;
+    const viaSession = new Set((sRows ?? []).map((r: any) => r.test_id as string));
+    tests = tests.filter((t: any) => (t.generated_from?.intervention_id ?? null) === interventionFilter || viaSession.has(t.id));
+  }
+  if (sessionFilter) {
+    const { data: sRow, error: sErr } = await sb.from('test_sessions').select('test_id').eq('id', sessionFilter).maybeSingle();
+    if (sErr) throw sErr;
+    // `tests` is already limited to this user's own tests, so this cannot reach another user's session.
+    tests = sRow ? tests.filter((t: any) => t.id === sRow.test_id) : [];
+  }
+  tests = tests.slice(0, limit * 2);
+  if (tests.length === 0) return { window_days: days, tasks: [] as any[] };
+
+  const testIds = tests.map((t: any) => t.id as string);
+  const sessions = await selectIn(sb, 'test_sessions', 'id, test_id, status, intervention_id, server_start_time', 'test_id', testIds);
+  const latestByTest = new Map<string, any>();
+  for (const s of sessions.sort((a, b) => String(b.server_start_time).localeCompare(String(a.server_start_time)))) {
+    if (!latestByTest.has(s.test_id)) latestByTest.set(s.test_id, s);
+  }
+  const sessionIds = Array.from(latestByTest.values()).map((s) => s.id as string);
+  const [questions, responses, parts] = await Promise.all([
+    selectIn(sb, 'questions', QUESTION_SELECT, 'test_id', testIds, { paged: true }),
+    selectIn(sb, 'responses', 'session_id, question_id, selected_answer, is_correct, answered_at, time_spent_seconds', 'session_id', sessionIds, {
+      paged: true,
+      decorate: (q) => q.eq('user_id', userId)
+    }),
+    selectIn(sb, 'session_participants', 'session_id, submitted_at', 'session_id', sessionIds, {
+      decorate: (q) => q.eq('user_id', userId)
+    })
+  ]);
+  const submittedBySession = new Map(parts.map((p) => [p.session_id as string, !!p.submitted_at]));
+  const respMap = new Map(responses.map((r) => [`${r.session_id}:${r.question_id}`, r]));
+
+  // Prior history per canonical question, so each question can say "you'd already
+  // missed this N times before this task was built" (the `reason` the plan asks for).
+  const allAttempts = await loadAttempts(sb, userId, { sinceIso: sinceFromDays(Math.max(days, 180)), maxRows: 4000 });
+  const historyByCanonical = groupByCanonical(allAttempts);
+
+  const tasks = tests.map((t: any) => {
+    const s = latestByTest.get(t.id);
+    const gf = (t.generated_from ?? {}) as GeneratedFrom;
+    const createdMs = new Date(t.created_at).getTime();
+    const submitted = s ? submittedBySession.get(s.id) === true : false;
+    const qs = questions.filter((q) => q.test_id === t.id).sort((a, b) => (a.question_number ?? 0) - (b.question_number ?? 0));
+    const rows = qs.map((q) => {
+      const r = s ? respMap.get(`${s.id}:${q.id}`) : undefined;
+      const status = !r ? (submitted ? 'SKIPPED' : 'UNANSWERED') : statusOf(r.selected_answer, r.is_correct);
+      const prior = (historyByCanonical.get(canonicalQuestionId(q)) ?? []).filter(
+        (a) => a.answered_at && new Date(a.answered_at).getTime() < createdMs && a.test_id !== t.id
+      );
+      const priorHist = summarizeHistory(prior);
+      return {
+        ...questionWithOutcome({ q, r, status }),
+        purpose: wanted === 'targeted_repair' ? 'repair' : 'retention',
+        reason: {
+          concept: q.topic ?? q.chapter ?? null,
+          selection_pool: gf.pool ?? null,
+          previous_attempts: priorHist.attempts,
+          previous_wrong: priorHist.wrong,
+          previous_skipped: priorHist.skipped,
+          last_correct_before: priorHist.last_correct_at
         }
+      };
+    });
+    const totals = tally(rows);
+    return {
+      intervention_id: gf.intervention_id ?? s?.intervention_id ?? null,
+      test_id: t.id,
+      session_id: s?.id ?? null,
+      title: t.title,
+      created_at: t.created_at,
+      chapter: gf.chapter ?? null,
+      topic: gf.topic ?? null,
+      selection_pool: gf.pool ?? null,
+      submitted,
+      totals,
+      unresolved: totals.wrong + totals.skipped + totals.unanswered,
+      checkmate_context: extraReason ? extraReason(gf.chapter ?? null, gf.topic ?? null) : undefined,
+      questions: rows
+    };
+  });
+
+  const filtered = onlyOpen ? tasks.filter((t) => t.unresolved > 0) : tasks;
+  return { window_days: days, tasks: filtered.slice(0, limit) };
 }
 
-object GatewaySyncScheduler {
-
-    private const val PERIODIC_WORK = "checkmate_gateway_sync"
-    private const val STARTUP_WORK = "checkmate_gateway_sync_startup"
-
-    /** WorkManager's periodic floor is 15 min; 30 keeps the snapshot fresh without wasting battery. */
-    private const val INTERVAL_MINUTES = 30L
-
-    fun schedule(context: Context) {
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-        val wm = WorkManager.getInstance(context)
-
-        wm.enqueueUniquePeriodicWork(
-            PERIODIC_WORK,
-            ExistingPeriodicWorkPolicy.KEEP,
-            PeriodicWorkRequestBuilder<GatewaySyncWorker>(INTERVAL_MINUTES, TimeUnit.MINUTES)
-                .setConstraints(constraints)
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
-                .build()
-        )
-        // One immediate run per app start so a fresh install / new token has data right away.
-        wm.enqueueUniqueWork(
-            STARTUP_WORK,
-            ExistingWorkPolicy.KEEP,
-            OneTimeWorkRequestBuilder<GatewaySyncWorker>()
-                .setConstraints(constraints)
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
-                .build()
-        )
-    }
-
-    fun cancel(context: Context) {
-        val wm = WorkManager.getInstance(context)
-        wm.cancelUniqueWork(PERIODIC_WORK)
-        wm.cancelUniqueWork(STARTUP_WORK)
-    }
+export function getRepairQuestions(
+  sb: SupabaseClient,
+  userId: string,
+  args: Record<string, unknown>,
+  extraReason?: (chapter: string | null, topic: string | null) => unknown
+) {
+  return taskGroups(sb, userId, 'targeted_repair', args, extraReason).then((r) => ({
+    ...r,
+    note:
+      'Each task is a Checkmate repair intervention. A question with WRONG/SKIPPED/UNANSWERED is still unresolved; CORRECT means that repair attempt fixed it.'
+  }));
 }
 
-//===== FILE: modules/learning/build.gradle.kts =====
-plugins {
-    id("com.android.library")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.serialization")
-    // Room compiler needs kapt for Kotlin sources — same reasoning as
-    // :modules:planner (InterventionDatabase) and :modules:psyche
-    // (BehaviorDatabase); LearningDatabase below follows the same pattern.
-    id("org.jetbrains.kotlin.kapt")
-}
-android {
-    namespace  = "com.checkmate.learning"
-    compileSdk = 35
-    defaultConfig { minSdk = 26; targetSdk = 35 }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions { jvmTarget = "17" }
-}
-dependencies {
-    // Added for Phase 1.4 (KnowledgeGraph) — needs ExamSyllabus (Exam -> Subject ->
-    // Chapter -> Topic) as the seed source for Concept rows. Same dependency
-    // direction :modules:planner and :modules:psyche already use (both depend on
-    // :modules:core; core depends on neither).
-    implementation(project(":modules:core"))
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-    // Used only for the List<String> Room TypeConverter (conceptIds/concepts) —
-    // same Json instance pattern already used in :modules:psyche.
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
-    implementation("androidx.room:room-runtime:2.6.1")
-    implementation("androidx.room:room-ktx:2.6.1")
-    kapt("androidx.room:room-compiler:2.6.1")
-    testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
-    // Real org.json impl for the JVM test classpath — LlmDiagnosticResponseParseTest
-    // and LlmExplanationResponseParseTest exercise actual JSONObject parsing, and
-    // the android.jar stub's org.json classes throw "not mocked" on every call
-    // instead of returning usable defaults. Same fix already applied in
-    // :modules:planner's build.gradle.kts for the identical LlmIntentParserTest gap.
-    testImplementation("org.json:json:20231013")
+// ── Task-level views (one row per repair / retention task, no question text) ──
+// Sits above getRepairQuestions / getRetentionQuestions: answers "did this task fix
+// anything?" cheaply, and lists only the question ids that are still unresolved so the
+// caller can drill into them with get_question_context / get_qbank_session.
+const FAST_ANSWER_SECONDS = 2;
+
+type TaskDetail = 'summary' | 'full';
+
+// Defaults keep the response small enough for a model context window:
+//   summary -> 8 tasks, compact rows, NO checkmate_context
+//   full    -> 3 tasks unless a specific session_id is given
+const SUMMARY_DEFAULT_LIMIT = 8;
+const FULL_DEFAULT_LIMIT = 3;
+
+function prepareTaskArgs(args: Record<string, unknown>): { args: Record<string, unknown>; detail: TaskDetail; capped: boolean } {
+  const rawDetail = optString(args.detail, 'detail') ?? 'summary';
+  if (rawDetail !== 'summary' && rawDetail !== 'full') {
+    throw new ToolInputError("detail must be 'summary' or 'full'");
+  }
+  const detail: TaskDetail = rawDetail;
+  // session_id is unique; intervention_id can be shared by many tasks, so it must not lift the cap.
+  const hasIdFilter = !!optString(args.session_id, 'session_id');
+  const requested = clampInt(args.limit, detail === 'full' ? FULL_DEFAULT_LIMIT : SUMMARY_DEFAULT_LIMIT, 1, 30);
+  // Full detail repeats context + every unresolved question, so never allow a large unfiltered dump.
+  const limit = detail === 'full' && !hasIdFilter ? Math.min(requested, FULL_DEFAULT_LIMIT) : requested;
+  return { args: { ...args, limit }, detail, capped: limit < requested };
 }
 
-//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/analytics/SubjectScoreCalculatorTest.kt =====
-package com.checkmate.learning.analytics
-
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Test
-
-class SubjectScoreCalculatorTest {
-
-    private fun fact(chapter: String, topic: String?, correct: Boolean, attempted: Boolean = true) =
-        ScoredQuestionFact(chapter = chapter, topic = topic, correct = correct, attempted = attempted)
-
-    @Test
-    fun `marks are tallied with real NEET plus-4 minus-1 scoring`() {
-        val questions = listOf(
-            fact("Electrostatics", "Electrostatics", correct = true),
-            fact("Electrostatics", "Electrostatics", correct = true),
-            fact("Electrostatics", "Electrostatics", correct = false),
-            fact("Electrostatics", "Electrostatics", correct = false, attempted = false)
-        )
-
-        val scores = SubjectScoreCalculator.compute("NEET", questions)
-
-        assertEquals(1, scores.size)
-        val physics = scores.first()
-        assertEquals("Physics", physics.subject)
-        assertEquals(4, physics.questionsCount)
-        assertEquals(2, physics.correct)
-        assertEquals(1, physics.wrong)
-        assertEquals(1, physics.skipped)
-        // 2*4 - 1*1 = 7
-        assertEquals(7, physics.marksObtained)
-        assertEquals(16, physics.marksTotal)
-    }
-
-    @Test
-    fun `questions across multiple subjects are grouped separately`() {
-        val questions = listOf(
-            fact("Human Physiology", "Human Physiology", correct = true),
-            fact("Human Physiology", "Human Physiology", correct = true),
-            fact("Equilibrium", "Equilibrium", correct = false)
-        )
-
-        val scores = SubjectScoreCalculator.compute("NEET", questions)
-
-        val subjects = scores.map { it.subject }.toSet()
-        assertTrue(subjects.contains("Biology"))
-        assertTrue(subjects.contains("Chemistry"))
-    }
-
-    @Test
-    fun `a question that resolves to no subject is surfaced as Unmapped, not dropped`() {
-        // SubjectScoreCalculator's own doc: dropping unresolved-subject questions was
-        // the bug (a real report import silently lost 3 of 6 chapters' worth of marks
-        // this way) — UNMAPPED_SUBJECT is the deliberate replacement so a coverage gap
-        // shows up as a visible bucket instead of vanishing. This test previously
-        // asserted the old dropped-and-empty behavior; updated to match the fix.
-        val questions = listOf(fact("Not A Real Chapter", "Not A Real Topic", correct = true))
-
-        val scores = SubjectScoreCalculator.compute("NEET", questions)
-
-        assertEquals(1, scores.size)
-        val unmapped = scores.first()
-        assertEquals(SubjectScoreCalculator.UNMAPPED_SUBJECT, unmapped.subject)
-        assertEquals(1, unmapped.questionsCount)
-    }
+function lastAnswerMs(qs: any[]): number | null {
+  let best: number | null = null;
+  for (const q of qs) {
+    if (!q.answered_at) continue;
+    const ms = new Date(q.answered_at).getTime();
+    if (Number.isFinite(ms) && (best === null || ms > best)) best = ms;
+  }
+  return best;
 }
+
+function summarizeTask(t: any, detail: TaskDetail) {
+  const qs: any[] = t.questions ?? [];
+  const answered = qs.filter((q) => q.status === 'CORRECT' || q.status === 'WRONG');
+  const fast = answered.filter((q) => typeof q.time_spent_seconds === 'number' && q.time_spent_seconds <= FAST_ANSWER_SECONDS).length;
+  const total = qs.length;
+  const lastMs = lastAnswerMs(qs);
+  const base = {
+    task_id: t.session_id ?? t.test_id,
+    intervention_id: t.intervention_id,
+    test_id: t.test_id,
+    session_id: t.session_id,
+    chapter: t.chapter,
+    topic: t.topic,
+    state: !t.submitted ? 'pending' : t.unresolved === 0 ? 'resolved' : 'partially_resolved',
+    submitted: t.submitted,
+    question_count: total,
+    resolved_count: t.totals.correct,
+    unresolved_count: t.unresolved,
+    totals: t.totals,
+    // correct / answered (WRONG + CORRECT only). null when nothing was answered.
+    accuracy: answered.length > 0 ? Math.round((t.totals.correct / answered.length) * 1000) / 1000 : null,
+    created_at: t.created_at,
+    last_attempt_at: lastMs !== null ? new Date(lastMs).toISOString() : null,
+    // Answers given in <= 2s. A high count means the task may have been tapped through
+    // without reading, so its WRONG results say little about what the student knows.
+    fast_answers_under_3s: fast
+  };
+
+  if (detail === 'summary') {
+    return {
+      ...base,
+      // attempts = how many times this question had been attempted BEFORE this task was built.
+      unresolved_questions: qs
+        .filter((q) => q.status !== 'CORRECT')
+        .map((q) => ({
+          question_id: q.question_id,
+          status: q.status,
+          attempts: q.reason?.previous_attempts ?? 0
+        }))
+    };
+  }
+
+  return {
+    ...base,
+    title: t.title,
+    selection_pool: t.selection_pool,
+    resolved_pct: total > 0 ? Math.round((t.totals.correct / total) * 1000) / 10 : null,
+    answered_count: answered.length,
+    checkmate_context: t.checkmate_context,
+    unresolved_questions: qs
+      .filter((q) => q.status !== 'CORRECT')
+      .map((q) => ({
+        question_id: q.question_id,
+        canonical_question_id: q.canonical_question_id,
+        question_number: q.question_number,
+        chapter: q.chapter,
+        status: q.status,
+        selected_answer: q.selected_answer,
+        time_spent_seconds: q.time_spent_seconds,
+        previous_attempts: q.reason?.previous_attempts ?? null,
+        previous_wrong: q.reason?.previous_wrong ?? null
+      }))
+  };
+}
+
+const TASK_SIZE_NOTE =
+  " detail='summary' (default) returns compact rows without checkmate_context, 8 tasks by default. For one task in full, call again with detail='full' and the session_id from a summary row (full detail is capped at 3 tasks unless a session_id is given).";
+
+export async function getRepairTasks(
+  sb: SupabaseClient,
+  userId: string,
+  args: Record<string, unknown>,
+  extraReason?: (chapter: string | null, topic: string | null) => unknown
+) {
+  const prep = prepareTaskArgs(args);
+  // checkmate_context is only attached in full detail, so don't compute it for summaries.
+  const r = await taskGroups(sb, userId, 'targeted_repair', prep.args, prep.detail === 'full' ? extraReason : undefined);
+  return {
+    window_days: r.window_days,
+    detail: prep.detail,
+    ...(prep.capped ? { limit_capped_to: FULL_DEFAULT_LIMIT } : {}),
+    tasks: r.tasks.map((t) => summarizeTask(t, prep.detail)),
+    note:
+      'One row per Checkmate repair task. state: pending = not submitted yet, resolved = every question CORRECT, partially_resolved = some still WRONG/SKIPPED. Use checkmate_get_repair_questions for the full questions, or checkmate_get_question_context with an unresolved question_id.' +
+      TASK_SIZE_NOTE
+  };
+}
+
+export async function getRetentionTasks(
+  sb: SupabaseClient,
+  userId: string,
+  args: Record<string, unknown>,
+  extraReason?: (chapter: string | null, topic: string | null) => unknown
+) {
+  const prep = prepareTaskArgs(args);
+  const r = await taskGroups(sb, userId, 'retention_check', prep.args, prep.detail === 'full' ? extraReason : undefined);
+  return {
+    window_days: r.window_days,
+    detail: prep.detail,
+    ...(prep.capped ? { limit_capped_to: FULL_DEFAULT_LIMIT } : {}),
+    tasks: r.tasks.map((t) => summarizeTask(t, prep.detail)),
+    note:
+      'One row per retention-check task Checkmate scheduled. A WRONG answer here means the concept was forgotten; CORRECT means retention held. For the spaced-repetition queue that is due now use checkmate_get_retention_due; for the questions themselves use checkmate_get_retention_questions.' +
+      TASK_SIZE_NOTE
+  };
+}
+
+export async function getRetentionQuestions(
+  sb: SupabaseClient,
+  userId: string,
+  args: Record<string, unknown>,
+  extraReason?: (chapter: string | null, topic: string | null) => unknown
+) {
+  const mode = (optString(args.mode, 'mode') ?? 'both').toLowerCase();
+  if (!['due', 'checks', 'both'].includes(mode)) throw new ToolInputError('mode must be one of: due, checks, both');
+  const limit = clampInt(args.limit, 20, 1, 50);
+  const chapter = optString(args.chapter, 'chapter');
+
+  const result: Record<string, unknown> = {};
+
+  if (mode === 'due' || mode === 'both') {
+    let q: any = sb
+      .from('question_mastery')
+      .select('canonical_question_id, chapter, topic, last_result, last_wrong_source, correct_streak, retention_box, next_review_at, last_attempted_at, times_attempted, times_correct')
+      .eq('user_id', userId)
+      .lte('next_review_at', new Date().toISOString())
+      .order('next_review_at', { ascending: true })
+      .limit(limit);
+    // Names are matched loosely (see chapter-match.ts); LIKE narrows in SQL, chapterMatches is the real test.
+    if (chapter) q = q.ilike('chapter', chapterLikePattern(chapter));
+    const { data: dueRaw, error } = await q;
+    if (error) throw error;
+    const due = chapter ? (dueRaw ?? []).filter((d: any) => chapterMatches(d.chapter, chapter)) : dueRaw;
+    const qs = await selectIn(sb, 'questions', QUESTION_SELECT, 'id', (due ?? []).map((d: any) => d.canonical_question_id as string));
+    const qById = new Map(qs.map((x) => [x.id as string, x]));
+    const nowMs = Date.now();
+    result.due = (due ?? [])
+      .map((d: any) => {
+        const q0 = qById.get(d.canonical_question_id);
+        if (!q0) return null;
+        const weak = d.last_result === 'wrong' || (d.correct_streak ?? 0) === 0;
+        return {
+          ...shapeQuestion(q0),
+          purpose: 'retention',
+          // The distinction that matters: "weak at this" vs "strong, but due for spaced recall".
+          strength: weak ? 'weak' : 'strong_but_due',
+          retention: {
+            last_result: d.last_result,
+            last_attempted_at: d.last_attempted_at,
+            next_review_at: d.next_review_at,
+            overdue_days: Math.max(0, Math.floor((nowMs - new Date(d.next_review_at).getTime()) / 86_400_000)),
+            retention_box: d.retention_box,
+            correct_streak: d.correct_streak,
+            times_attempted: d.times_attempted,
+            times_correct: d.times_correct
+          }
+        };
+      })
+      .filter(Boolean);
+  }
+
+  if (mode === 'checks' || mode === 'both') {
+    const checks = await taskGroups(sb, userId, 'retention_check', { ...args, limit: Math.min(limit, 10) }, extraReason);
+    result.checks = checks.tasks;
+  }
+
+  return {
+    ...result,
+    note: "'due' = Testmate's spaced-repetition queue (Leitner boxes). 'checks' = retention-check sessions Checkmate scheduled, with per-question outcomes."
+  };
+}
+
+// ── Tool: one question's whole story ─────────────────────────────────────────
+async function resolveOwnedQuestion(sb: SupabaseClient, userId: string, questionId: string) {
+  const { data: q, error } = await sb.from('questions').select(QUESTION_SELECT).eq('id', questionId).maybeSingle();
+  if (error) throw error;
+  if (!q) throw new ToolInputError('question_id not found');
+  // A copy living inside another student's private repair/Q-bank test must not be readable.
+  const { data: test } = await sb.from('tests').select('owner_user_id').eq('id', q.test_id).maybeSingle();
+  if (test?.owner_user_id && test.owner_user_id !== userId) throw new ToolInputError('question_id not found');
+  const canonicalId = canonicalQuestionId(q);
+  const canonical =
+    canonicalId === q.id
+      ? q
+      : (await sb.from('questions').select(QUESTION_SELECT).eq('id', canonicalId).maybeSingle()).data ?? q;
+  return { requested: q, canonical, canonicalId };
+}
+
+async function loadQuestionAttempts(sb: SupabaseClient, userId: string, canonicalId: string): Promise<Attempt[]> {
+  const { data: copies, error } = await sb
+    .from('questions')
+    .select('id')
+    .or(`id.eq.${canonicalId},origin_question_id.eq.${canonicalId}`);
+  if (error) throw error;
+  const ids = (copies ?? []).map((c: any) => c.id as string);
+  const rows = await selectIn(
+    sb,
+    'responses',
+    'id, session_id, question_id, selected_answer, is_correct, answered_at, time_spent_seconds',
+    'question_id',
+    ids,
+    { decorate: (q) => q.eq('user_id', userId).order('answered_at', { ascending: false }) }
+  );
+  return (await enrichResponses(sb, rows)).sort(
+    (a, b) => (b.answered_at ? new Date(b.answered_at).getTime() : 0) - (a.answered_at ? new Date(a.answered_at).getTime() : 0)
+  );
+}
+
+async function loadMastery(sb: SupabaseClient, userId: string, canonicalId: string) {
+  const { data } = await sb
+    .from('question_mastery')
+    .select('last_result, correct_streak, retention_box, next_review_at, last_attempted_at, times_attempted, times_correct, last_wrong_source')
+    .eq('user_id', userId)
+    .eq('canonical_question_id', canonicalId)
+    .maybeSingle();
+  return data ?? null;
+}
+
+export async function getQuestionHistory(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const questionId = optString(args.question_id, 'question_id');
+  if (!questionId) throw new ToolInputError('question_id is required');
+  const { canonical, canonicalId } = await resolveOwnedQuestion(sb, userId, questionId);
+  const [attempts, mastery] = await Promise.all([loadQuestionAttempts(sb, userId, canonicalId), loadMastery(sb, userId, canonicalId)]);
+  return {
+    question: shapeQuestion(canonical),
+    mastery,
+    summary: summarizeHistory(attempts),
+    attempts: attempts.slice(0, 50).map((a) => shapeAttempt(a))
+  };
+}
+
+export async function getQuestionContext(
+  sb: SupabaseClient,
+  userId: string,
+  args: Record<string, unknown>,
+  conceptLookup?: (chapter: string | null, topic: string | null) => unknown
+) {
+  const questionId = optString(args.question_id, 'question_id');
+  if (!questionId) throw new ToolInputError('question_id is required');
+  const { canonical, canonicalId } = await resolveOwnedQuestion(sb, userId, questionId);
+  const [attempts, mastery] = await Promise.all([loadQuestionAttempts(sb, userId, canonicalId), loadMastery(sb, userId, canonicalId)]);
+
+  const bySource: Record<string, ReturnType<typeof summarizeHistory>> = {};
+  for (const p of ['full_test', 'qbank_practice', 'targeted_repair', 'retention_check'] as Provenance[]) {
+    const g = attempts.filter((a) => a.provenance === p);
+    if (g.length) bySource[p] = summarizeHistory(g);
+  }
+  const interventions = Array.from(
+    new Map(
+      attempts
+        .filter((a) => a.intervention_id)
+        .map((a) => [`${a.intervention_id}`, { intervention_id: a.intervention_id, provenance: a.provenance, status: a.status, answered_at: a.answered_at }])
+    ).values()
+  );
+  const latest = attempts[0] ?? null;
+  return {
+    question: shapeQuestion(canonical),
+    current_state: latest ? { status: latest.status, as_of: latest.answered_at, provenance: latest.provenance } : null,
+    history: summarizeHistory(attempts),
+    history_by_source: bySource,
+    appeared_in: Array.from(new Set(attempts.map((a) => a.test_title).filter(Boolean))).slice(0, 15),
+    repair_and_retention_tasks: interventions.slice(0, 15),
+    retention_state: mastery,
+    checkmate_concept: conceptLookup ? conceptLookup(canonical.chapter ?? null, canonical.topic ?? null) ?? null : null,
+    recent_attempts: attempts.slice(0, 10).map((a) => shapeAttempt(a))
+  };
+}
+
+// ── Tool: a test / session breakdown ─────────────────────────────────────────
+export async function getTestBreakdown(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  let sessionId = optString(args.session_id, 'session_id');
+  const testId = optString(args.test_id, 'test_id');
+  if (!sessionId && !testId) throw new ToolInputError('Provide session_id or test_id');
+
+  if (!sessionId && testId) {
+    const sessions = await selectIn(sb, 'test_sessions', 'id, server_start_time', 'test_id', [testId]);
+    const mine = await selectIn(sb, 'session_participants', 'session_id, submitted_at', 'session_id', sessions.map((s) => s.id as string), {
+      decorate: (q) => q.eq('user_id', userId)
+    });
+    const mineIds = new Set(mine.map((m) => m.session_id as string));
+    const candidate = sessions
+      .filter((s) => mineIds.has(s.id))
+      .sort((a, b) => String(b.server_start_time).localeCompare(String(a.server_start_time)))[0];
+    if (!candidate) throw new ToolInputError('No session of yours exists for that test_id');
+    sessionId = candidate.id as string;
+  }
+
+  const d = await loadSessionDetail(sb, userId, sessionId!);
+  const { data: summary } = await sb
+    .from('result_summaries')
+    .select('*')
+    .eq('session_id', sessionId!)
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  const withText = args.include_question_text === true;
+  const chapterStats = new Map<string, { correct: number; wrong: number; skipped: number; time: number; timed: number }>();
+  for (const r of d.rows) {
+    const key = r.q.chapter ?? 'Uncategorized';
+    const s = chapterStats.get(key) ?? { correct: 0, wrong: 0, skipped: 0, time: 0, timed: 0 };
+    if (r.status === 'CORRECT') s.correct += 1;
+    else if (r.status === 'WRONG') s.wrong += 1;
+    else s.skipped += 1;
+    if (typeof r.r?.time_spent_seconds === 'number') {
+      s.time += r.r.time_spent_seconds;
+      s.timed += 1;
+    }
+    chapterStats.set(key, s);
+  }
+  const prov = provenanceOf(d.test?.generated_from, d.session.intervention_id);
+
+  return {
+    session_id: d.session.id,
+    test_id: d.session.test_id,
+    title: d.test?.title ?? null,
+    provenance: prov,
+    submitted: d.submitted,
+    submitted_at: d.submitted_at,
+    result: summary
+      ? {
+          score: summary.score,
+          total_marks: summary.total_marks,
+          accuracy_pct: summary.accuracy_pct,
+          attempted: summary.attempted_count,
+          correct: summary.correct_count,
+          incorrect: summary.incorrect_count,
+          skipped: summary.skipped_count,
+          avg_time_per_question: summary.avg_time_per_question,
+          rank_in_session: summary.rank_in_session
+        }
+      : null,
+    by_chapter: Array.from(chapterStats.entries())
+      .map(([chapter, s]) => ({
+        chapter,
+        correct: s.correct,
+        wrong: s.wrong,
+        skipped: s.skipped,
+        accuracy_pct: s.correct + s.wrong > 0 ? Math.round((s.correct / (s.correct + s.wrong)) * 1000) / 10 : null,
+        avg_time_seconds: s.timed ? Math.round(s.time / s.timed) : null
+      }))
+      .sort((a, b) => b.wrong + b.skipped - (a.wrong + a.skipped)),
+    questions: d.rows.map((r) => {
+      const base = { ...questionWithOutcome(r, false), correct_answer: r.q.correct_answer ?? null };
+      // Full text/options/explanation only for the questions worth diagnosing.
+      return withText && r.status !== 'CORRECT' ? { ...questionWithOutcome(r, true) } : base;
+    })
+  };
+}
+
+
+
+//===== TERMUXFILE: Testmate/lib/gateway/tools-lib.ts =====
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { computeDailyTarget, DailyTargetBreakdown } from '@/lib/daily-target-engine';
+import { getQbankWrongSkippedByChapter } from '@/lib/qbank-review';
+import {
+  Attempt,
+  clampInt,
+  getSubjectByChapter,
+  groupByCanonical,
+  loadAttempts,
+  provenanceOf,
+  summarizeHistory
+} from './evidence';
+import { chapterMatches } from './chapter-match';
+import { fillSubjects } from './subject-fill';
+import { freshness, getProjection } from './projection';
+import { ToolDataUnavailable, ToolInputError } from './types';
+
+// Non-question tools: tests, schedule, targets, question-level mastery, Checkmate's pushed
+// projection, and the composite "context" tools built from them.
+
+function optStr(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+const eq = (a?: string | null, b?: string | null) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+const round = (n: number, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
+
+// ── Checkmate projection access ──────────────────────────────────────────────
+export async function loadStudentModel(sb: SupabaseClient, userId: string) {
+  const p = await getProjection(sb, userId, 'student_model');
+  if (!p) return null;
+  // Concepts the phone sent without a subject get one from Testmate's syllabus_chapters
+  // (see subject-fill.ts). Best-effort: if the syllabus isn't seeded the model is unchanged.
+  const { model, filled, unresolved_chapters } = fillSubjects(p.payload as any, await getSubjectByChapter(sb));
+  return {
+    ...model,
+    ...(filled > 0 ? { _subjects_filled_from_syllabus: filled } : {}),
+    ...(unresolved_chapters.length > 0 ? { _chapters_without_subject: unresolved_chapters } : {}),
+    _freshness: freshness(p.generated_at)
+  };
+}
+
+function requireModel(m: any) {
+  if (!m) {
+    throw new ToolDataUnavailable(
+      "Checkmate hasn't synced its student model to the gateway yet. Open the Checkmate app (it syncs in the background roughly every 30 minutes), then retry. Question-level tools still work."
+    );
+  }
+  return m;
+}
+
+export function conceptLookupFor(model: any | null) {
+  if (!model) return undefined;
+  return (chapter: string | null, topic: string | null) => {
+    const concepts = (model.concepts as any[]).filter((c) => chapterMatches(c.chapter, chapter) && (!topic || !c.topic || eq(c.topic, topic)));
+    if (concepts.length === 0) return null;
+    const errors = (model.unresolved_errors as any[]).filter((e) => chapterMatches(e.chapter, chapter) && (!topic || !e.topic || eq(e.topic, topic)));
+    return {
+      concepts: concepts.slice(0, 5).map((c) => ({
+        subject: c.subject,
+        chapter: c.chapter,
+        topic: c.topic,
+        mastery: c.mastery,
+        retention_decision: c.retention_decision,
+        forgetting_risk: c.forgetting_risk,
+        weak: c.weak
+      })),
+      unresolved_error_patterns: errors.slice(0, 5).map((e) => ({ error_type: e.error_type, occurrences: e.occurrences, last_seen_at: e.last_seen_at }))
+    };
+  };
+}
+
+export function getMastery(model: any, extras: { questionLevel: unknown }, args: Record<string, unknown>) {
+  const m = requireModel(model);
+  const subject = optStr(args.subject);
+  const chapter = optStr(args.chapter);
+  const topic = optStr(args.topic);
+  const limit = clampInt(args.limit, 40, 1, 150);
+  let concepts = (m.concepts as any[]).filter(
+    (c) => (!subject || eq(c.subject, subject)) && (!chapter || chapterMatches(c.chapter, chapter)) && (!topic || eq(c.topic, topic))
+  );
+  concepts = concepts.sort((a, b) => (a.mastery ?? 1) - (b.mastery ?? 1));
+  const bySubject = new Map<string, { n: number; sum: number; weak: number }>();
+  for (const c of concepts) {
+    const key = c.subject ?? 'Unclassified';
+    const s = bySubject.get(key) ?? { n: 0, sum: 0, weak: 0 };
+    s.n += 1;
+    s.sum += c.mastery ?? 0;
+    if (c.weak) s.weak += 1;
+    bySubject.set(key, s);
+  }
+  return {
+    source: 'checkmate_student_model',
+    freshness: m._freshness,
+    overall: m.overall,
+    by_subject: Array.from(bySubject.entries()).map(([name, s]) => ({
+      subject: name,
+      concepts: s.n,
+      average_mastery: s.n ? round(s.sum / s.n) : null,
+      weak_concepts: s.weak
+    })),
+    matching: concepts.length,
+    concepts: concepts.slice(0, limit).map(({ concept_id, ...rest }) => ({ concept_id, ...rest })),
+    question_level: extras.questionLevel
+  };
+}
+
+export function getWeakConcepts(model: any, args: Record<string, unknown>) {
+  const m = requireModel(model);
+  const subject = optStr(args.subject);
+  const limit = clampInt(args.limit, 10, 1, 50);
+  const weak = (m.concepts as any[])
+    .filter((c) => c.weak && (!subject || eq(c.subject, subject)))
+    .sort((a, b) => (a.mastery ?? 1) - (b.mastery ?? 1));
+  return {
+    source: 'checkmate_student_model',
+    freshness: m._freshness,
+    total_weak: weak.length,
+    concepts: weak.slice(0, limit).map((c) => ({
+      concept_id: c.concept_id,
+      subject: c.subject,
+      chapter: c.chapter,
+      topic: c.topic,
+      mastery: c.mastery,
+      recent_accuracy: c.recent_accuracy,
+      attempt_count: c.attempt_count,
+      error_count: c.error_count,
+      retention_decision: c.retention_decision,
+      prerequisite_issues: c.prerequisite_issues
+    }))
+  };
+}
+
+export function getErrorPatterns(model: any, args: Record<string, unknown>) {
+  const m = requireModel(model);
+  const subject = optStr(args.subject);
+  const chapter = optStr(args.chapter);
+  const limit = clampInt(args.limit, 20, 1, 100);
+  const rows = (m.unresolved_errors as any[])
+    .filter((e) => (!subject || eq(e.subject, subject)) && (!chapter || chapterMatches(e.chapter, chapter)))
+    .sort((a, b) => b.occurrences - a.occurrences);
+  return {
+    source: 'checkmate_student_model',
+    freshness: m._freshness,
+    note: "error_type comes from Checkmate's heuristic classifier; today only CARELESS and TIME_PRESSURE are reliably distinguishable, others are placeholders.",
+    total_unresolved_patterns: rows.length,
+    patterns: rows.slice(0, limit)
+  };
+}
+
+export async function getInterventionHistory(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const p = await getProjection(sb, userId, 'interventions');
+  if (!p) {
+    throw new ToolDataUnavailable("Checkmate hasn't synced its intervention history yet. Open the Checkmate app and retry.");
+  }
+  const days = clampInt(args.days, 30, 1, 365);
+  const limit = clampInt(args.limit, 25, 1, 100);
+  const outcome = optStr(args.provenance)?.toUpperCase();
+  const since = Date.now() - days * 86_400_000;
+  let entries = (p.payload.entries as any[]).filter((e) => e.resolved_at && new Date(e.resolved_at).getTime() >= since);
+  if (outcome) entries = entries.filter((e) => String(e.provenance).toUpperCase() === outcome);
+  entries.sort((a, b) => String(b.resolved_at).localeCompare(String(a.resolved_at)));
+
+  const tally: Record<string, number> = {};
+  for (const e of entries) tally[e.provenance ?? 'UNKNOWN'] = (tally[e.provenance ?? 'UNKNOWN'] ?? 0) + 1;
+  return {
+    source: 'checkmate_outcome_ledger',
+    freshness: freshness(p.generated_at),
+    window_days: days,
+    note: "provenance SUCCESS = a decisive resolution; NETWORK_FALLBACK/LLM_INVALID = Checkmate's deterministic fallback ran; USER_ABORTED/TTL_EXPIRED = the student didn't act. 'What has Checkmate already tried?' lives here.",
+    by_provenance: tally,
+    total: entries.length,
+    interventions: entries.slice(0, limit)
+  };
+}
+
+export async function getTodayPlan(sb: SupabaseClient, userId: string) {
+  const p = await getProjection(sb, userId, 'today_plan');
+  if (!p) throw new ToolDataUnavailable("Checkmate hasn't synced today's plan yet. Open the Checkmate app and retry.");
+  const fresh = freshness(p.generated_at, 180);
+  const tasks = p.payload.tasks as any[];
+  const count = (s: string) => tasks.filter((t) => t.state === s).length;
+  return {
+    source: 'checkmate_planner',
+    freshness: fresh,
+    plan_day: p.payload.day_key,
+    note: fresh.stale ? 'This plan snapshot is stale — task states may have changed on the phone since.' : undefined,
+    completion_percent: p.payload.completion_percent,
+    totals: { tasks: tasks.length, done: count('DONE'), pending: count('PENDING'), active: count('ACTIVE'), paused: count('PAUSED'), skipped: count('SKIPPED') },
+    tasks
+  };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+export async function getRecentTests(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const limit = clampInt(args.limit, 8, 1, 30);
+  const includePractice = args.include_practice === true;
+
+  const { data: parts, error } = await sb
+    .from('session_participants')
+    .select('session_id, submitted_at')
+    .eq('user_id', userId)
+    .not('submitted_at', 'is', null)
+    .order('submitted_at', { ascending: false })
+    .limit(limit * 4);
+  if (error) throw error;
+  const sessionIds = (parts ?? []).map((p: any) => p.session_id as string);
+  if (sessionIds.length === 0) return { tests: [] };
+
+  const [{ data: sessions }, { data: summaries }] = await Promise.all([
+    sb.from('test_sessions').select('id, test_id, intervention_id').in('id', sessionIds.slice(0, 150)),
+    sb.from('result_summaries').select('*').eq('user_id', userId).in('session_id', sessionIds.slice(0, 150))
+  ]);
+  const testIds = Array.from(new Set((sessions ?? []).map((s: any) => s.test_id as string)));
+  const { data: tests } = testIds.length
+    ? await sb.from('tests').select('id, title, generated_from').in('id', testIds.slice(0, 150))
+    : { data: [] as any[] };
+  const testById = new Map((tests ?? []).map((t: any) => [t.id as string, t]));
+  const sessionById = new Map((sessions ?? []).map((s: any) => [s.id as string, s]));
+  const summaryBySession = new Map((summaries ?? []).map((r: any) => [r.session_id as string, r]));
+
+  const out: any[] = [];
+  for (const p of parts ?? []) {
+    const s: any = sessionById.get(p.session_id);
+    if (!s) continue;
+    const t: any = testById.get(s.test_id);
+    const prov = provenanceOf(t?.generated_from, s.intervention_id);
+    if (!includePractice && prov !== 'full_test') continue;
+    const r: any = summaryBySession.get(p.session_id);
+    out.push({
+      session_id: p.session_id,
+      test_id: s.test_id,
+      title: t?.title ?? null,
+      provenance: prov,
+      submitted_at: p.submitted_at,
+      score: r?.score ?? null,
+      total_marks: r?.total_marks ?? null,
+      accuracy_pct: r?.accuracy_pct ?? null,
+      attempted: r?.attempted_count ?? null,
+      correct: r?.correct_count ?? null,
+      incorrect: r?.incorrect_count ?? null,
+      skipped: r?.skipped_count ?? null,
+      avg_time_per_question: r?.avg_time_per_question ?? null,
+      weakest_chapters: ((r?.weak_chapters as any[]) ?? []).slice(0, 5),
+      weakest_topics: ((r?.weak_topics as any[]) ?? []).slice(0, 5)
+    });
+    if (out.length >= limit) break;
+  }
+  return {
+    note: includePractice ? undefined : 'Full tests only. Pass include_practice=true to include Q-bank / repair / retention sessions.',
+    tests: out
+  };
+}
+
+// ── Schedule / targets (computed by the existing engine — not re-derived) ────
+export async function loadDailyTarget(userId: string): Promise<DailyTargetBreakdown> {
+  return computeDailyTarget(userId);
+}
+
+export function dailyTargetView(b: DailyTargetBreakdown) {
+  if (!b.configured) {
+    return {
+      configured: false,
+      note: 'No exam date configured in Testmate yet (Admin → Settings → Exam & study targets), so there is no daily target.'
+    };
+  }
+  const why: string[] = [];
+  if (b.days_left !== null) {
+    why.push(`${b.days_left} day(s) left to the ${b.deadline_source === 'syllabus_deadline' ? 'syllabus deadline' : 'exam date'}; ${b.remaining_questions} of ${b.total_questions} questions remain.`);
+  }
+  if (b.ft_pressure?.applied) {
+    why.push(`Full-test pressure raised the coverage target from ${b.ft_pressure.base_target} to ${b.ft_pressure.boosted_target} (binding test: ${b.ft_pressure.binding_test}).`);
+  } else if (b.ft_pressure) {
+    why.push('Full-test deadlines did not demand more than the global pace, so no boost was applied.');
+  }
+  if (b.capacity_capped) why.push('The target was capped by your daily capacity setting.');
+  why.push(`Today: ${b.today_target.coverage} coverage + ${b.today_target.repair} repair + ${b.today_target.retention} retention = ${b.today_target.total}; ${b.today_completed} done so far.`);
+  return {
+    configured: true,
+    exam_date: b.exam_date,
+    syllabus_deadline: b.syllabus_deadline,
+    deadline_source: b.deadline_source,
+    days_left: b.days_left,
+    total_questions: b.total_questions,
+    completed_questions: b.completed_questions,
+    remaining_questions: b.remaining_questions,
+    today_target: b.today_target,
+    today_completed: b.today_completed,
+    capacity_capped: b.capacity_capped,
+    subject_breakdown: b.subject_breakdown,
+    ft_pressure: b.ft_pressure,
+    why,
+    computed_at: b.computed_at
+  };
+}
+
+export function upcomingTestsView(b: DailyTargetBreakdown, args: Record<string, unknown>) {
+  const limit = clampInt(args.limit, 5, 1, 20);
+  return {
+    configured: b.configured,
+    upcoming_tests: b.upcoming_tests.slice(0, limit),
+    note: 'chapters_without_questions = chapters in that FT with nothing in the bank yet. required_per_day = daily pace needed to finish everything due by that FT.'
+  };
+}
+
+export function coverageGapsView(b: DailyTargetBreakdown, args: Record<string, unknown>) {
+  const limit = clampInt(args.limit, 15, 1, 60);
+  const subject = optStr(args.subject);
+  if (b.coverage_gaps === null) {
+    return { coverage_gaps: null, note: 'syllabus_chapters is not seeded in Testmate, so per-chapter coverage gaps are unavailable.' };
+  }
+  const gaps = b.coverage_gaps.filter((g) => !subject || eq(g.subject, subject));
+  return { total_gaps: gaps.length, coverage_gaps: gaps.slice(0, limit) };
+}
+
+// ── Question-level mastery + retention + Q-bank (Testmate side) ──────────────
+async function fetchMasteryRows(sb: SupabaseClient, userId: string): Promise<any[]> {
+  const out: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await sb
+      .from('question_mastery')
+      .select('canonical_question_id, chapter, topic, last_result, last_wrong_source, correct_streak, retention_box, next_review_at, times_attempted, times_correct')
+      .eq('user_id', userId)
+      .order('canonical_question_id', { ascending: true })
+      .range(from, from + 999);
+    if (error) throw error;
+    out.push(...(data ?? []));
+    if ((data ?? []).length < 1000) break;
+  }
+  return out;
+}
+
+export async function questionLevelMastery(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const subject = optStr(args.subject);
+  const chapter = optStr(args.chapter);
+  const subjectByChapter = subject ? await getSubjectByChapter(sb) : new Map<string, string>();
+  const rows = (await fetchMasteryRows(sb, userId)).filter(
+    (r) => (!chapter || chapterMatches(r.chapter, chapter)) && (!subject || eq(subjectByChapter.get(r.chapter ?? ''), subject))
+  );
+  const now = Date.now();
+  const byChapter = new Map<string, any>();
+  for (const r of rows) {
+    const key = r.chapter ?? 'Uncategorized';
+    const s = byChapter.get(key) ?? { tracked: 0, correct_now: 0, wrong_now: 0, box: 0, due: 0, att: 0, cor: 0 };
+    s.tracked += 1;
+    if (r.last_result === 'correct') s.correct_now += 1;
+    if (r.last_result === 'wrong') s.wrong_now += 1;
+    s.box += r.retention_box ?? 0;
+    if (r.next_review_at && new Date(r.next_review_at).getTime() <= now) s.due += 1;
+    s.att += r.times_attempted ?? 0;
+    s.cor += r.times_correct ?? 0;
+    byChapter.set(key, s);
+  }
+  return {
+    source: 'testmate_question_mastery',
+    questions_tracked: rows.length,
+    chapters: Array.from(byChapter.entries())
+      .map(([name, s]) => ({
+        chapter: name,
+        questions_tracked: s.tracked,
+        currently_correct: s.correct_now,
+        currently_wrong: s.wrong_now,
+        lifetime_accuracy_pct: s.att ? round((s.cor / s.att) * 100, 1) : null,
+        avg_retention_box: s.tracked ? round(s.box / s.tracked, 2) : null,
+        due_for_review: s.due
+      }))
+      .sort((a, b) => b.currently_wrong - a.currently_wrong)
+      .slice(0, 60)
+  };
+}
+
+export async function getRetentionDue(sb: SupabaseClient, userId: string, model: any | null, args: Record<string, unknown>) {
+  const limit = clampInt(args.limit, 10, 1, 50);
+  const chapter = optStr(args.chapter);
+  const rows = (await fetchMasteryRows(sb, userId)).filter((r) => !chapter || chapterMatches(r.chapter, chapter));
+  const now = Date.now();
+  const due = rows
+    .filter((r) => r.next_review_at && new Date(r.next_review_at).getTime() <= now)
+    .map((r) => ({ ...r, overdue_days: Math.floor((now - new Date(r.next_review_at).getTime()) / 86_400_000) }));
+  const weak = due.filter((r) => r.last_result === 'wrong' || (r.correct_streak ?? 0) === 0);
+  const byChapter = new Map<string, number>();
+  for (const r of due) byChapter.set(r.chapter ?? 'Uncategorized', (byChapter.get(r.chapter ?? 'Uncategorized') ?? 0) + 1);
+
+  return {
+    question_level: {
+      source: 'testmate_spaced_repetition',
+      due_now: due.length,
+      overdue_over_3_days: due.filter((r) => r.overdue_days > 3).length,
+      weak_and_due: weak.length,
+      strong_but_due: due.length - weak.length,
+      by_chapter: Array.from(byChapter.entries())
+        .map(([name, n]) => ({ chapter: name, due: n }))
+        .sort((a, b) => b.due - a.due)
+        .slice(0, 15),
+      next_step: 'Call checkmate_get_retention_questions to see the actual questions.'
+    },
+    concept_level: model
+      ? {
+          source: 'checkmate_student_model',
+          freshness: model._freshness,
+          needs_review: (model.concepts as any[])
+            .filter((c) => c.retention_decision === 'REVIEW' && (!chapter || chapterMatches(c.chapter, chapter)))
+            .sort((a, b) => (b.forgetting_risk ?? 0) - (a.forgetting_risk ?? 0))
+            .slice(0, limit)
+            .map((c) => ({ subject: c.subject, chapter: c.chapter, topic: c.topic, mastery: c.mastery, forgetting_risk: c.forgetting_risk, last_seen_at: c.last_seen_at }))
+        }
+      : { available: false, note: "Checkmate hasn't synced its student model yet." }
+  };
+}
+
+export async function getQbankProgress(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const subject = optStr(args.subject);
+  const chapter = optStr(args.chapter);
+  const subjectByChapter = await getSubjectByChapter(sb);
+
+  // Canonical Q-bank supply = tag_source 'coaching_module' (see app/api/qbank/practice's POOL SOURCE note).
+  const bank: { id: string; chapter: string | null }[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await sb
+      .from('questions')
+      .select('id, chapter')
+      .eq('tag_source', 'coaching_module')
+      .order('id', { ascending: true })
+      .range(from, from + 999);
+    if (error) throw error;
+    bank.push(...((data ?? []) as any[]));
+    if ((data ?? []).length < 1000) break;
+  }
+  const mastery = await fetchMasteryRows(sb, userId);
+  const masteryByCanonical = new Map(mastery.map((m) => [m.canonical_question_id as string, m]));
+  const wrongSkipped = new Map((await getQbankWrongSkippedByChapter(sb, userId)).map((r) => [r.chapter, r]));
+
+  const byChapter = new Map<string, { total: number; attempted: number; correct_now: number }>();
+  for (const q of bank) {
+    const key = q.chapter ?? 'Uncategorized';
+    if (chapter && !chapterMatches(key, chapter)) continue;
+    if (subject && !eq(subjectByChapter.get(key), subject)) continue;
+    const s = byChapter.get(key) ?? { total: 0, attempted: 0, correct_now: 0 };
+    s.total += 1;
+    const m = masteryByCanonical.get(q.id);
+    if (m) {
+      s.attempted += 1;
+      if (m.last_result === 'correct') s.correct_now += 1;
+    }
+    byChapter.set(key, s);
+  }
+  const chapters = Array.from(byChapter.entries())
+    .map(([name, s]) => ({
+      chapter: name,
+      subject: subjectByChapter.get(name) ?? null,
+      bank_questions: s.total,
+      attempted: s.attempted,
+      remaining_unattempted: s.total - s.attempted,
+      currently_correct: s.correct_now,
+      qbank_wrong: wrongSkipped.get(name)?.wrong ?? 0,
+      qbank_skipped: wrongSkipped.get(name)?.skipped ?? 0
+    }))
+    .sort((a, b) => b.remaining_unattempted - a.remaining_unattempted);
+  const totals = chapters.reduce(
+    (t, c) => ({
+      bank_questions: t.bank_questions + c.bank_questions,
+      attempted: t.attempted + c.attempted,
+      qbank_wrong: t.qbank_wrong + c.qbank_wrong,
+      qbank_skipped: t.qbank_skipped + c.qbank_skipped
+    }),
+    { bank_questions: 0, attempted: 0, qbank_wrong: 0, qbank_skipped: 0 }
+  );
+  return {
+    note: 'Wrong/skipped here are Q-bank practice only (never mixed with full tests or repairs).',
+    totals: { ...totals, remaining_unattempted: totals.bank_questions - totals.attempted },
+    chapters: chapters.slice(0, 40)
+  };
+}
+
+// ── Snapshot + composite context ─────────────────────────────────────────────
+async function attemptsSummary(sb: SupabaseClient, userId: string, days: number) {
+  const attempts: Attempt[] = await loadAttempts(sb, userId, { sinceIso: new Date(Date.now() - days * 86_400_000).toISOString(), maxRows: 2500 });
+  const subjectByChapter = await getSubjectByChapter(sb);
+  const tally = () => ({ correct: 0, wrong: 0, skipped: 0 });
+  const overall = tally();
+  const per = new Map<string, ReturnType<typeof tally>>();
+  for (const a of attempts) {
+    const key = a.question.chapter ? subjectByChapter.get(a.question.chapter) ?? 'Unclassified' : 'Unclassified';
+    const s = per.get(key) ?? tally();
+    const bucket = a.status === 'CORRECT' ? 'correct' : a.status === 'WRONG' ? 'wrong' : a.status === 'SKIPPED' ? 'skipped' : null;
+    if (bucket) {
+      s[bucket] += 1;
+      overall[bucket] += 1;
+    }
+    per.set(key, s);
+  }
+  const acc = (t: { correct: number; wrong: number }) => (t.correct + t.wrong ? round((t.correct / (t.correct + t.wrong)) * 100, 1) : null);
+  return {
+    attempts,
+    summary: {
+      window_days: days,
+      overall: { ...overall, accuracy_pct: acc(overall) },
+      by_subject: Array.from(per.entries()).map(([subject, t]) => ({ subject, ...t, accuracy_pct: acc(t) }))
+    }
+  };
+}
+
+function stillWrongTop(attempts: Attempt[], n: number) {
+  const groups = groupByCanonical(attempts);
+  const out: any[] = [];
+  for (const [id, g] of Array.from(groups.entries())) {
+    if (g[0].status !== 'WRONG') continue;
+    const h = summarizeHistory(g);
+    out.push({ question_id: g[0].question.id, canonical_question_id: id, chapter: g[0].question.chapter ?? null, topic: g[0].question.topic ?? null, times_wrong: h.wrong, last_wrong_at: h.last_wrong_at });
+  }
+  return out.sort((a, b) => b.times_wrong - a.times_wrong).slice(0, n);
+}
+
+export async function getStudentSnapshot(sb: SupabaseClient, userId: string, model: any | null) {
+  const [recent, target, tests] = await Promise.all([
+    attemptsSummary(sb, userId, 14),
+    loadDailyTarget(userId).catch(() => null),
+    getRecentTests(sb, userId, { limit: 3 }).catch(() => ({ tests: [] as any[] }))
+  ]);
+  const retention = await getRetentionDue(sb, userId, model, { limit: 3 });
+  const bySubject = new Map<string, { n: number; sum: number; weak: number }>();
+  for (const c of (model?.concepts as any[]) ?? []) {
+    const k = c.subject ?? 'Unclassified';
+    const s = bySubject.get(k) ?? { n: 0, sum: 0, weak: 0 };
+    s.n += 1;
+    s.sum += c.mastery ?? 0;
+    if (c.weak) s.weak += 1;
+    bySubject.set(k, s);
+  }
+  const view = target ? dailyTargetView(target) : null;
+  return {
+    exam: model?.exam ?? null,
+    checkmate: model
+      ? {
+          synced: true,
+          freshness: model._freshness,
+          overall: model.overall,
+          mastery_by_subject: Array.from(bySubject.entries()).map(([subject, s]) => ({ subject, concepts: s.n, average_mastery: s.n ? round(s.sum / s.n) : null, weak_concepts: s.weak }))
+        }
+      : { synced: false, note: "Checkmate hasn't synced its student model yet — concept-level mastery and error patterns are unavailable until it does." },
+    recent_accuracy: recent.summary,
+    recent_full_tests: tests.tests,
+    still_wrong_questions: stillWrongTop(recent.attempts, 5),
+    retention: { question_level: (retention as any).question_level, concepts_needing_review: (retention as any).concept_level?.needs_review?.length ?? null },
+    schedule: view && (view as any).configured
+      ? {
+          days_left: (view as any).days_left,
+          deadline_source: (view as any).deadline_source,
+          today_target: (view as any).today_target,
+          today_completed: (view as any).today_completed,
+          next_test: target!.upcoming_tests[0] ?? null
+        }
+      : view
+  };
+}
+
+const PURPOSES = ['diagnose', 'plan', 'review_test', 'prepare_for_test', 'analyze_performance', 'repair_weakness', 'explain_progress'] as const;
+export const CONTEXT_PURPOSES = PURPOSES as unknown as string[];
+
+/**
+ * The composite read tool. The gateway gathers what a purpose needs so the external model
+ * doesn't have to orchestrate 15 calls — and every section degrades independently
+ * (`{ unavailable: reason }`) instead of failing the whole context.
+ */
+export async function getContext(
+  sb: SupabaseClient,
+  userId: string,
+  model: any | null,
+  args: Record<string, unknown>,
+  deps: { testBreakdown: (a: Record<string, unknown>) => Promise<unknown>; repairQuestions: (a: Record<string, unknown>) => Promise<unknown>; wrongQuestions: (a: Record<string, unknown>) => Promise<unknown> }
+) {
+  const purpose = optStr(args.purpose);
+  if (!purpose || !CONTEXT_PURPOSES.includes(purpose)) {
+    throw new ToolInputError(`purpose must be one of: ${CONTEXT_PURPOSES.join(', ')}`);
+  }
+  const chapter = optStr(args.chapter);
+  const subject = optStr(args.subject);
+
+  const section = async (fn: () => unknown | Promise<unknown>) => {
+    try {
+      return await fn();
+    } catch (err: any) {
+      return { unavailable: err?.message ?? 'failed' };
+    }
+  };
+
+  let target: DailyTargetBreakdown | null = null;
+  const getTarget = async () => (target ??= await loadDailyTarget(userId));
+
+  const sections: Record<string, unknown> = { purpose };
+
+  switch (purpose) {
+    case 'diagnose': {
+      sections.snapshot = await section(() => getStudentSnapshot(sb, userId, model));
+      sections.weak_concepts = await section(() => getWeakConcepts(model, { subject, limit: 8 }));
+      sections.error_patterns = await section(() => getErrorPatterns(model, { subject, chapter, limit: 8 }));
+      sections.questions_you_keep_missing = await section(() => deps.wrongQuestions({ subject, chapter, days: 60, min_times: 2, limit: 8 }));
+      sections.what_checkmate_already_tried = await section(() => getInterventionHistory(sb, userId, { days: 30, limit: 8 }));
+      break;
+    }
+    case 'plan': {
+      sections.today_plan = await section(() => getTodayPlan(sb, userId));
+      sections.daily_target = await section(async () => dailyTargetView(await getTarget()));
+      sections.upcoming_tests = await section(async () => upcomingTestsView(await getTarget(), { limit: 3 }));
+      sections.retention_due = await section(() => getRetentionDue(sb, userId, model, { limit: 5 }));
+      sections.open_repairs = await section(() => deps.repairQuestions({ only_unresolved: true, limit: 5 }));
+      break;
+    }
+    case 'review_test': {
+      const args2 = { session_id: args.session_id, test_id: args.test_id };
+      if (!args2.session_id && !args2.test_id) {
+        const recent: any = await getRecentTests(sb, userId, { limit: 1 });
+        const first = recent.tests?.[0];
+        if (!first) throw new ToolDataUnavailable('No submitted full test found to review.');
+        args2.session_id = first.session_id;
+      }
+      sections.test = await section(() => deps.testBreakdown({ ...args2, include_question_text: true }));
+      sections.recent_tests = await section(() => getRecentTests(sb, userId, { limit: 4 }));
+      break;
+    }
+    case 'prepare_for_test': {
+      sections.upcoming_tests = await section(async () => upcomingTestsView(await getTarget(), { limit: 3 }));
+      sections.coverage_gaps = await section(async () => coverageGapsView(await getTarget(), { limit: 10, subject }));
+      sections.weak_concepts = await section(() => getWeakConcepts(model, { subject, limit: 8 }));
+      sections.retention_due = await section(() => getRetentionDue(sb, userId, model, { limit: 5 }));
+      sections.questions_you_keep_missing = await section(() => deps.wrongQuestions({ subject, chapter, days: 90, limit: 8 }));
+      sections.daily_target = await section(async () => dailyTargetView(await getTarget()));
+      break;
+    }
+    case 'analyze_performance': {
+      sections.recent_tests = await section(() => getRecentTests(sb, userId, { limit: 6 }));
+      sections.accuracy = await section(async () => (await attemptsSummary(sb, userId, 30)).summary);
+      sections.question_level_mastery = await section(() => questionLevelMastery(sb, userId, { subject, chapter }));
+      sections.error_patterns = await section(() => getErrorPatterns(model, { subject, chapter, limit: 8 }));
+      break;
+    }
+    case 'repair_weakness': {
+      sections.weak_concepts = await section(() => getWeakConcepts(model, { subject, limit: 6 }));
+      sections.repair_tasks = await section(() => deps.repairQuestions({ chapter, limit: 5 }));
+      sections.wrong_questions = await section(() => deps.wrongQuestions({ subject, chapter, days: 90, limit: 10 }));
+      sections.error_patterns = await section(() => getErrorPatterns(model, { subject, chapter, limit: 8 }));
+      sections.what_checkmate_already_tried = await section(() => getInterventionHistory(sb, userId, { days: 45, limit: 8 }));
+      break;
+    }
+    case 'explain_progress': {
+      sections.snapshot = await section(() => getStudentSnapshot(sb, userId, model));
+      sections.recent_tests = await section(() => getRecentTests(sb, userId, { limit: 6 }));
+      sections.mastery = await section(() => getMastery(model, { questionLevel: null }, { subject, limit: 15 }));
+      sections.what_checkmate_already_tried = await section(() => getInterventionHistory(sb, userId, { days: 60, limit: 10 }));
+      break;
+    }
+  }
+  return sections;
+}
+
+// A deliberately compact context — the "minimum useful state" tool.
+export async function getLearningContext(sb: SupabaseClient, userId: string, model: any | null) {
+  const section = async (fn: () => unknown | Promise<unknown>) => {
+    try {
+      return await fn();
+    } catch (err: any) {
+      return { unavailable: err?.message ?? 'failed' };
+    }
+  };
+  const target = await loadDailyTarget(userId).catch(() => null);
+  const recent = await attemptsSummary(sb, userId, 14).catch(() => null);
+  return {
+    priorities: await section(() => {
+      const w: any = getWeakConcepts(model, { limit: 5 });
+      return w.concepts.map((c: any) => ({ subject: c.subject, chapter: c.chapter, topic: c.topic, mastery: c.mastery }));
+    }),
+    recent_errors: await section(() => (getErrorPatterns(model, { limit: 5 }) as any).patterns),
+    retention_due: await section(async () => (await getRetentionDue(sb, userId, model, { limit: 5 })) as any),
+    upcoming_test: target ? target.upcoming_tests[0] ?? null : null,
+    todays_target: target ? dailyTargetView(target) : { unavailable: 'daily target could not be computed' },
+    recent_performance: recent ? recent.summary : null,
+    still_wrong_questions: recent ? stillWrongTop(recent.attempts, 5) : [],
+    recent_interventions: await section(async () => ((await getInterventionHistory(sb, userId, { days: 14, limit: 5 })) as any).interventions),
+    todays_plan: await section(async () => {
+      const p: any = await getTodayPlan(sb, userId);
+      return { freshness: p.freshness, totals: p.totals, tasks: p.tasks.map((t: any) => ({ subject: t.subject, topic: t.topic, state: t.state, learning_intent: t.learning_intent })) };
+    }),
+    next_step: 'Drill down with checkmate_get_wrong_questions, checkmate_get_repair_questions, checkmate_get_retention_questions, or checkmate_get_context(purpose=...).'
+  };
+}
+
+
+
+//===== TERMUXFILE: Testmate/lib/gateway/registry.ts =====
+import {
+  getQbankSession,
+  getQuestionContext,
+  getQuestionHistory,
+  getRecentAttempts,
+  getRepairQuestions,
+  getRepairTasks,
+  getRetentionQuestions,
+  getRetentionTasks,
+  getTestBreakdown,
+  getTodayQbank,
+  getWrongOrSkippedQuestions,
+  SOURCE_VALUES
+} from './evidence';
+import {
+  conceptLookupFor,
+  CONTEXT_PURPOSES,
+  coverageGapsView,
+  dailyTargetView,
+  getContext,
+  getErrorPatterns,
+  getInterventionHistory,
+  getLearningContext,
+  getMastery,
+  getQbankProgress,
+  getRecentTests,
+  getRetentionDue,
+  getStudentSnapshot,
+  getTodayPlan,
+  getWeakConcepts,
+  loadDailyTarget,
+  loadStudentModel,
+  questionLevelMastery,
+  upcomingTestsView
+} from './tools-lib';
+import { cancelRequest, createRequest, getRequests, REQUEST_STATUSES, TASK_TYPES } from './requests';
+import { Scope, ToolContext, ToolDef } from './types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool registry — semantic tools only. There is intentionally NO execute_sql,
+// get_table, dump_database, or get_all_*_events (FINAL_PLAN: "Absolutely don't expose").
+// The only mutating tools are the checkmate:plan REQUEST tools at the bottom: they append a
+// request for the Checkmate app to accept or reject and never touch learning data.
+// Names use underscores (not dots) because several
+// MCP hosts validate tool names against ^[a-zA-Z0-9_-]{1,64}$.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Prop = Record<string, unknown>;
+const S = (description: string): Prop => ({ type: 'string', description });
+const I = (description: string, min?: number, max?: number): Prop => ({ type: 'integer', description, ...(min !== undefined ? { minimum: min } : {}), ...(max !== undefined ? { maximum: max } : {}) });
+const B = (description: string): Prop => ({ type: 'boolean', description });
+const schema = (properties: Record<string, Prop> = {}, required: string[] = []) => ({
+  type: 'object',
+  properties,
+  required,
+  additionalProperties: false
+});
+
+const SUBJECT = S('Optional subject filter, e.g. Physics, Chemistry, Botany, Zoology.');
+const CHAPTER = S('Optional chapter name. Case-insensitive; a leading part of the full name works if it ends at a word boundary, e.g. "Biomolecules-II" matches "Biomolecules-II (Proteins, types & functions), Lipids, ...".');
+const TOPIC = S('Optional exact topic name.');
+const TASK_DETAIL: Prop = {
+  type: 'string',
+  enum: ['summary', 'full'],
+  description:
+    "'summary' (default): compact rows, no checkmate_context. 'full': adds checkmate_context and per-question detail; full results are capped at 3 tasks unless session_id is given."
+};
+const INTERVENTION_ID = S('Optional: return only tasks with this intervention_id. It can be shared by several tasks; prefer session_id.');
+const TASK_SESSION_ID = S('Optional: return only the task whose session has this id (take it from a summary row).');
+const DAYS = (def: number) => I(`Look-back window in days (default ${def}, max 365).`, 1, 365);
+const SOURCE: Prop = {
+  type: 'string',
+  enum: SOURCE_VALUES,
+  description:
+    "Where the attempt came from: full_test (real mocks/FTs), qbank_practice, targeted_repair (Checkmate repair tasks), retention_check. Default 'all'."
+};
+
+function tool(name: string, title: string, scope: Scope, description: string, inputSchema: Record<string, unknown>, handler: ToolDef['handler']): ToolDef {
+  return { name: `checkmate_${name}`, title, scope, description, inputSchema, handler };
+}
+
+function requestTool(
+  name: string,
+  title: string,
+  description: string,
+  inputSchema: Record<string, unknown>,
+  handler: ToolDef['handler'],
+  opts: { destructive?: boolean } = {}
+): ToolDef {
+  return { ...tool(name, title, 'checkmate:plan', description, inputSchema, handler), mutates: true, destructive: opts.destructive === true };
+}
+
+const REASON = S('Why this is worth doing, in one or two sentences, grounded in the data you looked at (10-500 chars).');
+
+export function buildTools(): ToolDef[] {
+  const READ: Scope = 'checkmate:read';
+  const ANALYSIS: Scope = 'checkmate:analysis';
+  const PLAN: Scope = 'checkmate:plan';
+
+  const model = (c: ToolContext) => loadStudentModel(c.supabase, c.principal.userId);
+  const uid = (c: ToolContext) => c.principal.userId;
+
+  return [
+    // ── Composite / entry points ───────────────────────────────────────────
+    tool('get_student_snapshot', 'Student snapshot', READ,
+      "START HERE. Compact whole-student state: Checkmate's overall mastery by subject, last-14-day accuracy, last full tests, still-wrong questions, retention load, and today's schedule/target. Then drill down with the other tools.",
+      schema(),
+      async (_a, c) => getStudentSnapshot(c.supabase, uid(c), await model(c))),
+
+    tool('get_learning_context', 'Learning context (compact)', ANALYSIS,
+      'The minimum useful state for advising the student: current priorities, recent errors, retention due, upcoming test, todays target, recent performance, still-wrong questions, recent interventions and the plan.',
+      schema(),
+      async (_a, c) => getLearningContext(c.supabase, uid(c), await model(c))),
+
+    tool('get_context', 'Purpose-specific context', ANALYSIS,
+      'One call that gathers everything a purpose needs (so you do not have to chain many tools). Each section degrades independently if some data is unavailable.',
+      schema(
+        {
+          purpose: { type: 'string', enum: CONTEXT_PURPOSES, description: 'diagnose | plan | review_test | prepare_for_test | analyze_performance | repair_weakness | explain_progress' },
+          subject: SUBJECT,
+          chapter: CHAPTER,
+          session_id: S('review_test only: a specific session to review (defaults to the latest full test).'),
+          test_id: S('review_test only: a specific test (uses your most recent session of it).')
+        },
+        ['purpose']
+      ),
+      async (a, c) => {
+        const m = await model(c);
+        return getContext(c.supabase, uid(c), m, a, {
+          testBreakdown: (x) => getTestBreakdown(c.supabase, uid(c), x),
+          repairQuestions: (x) => getRepairQuestions(c.supabase, uid(c), x, conceptLookupFor(m)),
+          wrongQuestions: (x) => getWrongOrSkippedQuestions(c.supabase, uid(c), 'WRONG', x)
+        });
+      }),
+
+    // ── Mastery / errors / retention ───────────────────────────────────────
+    tool('get_mastery', 'Mastery', READ,
+      "Concept-level mastery from Checkmate's student model (0-1; weak = below Checkmate's mastery threshold) plus Testmate's question-level accuracy and spaced-repetition state per chapter.",
+      schema({ subject: SUBJECT, chapter: CHAPTER, topic: TOPIC, limit: I('Max concepts (default 40).', 1, 150) }),
+      async (a, c) => {
+        const ql = await questionLevelMastery(c.supabase, uid(c), a).catch((e) => ({ unavailable: String(e?.message ?? e) }));
+        return getMastery(await model(c), { questionLevel: ql }, a);
+      }),
+
+    tool('get_weak_concepts', 'Weak concepts', READ,
+      'Concepts whose mastery is below threshold, weakest first, with weak prerequisite issues that may be the real cause.',
+      schema({ subject: SUBJECT, limit: I('Max concepts (default 10).', 1, 50) }),
+      async (a, c) => getWeakConcepts(await model(c), a)),
+
+    tool('get_error_patterns', 'Error patterns', READ,
+      'Unresolved recurring mistake patterns (error type x concept x occurrences) from Checkmate. Use for "why do I keep getting this chapter wrong?".',
+      schema({ subject: SUBJECT, chapter: CHAPTER, limit: I('Max patterns (default 20).', 1, 100) }),
+      async (a, c) => getErrorPatterns(await model(c), a)),
+
+    tool('get_retention_due', 'Retention due', READ,
+      'What the student is about to forget: question-level spaced-repetition queue (weak-and-due vs strong-but-due) plus concepts Checkmate says need review. Use checkmate_get_retention_questions for the questions themselves.',
+      schema({ chapter: CHAPTER, limit: I('Max concept rows (default 10).', 1, 50) }),
+      async (a, c) => getRetentionDue(c.supabase, uid(c), await model(c), a)),
+
+    // ── Question-level learning evidence (v1 core) ─────────────────────────
+    tool('get_wrong_questions', 'Wrong questions', READ,
+      "The actual questions the student gets wrong: text, options, THEIR answer, the correct answer, explanation, chapter/topic, when, and from where (full test / Q-bank / repair / retention). Defaults to questions whose latest attempt is still wrong; times_wrong shows repeat failures.",
+      schema({
+        subject: SUBJECT,
+        chapter: CHAPTER,
+        topic: TOPIC,
+        days: DAYS(60),
+        source: SOURCE,
+        min_times: I('Only questions wrong at least this many times (use 2+ for "keeps getting wrong").', 1, 50),
+        include_resolved: B('Also include questions that were wrong before but are now answered correctly (default false).'),
+        limit: I('Max questions (default 20, max 50).', 1, 50)
+      }),
+      async (a, c) => getWrongOrSkippedQuestions(c.supabase, uid(c), 'WRONG', a)),
+
+    tool('get_skipped_questions', 'Skipped questions', READ,
+      "Questions the student skipped, with options, correct answer and explanation. Includes questions never opened in a submitted test (skip_kind never_opened) as well as ones left blank.",
+      schema({
+        subject: SUBJECT,
+        chapter: CHAPTER,
+        topic: TOPIC,
+        days: DAYS(60),
+        source: SOURCE,
+        min_times: I('Only questions skipped at least this many times.', 1, 50),
+        include_resolved: B('Also include questions skipped before but since answered (default false).'),
+        limit: I('Max questions (default 20, max 50).', 1, 50)
+      }),
+      async (a, c) => getWrongOrSkippedQuestions(c.supabase, uid(c), 'SKIPPED', a)),
+
+    tool('get_recent_attempts', 'Recent attempts', READ,
+      'Compact chronological stream of recent question outcomes (CORRECT/WRONG/SKIPPED) with provenance. No question text — drill in with get_question_context.',
+      schema({
+        subject: SUBJECT,
+        chapter: CHAPTER,
+        topic: TOPIC,
+        days: DAYS(14),
+        source: SOURCE,
+        result: { type: 'string', enum: ['all', 'correct', 'wrong', 'skipped'], description: "Filter by outcome (default 'all')." },
+        limit: I('Max attempts (default 30, max 100).', 1, 100)
+      }),
+      async (a, c) => getRecentAttempts(c.supabase, uid(c), a)),
+
+    tool('get_today_qbank', "Today's Q-bank", READ,
+      "The Q-bank practice sessions started today (student's local day) with every assigned question, its purpose (coverage vs retry of past misses) and status UNANSWERED/CORRECT/WRONG/SKIPPED. For the target itself use get_daily_target.",
+      schema({ date: S('Optional YYYY-MM-DD (student local date). Default today.') }),
+      async (a, c) => getTodayQbank(c.supabase, uid(c), a)),
+
+    tool('get_qbank_session', 'Session detail', READ,
+      'Full detail of one practice/repair/retention/test session: its questions with options, correct answers, explanations and the student\'s outcome on each, plus purpose and provenance.',
+      schema({ session_id: S('Session id from another tool.') }, ['session_id']),
+      async (a, c) => getQbankSession(c.supabase, uid(c), a)),
+
+    tool('get_repair_questions', 'Repair questions', READ,
+      "Checkmate repair tasks -> their questions -> outcomes. Each question carries the reason it was chosen (concept, selection pool, how often it was missed before). CORRECT means that repair fixed it; WRONG/SKIPPED/UNANSWERED means unresolved.",
+      schema({
+        chapter: CHAPTER,
+        days: DAYS(60),
+        only_unresolved: B('Only tasks that still have wrong/skipped/unanswered questions.'),
+        limit: I('Max tasks (default 10, max 30).', 1, 30)
+      }),
+      async (a, c) => getRepairQuestions(c.supabase, uid(c), a, conceptLookupFor(await model(c)))),
+
+    tool('get_retention_questions', 'Retention questions', READ,
+      "Questions due for spaced retrieval ('due': flagged weak vs strong_but_due) and past retention-check sessions with per-question outcomes ('checks').",
+      schema({
+        mode: { type: 'string', enum: ['due', 'checks', 'both'], description: "Default 'both'." },
+        chapter: CHAPTER,
+        days: DAYS(60),
+        only_unresolved: B('checks only: tasks with unresolved questions.'),
+        limit: I('Max items (default 20, max 50).', 1, 50)
+      }),
+      async (a, c) => getRetentionQuestions(c.supabase, uid(c), a, conceptLookupFor(await model(c)))),
+
+    tool('get_repair_tasks', 'Repair tasks', READ,
+      "Task-level view of Checkmate repair interventions: one row per task with its state (pending / partially_resolved / resolved), counts, accuracy and ONLY the still-unresolved question ids. Compact by default (detail='summary'); use detail='full' with a session_id to drill into one task. Use get_repair_questions for the full questions.",
+      schema({
+        chapter: CHAPTER,
+        days: DAYS(60),
+        only_unresolved: B('Only tasks that still have wrong/skipped/unanswered questions.'),
+        detail: TASK_DETAIL,
+        intervention_id: INTERVENTION_ID,
+        session_id: TASK_SESSION_ID,
+        limit: I('Max tasks (default 8 in summary, 3 in full; max 30).', 1, 30)
+      }),
+      async (a, c) => getRepairTasks(c.supabase, uid(c), a, conceptLookupFor(await model(c)))),
+
+    tool('get_retention_tasks', 'Retention tasks', READ,
+      "Task-level view of retention checks Checkmate scheduled: one row per task with its state, counts, accuracy and ONLY the unresolved question ids (forgotten or unanswered). Compact by default (detail='summary'); use detail='full' with a session_id to drill into one task. Use get_retention_due for the spaced-repetition queue and get_retention_questions for the questions themselves.",
+      schema({
+        chapter: CHAPTER,
+        days: DAYS(60),
+        only_unresolved: B('Only tasks that still have wrong/skipped/unanswered questions.'),
+        detail: TASK_DETAIL,
+        intervention_id: INTERVENTION_ID,
+        session_id: TASK_SESSION_ID,
+        limit: I('Max tasks (default 8 in summary, 3 in full; max 30).', 1, 30)
+      }),
+      async (a, c) => getRetentionTasks(c.supabase, uid(c), a, conceptLookupFor(await model(c)))),
+
+    tool('get_question_history', 'Question history', READ,
+      'Every attempt the student has made at one question (across all its copies in tests/Q-bank/repairs), with spaced-repetition state.',
+      schema({ question_id: S('Question id from another tool.') }, ['question_id']),
+      async (a, c) => getQuestionHistory(c.supabase, uid(c), a)),
+
+    tool('get_question_context', 'Question context', READ,
+      "One question's full story: text/options/answer/explanation, current state, history by source, which repair/retention tasks it appeared in, retention state, and Checkmate's mastery/error context for its chapter.",
+      schema({ question_id: S('Question id from another tool.') }, ['question_id']),
+      async (a, c) => getQuestionContext(c.supabase, uid(c), a, conceptLookupFor(await model(c)))),
+
+    // ── Tests / schedule ───────────────────────────────────────────────────
+    tool('get_recent_tests', 'Recent tests', READ,
+      'Recent submitted full tests with score, accuracy, skipped/incorrect counts, timing and weakest chapters/topics.',
+      schema({ limit: I('Max tests (default 8).', 1, 30), include_practice: B('Also include Q-bank/repair/retention sessions.') }),
+      async (a, c) => getRecentTests(c.supabase, uid(c), a)),
+
+    tool('get_test_breakdown', 'Test breakdown', READ,
+      'Question-by-question breakdown of one test session with per-chapter accuracy/time. Set include_question_text=true to get text, options and explanations for the wrong/skipped questions.',
+      schema({
+        session_id: S('Session id (preferred).'),
+        test_id: S('Or a test id — uses your most recent session of it.'),
+        include_question_text: B('Include full text/options/explanation for non-correct questions.')
+      }),
+      async (a, c) => getTestBreakdown(c.supabase, uid(c), a)),
+
+    tool('get_upcoming_tests', 'Upcoming tests', READ,
+      'Upcoming full tests with date, study deadline, scope chapters, chapters with no questions yet, remaining work and the daily pace needed.',
+      schema({ limit: I('Max tests (default 5).', 1, 20) }),
+      async (a, c) => upcomingTestsView(await loadDailyTarget(uid(c)), a)),
+
+    tool('get_daily_target', 'Daily target', READ,
+      "Today's Q-bank target (coverage/repair/retention), progress so far, per-subject split, and WHY it is what it is (deadline source, FT pressure, capacity cap).",
+      schema(),
+      async (_a, c) => dailyTargetView(await loadDailyTarget(uid(c)))),
+
+    tool('get_coverage_gaps', 'Coverage gaps', READ,
+      'Chapters with questions still unattempted, most urgent first (by the next test that covers them).',
+      schema({ subject: SUBJECT, limit: I('Max chapters (default 15).', 1, 60) }),
+      async (a, c) => coverageGapsView(await loadDailyTarget(uid(c)), a)),
+
+    tool('get_qbank_progress', 'Q-bank progress', READ,
+      'Per-chapter Q-bank progress: bank size, attempted, remaining, currently correct, and Q-bank-only wrong/skipped counts.',
+      schema({ subject: SUBJECT, chapter: CHAPTER }),
+      async (a, c) => getQbankProgress(c.supabase, uid(c), a)),
+
+    // ── Plan / interventions ───────────────────────────────────────────────
+    tool('get_today_plan', "Today's plan", READ,
+      "Today's study tasks from Checkmate's planner (state, type, schedule, learning intent, rationale). Snapshot synced from the phone; check freshness.",
+      schema(),
+      async (_a, c) => getTodayPlan(c.supabase, uid(c))),
+
+    tool('get_intervention_history', 'Intervention history', READ,
+      "What Checkmate has already tried and how each ended (outcome ledger). Use to avoid repeating recommendations that already failed or were ignored.",
+      schema({
+        days: DAYS(30),
+        provenance: S('Optional: SUCCESS, USER_ABORTED, TTL_EXPIRED, EXECUTION_FAILED, POLICY_REJECTED, NETWORK_FALLBACK, LLM_INVALID.'),
+        limit: I('Max entries (default 25).', 1, 100)
+      }),
+      async (a, c) => getInterventionHistory(c.supabase, uid(c), a)),
+
+    // ── Requests (checkmate:plan only; queue a request, never change data) ─
+    requestTool('request_repair', 'Request a repair',
+      "Ask Checkmate to schedule a repair for a chapter (optionally a topic or concept). This only QUEUES a request: the student's Checkmate app checks it against its own policy and may accept or reject it, and an identical open request is not duplicated. Call it only when the student asked for it in this conversation, and look at checkmate_get_repair_tasks first so you don't request a repair that already exists.",
+      schema({ chapter: S('Chapter to repair. The full name or a unique leading part.'), topic: S('Optional topic.'), concept: S('Optional concept inside the chapter.'), reason: REASON }, ['chapter', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'request_repair', a)),
+
+    requestTool('create_task', 'Request a study task',
+      "Ask Checkmate to add a study task to the student's plan. Queues a request only; Checkmate decides. Call it only when the student asked for it, and check checkmate_get_today_plan first.",
+      schema({
+        task_type: { type: 'string', enum: [...TASK_TYPES], description: 'repair | retention | qbank_practice | revision' },
+        chapter: S('Chapter the task is about.'),
+        title: S('Optional short title (max 120 chars).'),
+        target_questions: I('How many questions (default 10, max 50).', 1, 50),
+        due_date: S('Optional YYYY-MM-DD within the next 14 days.'),
+        reason: REASON
+      }, ['task_type', 'chapter', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'create_task', a)),
+
+    requestTool('dismiss_task', 'Request dismissing a task',
+      "Ask Checkmate to dismiss a planned task, using the task id from checkmate_get_today_plan. Queues a request only; Checkmate decides. Call it only when the student asked for it.",
+      schema({ task_id: S('Task id from checkmate_get_today_plan.'), reason: REASON }, ['task_id', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'dismiss_task', a),
+      { destructive: true }),
+
+    requestTool('cancel_request', 'Cancel a pending request',
+      'Cancel a request that Checkmate has not picked up yet. Requests already claimed, accepted or rejected cannot be cancelled.',
+      schema({ request_id: S('Request id returned when it was queued.') }, ['request_id']),
+      async (a, c) => cancelRequest(c.supabase, uid(c), a)),
+
+    // Read-only, but behind PLAN: only tokens allowed to make requests see their outcomes.
+    tool('get_requests', 'Request status', PLAN,
+      'Status and outcome of requests you made: pending (not picked up), claimed (Checkmate is reviewing), accepted, rejected (with Checkmate\'s message), expired (24h without an answer) or cancelled. Pass request_id for one request.',
+      schema({
+        request_id: S('Optional: a single request.'),
+        status: { type: 'string', enum: [...REQUEST_STATUSES], description: 'Optional status filter.' },
+        days: DAYS(7),
+        limit: I('Max requests (default 10, max 30).', 1, 30)
+      }),
+      async (a, c) => getRequests(c.supabase, uid(c), a))
+  ];
+}
+
+// ── Resources (stable read-only context snapshots) ───────────────────────────
+export interface ResourceDef {
+  uri: string;
+  name: string;
+  title: string;
+  description: string;
+  scope: Scope;
+  read: (c: ToolContext) => Promise<unknown>;
+}
+
+export function buildResources(): ResourceDef[] {
+  return [
+    { uri: 'checkmate://student/snapshot', name: 'student-snapshot', title: 'Student snapshot', description: 'Whole-student state at a glance.', scope: 'checkmate:read',
+      read: async (c) => getStudentSnapshot(c.supabase, c.principal.userId, await loadStudentModel(c.supabase, c.principal.userId)) },
+    { uri: 'checkmate://student/current-context', name: 'student-current-context', title: 'Current learning context', description: 'Compact context for advising the student.', scope: 'checkmate:analysis',
+      read: async (c) => getLearningContext(c.supabase, c.principal.userId, await loadStudentModel(c.supabase, c.principal.userId)) },
+    { uri: 'checkmate://student/today', name: 'student-today', title: "Today", description: "Today's plan.", scope: 'checkmate:read',
+      read: async (c) => getTodayPlan(c.supabase, c.principal.userId) },
+    { uri: 'checkmate://student/upcoming-tests', name: 'student-upcoming-tests', title: 'Upcoming tests', description: 'Upcoming full tests and the pace needed.', scope: 'checkmate:read',
+      read: async (c) => upcomingTestsView(await loadDailyTarget(c.principal.userId), { limit: 8 }) },
+    { uri: 'checkmate://student/mastery', name: 'student-mastery', title: 'Mastery', description: 'Concept-level mastery.', scope: 'checkmate:read',
+      read: async (c) => getMastery(await loadStudentModel(c.supabase, c.principal.userId), { questionLevel: await questionLevelMastery(c.supabase, c.principal.userId, {}).catch(() => null) }, { limit: 60 }) }
+  ];
+}
+
+// ── Prompts (reusable workflows) ─────────────────────────────────────────────
+export interface PromptDef {
+  name: string;
+  title: string;
+  description: string;
+  arguments: { name: string; description: string; required: boolean }[];
+  render: (args: Record<string, string>) => string;
+}
+
+export function buildPrompts(): PromptDef[] {
+  const opt = (name: string, description: string) => ({ name, description, required: false });
+  return [
+    { name: 'diagnose_student', title: 'Diagnose the student', description: 'Find the biggest problems and their likely root causes.', arguments: [opt('subject', 'Limit to one subject')],
+      render: (a) => `Diagnose this student's biggest learning problems${a.subject ? ` in ${a.subject}` : ''}. Call checkmate_get_context with purpose="diagnose", then inspect the actual questions behind the top weaknesses with checkmate_get_wrong_questions (min_times=2) and checkmate_get_question_context. Separate "weak at it" from "strong but due for retention", check checkmate_get_intervention_history so you don't recommend what already failed, and finish with the 3 highest-leverage problems, each backed by specific questions.` },
+    { name: 'review_recent_test', title: 'Review a recent test', description: 'Explain why a test went the way it did.', arguments: [opt('session_id', 'Session to review (default: latest full test)')],
+      render: (a) => `Review ${a.session_id ? `session ${a.session_id}` : 'the most recent full test'}. Call checkmate_get_context with purpose="review_test"${a.session_id ? ` and session_id="${a.session_id}"` : ''}. Compare it with the previous tests, look at the wrong and skipped questions themselves (not just counts), and explain concretely what cost marks: concept gaps, careless errors, time pressure or skipped questions.` },
+    { name: 'plan_today', title: "Plan today", description: "Decide what to do today.", arguments: [],
+      render: () => `Plan today. Call checkmate_get_context with purpose="plan". Reconcile the planner's tasks, the Q-bank daily target, open repair questions, retention due and the nearest test, then give a prioritized order with time estimates and the reason for each item.` },
+    { name: 'prepare_for_test', title: 'Prepare for the next test', description: 'Build a prep strategy for an upcoming test.', arguments: [opt('subject', 'Focus subject')],
+      render: (a) => `Help the student prepare for the next full test${a.subject ? ` (focus: ${a.subject})` : ''}. Call checkmate_get_context with purpose="prepare_for_test". Weigh coverage gaps against weak concepts, retention due and questions they keep missing, and give a day-by-day plan to the study deadline.` },
+    { name: 'review_weakness', title: 'Repair a weakness', description: 'Work through one weak chapter.', arguments: [opt('chapter', 'Chapter to repair')],
+      render: (a) => `Work through ${a.chapter ? `the chapter "${a.chapter}"` : "the student's weakest chapter"}. Call checkmate_get_context with purpose="repair_weakness"${a.chapter ? ` and chapter="${a.chapter}"` : ''}. Inspect the repair tasks and which questions stayed unresolved, identify the shared misconception or prerequisite gap, and propose a concrete next step.` },
+    { name: 'explain_progress', title: 'Explain progress', description: 'Summarize progress honestly.', arguments: [],
+      render: () => `Explain how the student is progressing. Call checkmate_get_context with purpose="explain_progress". Be specific and honest: what improved, what stalled, and what the data cannot tell yet (note any stale or missing sync).` }
+  ];
+}
+
+
+
+//===== TERMUXFILE: Testmate/lib/gateway/types.ts =====
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+// Scope vocabulary from FINAL_PLAN. read + analysis are the default; checkmate:plan (Phase 3)
+// unlocks the request tools, which only QUEUE a request for Checkmate to accept or reject.
+// behavior / write / admin stay reserved.
+export const ALL_SCOPES = [
+  'checkmate:read',
+  'checkmate:analysis',
+  'checkmate:behavior',
+  'checkmate:plan',
+  'checkmate:write',
+  'checkmate:admin'
+] as const;
+export type Scope = (typeof ALL_SCOPES)[number];
+
+// What a token gets when no scopes are asked for: read-only, exactly as in v1.
+export const DEFAULT_SCOPES: Scope[] = ['checkmate:read', 'checkmate:analysis'];
+// What POST /api/gateway/tokens may mint when asked explicitly. checkmate:plan is OFF by
+// default and must be requested; write/admin/behavior still can't be issued at all.
+export const MINTABLE_SCOPES: Scope[] = ['checkmate:read', 'checkmate:analysis', 'checkmate:plan'];
+// Kept so older imports keep compiling.
+export const V1_MINTABLE_SCOPES: Scope[] = DEFAULT_SCOPES;
+
+export interface GatewayPrincipal {
+  userId: string;
+  tokenId: string;
+  label: string;
+  scopes: Scope[];
+}
+
+export interface ToolContext {
+  principal: GatewayPrincipal;
+  supabase: SupabaseClient;
+}
+
+export interface ToolDef {
+  name: string;
+  title: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  scope: Scope;
+  /** Queues or changes a request (so it is not read-only). Drives the MCP annotations. */
+  mutates?: boolean;
+  /** Asks for something to be removed/dismissed; hosts may prompt before running it. */
+  destructive?: boolean;
+  handler: (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;
+}
+
+/** Bad arguments from the model — reported as a tool error it can read and fix, not a 500. */
+export class ToolInputError extends Error {}
+
+/** Data the tool needs doesn't exist yet (e.g. phone hasn't synced). Also model-readable. */
+export class ToolDataUnavailable extends Error {}
+
+export function isScope(s: unknown): s is Scope {
+  return typeof s === 'string' && (ALL_SCOPES as readonly string[]).includes(s);
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/mcp.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getServiceClient } from '@/lib/supabase';
+import { authenticateGateway, hasScope } from './auth';
+import { isRateLimited, recordAudit } from './audit';
+import { buildPrompts, buildResources, buildTools } from './registry';
+import { capResponse, minimize } from './sanitize';
+import { GatewayPrincipal, ToolDataUnavailable, ToolInputError } from './types';
+
+// Minimal MCP server over Streamable HTTP (POST JSON-RPC, JSON responses, no SSE, no
+// sessions — every call is independent, which is what a stateless serverless host wants).
+
+// Legacy (handshake-era) versions, negotiated through `initialize` exactly as before.
+const SUPPORTED_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+// Modern (stateless) revision: no handshake, version/identity/capabilities travel on every request.
+const MODERN_VERSION = '2026-07-28';
+const ALL_VERSIONS = [MODERN_VERSION, ...SUPPORTED_VERSIONS];
+const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
+const META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo';
+const SERVER_INFO = { name: 'checkmate-gateway', title: 'Checkmate Learning Gateway', version: '1.2.0' };
+const INSTRUCTIONS =
+  "Access to one student's learning data from Checkmate (planner/mastery) and Testmate (tests, Q-bank). All data tools are read-only. " +
+  'Start with checkmate_get_student_snapshot, or checkmate_get_context(purpose=...) for a task-specific bundle. ' +
+  'Question-level tools return the real questions, the student\'s answers, correct answers and explanations — use them to ground any diagnosis ' +
+  'instead of guessing from counts. Data may be stale if the phone has not synced (see freshness fields). ' +
+  'This gateway cannot change learning data. A token with the checkmate:plan scope additionally gets request tools ' +
+  '(checkmate_request_repair, checkmate_create_task, checkmate_dismiss_task) that only QUEUE a request: the student\'s Checkmate app ' +
+  'decides whether to accept it. Only make a request when the student has asked for it in this conversation.';
+
+type JsonRpcId = string | number | null;
+interface JsonRpcRequest {
+  jsonrpc: '2.0';
+  id?: JsonRpcId;
+  method: string;
+  params?: Record<string, any>;
+}
+
+const ERR = { parse: -32700, invalidRequest: -32600, methodNotFound: -32601, invalidParams: -32602, internal: -32603 };
+// -32020..-32099 are reserved for the MCP spec (2026-07-28).
+const ERR_MODERN = { headerMismatch: -32020, unsupportedVersion: -32022 };
+
+function rpcError(id: JsonRpcId | undefined, code: number, message: string) {
+  return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
+}
+function rpcResult(id: JsonRpcId | undefined, result: unknown) {
+  return { jsonrpc: '2.0', id: id ?? null, result };
+}
+
+function originAllowed(req: NextRequest): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return true; // server-to-server hosts send none
+  const allowed = (process.env.GATEWAY_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // Default: refuse browser origins entirely (DNS-rebinding defense). Opt specific
+  // origins in with GATEWAY_ALLOWED_ORIGINS if a browser-based MCP client is ever needed.
+  return allowed.includes(origin);
+}
+
+const tools = buildTools();
+const toolByName = new Map(tools.map((t) => [t.name, t]));
+const resources = buildResources();
+const prompts = buildPrompts();
+
+function toolResult(payload: unknown, isError = false) {
+  const { text } = capResponse(isError ? payload : minimize(payload));
+  return { content: [{ type: 'text', text }], isError };
+}
+
+async function handleOne(msg: JsonRpcRequest, principal: GatewayPrincipal): Promise<unknown | null> {
+  const isNotification = msg.id === undefined;
+  const started = Date.now();
+  const supabase = getServiceClient();
+  const ctx = { principal, supabase };
+
+  const audit = (extra: { tool?: string; args?: unknown; ok: boolean; error?: string; bytes?: number }) =>
+    recordAudit({ principal, method: msg.method, tool: extra.tool, args: extra.args, ok: extra.ok, error: extra.error, durationMs: Date.now() - started, responseBytes: extra.bytes });
+
+  try {
+    switch (msg.method) {
+      case 'initialize': {
+        const requested = msg.params?.protocolVersion;
+        const version = SUPPORTED_VERSIONS.includes(requested) ? requested : SUPPORTED_VERSIONS[0];
+        void audit({ ok: true });
+        return rpcResult(msg.id, {
+          protocolVersion: version,
+          capabilities: { tools: { listChanged: false }, resources: { listChanged: false, subscribe: false }, prompts: { listChanged: false } },
+          serverInfo: SERVER_INFO,
+          instructions: INSTRUCTIONS
+        });
+      }
+      case 'notifications/initialized':
+      case 'notifications/cancelled':
+        return null;
+      case 'ping':
+        return rpcResult(msg.id, {});
+
+      case 'tools/list': {
+        const visible = tools.filter((t) => hasScope(principal, t.scope));
+        return rpcResult(msg.id, {
+          tools: visible.map((t) => ({
+            name: t.name,
+            title: t.title,
+            description: t.description,
+            inputSchema: t.inputSchema,
+            // Request tools must NOT claim to be read-only, or a host may auto-approve them.
+            annotations: { readOnlyHint: !t.mutates, destructiveHint: !!t.destructive, idempotentHint: !t.mutates, openWorldHint: false }
+          }))
+        });
+      }
+
+      case 'tools/call': {
+        const name = msg.params?.name;
+        const args = (msg.params?.arguments ?? {}) as Record<string, unknown>;
+        const tool = typeof name === 'string' ? toolByName.get(name) : undefined;
+        if (!tool) return rpcError(msg.id, ERR.invalidParams, `Unknown tool: ${String(name)}`);
+        if (typeof args !== 'object' || Array.isArray(args)) return rpcError(msg.id, ERR.invalidParams, 'arguments must be an object');
+        if (!hasScope(principal, tool.scope)) {
+          void audit({ tool: tool.name, args, ok: false, error: `missing scope ${tool.scope}` });
+          return rpcResult(msg.id, toolResult({ error: `This token does not have the ${tool.scope} scope.` }, true));
+        }
+        try {
+          const result = await tool.handler(args, ctx);
+          const out = toolResult(result);
+          void audit({ tool: tool.name, args, ok: true, bytes: Buffer.byteLength(out.content[0].text, 'utf8') });
+          return rpcResult(msg.id, out);
+        } catch (err: any) {
+          // Tool-level failures are returned as readable tool errors so the model can
+          // self-correct; only genuine bugs get a generic message (details stay in logs).
+          const known = err instanceof ToolInputError || err instanceof ToolDataUnavailable;
+          if (!known) console.error(`[gateway] ${tool.name} failed:`, err?.message ?? err);
+          const message = known ? err.message : 'Internal error while reading learning data. Try narrowing the filters or retry shortly.';
+          void audit({ tool: tool.name, args, ok: false, error: known ? message : `internal: ${String(err?.message ?? err)}` });
+          return rpcResult(msg.id, toolResult({ error: message }, true));
+        }
+      }
+
+      case 'resources/list': {
+        const visible = resources.filter((r) => hasScope(principal, r.scope));
+        return rpcResult(msg.id, {
+          resources: visible.map((r) => ({ uri: r.uri, name: r.name, title: r.title, description: r.description, mimeType: 'application/json' }))
+        });
+      }
+      case 'resources/read': {
+        const uri = msg.params?.uri;
+        const res = resources.find((r) => r.uri === uri);
+        if (!res || !hasScope(principal, res.scope)) return rpcError(msg.id, ERR.invalidParams, `Unknown resource: ${String(uri)}`);
+        try {
+          const { text } = capResponse(minimize(await res.read(ctx)));
+          void audit({ tool: `resource:${res.uri}`, ok: true, bytes: Buffer.byteLength(text, 'utf8') });
+          return rpcResult(msg.id, { contents: [{ uri: res.uri, mimeType: 'application/json', text }] });
+        } catch (err: any) {
+          const known = err instanceof ToolInputError || err instanceof ToolDataUnavailable;
+          void audit({ tool: `resource:${res.uri}`, ok: false, error: known ? err.message : `internal: ${String(err?.message ?? err)}` });
+          return rpcError(msg.id, ERR.internal, known ? err.message : 'Failed to read resource');
+        }
+      }
+
+      case 'prompts/list':
+        return rpcResult(msg.id, { prompts: prompts.map((p) => ({ name: p.name, title: p.title, description: p.description, arguments: p.arguments })) });
+      case 'prompts/get': {
+        const p = prompts.find((x) => x.name === msg.params?.name);
+        if (!p) return rpcError(msg.id, ERR.invalidParams, `Unknown prompt: ${String(msg.params?.name)}`);
+        const args: Record<string, string> = {};
+        for (const [k, v] of Object.entries((msg.params?.arguments ?? {}) as Record<string, unknown>)) if (typeof v === 'string') args[k] = v.slice(0, 200);
+        return rpcResult(msg.id, { description: p.description, messages: [{ role: 'user', content: { type: 'text', text: p.render(args) } }] });
+      }
+
+      default:
+        void audit({ ok: false, error: 'method not found' });
+        return isNotification ? null : rpcError(msg.id, ERR.methodNotFound, `Method not found: ${msg.method}`);
+    }
+  } catch (err: any) {
+    console.error('[gateway] unhandled:', err?.message ?? err);
+    return isNotification ? null : rpcError(msg.id, ERR.internal, 'Internal error');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP 2026-07-28 (stateless) support. Served alongside the legacy handshake path on the
+// same endpoint: a request is "modern" when it carries the 2026-07-28 per-request
+// `_meta` version or the matching MCP-Protocol-Version header. Everything else goes
+// through the unchanged legacy code above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MODERN_METHODS = new Set([
+  'server/discover',
+  'tools/list',
+  'tools/call',
+  'resources/list',
+  'resources/read',
+  'prompts/list',
+  'prompts/get'
+]);
+
+// Cache hints required on list/read results. Everything here is behind a per-student
+// token (and tools/list varies by scope), so nothing is shareable: scope is always private.
+const CACHE_HINTS: Record<string, { ttlMs: number; cacheScope: 'private' }> = {
+  'server/discover': { ttlMs: 300_000, cacheScope: 'private' },
+  'tools/list': { ttlMs: 60_000, cacheScope: 'private' },
+  'prompts/list': { ttlMs: 300_000, cacheScope: 'private' },
+  'resources/list': { ttlMs: 300_000, cacheScope: 'private' },
+  'resources/read': { ttlMs: 0, cacheScope: 'private' } // live student data
+};
+
+function isModernRequest(req: NextRequest, body: unknown): boolean {
+  if (req.headers.get('mcp-protocol-version') === MODERN_VERSION) return true;
+  const first: any = Array.isArray(body) ? body[0] : body;
+  const metaVersion = first?.params?._meta?.[META_VERSION];
+  return typeof metaVersion === 'string';
+}
+
+/** Mcp-Name / Mcp-Param values that are not plain ASCII arrive as =?base64?...?= (spec: Value Encoding). */
+function decodeHeaderValue(raw: string): string {
+  const m = /^=\?base64\?(.*)\?=$/.exec(raw);
+  if (!m) return raw;
+  try {
+    return Buffer.from(m[1], 'base64').toString('utf8');
+  } catch {
+    return raw;
+  }
+}
+
+function modernError(status: number, id: JsonRpcId | undefined, code: number, message: string, data?: unknown) {
+  const error: Record<string, unknown> = { code, message };
+  if (data !== undefined) error.data = data;
+  return NextResponse.json({ jsonrpc: '2.0', id: id ?? null, error }, { status, headers: { 'Cache-Control': 'no-store' } });
+}
+
+async function handleModern(req: NextRequest, principal: GatewayPrincipal, body: unknown): Promise<NextResponse> {
+  if (Array.isArray(body)) {
+    return modernError(400, null, ERR.invalidRequest, 'Batches are not supported in 2026-07-28: send one JSON-RPC message per POST.');
+  }
+  const msg = body as JsonRpcRequest;
+  if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    return modernError(400, (msg as any)?.id, ERR.invalidRequest, 'Invalid JSON-RPC request');
+  }
+  const id = msg.id;
+
+  // Version: header and body `_meta` must agree, then must be one we serve.
+  const headerVersion = req.headers.get('mcp-protocol-version');
+  const metaVersion = msg.params?._meta?.[META_VERSION];
+  if (typeof metaVersion !== 'string' || headerVersion !== metaVersion) {
+    return modernError(
+      400,
+      id,
+      ERR_MODERN.headerMismatch,
+      `Header mismatch: MCP-Protocol-Version header (${headerVersion ?? 'missing'}) must match _meta["${META_VERSION}"] (${typeof metaVersion === 'string' ? metaVersion : 'missing'}).`
+    );
+  }
+  if (metaVersion !== MODERN_VERSION) {
+    return modernError(400, id, ERR_MODERN.unsupportedVersion, 'Unsupported protocol version', { supported: ALL_VERSIONS, requested: metaVersion });
+  }
+
+  // This revision defines no client notifications over HTTP; accept and ignore any that arrive.
+  if (id === undefined) return new NextResponse(null, { status: 202 });
+
+  // Routing headers must mirror the body (a gateway may have routed on them).
+  const methodHeader = req.headers.get('mcp-method');
+  if (methodHeader !== msg.method) {
+    return modernError(400, id, ERR_MODERN.headerMismatch, `Header mismatch: Mcp-Method header (${methodHeader ?? 'missing'}) does not match body method (${msg.method}).`);
+  }
+  const nameSource =
+    msg.method === 'tools/call' || msg.method === 'prompts/get' ? msg.params?.name : msg.method === 'resources/read' ? msg.params?.uri : undefined;
+  if (msg.method === 'tools/call' || msg.method === 'prompts/get' || msg.method === 'resources/read') {
+    const nameHeader = req.headers.get('mcp-name');
+    if (nameHeader === null || typeof nameSource !== 'string' || decodeHeaderValue(nameHeader) !== nameSource) {
+      return modernError(400, id, ERR_MODERN.headerMismatch, 'Header mismatch: Mcp-Name header is missing or does not match the request body.');
+    }
+  }
+
+  if (!MODERN_METHODS.has(msg.method)) {
+    return modernError(404, id, ERR.methodNotFound, `Method not found: ${msg.method}`);
+  }
+
+  const baseMeta = { [META_SERVER_INFO]: { name: SERVER_INFO.name, version: SERVER_INFO.version } };
+  const finish = (result: Record<string, unknown>) => {
+    const hint = CACHE_HINTS[msg.method];
+    return {
+      ...result,
+      resultType: 'complete',
+      ...(hint ?? {}),
+      _meta: { ...((result._meta as Record<string, unknown>) ?? {}), ...baseMeta }
+    };
+  };
+
+  if (msg.method === 'server/discover') {
+    void recordAudit({ principal, method: msg.method, ok: true, durationMs: 0 });
+    return NextResponse.json(
+      rpcResult(id, finish({ supportedVersions: ALL_VERSIONS, capabilities: { tools: {}, resources: {}, prompts: {} }, instructions: INSTRUCTIONS })),
+      { headers: { 'Cache-Control': 'no-store' } }
+    );
+  }
+
+  const reply: any = await handleOne(msg, principal);
+  if (reply && typeof reply === 'object' && 'result' in reply && reply.result && typeof reply.result === 'object') {
+    reply.result = finish(reply.result as Record<string, unknown>);
+  }
+  return NextResponse.json(reply, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+export async function handleMcpPost(req: NextRequest): Promise<NextResponse> {
+  if (!originAllowed(req)) return NextResponse.json({ error: 'Origin not allowed' }, { status: 403 });
+
+  const auth = await authenticateGateway(req);
+  if (!auth.ok) {
+    return NextResponse.json(rpcError(null, ERR.invalidRequest, auth.message), {
+      status: auth.status,
+      headers: { 'WWW-Authenticate': 'Bearer realm="checkmate-gateway"' }
+    });
+  }
+  const { principal } = auth;
+
+  if (await isRateLimited(principal.tokenId)) {
+    return NextResponse.json(rpcError(null, ERR.internal, 'Rate limit exceeded — slow down and retry in a minute.'), {
+      status: 429,
+      headers: { 'Retry-After': '30' }
+    });
+  }
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(rpcError(null, ERR.parse, 'Parse error'), { status: 400 });
+  }
+
+  if (isModernRequest(req, body)) return handleModern(req, principal, body);
+
+  const isBatch = Array.isArray(body);
+  const messages = (isBatch ? body : [body]) as JsonRpcRequest[];
+  if (messages.length === 0 || messages.length > 10) {
+    return NextResponse.json(rpcError(null, ERR.invalidRequest, 'Batch must contain 1-10 messages'), { status: 400 });
+  }
+
+  const replies: unknown[] = [];
+  for (const m of messages) {
+    if (!m || m.jsonrpc !== '2.0' || typeof m.method !== 'string') {
+      replies.push(rpcError((m as any)?.id, ERR.invalidRequest, 'Invalid JSON-RPC request'));
+      continue;
+    }
+    const r = await handleOne(m, principal);
+    if (r !== null) replies.push(r);
+  }
+
+  if (replies.length === 0) return new NextResponse(null, { status: 202 }); // notifications only
+  return NextResponse.json(isBatch ? replies : replies[0], { headers: { 'Cache-Control': 'no-store' } });
+}
+
+
+
+//===== TERMUXFILE: Testmate/lib/gateway/requests.ts =====
+import { createHash } from 'crypto';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { chapterMatches } from './chapter-match';
+import { getSubjectByChapter } from './evidence';
+import { ToolInputError } from './types';
+import type { GatewayPrincipal } from './types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request queue (FINAL_PLAN Phase 3 / "Writes: V2").
+//
+// The gateway NEVER changes mastery, attempts, tasks or tests. A tool call from an
+// external AI only appends a bounded, validated row to gateway_requests. Checkmate on the
+// phone pulls pending rows, applies its own policy layer, and reports accepted/rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const REQUEST_KINDS = ['request_repair', 'create_task', 'dismiss_task'] as const;
+export type RequestKind = (typeof REQUEST_KINDS)[number];
+export const TASK_TYPES = ['repair', 'retention', 'qbank_practice', 'revision'] as const;
+export const REQUEST_STATUSES = ['pending', 'claimed', 'accepted', 'rejected', 'expired', 'cancelled'] as const;
+
+export const MAX_OPEN_REQUESTS = 5; // pending + claimed, per student
+export const MAX_REQUESTS_PER_DAY = 20; // created in the last 24h, per student
+const TTL_MS = 24 * 3_600_000;
+const STALE_CLAIM_MS = 10 * 60_000; // a claim the phone never answered becomes claimable again
+const TABLE = 'gateway_requests';
+const OPEN: string[] = ['pending', 'claimed'];
+
+/** Error with an HTTP status, for the device-facing routes. */
+export class RequestError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// ── Input hygiene ────────────────────────────────────────────────────────────
+// Everything below arrives from a model, so it is treated as untrusted data: bounded,
+// control characters stripped, unknown fields ignored.
+function cleanText(v: unknown, field: string, opts: { min?: number; max: number; required?: boolean }): string | undefined {
+  if (v === undefined || v === null || v === '') {
+    if (opts.required) throw new ToolInputError(`${field} is required.`);
+    return undefined;
+  }
+  if (typeof v !== 'string') throw new ToolInputError(`${field} must be a string.`);
+  const t = v.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t) {
+    if (opts.required) throw new ToolInputError(`${field} is required.`);
+    return undefined;
+  }
+  if (opts.min && t.length < opts.min) throw new ToolInputError(`${field} must be at least ${opts.min} characters.`);
+  if (t.length > opts.max) throw new ToolInputError(`${field} must be at most ${opts.max} characters.`);
+  return t;
+}
+
+async function canonicalChapter(sb: SupabaseClient, raw: string): Promise<string> {
+  const known = await getSubjectByChapter(sb);
+  if (known.size === 0) return raw; // syllabus not seeded: nothing to check against
+  const names = Array.from(known.keys());
+  const exact = names.filter((n) => n.trim().toLowerCase() === raw.trim().toLowerCase());
+  const hits = exact.length > 0 ? exact : names.filter((n) => chapterMatches(n, raw));
+  if (hits.length === 1) return hits[0];
+  if (hits.length === 0) {
+    throw new ToolInputError(`Unknown chapter "${raw}". Use a chapter name from checkmate_get_qbank_progress.`);
+  }
+  throw new ToolInputError(`"${raw}" matches ${hits.length} chapters; use the full name. Matches: ${hits.slice(0, 5).join(' | ')}`);
+}
+
+function validDueDate(v: unknown): string | undefined {
+  const s = cleanText(v, 'due_date', { max: 10 });
+  if (!s) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(`${s}T00:00:00Z`))) {
+    throw new ToolInputError('due_date must be a real date in YYYY-MM-DD format.');
+  }
+  const day = Date.parse(`${s}T00:00:00Z`);
+  const today = Date.parse(new Date().toISOString().slice(0, 10) + 'T00:00:00Z');
+  if (day < today - 86_400_000 || day > today + 14 * 86_400_000) {
+    throw new ToolInputError('due_date must be within the next 14 days.');
+  }
+  return s;
+}
+
+export async function normalizeRequest(
+  sb: SupabaseClient,
+  kind: RequestKind,
+  args: Record<string, unknown>
+): Promise<{ payload: Record<string, unknown>; reason: string }> {
+  const reason = cleanText(args.reason, 'reason', { min: 10, max: 500, required: true })!;
+
+  if (kind === 'request_repair') {
+    const chapter = await canonicalChapter(sb, cleanText(args.chapter, 'chapter', { max: 200, required: true })!);
+    return {
+      payload: {
+        chapter,
+        topic: cleanText(args.topic, 'topic', { max: 200 }) ?? null,
+        concept: cleanText(args.concept, 'concept', { max: 200 }) ?? null
+      },
+      reason
+    };
+  }
+
+  if (kind === 'create_task') {
+    const taskType = cleanText(args.task_type, 'task_type', { max: 30, required: true })!;
+    if (!(TASK_TYPES as readonly string[]).includes(taskType)) {
+      throw new ToolInputError(`task_type must be one of: ${TASK_TYPES.join(', ')}`);
+    }
+    const chapter = await canonicalChapter(sb, cleanText(args.chapter, 'chapter', { max: 200, required: true })!);
+    let target = 10;
+    if (args.target_questions !== undefined && args.target_questions !== null) {
+      const n = Number(args.target_questions);
+      if (!Number.isInteger(n) || n < 1 || n > 50) throw new ToolInputError('target_questions must be a whole number from 1 to 50.');
+      target = n;
+    }
+    return {
+      payload: {
+        task_type: taskType,
+        chapter,
+        title: cleanText(args.title, 'title', { max: 120 }) ?? null,
+        target_questions: target,
+        due_date: validDueDate(args.due_date) ?? null
+      },
+      reason
+    };
+  }
+
+  // dismiss_task
+  return { payload: { task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })! }, reason };
+}
+
+// payload keys are always built in a fixed order above, so this is deterministic.
+export function dedupeKey(kind: RequestKind, payload: Record<string, unknown>): string {
+  return createHash('sha256').update(`${kind}|${JSON.stringify(payload)}`).digest('hex');
+}
+
+// ── Views (what leaves the server; never user_id / token_id) ─────────────────
+function view(row: any) {
+  return {
+    request_id: row.id,
+    kind: row.kind,
+    status: row.status,
+    payload: row.payload,
+    reason: row.reason,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    resolved_at: row.resolved_at ?? null,
+    result: row.result ?? null
+  };
+}
+
+const COLS = 'id, kind, status, payload, reason, created_at, expires_at, claimed_at, resolved_at, result';
+
+async function expireStale(sb: SupabaseClient, userId: string): Promise<void> {
+  const { error } = await sb
+    .from(TABLE)
+    .update({ status: 'expired', resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('status', 'pending')
+    .lt('expires_at', new Date().toISOString());
+  if (error) console.error('[gateway/requests] expire failed:', error.message);
+}
+
+async function countRows(sb: SupabaseClient, userId: string, build: (q: any) => any): Promise<number> {
+  const { count, error } = await build(sb.from(TABLE).select('id', { count: 'exact', head: true }).eq('user_id', userId));
+  if (error) throw error;
+  return count ?? 0;
+}
+
+// ── AI-facing operations (called from gateway tools) ─────────────────────────
+export async function createRequest(
+  sb: SupabaseClient,
+  principal: GatewayPrincipal,
+  kind: RequestKind,
+  args: Record<string, unknown>
+) {
+  const userId = principal.userId;
+  const { payload, reason } = await normalizeRequest(sb, kind, args);
+  const key = dedupeKey(kind, payload);
+  await expireStale(sb, userId);
+
+  const open = await countRows(sb, userId, (q) => q.in('status', OPEN));
+  if (open >= MAX_OPEN_REQUESTS) {
+    throw new ToolInputError(
+      `There are already ${open} open requests (limit ${MAX_OPEN_REQUESTS}). Wait for Checkmate to answer them, or cancel some with checkmate_cancel_request.`
+    );
+  }
+  const today = await countRows(sb, userId, (q) => q.gte('created_at', new Date(Date.now() - 86_400_000).toISOString()));
+  if (today >= MAX_REQUESTS_PER_DAY) {
+    throw new ToolInputError(`Daily request limit reached (${MAX_REQUESTS_PER_DAY} per 24h). Try again later.`);
+  }
+
+  const { data, error } = await sb
+    .from(TABLE)
+    .insert({
+      user_id: userId,
+      token_id: principal.tokenId,
+      kind,
+      payload,
+      reason,
+      dedupe_key: key,
+      expires_at: new Date(Date.now() + TTL_MS).toISOString()
+    })
+    .select(COLS)
+    .single();
+
+  if (error) {
+    if ((error as any).code === '23505') {
+      const { data: existing } = await sb
+        .from(TABLE)
+        .select(COLS)
+        .eq('user_id', userId)
+        .eq('dedupe_key', key)
+        .in('status', OPEN)
+        .maybeSingle();
+      if (existing) {
+        return { ...view(existing), duplicate: true, note: 'An identical request is already open, so nothing new was queued.' };
+      }
+    }
+    throw error;
+  }
+  return {
+    ...view(data),
+    note:
+      "Queued only. Nothing has changed yet: Checkmate on the student's phone checks it against its own policy and may accept or reject it. Use checkmate_get_requests to see the outcome (the phone must be online)."
+  };
+}
+
+export async function getRequests(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  await expireStale(sb, userId);
+  const id = cleanText(args.request_id, 'request_id', { max: 64 });
+  if (id) {
+    const { data, error } = await sb.from(TABLE).select(COLS).eq('user_id', userId).eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!data) throw new ToolInputError('No request with that id.');
+    return { request: view(data) };
+  }
+  const status = cleanText(args.status, 'status', { max: 20 });
+  if (status && !(REQUEST_STATUSES as readonly string[]).includes(status)) {
+    throw new ToolInputError(`status must be one of: ${REQUEST_STATUSES.join(', ')}`);
+  }
+  const days = Math.min(30, Math.max(1, Math.trunc(Number(args.days) || 7)));
+  const limit = Math.min(30, Math.max(1, Math.trunc(Number(args.limit) || 10)));
+  let q: any = sb
+    .from(TABLE)
+    .select(COLS)
+    .eq('user_id', userId)
+    .gte('created_at', new Date(Date.now() - days * 86_400_000).toISOString())
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (status) q = q.eq('status', status);
+  const { data, error } = await q;
+  if (error) throw error;
+  return { window_days: days, requests: (data ?? []).map(view) };
+}
+
+export async function cancelRequest(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const id = cleanText(args.request_id, 'request_id', { max: 64, required: true })!;
+  const { data, error } = await sb
+    .from(TABLE)
+    .update({ status: 'cancelled', resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('id', id)
+    .eq('status', 'pending')
+    .select(COLS)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return { request: view(data), note: 'Cancelled before Checkmate picked it up.' };
+
+  const { data: row } = await sb.from(TABLE).select('status').eq('user_id', userId).eq('id', id).maybeSingle();
+  if (!row) throw new ToolInputError('No request with that id.');
+  throw new ToolInputError(`Only a pending request can be cancelled; this one is already ${row.status}.`);
+}
+
+// ── Device-facing operations (Checkmate Android, device-token auth) ──────────
+export async function claimPendingRequests(sb: SupabaseClient, userId: string, limit = 10) {
+  await expireStale(sb, userId);
+  const nowIso = new Date().toISOString();
+  const staleIso = new Date(Date.now() - STALE_CLAIM_MS).toISOString();
+
+  const { data: pend, error: e1 } = await sb
+    .from(TABLE)
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'pending')
+    .gt('expires_at', nowIso)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (e1) throw e1;
+  const { data: stale, error: e2 } = await sb
+    .from(TABLE)
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'claimed')
+    .lt('claimed_at', staleIso)
+    .gt('expires_at', nowIso)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  if (e2) throw e2;
+
+  const claimed: any[] = [];
+  // The status guard in each update makes a claim atomic per row: two phones racing for the
+  // same row can't both win.
+  for (const [ids, from] of [
+    [(pend ?? []).map((r: any) => r.id), 'pending'],
+    [(stale ?? []).map((r: any) => r.id), 'claimed']
+  ] as [string[], string][]) {
+    if (ids.length === 0) continue;
+    const { data, error } = await sb
+      .from(TABLE)
+      .update({ status: 'claimed', claimed_at: nowIso })
+      .eq('user_id', userId)
+      .eq('status', from)
+      .in('id', ids)
+      .select(COLS);
+    if (error) throw error;
+    claimed.push(...(data ?? []));
+  }
+  claimed.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  return {
+    requests: claimed.slice(0, limit).map((r) => ({
+      request_id: r.id,
+      kind: r.kind,
+      payload: r.payload,
+      reason: r.reason,
+      created_at: r.created_at,
+      expires_at: r.expires_at
+    }))
+  };
+}
+
+export async function resolveRequest(sb: SupabaseClient, userId: string, id: string, body: any) {
+  const status = body?.status;
+  if (status !== 'accepted' && status !== 'rejected') throw new RequestError("status must be 'accepted' or 'rejected'", 400);
+  const r = body?.result && typeof body.result === 'object' ? body.result : {};
+  const short = (v: unknown, max: number) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+  const result = {
+    message: short(r.message, 300),
+    policy_decision: short(r.policy_decision, 60),
+    task_id: short(r.task_id, 100),
+    intervention_id: short(r.intervention_id, 100)
+  };
+
+  const { data, error } = await sb
+    .from(TABLE)
+    .update({ status, result, resolved_at: new Date().toISOString() })
+    .eq('user_id', userId)
+    .eq('id', id)
+    .eq('status', 'claimed')
+    .select(COLS)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return { request: view(data) };
+
+  const { data: row, error: e2 } = await sb.from(TABLE).select(COLS).eq('user_id', userId).eq('id', id).maybeSingle();
+  if (e2) throw e2;
+  if (!row) throw new RequestError('No request with that id.', 404);
+  if (row.status === status) return { request: view(row) }; // a retried report is not an error
+  throw new RequestError(`Request is ${row.status}; only a claimed request can be resolved.`, 409);
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/subject-fill.ts =====
+import { makeChapterResolver } from '@/lib/ft-schedule';
+import { chapterMatches } from './chapter-match';
+
+// Checkmate's concept rows often carry no subject: Testmate reports have only chapter/topic,
+// so the phone creates the concept with subject = null unless a syllabus seed happened to join.
+// The gateway then grouped everything under "Unclassified". Testmate already knows the answer:
+// syllabus_chapters (the chapter names the FT schedule uses) maps each chapter to a subject.
+// This fills ONLY missing subjects, never overrides one Checkmate sent, and leaves a chapter
+// unresolved rather than guessing when it is ambiguous across subjects (bare "Biomolecules"
+// and "Thermodynamics" each exist in two subjects).
+
+export interface SubjectFillResult<T> {
+  model: T;
+  filled: number;
+  unresolved_chapters: string[];
+}
+
+export function fillSubjects<T extends Record<string, any>>(model: T, subjectByChapter: Map<string, string>): SubjectFillResult<T> {
+  if (!model || subjectByChapter.size === 0) return { model, filled: 0, unresolved_chapters: [] };
+
+  const canonical = Array.from(subjectByChapter.keys());
+  const resolver = makeChapterResolver(canonical);
+  const cache = new Map<string, string | null>();
+  const unresolved = new Set<string>();
+
+  const subjectFor = (chapter: unknown): string | null => {
+    if (typeof chapter !== 'string' || !chapter.trim()) return null;
+    if (cache.has(chapter)) return cache.get(chapter) ?? null;
+    let subject: string | null = null;
+    const hit = resolver(chapter);
+    if (hit) {
+      subject = subjectByChapter.get(hit) ?? null;
+    } else {
+      // Second chance: leading-part match either way round. Only accepted when every
+      // candidate belongs to the same subject, so an ambiguous bare name stays unresolved.
+      const subjects = new Set<string>();
+      for (const c of canonical) {
+        if (chapterMatches(c, chapter) || chapterMatches(chapter, c)) subjects.add(subjectByChapter.get(c)!);
+      }
+      if (subjects.size === 1) subject = Array.from(subjects)[0];
+    }
+    if (!subject) unresolved.add(chapter);
+    cache.set(chapter, subject);
+    return subject;
+  };
+
+  let filled = 0;
+  const fix = <R extends Record<string, any>>(row: R): R => {
+    if (!row || row.subject) return row; // never override a subject Checkmate sent
+    const s = subjectFor(row.chapter);
+    if (!s) return row;
+    filled += 1;
+    return { ...row, subject: s };
+  };
+
+  const out: Record<string, any> = { ...model };
+  if (Array.isArray(model.concepts)) {
+    out.concepts = model.concepts.map((c: any) => {
+      const fixed = fix(c);
+      if (Array.isArray(fixed?.prerequisite_issues)) {
+        return { ...fixed, prerequisite_issues: fixed.prerequisite_issues.map((p: any) => fix(p)) };
+      }
+      return fixed;
+    });
+  }
+  if (Array.isArray(model.unresolved_errors)) out.unresolved_errors = model.unresolved_errors.map((e: any) => fix(e));
+  return { model: out as T, filled, unresolved_chapters: Array.from(unresolved).slice(0, 20) };
+}
+
+//===== TERMUXFILE: Testmate/app/api/gateway/tokens/route.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getCurrentUser } from '@/lib/auth';
+import { getServiceClient } from '@/lib/supabase';
+import { generateMcpToken } from '@/lib/gateway/auth';
+import { DEFAULT_SCOPES, isScope, MINTABLE_SCOPES, Scope } from '@/lib/gateway/types';
+import { projectionStatus } from '@/lib/gateway/projection';
+
+export const dynamic = 'force-dynamic';
+
+// Token management for the MCP gateway. COOKIE SESSION ONLY (like /api/auth/device-tokens):
+// neither a device token nor a gateway token can mint gateway tokens, so a leaked token
+// can't escalate itself.
+
+// POST { label?, scopes?: string[], expires_in_days?: number }  -> raw token shown ONCE
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUser();
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+
+  let body: any = {};
+  try {
+    body = await req.json();
+  } catch {
+    // defaults
+  }
+  const label = typeof body?.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 60) : 'External AI';
+
+  let scopes: Scope[] = DEFAULT_SCOPES;
+  if (Array.isArray(body?.scopes)) {
+    const requested = body.scopes.filter(isScope) as Scope[];
+    const bad = body.scopes.filter((s: unknown) => !isScope(s) || !MINTABLE_SCOPES.includes(s as Scope));
+    if (bad.length > 0) {
+      return NextResponse.json({ error: `Scopes not available: ${bad.join(', ')}. Allowed: ${MINTABLE_SCOPES.join(', ')}` }, { status: 400 });
+    }
+    scopes = Array.from(new Set(requested));
+    if (scopes.length === 0) return NextResponse.json({ error: 'At least one scope is required' }, { status: 400 });
+  }
+
+  let expiresAt: string | null = null;
+  let expiresInDays: number | null = null;
+  if (body?.expires_in_days !== undefined && body.expires_in_days !== null) {
+    const days = Number(body.expires_in_days);
+    if (!Number.isFinite(days) || days < 1 || days > 365) {
+      return NextResponse.json({ error: 'expires_in_days must be between 1 and 365' }, { status: 400 });
+    }
+    expiresInDays = days;
+    expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
+  }
+  // A token that can queue requests is higher-risk than a read token: it must expire soon.
+  if (scopes.includes('checkmate:plan') && (expiresInDays === null || expiresInDays > 30)) {
+    return NextResponse.json({ error: 'Tokens with checkmate:plan must set expires_in_days (max 30).' }, { status: 400 });
+  }
+
+  const { raw, hash } = generateMcpToken();
+  const supabase = getServiceClient();
+  const { data, error } = await supabase
+    .from('mcp_tokens')
+    .insert({ user_id: user.id, token_hash: hash, label, scopes, expires_at: expiresAt })
+    .select('id, label, scopes, created_at, expires_at')
+    .single();
+  if (error || !data) return NextResponse.json({ error: error?.message ?? 'Failed to create token' }, { status: 500 });
+
+  return NextResponse.json({ token: raw, ...data });
+}
+
+// GET -> token metadata, recent audit rows, and projection freshness (never raw tokens/hashes)
+export async function GET() {
+  const user = await getCurrentUser();
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+
+  const supabase = getServiceClient();
+  const [tokens, audit, projections] = await Promise.all([
+    supabase
+      .from('mcp_tokens')
+      .select('id, label, scopes, created_at, last_used_at, expires_at, revoked_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false }),
+    supabase
+      .from('gateway_audit')
+      .select('id, token_id, method, tool, ok, error, duration_ms, response_bytes, created_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(40),
+    projectionStatus(supabase, user.id)
+  ]);
+  if (tokens.error) return NextResponse.json({ error: tokens.error.message }, { status: 500 });
+  return NextResponse.json({ tokens: tokens.data ?? [], audit: audit.data ?? [], projections });
+}
+
+// DELETE ?id=<token_id> -> soft revoke (takes effect on the next request)
+export async function DELETE(req: NextRequest) {
+  const user = await getCurrentUser();
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  const id = req.nextUrl.searchParams.get('id');
+  if (!id) return NextResponse.json({ error: 'id query param is required' }, { status: 400 });
+
+  const supabase = getServiceClient();
+  const { error } = await supabase
+    .from('mcp_tokens')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('user_id', user.id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json({ revoked: true });
+}
+
+
+//===== TERMUXFILE: Testmate/app/api/gateway/requests/route.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getCurrentUserFromRequest } from '@/lib/auth';
+import { getServiceClient } from '@/lib/supabase';
+import { claimPendingRequests } from '@/lib/gateway/requests';
+
+export const dynamic = 'force-dynamic';
+export const maxDuration = 30;
+
+// GET /api/gateway/requests — Checkmate Android (device-token Bearer) pulls the requests
+// an external AI queued. Each returned request is atomically CLAIMED, so two pulls never
+// hand out the same one; a claim the phone never answers becomes claimable again after
+// 10 minutes. The phone then runs each through its own PolicyValidator / TaskEscrow and
+// reports back with POST /api/gateway/requests/{id}.
+export async function GET(req: NextRequest) {
+  const user = await getCurrentUserFromRequest(req);
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  try {
+    return NextResponse.json(await claimPendingRequests(getServiceClient(), user.id));
+  } catch (err: any) {
+    console.error('[gateway/requests] claim failed:', err?.message);
+    return NextResponse.json({ error: 'Failed to load requests' }, { status: 500 });
+  }
+}
+
+//===== TERMUXFILE: Testmate/app/api/gateway/requests/[id]/route.ts =====
+import { NextRequest, NextResponse } from 'next/server';
+import { getCurrentUserFromRequest } from '@/lib/auth';
+import { getServiceClient } from '@/lib/supabase';
+import { RequestError, resolveRequest } from '@/lib/gateway/requests';
+
+export const dynamic = 'force-dynamic';
+
+// POST /api/gateway/requests/{id}  { status: 'accepted' | 'rejected', result?: { message?,
+// policy_decision?, task_id?, intervention_id? } }
+// Checkmate reports what its policy layer decided. Only a CLAIMED request of the caller's
+// own can be resolved; repeating the same report is accepted (the phone may retry).
+export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
+  const user = await getCurrentUserFromRequest(req);
+  if (!user) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+  try {
+    return NextResponse.json(await resolveRequest(getServiceClient(), user.id, params.id, body));
+  } catch (err: any) {
+    if (err instanceof RequestError) return NextResponse.json({ error: err.message }, { status: err.status });
+    console.error('[gateway/requests] resolve failed:', err?.message);
+    return NextResponse.json({ error: 'Failed to record result' }, { status: 500 });
+  }
+}
+
+//===== TERMUXFILE: Testmate/db/migrations/019_gateway_requests.sql =====
+-- 019_gateway_requests.sql
+-- Phase 3: controlled writes for the MCP gateway.
+--
+-- An external AI never mutates Checkmate data. With a `checkmate:plan` token it can only
+-- append a REQUEST row here. The Checkmate Android app pulls pending rows over its
+-- device-token endpoint, runs each through its own PolicyValidator / TaskEscrow /
+-- ActionExecutor, and reports accepted or rejected back. Android stays the source of truth.
+--
+-- Access: service role only (RLS on, no policies), same posture as the other gateway tables.
+-- ASSUMPTION: user_id is a uuid (auth user id). token_id is text so it works whatever type
+-- mcp_tokens.id has. Adjust if migration 018 used different types.
+
+create table if not exists gateway_requests (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null,
+  token_id    text,
+  kind        text not null check (kind in ('request_repair', 'create_task', 'dismiss_task')),
+  payload     jsonb not null,
+  reason      text not null,
+  dedupe_key  text not null,
+  status      text not null default 'pending'
+              check (status in ('pending', 'claimed', 'accepted', 'rejected', 'expired', 'cancelled')),
+  result      jsonb,
+  created_at  timestamptz not null default now(),
+  expires_at  timestamptz not null default (now() + interval '24 hours'),
+  claimed_at  timestamptz,
+  resolved_at timestamptz
+);
+
+-- The same request can't be queued twice while one is still open (stops a model that
+-- retries from stacking duplicate repairs, the way regenerated tasks piled up before).
+create unique index if not exists gateway_requests_open_dedupe
+  on gateway_requests (user_id, dedupe_key)
+  where status in ('pending', 'claimed');
+
+create index if not exists gateway_requests_user_status
+  on gateway_requests (user_id, status, created_at desc);
+
+alter table gateway_requests enable row level security;
 
