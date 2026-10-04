@@ -259,12 +259,26 @@ class GatewaySyncWorker(
     params: WorkerParameters
 ) : CoroutineWorker(context, params) {
 
-    override suspend fun doWork(): Result =
-        when (GatewaySync.pushAll(applicationContext)) {
+    override suspend fun doWork(): Result {
+        val pushed = GatewaySync.pushAll(applicationContext)
+
+        // After the snapshot push, so the server's view is fresh when the AI reads an outcome.
+        // Independent of the push result and never fails the job: a request-queue problem must not
+        // block snapshots, and anything unanswered is simply picked up on the next run.
+        try {
+            GatewayRequestSync.processPending(applicationContext)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("GatewaySyncWorker", "request queue pass failed: ${e.message}")
+        }
+
+        return when (pushed) {
             GatewaySync.PushResult.RETRYABLE_FAILURE -> if (runAttemptCount < 3) Result.retry() else Result.success()
             // Not configured / rejected: nothing to gain from retrying; the next periodic run re-checks.
             else -> Result.success()
         }
+    }
 }
 
 object GatewaySyncScheduler {
