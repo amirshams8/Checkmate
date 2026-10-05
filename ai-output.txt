@@ -48,6 +48,11 @@ import java.util.concurrent.TimeUnit
  * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
  * refusal is reported back with the real reason so the AI can see why.
  *
+ * SUPPORTED (plan edits): `update_task` and `delete_task` work ONLY on pending plain study tasks that an
+ * AI assistant itself added (never the student's own tasks, never engine/repair tasks), and
+ * `batch_schedule` applies up to [MAX_BATCH_ITEMS] creates/moves as ONE unit (all pass every check
+ * against the plan-as-it-would-be, or nothing is written). `sync_now` pushes every snapshot at once.
+ *
  * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
  * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
  * `schedule_task` (move a PENDING task in today's plan to a start time, see [decideScheduleTask]).
@@ -84,6 +89,7 @@ object GatewayRequestSync {
     private const val KEY_HANDLED = "gateway_request_results"
     private const val MAX_HANDLED = 20
     private const val MAX_MESSAGE = 280
+    const val MAX_BATCH_ITEMS = 12
     private const val MINUTES_PER_DAY = 24 * 60
 
     /** One processing pass at a time: the fast poller and the WorkManager worker must not race. */
@@ -163,6 +169,10 @@ object GatewayRequestSync {
         )
         "create_task" -> decideCreateTask(context, req)
         "schedule_task" -> decideScheduleTask(req)
+        "update_task" -> decideUpdateTask(req)
+        "delete_task" -> decideDeleteTask(req)
+        "batch_schedule" -> decideBatchSchedule(req)
+        "sync_now" -> decideSyncNow(context)
         "dismiss_task" -> Decision(
             false,
             "Checkmate does not allow tasks to be dismissed from outside the app.",
@@ -208,12 +218,7 @@ object GatewayRequestSync {
         if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
             return Decision(false, "A study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).", "DURATION_OUT_OF_RANGE")
         }
-        val taskType = when (p.optStr("study_type")) {
-            "LECTURE" -> TaskType.LECTURE
-            "REVISION" -> TaskType.REVISION
-            "READING" -> TaskType.READING
-            else -> TaskType.PRACTICE
-        }
+        val taskType = studyTaskType(p.optStr("study_type"))
 
         val today = PlanStore.getTodayTasksSnapshot_Sync()
         if (today.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
@@ -301,6 +306,183 @@ object GatewayRequestSync {
         return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
 
+    // ── plan edits: update / delete / batch / sync (phone-side guards, see class doc) ───────
+
+    private fun studyTaskType(s: String?): TaskType = when (s) {
+        "LECTURE" -> TaskType.LECTURE
+        "REVISION" -> TaskType.REVISION
+        "READING" -> TaskType.READING
+        else -> TaskType.PRACTICE
+    }
+
+    /** A plain study task an AI assistant added. The only kind outside requests may edit or delete. */
+    private fun isAiStudyTask(t: StudyTask): Boolean = t.rationale.startsWith(AI_TASK_MARKER) && t.learningIntent == null
+
+    private fun decideDeleteTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be deleted from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be deleted.", "TASK_NOT_PENDING")
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would delete ${task.subject}: ${task.topic}. Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        PlanStore.removeTask(task.id)
+        return Decision(true, "Deleted ${task.subject}: ${task.topic} from today's plan.", "ALLOW", task.id)
+    }
+
+    private fun decideUpdateTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        val task = today.firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be edited from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be edited.", "TASK_NOT_PENDING")
+        }
+
+        val newTopic = p.optStr("topic")?.take(200) ?: task.topic
+        val requestedMinutes = if (p.has("duration_minutes") && !p.isNull("duration_minutes")) p.optInt("duration_minutes", 0) else null
+        if (requestedMinutes != null && requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+            return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
+        }
+        val newMinutes = requestedMinutes ?: task.durationMinutes
+        val requestedStart = p.optStr("scheduled_start_time")
+        if (requestedStart != null && !HHMM.matches(requestedStart)) {
+            return Decision(false, "'$requestedStart' is not a valid HH:mm time.", "INVALID_TIME")
+        }
+        val newStart = requestedStart ?: task.scheduledStartTime
+
+        if (newTopic == task.topic && newMinutes == task.durationMinutes && newStart == task.scheduledStartTime) {
+            return Decision(false, "Nothing to change: the task already has those values.", "NO_OP_ALREADY_APPLIED")
+        }
+        val force = p.optBoolean("force", false)
+        var forcedNote = ""
+        val timeChanged = newStart != task.scheduledStartTime || newMinutes != task.durationMinutes
+        if (newStart != null && timeChanged) {
+            slotProblem(newStart, newMinutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
+            if (force) forcedNote = describeForce(newStart, newMinutes, ignoreTaskId = task.id)
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would update ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        // One write for topic + length + time, so the plan never shows a half-applied edit.
+        PlanStore.saveTodayTasks(
+            today.map { if (it.id == task.id) it.copy(topic = newTopic, durationMinutes = newMinutes, scheduledStartTime = newStart) else it }
+        )
+        return Decision(true, "Updated ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote", "ALLOW", task.id)
+    }
+
+    /**
+     * All-or-nothing day plan. Every item is checked against the plan as it WOULD look after the earlier
+     * items (so two items can't claim the same slot), with the same rules as a single create / move.
+     * Any failure rejects the whole batch and writes nothing; success is a single plan write.
+     */
+    private fun decideBatchSchedule(req: Pending): Decision {
+        val p = req.payload
+        val items = p.optJSONArray("items") ?: return Decision(false, "The request has no items.", "MALFORMED")
+        if (items.length() < 1 || items.length() > MAX_BATCH_ITEMS) {
+            return Decision(false, "A batch needs 1-$MAX_BATCH_ITEMS items (got ${items.length()}).", "MALFORMED")
+        }
+        val dry = p.optBoolean("dry_run", false)
+        var working: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+        var created = 0
+        var moved = 0
+
+        fun fail(i: Int, code: String, message: String) =
+            Decision(false, "Batch rejected, nothing was applied. Item ${i + 1}: $message", code)
+
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: return fail(i, "MALFORMED", "not an object.")
+            val force = item.optBoolean("force", false)
+            when (item.optStr("op")) {
+                "create" -> {
+                    val subject = item.optStr("subject") ?: return fail(i, "MALFORMED", "no subject.")
+                    val topic = item.optStr("topic") ?: return fail(i, "MALFORMED", "no topic.")
+                    val minutes = item.optInt("duration_minutes", DEFAULT_STUDY_MINUTES)
+                    if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                        return fail(i, "DURATION_OUT_OF_RANGE", "a study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).")
+                    }
+                    if (working.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
+                        return fail(i, "DAILY_AI_TASK_LIMIT", "already $MAX_AI_TASKS_PER_DAY AI-requested tasks today.")
+                    }
+                    if (working.any {
+                            it.state != TaskState.DONE && it.state != TaskState.SKIPPED &&
+                                norm(it.subject) == norm(subject) && norm(it.topic) == norm(topic)
+                        }
+                    ) {
+                        return fail(i, "ALREADY_PLANNED", "the plan already has an open task for $subject: $topic.")
+                    }
+                    val requested = item.optStr("scheduled_start_time")
+                    val start: String? = if (requested != null) {
+                        slotProblem(requested, minutes, ignoreTaskId = null, force = force, tasks = working)
+                            ?.let { return fail(i, it.code, it.message) }
+                        requested
+                    } else {
+                        firstFreeStartFromNow(minutes, ignoreTaskId = null, tasks = working)
+                    }
+                    working = working + StudyTask(
+                        subject = subject,
+                        topic = topic,
+                        durationMinutes = minutes,
+                        isCustom = true,
+                        taskType = studyTaskType(item.optStr("study_type")),
+                        scheduledStartTime = start,
+                        rationale = "$AI_TASK_MARKER: ${req.reason}".take(300)
+                    )
+                    created += 1
+                }
+                "move" -> {
+                    val id = item.optStr("task_id") ?: return fail(i, "MALFORMED", "no task_id.")
+                    val start = item.optStr("scheduled_start_time") ?: return fail(i, "MALFORMED", "no start time.")
+                    if (!HHMM.matches(start)) return fail(i, "INVALID_TIME", "'$start' is not a valid HH:mm time.")
+                    val task = working.firstOrNull { it.id == id }
+                        ?: return fail(i, "UNKNOWN_TASK_ID", "no task with that id in today's plan.")
+                    if (task.state != TaskState.PENDING) return fail(i, "TASK_NOT_PENDING", "that task is ${task.state}.")
+                    val requestedMinutes = if (item.has("duration_minutes") && !item.isNull("duration_minutes")) item.optInt("duration_minutes", 0) else null
+                    if (requestedMinutes != null) {
+                        if (requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                            return fail(i, "DURATION_OUT_OF_RANGE", "duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).")
+                        }
+                        if (task.learningIntent != null && requestedMinutes != task.durationMinutes) {
+                            return fail(i, "DURATION_LOCKED", "Checkmate sized that repair task itself; ask only for a new time.")
+                        }
+                    }
+                    val minutes = requestedMinutes ?: task.durationMinutes
+                    if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
+                        return fail(i, "NO_OP_ALREADY_APPLIED", "that task is already scheduled for $start.")
+                    }
+                    slotProblem(start, minutes, ignoreTaskId = task.id, force = force, tasks = working)
+                        ?.let { return fail(i, it.code, it.message) }
+                    working = working.map { if (it.id == id) it.copy(scheduledStartTime = start, durationMinutes = minutes) else it }
+                    moved += 1
+                }
+                else -> return fail(i, "UNSUPPORTED_KIND", "op must be 'create' or 'move'.")
+            }
+        }
+
+        val summary = "$created added, $moved moved"
+        if (dry) return Decision(true, "Dry run OK: batch would apply ($summary). Nothing was changed.", "DRY_RUN_OK")
+        PlanStore.saveTodayTasks(working)
+        return Decision(true, "Batch applied ($summary).", "ALLOW")
+    }
+
+    /** Pushes every snapshot right now, so the AI's next reads (plan, mastery, interventions) are fresh. */
+    private suspend fun decideSyncNow(context: Context): Decision =
+        when (GatewaySync.pushAll(context)) {
+            GatewaySync.PushResult.OK -> Decision(true, "Pushed fresh snapshots.", "ALLOW")
+            GatewaySync.PushResult.SKIPPED_NOT_CONFIGURED -> Decision(false, "The phone has no Testmate URL/token configured.", "SYNC_NOT_CONFIGURED")
+            else -> Decision(false, "Some snapshots could not be pushed (network or server error).", "SYNC_FAILED")
+        }
+
     private fun nowMinute(): Int {
         val c = Calendar.getInstance()
         return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
@@ -358,40 +540,59 @@ object GatewayRequestSync {
     }
 
     /** Unfinished tasks that already have a time, as (start, end) minutes. */
-    private fun occupiedRanges(ignoreTaskId: String?): List<Pair<Int, Int>> =
-        PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+    private fun occupiedRanges(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<Pair<Int, Int>> =
+        tasks.mapNotNull { t ->
             if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
             val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
             s to (s + t.durationMinutes)
         }
 
     /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
-    private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsToday(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
         val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
         val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
         val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
-        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId))
+        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId, tasks))
     }
 
     /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
-    private fun freeSlotsFromNow(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsFromNow(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         val now = nowMinute()
-        return freeSlotsToday(ignoreTaskId).mapNotNull {
+        return freeSlotsToday(ignoreTaskId, tasks).mapNotNull {
             val s = maxOf(it.startMinute, now)
             if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
         }
     }
 
-    private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
-        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
+    private fun firstFreeStartFromNow(
+        minutes: Int,
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): String? =
+        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId, tasks))?.let { FreeSlotCalculator.formatMinutes(it) }
 
     /**
      * Null when [startHHmm] for [minutes] is allowed today; otherwise a coded problem with a message the
      * AI can act on. With [force] the study window and blocked slots are ignored; the past, midnight and
      * other unfinished tasks are still enforced.
      */
-    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?, force: Boolean): SlotProblem? {
+    private fun slotProblem(
+        startHHmm: String,
+        minutes: Int,
+        ignoreTaskId: String?,
+        force: Boolean,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): SlotProblem? {
         if (!HHMM.matches(startHHmm)) return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
         val start = FreeSlotCalculator.parseTimeOrNull(startHHmm)
             ?: return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
@@ -407,12 +608,12 @@ object GatewayRequestSync {
             return SlotProblem("PAST_MIDNIGHT", "$startHHmm for $minutes min would run past midnight; Checkmate only plans today.")
         }
         val range = "$startHHmm-${FreeSlotCalculator.formatMinutes(end)}"
-        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
+        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId, tasks)
         val suggestionText = if (suggestion != null) " First free $minutes-minute slot today starts at $suggestion."
         else " There is no free $minutes-minute slot left today."
 
         // Overlap with another unfinished task: never overridable.
-        if (occupiedRanges(ignoreTaskId).any { start < it.second && end > it.first }) {
+        if (occupiedRanges(ignoreTaskId, tasks).any { start < it.second && end > it.first }) {
             return SlotProblem("OVERLAP", "$range overlaps another unfinished task in today's plan; force cannot override that.$suggestionText")
         }
         if (force) return null
@@ -1240,6 +1441,42 @@ object GatewaySyncScheduler {
     }
 }
 
+//===== TERMUXFILE: Testmate/db/migrations/022_gateway_plan_edit_kinds.sql =====
+-- 022_gateway_plan_edit_kinds.sql
+-- Lets gateway_requests.kind hold the plan-edit kinds: 'update_task', 'delete_task',
+-- 'batch_schedule' and 'sync_now'. Their arguments live inside payload (items, force, dry_run),
+-- so nothing else in the schema changes.
+-- Same approach as 021: any CHECK on gateway_requests that mentions "kind" (and not "status") is
+-- dropped and replaced with the full list. Safe to re-run.
+
+DO $$
+DECLARE c record;
+BEGIN
+  IF to_regclass('public.gateway_requests') IS NULL THEN
+    RAISE NOTICE 'gateway_requests does not exist; run 019 first';
+    RETURN;
+  END IF;
+
+  FOR c IN
+    SELECT conname
+    FROM pg_constraint
+    WHERE conrelid = 'public.gateway_requests'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) ILIKE '%kind%'
+      AND pg_get_constraintdef(oid) NOT ILIKE '%status%'
+  LOOP
+    EXECUTE format('ALTER TABLE public.gateway_requests DROP CONSTRAINT %I', c.conname);
+  END LOOP;
+
+  ALTER TABLE public.gateway_requests
+    ADD CONSTRAINT gateway_requests_kind_check
+    CHECK (kind IN (
+      'request_repair', 'create_task', 'schedule_task',
+      'update_task', 'delete_task', 'batch_schedule', 'sync_now',
+      'dismiss_task'
+    ));
+END $$;
+
 //===== TERMUXFILE: Testmate/lib/gateway/projection.ts =====
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getSubjectByChapter, localDateString } from './evidence';
@@ -1594,7 +1831,7 @@ export async function projectionStatus(sb: SupabaseClient, userId: string) {
 
 //===== TERMUXFILE: Testmate/lib/gateway/constraints.ts =====
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { freshness, getProjection } from './projection';
+import { freshness, getProjection, projectionStatus } from './projection';
 import { MAX_OPEN_REQUESTS, MAX_REQUESTS_PER_DAY } from './requests';
 import { getTodayPlan } from './tools-lib';
 import { ToolDataUnavailable } from './types';
@@ -1711,6 +1948,53 @@ export async function getTodayPlanWithRollover(sb: SupabaseClient, userId: strin
   };
 }
 
+// The phone's poller pushes today's plan about every 2 minutes while Checkmate's process is alive, so the
+// age of that snapshot is the best "is the phone reachable" signal the server has without a heartbeat table.
+const ONLINE_WITHIN_MIN = 6;
+
+export async function getPhoneStatus(sb: SupabaseClient, userId: string) {
+  const nowIso = new Date().toISOString();
+  const statuses = await projectionStatus(sb, userId);
+  const plan = statuses.find((s: any) => s.kind === 'today_plan');
+  const ageMin = plan ? Math.max(0, Math.round((Date.now() - new Date(plan.received_at).getTime()) / 60_000)) : null;
+  const connected = ageMin !== null && ageMin <= ONLINE_WITHIN_MIN;
+
+  const { data: rows, error } = await sb
+    .from('gateway_requests')
+    .select('id, kind, status, created_at, claimed_at')
+    .eq('user_id', userId)
+    .in('status', ['pending', 'claimed'])
+    .gt('expires_at', nowIso)
+    .order('created_at', { ascending: true })
+    .limit(50);
+  if (error) throw error;
+  const pending = (rows ?? []).filter((r: any) => r.status === 'pending');
+  const claimed = (rows ?? []).filter((r: any) => r.status === 'claimed');
+  const oldest = pending[0] ? Math.round((Date.now() - new Date(pending[0].created_at).getTime()) / 1000) : null;
+
+  let diagnosis: string;
+  if (pending.length === 0 && claimed.length === 0) diagnosis = 'Nothing is waiting on the phone.';
+  else if (!connected) diagnosis = 'Requests are waiting and the phone has not synced recently: it is probably offline or Checkmate is closed. They will be picked up when it reconnects (requests expire after 24h).';
+  else if (claimed.length > 0 && pending.length === 0) diagnosis = 'The phone has picked these up and is deciding; answers should arrive within seconds.';
+  else diagnosis = 'The phone is connected and polls every ~15 seconds; pending requests should be picked up shortly.';
+
+  return {
+    phone: {
+      connected,
+      last_plan_sync_at: plan?.received_at ?? null,
+      last_plan_sync_age_minutes: ageMin,
+      connected_means: `today's plan snapshot received within ${ONLINE_WITHIN_MIN} minutes (the in-app poller pushes it about every 2 minutes)`
+    },
+    requests_waiting: {
+      pending_not_picked_up: pending.length,
+      claimed_being_decided: claimed.length,
+      oldest_pending_age_seconds: oldest
+    },
+    diagnosis,
+    snapshots: statuses
+  };
+}
+
 //===== TERMUXFILE: Testmate/lib/gateway/requests.ts =====
 import { createHash } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -1729,10 +2013,11 @@ import type { GatewayPrincipal } from './types';
 
 // dismiss_task stays in the list only so old rows still type-check; no tool creates it any more
 // and the phone always rejects it.
-export const REQUEST_KINDS = ['request_repair', 'create_task', 'schedule_task', 'dismiss_task'] as const;
+export const REQUEST_KINDS = ['request_repair', 'create_task', 'schedule_task', 'update_task', 'delete_task', 'batch_schedule', 'sync_now', 'dismiss_task'] as const;
 export type RequestKind = (typeof REQUEST_KINDS)[number];
 export const TASK_TYPES = ['repair', 'retention', 'qbank_practice', 'revision', 'study'] as const;
 export const STUDY_TYPES = ['LECTURE', 'PRACTICE', 'REVISION', 'READING'] as const;
+export const MAX_BATCH_ITEMS = 12;
 export const MIN_STUDY_MINUTES = 10;
 export const MAX_STUDY_MINUTES = 120;
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -1908,6 +2193,80 @@ export async function normalizeRequest(
       },
       reason
     };
+  }
+
+  if (kind === 'update_task') {
+    const topic = cleanText(args.topic, 'topic', { max: 200 });
+    const duration = validMinutes(args.duration_minutes, 'duration_minutes');
+    const start = validTime(args.scheduled_start_time, 'scheduled_start_time', false);
+    if (!topic && duration === undefined && !start) {
+      throw new ToolInputError('Give at least one of topic, duration_minutes or scheduled_start_time to change.');
+    }
+    return {
+      payload: {
+        task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })!,
+        topic: topic ?? null,
+        duration_minutes: duration ?? null,
+        scheduled_start_time: start ?? null,
+        force: validFlag(args.force, 'force'),
+        dry_run: validFlag(args.dry_run, 'dry_run')
+      },
+      reason
+    };
+  }
+
+  if (kind === 'delete_task') {
+    return {
+      payload: {
+        task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })!,
+        dry_run: validFlag(args.dry_run, 'dry_run')
+      },
+      reason
+    };
+  }
+
+  if (kind === 'sync_now') {
+    return { payload: {}, reason };
+  }
+
+  if (kind === 'batch_schedule') {
+    const raw = Array.isArray(args.items) ? (args.items as unknown[]) : null;
+    if (!raw || raw.length < 1 || raw.length > MAX_BATCH_ITEMS) {
+      throw new ToolInputError(`items must be a list of 1 to ${MAX_BATCH_ITEMS} entries.`);
+    }
+    const items: Record<string, unknown>[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      const it = raw[i] as Record<string, unknown> | null;
+      const at = `items[${i}]`;
+      if (!it || typeof it !== 'object' || Array.isArray(it)) throw new ToolInputError(`${at} must be an object.`);
+      const op = cleanText(it.op, `${at}.op`, { max: 10, required: true })!;
+      if (op === 'create') {
+        const studyType = (cleanText(it.study_type, `${at}.study_type`, { max: 20 }) ?? 'PRACTICE').toUpperCase();
+        if (!(STUDY_TYPES as readonly string[]).includes(studyType)) {
+          throw new ToolInputError(`${at}.study_type must be one of: ${STUDY_TYPES.join(', ')}`);
+        }
+        items.push({
+          op: 'create',
+          study_type: studyType,
+          subject: cleanText(it.subject, `${at}.subject`, { max: 60, required: true })!,
+          topic: cleanText(it.topic, `${at}.topic`, { max: 200, required: true })!,
+          duration_minutes: validMinutes(it.duration_minutes, `${at}.duration_minutes`) ?? 45,
+          scheduled_start_time: validTime(it.scheduled_start_time, `${at}.scheduled_start_time`, false) ?? null,
+          force: validFlag(it.force, `${at}.force`)
+        });
+      } else if (op === 'move') {
+        items.push({
+          op: 'move',
+          task_id: cleanText(it.task_id, `${at}.task_id`, { max: 100, required: true })!,
+          scheduled_start_time: validTime(it.scheduled_start_time, `${at}.scheduled_start_time`, true)!,
+          duration_minutes: validMinutes(it.duration_minutes, `${at}.duration_minutes`) ?? null,
+          force: validFlag(it.force, `${at}.force`)
+        });
+      } else {
+        throw new ToolInputError(`${at}.op must be 'create' or 'move'.`);
+      }
+    }
+    return { payload: { items, dry_run: validFlag(args.dry_run, 'dry_run') }, reason };
   }
 
   // dismiss_task
@@ -2194,8 +2553,8 @@ import {
   questionLevelMastery,
   upcomingTestsView
 } from './tools-lib';
-import { getFreeSlots, getQuota, getStudyWindow, getTodayPlanWithRollover } from './constraints';
-import { REQUEST_STATUSES, STUDY_TYPES, TASK_TYPES, cancelRequest, createRequest, getRequests } from './requests';
+import { getFreeSlots, getPhoneStatus, getQuota, getStudyWindow, getTodayPlanWithRollover } from './constraints';
+import { MAX_BATCH_ITEMS, REQUEST_STATUSES, STUDY_TYPES, TASK_TYPES, cancelRequest, createRequest, getRequests } from './requests';
 import { Scope, ToolContext, ToolDef } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2612,6 +2971,68 @@ export function buildTools(): ToolDef[] {
       "How much room is left before a request is refused: open requests used out of the limit, requests in the last 24h out of the limit, and AI-created tasks today out of the daily cap (as of the phone's last sync, plus study creates still waiting). Call before queuing a batch.",
       schema(),
       async (_a, c) => getQuota(c.supabase, uid(c))),
+
+    requestTool('update_task', 'Edit a task I added',
+      "Change the topic, length and/or start time of a task an AI assistant added earlier (plain study tasks only, still pending; the student's own tasks and Checkmate's repair tasks cannot be edited). Time and length changes follow the same checks as checkmate_schedule_task, including force and dry_run. Queues a request only; call it only when the student asked for it.",
+      schema({
+        task_id: S('Task id from checkmate_get_today_plan.'),
+        topic: S('New topic text.'),
+        duration_minutes: I('New length in minutes (10 to 120).', 10, 120),
+        scheduled_start_time: S('New start time today, 24-hour HH:mm.'),
+        force: B('true = the student explicitly asked for exactly this time; skips the study-window and blocked-slot checks (never the overlap check).'),
+        dry_run: B('true = run every check and answer DRY_RUN_OK or the real rejection, changing nothing.'),
+        reason: REASON
+      }, ['task_id', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'update_task', a)),
+
+    requestTool('delete_task', 'Delete a task I added',
+      "Remove a task an AI assistant added earlier. Only plain study tasks that are still pending: the student's own tasks, Checkmate's repair/retention tasks and anything started or finished cannot be deleted from outside the app. Queues a request only; call it only when the student asked for it.",
+      schema({
+        task_id: S('Task id from checkmate_get_today_plan.'),
+        dry_run: B('true = answer DRY_RUN_OK or the real rejection, deleting nothing.'),
+        reason: REASON
+      }, ['task_id', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'delete_task', a),
+      { destructive: true }),
+
+    requestTool('batch_schedule', 'Request a whole day plan in one go',
+      `Plan several things as ONE request: up to ${MAX_BATCH_ITEMS} items, each either {op:'create', subject, topic, study_type, duration_minutes, scheduled_start_time?, force?} (a plain study block) or {op:'move', task_id, scheduled_start_time, duration_minutes?, force?}. The phone checks every item against the plan as it would look after the earlier items, so items cannot collide; if ANY item fails, NOTHING is applied and the rejection names the item and the reason. Use dry_run first for a long plan. Call checkmate_get_study_window, checkmate_get_free_slots and checkmate_get_quota before building it. Queues a request only; call it only when the student asked for it.`,
+      schema({
+        items: {
+          type: 'array',
+          minItems: 1,
+          maxItems: MAX_BATCH_ITEMS,
+          description: `1 to ${MAX_BATCH_ITEMS} create/move items, applied in order.`,
+          items: {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['create', 'move'], description: 'create = new study block; move = change time/length of an existing pending task.' },
+              subject: S('create: subject.'),
+              topic: S('create: what to study.'),
+              study_type: { type: 'string', enum: [...STUDY_TYPES], description: 'create: LECTURE | PRACTICE | REVISION | READING (default PRACTICE).' },
+              task_id: S('move: task id from checkmate_get_today_plan.'),
+              duration_minutes: I('create: length (default 45). move: optional new length. 10 to 120.', 10, 120),
+              scheduled_start_time: S('24-hour HH:mm today. Required for move; optional for create (omitted = first free slot).'),
+              force: B('true = the student explicitly asked for exactly this time (skips window and blocked-slot checks, never overlap).')
+            },
+            required: ['op'],
+            additionalProperties: false
+          }
+        },
+        dry_run: B('true = run every check on the whole batch and answer DRY_RUN_OK or the first failing item, applying nothing.'),
+        reason: REASON
+      }, ['items', 'reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'batch_schedule', a)),
+
+    requestTool('sync_now', 'Ask the phone to push fresh snapshots',
+      "Ask Checkmate to push every snapshot (plan, constraints, student model, interventions, behavior) immediately. The phone already refreshes today's plan about every 2 minutes and picks requests up within seconds while the app is open, so use this only when something looks stale. Check checkmate_get_phone_status first: if the phone is offline this just waits.",
+      schema({ reason: REASON }, ['reason']),
+      async (a, c) => createRequest(c.supabase, c.principal, 'sync_now', a)),
+
+    tool('get_phone_status', 'Phone connection status', PLAN,
+      "Whether the student's phone is reachable and what is waiting on it: last plan sync time, requests not yet picked up vs being decided, and a plain-language diagnosis (offline vs just not polled yet). Call it when a request stays pending.",
+      schema(),
+      async (_a, c) => getPhoneStatus(c.supabase, uid(c))),
 
     requestTool('cancel_request', 'Cancel a pending request',
       'Cancel a request that Checkmate has not picked up yet. Requests already claimed, accepted or rejected cannot be cancelled.',
