@@ -4086,6 +4086,8 @@ import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -4122,12 +4124,23 @@ import java.util.concurrent.TimeUnit
  * only, 10..120 minutes, inside the student's study window, never over a blocked slot or
  * another unfinished task, at most [MAX_AI_TASKS_PER_DAY] AI-created tasks a day, and no
  * duplicate of a task that is still open.
+ *
+ * FORCE: a `study` create or a `schedule_task` may carry `force: true` (the AI only sends it
+ * when the student explicitly asked for that exact time). Force skips ONLY the study-window and
+ * blocked-slot checks. It never skips: a time already in the past, running past midnight, or an
+ * overlap with another unfinished task (two tasks in one slot breaks the plan).
+ *
+ * Slot rejections are split into distinct policy decisions so the AI can tell whether `force`
+ * would help: OVERLAP (force cannot fix), BLOCKED_SLOT and OUTSIDE_WINDOW (force fixes),
+ * TIME_IN_PAST, PAST_MIDNIGHT and INVALID_TIME (force cannot fix).
  * NOT SUPPORTED (reported as rejected, with a message): `dismiss_task` (no policy action exists
  * to remove a task from outside the app), `create_task` for retention/revision (those must go
  * through RetentionTaskLedger's session loop), and any due_date other than today.
  *
- * Runs from [GatewaySyncWorker] after the snapshot push (every ~30 min and at app start), so a
- * request is picked up within one sync interval, not instantly.
+ * Runs from [GatewaySyncWorker] after the snapshot push (every ~30 min and at app start) AND from
+ * [GatewaySyncScheduler.startFastPolling] every few seconds while the app process is alive, so a
+ * request is normally picked up within seconds. Both paths share [processLock], so a request is
+ * never decided twice by two overlapping runs.
  */
 object GatewayRequestSync {
 
@@ -4135,6 +4148,10 @@ object GatewayRequestSync {
     private const val KEY_HANDLED = "gateway_request_results"
     private const val MAX_HANDLED = 20
     private const val MAX_MESSAGE = 280
+    private const val MINUTES_PER_DAY = 24 * 60
+
+    /** One processing pass at a time: the fast poller and the WorkManager worker must not race. */
+    private val processLock = Mutex()
 
     /** Judgment calls, not syllabus facts: a repair with no question target gets 30 minutes; a
      *  task with a question target gets 1 minute per question (NEET pace), clamped to
@@ -4147,7 +4164,7 @@ object GatewayRequestSync {
     const val MIN_STUDY_MINUTES = 10
     const val MAX_STUDY_MINUTES = 120
     const val DEFAULT_STUDY_MINUTES = 45
-    const val MAX_AI_TASKS_PER_DAY = 3
+    const val MAX_AI_TASKS_PER_DAY = 15
     /** Stored in StudyTask.rationale so AI-created tasks can be counted (and told apart) later. */
     private const val AI_TASK_MARKER = "Requested by an AI assistant"
     private val HHMM = Regex("""^([01]\d|2[0-3]):[0-5]\d$""")
@@ -4169,10 +4186,14 @@ object GatewayRequestSync {
 
     /** Pulls, decides and reports every pending request. Returns how many were reported. */
     suspend fun processPending(context: Context): Int = withContext(Dispatchers.IO) {
-        val base = baseUrl() ?: return@withContext 0
-        val token = token() ?: return@withContext 0
-        val pending = pull(base, token) ?: return@withContext 0
-        if (pending.isEmpty()) return@withContext 0
+        processLock.withLock { processPendingLocked(context) }
+    }
+
+    private suspend fun processPendingLocked(context: Context): Int {
+        val base = baseUrl() ?: return 0
+        val token = token() ?: return 0
+        val pending = pull(base, token) ?: return 0
+        if (pending.isEmpty()) return 0
 
         var reported = 0
         for (req in pending) {
@@ -4189,7 +4210,7 @@ object GatewayRequestSync {
             }
             if (report(base, token, req.id, decision)) reported += 1
         }
-        reported
+        return reported
     }
 
     // ── decisions ───────────────────────────────────────────────────────────────
@@ -4265,9 +4286,12 @@ object GatewayRequestSync {
         }
         if (open) return Decision(false, "Today's plan already has an open task for $subject: $topic.", "ALREADY_PLANNED")
 
+        val force = p.optBoolean("force", false)
         val requested = p.optStr("scheduled_start_time")
+        var forcedNote = ""
         val start: String? = if (requested != null) {
-            slotProblem(requested, minutes, ignoreTaskId = null)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+            slotProblem(requested, minutes, ignoreTaskId = null, force = force)?.let { return Decision(false, it.message, it.code) }
+            if (force) forcedNote = describeForce(requested, minutes, ignoreTaskId = null)
             requested
         } else {
             firstFreeStartFromNow(minutes, ignoreTaskId = null)
@@ -4288,7 +4312,7 @@ object GatewayRequestSync {
             start != null -> "at $start (first free slot)"
             else -> "unscheduled (no free ${minutes}-minute slot left today)"
         }
-        return Decision(true, "Added $subject: $topic ($minutes min) to today's plan $where.", "ALLOW", task.id)
+        return Decision(true, "Added $subject: $topic ($minutes min) to today's plan $where.$forcedNote", "ALLOW", task.id)
     }
 
     private fun decideScheduleTask(req: Pending): Decision {
@@ -4317,10 +4341,12 @@ object GatewayRequestSync {
         if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
             return Decision(false, "That task is already scheduled for $start.", "NO_OP_ALREADY_APPLIED")
         }
-        slotProblem(start, minutes, ignoreTaskId = task.id)?.let { return Decision(false, it, "SLOT_UNAVAILABLE") }
+        val force = p.optBoolean("force", false)
+        slotProblem(start, minutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
+        val forcedNote = if (force) describeForce(start, minutes, ignoreTaskId = task.id) else ""
 
         PlanStore.updateTaskScheduleAndDuration(task.id, start, minutes)
-        return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.", "ALLOW", task.id)
+        return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
 
     private fun nowMinute(): Int {
@@ -4328,18 +4354,32 @@ object GatewayRequestSync {
         return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
     }
 
+    private data class SlotProblem(val code: String, val message: String)
+
+    /** The student's study window today in minutes-from-midnight (same prefs and defaults as the planner). */
+    private fun studyWindow(): Pair<Int, Int> {
+        val startStr = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
+        val endStr = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
+        val start = FreeSlotCalculator.parseTimeOrNull(startStr) ?: (6 * 60)
+        val end = FreeSlotCalculator.parseTimeOrNull(endStr) ?: (22 * 60)
+        return start to end
+    }
+
+    /** Unfinished tasks that already have a time, as (start, end) minutes. */
+    private fun occupiedRanges(ignoreTaskId: String?): List<Pair<Int, Int>> =
+        PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+            if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
+            val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
+            s to (s + t.durationMinutes)
+        }
+
     /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
     private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
         // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
         val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
         val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
         val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
-        val occupied = PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
-            if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
-            val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
-            s to (s + t.durationMinutes)
-        }
-        return FreeSlotCalculator.subtractOccupied(free, occupied)
+        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId))
     }
 
     /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
@@ -4354,19 +4394,65 @@ object GatewayRequestSync {
     private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
         FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
 
-    /** Null when [startHHmm] for [minutes] is allowed today; otherwise a message the AI can act on. */
-    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?): String? {
-        if (!HHMM.matches(startHHmm)) return "'$startHHmm' is not a valid HH:mm time."
-        val start = FreeSlotCalculator.parseTimeOrNull(startHHmm) ?: return "'$startHHmm' is not a valid HH:mm time."
+    /**
+     * Null when [startHHmm] for [minutes] is allowed today; otherwise a coded problem with a message the
+     * AI can act on. With [force] the study window and blocked slots are ignored; the past, midnight and
+     * other unfinished tasks are still enforced.
+     */
+    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?, force: Boolean): SlotProblem? {
+        if (!HHMM.matches(startHHmm)) return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
+        val start = FreeSlotCalculator.parseTimeOrNull(startHHmm)
+            ?: return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
         val now = nowMinute()
         if (start <= now) {
-            return "$startHHmm is not ahead of the current time (${FreeSlotCalculator.formatMinutes(now)}); choose a later time today."
+            return SlotProblem(
+                "TIME_IN_PAST",
+                "$startHHmm is not ahead of the current time (${FreeSlotCalculator.formatMinutes(now)}); choose a later time today."
+            )
         }
         val end = start + minutes
-        if (freeSlotsToday(ignoreTaskId).any { start >= it.startMinute && end <= it.endMinute }) return null
+        if (end > MINUTES_PER_DAY) {
+            return SlotProblem("PAST_MIDNIGHT", "$startHHmm for $minutes min would run past midnight; Checkmate only plans today.")
+        }
+        val range = "$startHHmm-${FreeSlotCalculator.formatMinutes(end)}"
         val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
-        return "$startHHmm-${FreeSlotCalculator.formatMinutes(end)} is outside the student's study window or overlaps a blocked slot or another task. " +
-            (if (suggestion != null) "First free $minutes-minute slot today starts at $suggestion." else "There is no free $minutes-minute slot left today.")
+        val suggestionText = if (suggestion != null) " First free $minutes-minute slot today starts at $suggestion."
+        else " There is no free $minutes-minute slot left today."
+
+        // Overlap with another unfinished task: never overridable.
+        if (occupiedRanges(ignoreTaskId).any { start < it.second && end > it.first }) {
+            return SlotProblem("OVERLAP", "$range overlaps another unfinished task in today's plan; force cannot override that.$suggestionText")
+        }
+        if (force) return null
+
+        val blocked = blockedOverlap(start, end)
+        if (blocked != null) {
+            return SlotProblem("BLOCKED_SLOT", "$range overlaps the blocked slot '$blocked'. Resend with force=true to override it.$suggestionText")
+        }
+        val (ws, we) = studyWindow()
+        if (start < ws || end > we) {
+            return SlotProblem(
+                "OUTSIDE_WINDOW",
+                "$range is outside the student's study window (${FreeSlotCalculator.formatMinutes(ws)}-${FreeSlotCalculator.formatMinutes(we)}). Resend with force=true to override it.$suggestionText"
+            )
+        }
+        return null
+    }
+
+    /** Label of the first blocked slot overlapping [start, end), or null. Unparseable slots are ignored. */
+    private fun blockedOverlap(start: Int, end: Int): String? {
+        val hit = ConsultationProfile.load().blockedSlots.firstOrNull { slot ->
+            val s = FreeSlotCalculator.parseTimeOrNull(slot.startTime) ?: return@firstOrNull false
+            val e = FreeSlotCalculator.parseTimeOrNull(slot.endTime) ?: return@firstOrNull false
+            e > s && start < e && end > s
+        } ?: return null
+        return hit.label.ifBlank { "blocked time" }
+    }
+
+    /** Suffix for an accepted forced request that really did bypass the window or a blocked slot. */
+    private fun describeForce(startHHmm: String, minutes: Int, ignoreTaskId: String?): String {
+        val code = slotProblem(startHHmm, minutes, ignoreTaskId, force = false)?.code
+        return if (code == "OUTSIDE_WINDOW" || code == "BLOCKED_SLOT") " (forced: study window / blocked slot overridden)" else ""
     }
 
     /**
@@ -4621,7 +4707,13 @@ import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.psyche.db.BehaviorDatabase
 import com.checkmate.testmate.TestmateApi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -5027,6 +5119,21 @@ object GatewaySyncScheduler {
 
     private const val PERIODIC_WORK = "checkmate_gateway_sync"
     private const val STARTUP_WORK = "checkmate_gateway_sync_startup"
+    private const val NOW_WORK = "checkmate_gateway_sync_now"
+    private const val TAG = "GatewaySyncScheduler"
+
+    /**
+     * How often the in-process poller asks the gateway for new AI requests. One small GET per tick
+     * (it returns nothing when the queue is empty), so a request is picked up within ~this long.
+     * WorkManager can't go below 15 min, hence the separate loop.
+     */
+    private const val FAST_POLL_SECONDS = 15L
+
+    /** Doubles after a failed/offline pass up to this cap, so a dead network doesn't burn battery. */
+    private const val FAST_POLL_MAX_BACKOFF_SECONDS = 120L
+
+    private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var pollJob: Job? = null
 
     /** WorkManager's periodic floor is 15 min; 30 keeps the snapshot fresh without wasting battery. */
     private const val INTERVAL_MINUTES = 30L
@@ -5054,12 +5161,61 @@ object GatewaySyncScheduler {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
                 .build()
         )
+        startFastPolling(context)
+    }
+
+    /**
+     * Near-instant pickup of AI requests while the app process is alive (the study guard's foreground
+     * service keeps it alive). Idempotent. After any pass that actually answered a request it also
+     * queues a snapshot push, so the AI's next read of today's plan shows the change.
+     */
+    fun startFastPolling(context: Context) {
+        if (pollJob?.isActive == true) return
+        val app = context.applicationContext
+        pollJob = pollScope.launch {
+            var wait = FAST_POLL_SECONDS
+            while (isActive) {
+                try {
+                    val answered = GatewayRequestSync.processPending(app)
+                    if (answered > 0) syncNow(app)
+                    wait = FAST_POLL_SECONDS
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "fast poll failed: ${e.message}")
+                    wait = (wait * 2).coerceAtMost(FAST_POLL_MAX_BACKOFF_SECONDS)
+                }
+                delay(wait * 1000L)
+            }
+        }
+    }
+
+    fun stopFastPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
+    /** One immediate snapshot push + request pass (a "Sync now" button can call this too). */
+    fun syncNow(context: Context) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            NOW_WORK,
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<GatewaySyncWorker>()
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+                .build()
+        )
     }
 
     fun cancel(context: Context) {
         val wm = WorkManager.getInstance(context)
         wm.cancelUniqueWork(PERIODIC_WORK)
         wm.cancelUniqueWork(STARTUP_WORK)
+        wm.cancelUniqueWork(NOW_WORK)
+        stopFastPolling()
     }
 }
 
