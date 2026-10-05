@@ -25,7 +25,13 @@ import com.checkmate.psyche.BehaviorLedger
 import com.checkmate.psyche.db.BehaviorDatabase
 import com.checkmate.testmate.TestmateApi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -431,6 +437,21 @@ object GatewaySyncScheduler {
 
     private const val PERIODIC_WORK = "checkmate_gateway_sync"
     private const val STARTUP_WORK = "checkmate_gateway_sync_startup"
+    private const val NOW_WORK = "checkmate_gateway_sync_now"
+    private const val TAG = "GatewaySyncScheduler"
+
+    /**
+     * How often the in-process poller asks the gateway for new AI requests. One small GET per tick
+     * (it returns nothing when the queue is empty), so a request is picked up within ~this long.
+     * WorkManager can't go below 15 min, hence the separate loop.
+     */
+    private const val FAST_POLL_SECONDS = 15L
+
+    /** Doubles after a failed/offline pass up to this cap, so a dead network doesn't burn battery. */
+    private const val FAST_POLL_MAX_BACKOFF_SECONDS = 120L
+
+    private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var pollJob: Job? = null
 
     /** WorkManager's periodic floor is 15 min; 30 keeps the snapshot fresh without wasting battery. */
     private const val INTERVAL_MINUTES = 30L
@@ -458,11 +479,60 @@ object GatewaySyncScheduler {
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
                 .build()
         )
+        startFastPolling(context)
+    }
+
+    /**
+     * Near-instant pickup of AI requests while the app process is alive (the study guard's foreground
+     * service keeps it alive). Idempotent. After any pass that actually answered a request it also
+     * queues a snapshot push, so the AI's next read of today's plan shows the change.
+     */
+    fun startFastPolling(context: Context) {
+        if (pollJob?.isActive == true) return
+        val app = context.applicationContext
+        pollJob = pollScope.launch {
+            var wait = FAST_POLL_SECONDS
+            while (isActive) {
+                try {
+                    val answered = GatewayRequestSync.processPending(app)
+                    if (answered > 0) syncNow(app)
+                    wait = FAST_POLL_SECONDS
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "fast poll failed: ${e.message}")
+                    wait = (wait * 2).coerceAtMost(FAST_POLL_MAX_BACKOFF_SECONDS)
+                }
+                delay(wait * 1000L)
+            }
+        }
+    }
+
+    fun stopFastPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
+    /** One immediate snapshot push + request pass (a "Sync now" button can call this too). */
+    fun syncNow(context: Context) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            NOW_WORK,
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<GatewaySyncWorker>()
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+                .build()
+        )
     }
 
     fun cancel(context: Context) {
         val wm = WorkManager.getInstance(context)
         wm.cancelUniqueWork(PERIODIC_WORK)
         wm.cancelUniqueWork(STARTUP_WORK)
+        wm.cancelUniqueWork(NOW_WORK)
+        stopFastPolling()
     }
 }
