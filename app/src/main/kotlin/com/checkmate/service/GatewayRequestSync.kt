@@ -47,6 +47,11 @@ import java.util.concurrent.TimeUnit
  * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
  * refusal is reported back with the real reason so the AI can see why.
  *
+ * SUPPORTED (plan edits): `update_task` and `delete_task` work ONLY on pending plain study tasks that an
+ * AI assistant itself added (never the student's own tasks, never engine/repair tasks), and
+ * `batch_schedule` applies up to [MAX_BATCH_ITEMS] creates/moves as ONE unit (all pass every check
+ * against the plan-as-it-would-be, or nothing is written). `sync_now` pushes every snapshot at once.
+ *
  * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
  * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
  * `schedule_task` (move a PENDING task in today's plan to a start time, see [decideScheduleTask]).
@@ -83,6 +88,7 @@ object GatewayRequestSync {
     private const val KEY_HANDLED = "gateway_request_results"
     private const val MAX_HANDLED = 20
     private const val MAX_MESSAGE = 280
+    const val MAX_BATCH_ITEMS = 12
     private const val MINUTES_PER_DAY = 24 * 60
 
     /** One processing pass at a time: the fast poller and the WorkManager worker must not race. */
@@ -162,6 +168,10 @@ object GatewayRequestSync {
         )
         "create_task" -> decideCreateTask(context, req)
         "schedule_task" -> decideScheduleTask(req)
+        "update_task" -> decideUpdateTask(req)
+        "delete_task" -> decideDeleteTask(req)
+        "batch_schedule" -> decideBatchSchedule(req)
+        "sync_now" -> decideSyncNow(context)
         "dismiss_task" -> Decision(
             false,
             "Checkmate does not allow tasks to be dismissed from outside the app.",
@@ -207,12 +217,7 @@ object GatewayRequestSync {
         if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
             return Decision(false, "A study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).", "DURATION_OUT_OF_RANGE")
         }
-        val taskType = when (p.optStr("study_type")) {
-            "LECTURE" -> TaskType.LECTURE
-            "REVISION" -> TaskType.REVISION
-            "READING" -> TaskType.READING
-            else -> TaskType.PRACTICE
-        }
+        val taskType = studyTaskType(p.optStr("study_type"))
 
         val today = PlanStore.getTodayTasksSnapshot_Sync()
         if (today.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
@@ -300,6 +305,183 @@ object GatewayRequestSync {
         return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
 
+    // ── plan edits: update / delete / batch / sync (phone-side guards, see class doc) ───────
+
+    private fun studyTaskType(s: String?): TaskType = when (s) {
+        "LECTURE" -> TaskType.LECTURE
+        "REVISION" -> TaskType.REVISION
+        "READING" -> TaskType.READING
+        else -> TaskType.PRACTICE
+    }
+
+    /** A plain study task an AI assistant added. The only kind outside requests may edit or delete. */
+    private fun isAiStudyTask(t: StudyTask): Boolean = t.rationale.startsWith(AI_TASK_MARKER) && t.learningIntent == null
+
+    private fun decideDeleteTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be deleted from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be deleted.", "TASK_NOT_PENDING")
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would delete ${task.subject}: ${task.topic}. Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        PlanStore.removeTask(task.id)
+        return Decision(true, "Deleted ${task.subject}: ${task.topic} from today's plan.", "ALLOW", task.id)
+    }
+
+    private fun decideUpdateTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        val task = today.firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be edited from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be edited.", "TASK_NOT_PENDING")
+        }
+
+        val newTopic = p.optStr("topic")?.take(200) ?: task.topic
+        val requestedMinutes = if (p.has("duration_minutes") && !p.isNull("duration_minutes")) p.optInt("duration_minutes", 0) else null
+        if (requestedMinutes != null && requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+            return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
+        }
+        val newMinutes = requestedMinutes ?: task.durationMinutes
+        val requestedStart = p.optStr("scheduled_start_time")
+        if (requestedStart != null && !HHMM.matches(requestedStart)) {
+            return Decision(false, "'$requestedStart' is not a valid HH:mm time.", "INVALID_TIME")
+        }
+        val newStart = requestedStart ?: task.scheduledStartTime
+
+        if (newTopic == task.topic && newMinutes == task.durationMinutes && newStart == task.scheduledStartTime) {
+            return Decision(false, "Nothing to change: the task already has those values.", "NO_OP_ALREADY_APPLIED")
+        }
+        val force = p.optBoolean("force", false)
+        var forcedNote = ""
+        val timeChanged = newStart != task.scheduledStartTime || newMinutes != task.durationMinutes
+        if (newStart != null && timeChanged) {
+            slotProblem(newStart, newMinutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
+            if (force) forcedNote = describeForce(newStart, newMinutes, ignoreTaskId = task.id)
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would update ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        // One write for topic + length + time, so the plan never shows a half-applied edit.
+        PlanStore.saveTodayTasks(
+            today.map { if (it.id == task.id) it.copy(topic = newTopic, durationMinutes = newMinutes, scheduledStartTime = newStart) else it }
+        )
+        return Decision(true, "Updated ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote", "ALLOW", task.id)
+    }
+
+    /**
+     * All-or-nothing day plan. Every item is checked against the plan as it WOULD look after the earlier
+     * items (so two items can't claim the same slot), with the same rules as a single create / move.
+     * Any failure rejects the whole batch and writes nothing; success is a single plan write.
+     */
+    private fun decideBatchSchedule(req: Pending): Decision {
+        val p = req.payload
+        val items = p.optJSONArray("items") ?: return Decision(false, "The request has no items.", "MALFORMED")
+        if (items.length() < 1 || items.length() > MAX_BATCH_ITEMS) {
+            return Decision(false, "A batch needs 1-$MAX_BATCH_ITEMS items (got ${items.length()}).", "MALFORMED")
+        }
+        val dry = p.optBoolean("dry_run", false)
+        var working: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+        var created = 0
+        var moved = 0
+
+        fun fail(i: Int, code: String, message: String) =
+            Decision(false, "Batch rejected, nothing was applied. Item ${i + 1}: $message", code)
+
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: return fail(i, "MALFORMED", "not an object.")
+            val force = item.optBoolean("force", false)
+            when (item.optStr("op")) {
+                "create" -> {
+                    val subject = item.optStr("subject") ?: return fail(i, "MALFORMED", "no subject.")
+                    val topic = item.optStr("topic") ?: return fail(i, "MALFORMED", "no topic.")
+                    val minutes = item.optInt("duration_minutes", DEFAULT_STUDY_MINUTES)
+                    if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                        return fail(i, "DURATION_OUT_OF_RANGE", "a study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).")
+                    }
+                    if (working.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
+                        return fail(i, "DAILY_AI_TASK_LIMIT", "already $MAX_AI_TASKS_PER_DAY AI-requested tasks today.")
+                    }
+                    if (working.any {
+                            it.state != TaskState.DONE && it.state != TaskState.SKIPPED &&
+                                norm(it.subject) == norm(subject) && norm(it.topic) == norm(topic)
+                        }
+                    ) {
+                        return fail(i, "ALREADY_PLANNED", "the plan already has an open task for $subject: $topic.")
+                    }
+                    val requested = item.optStr("scheduled_start_time")
+                    val start: String? = if (requested != null) {
+                        slotProblem(requested, minutes, ignoreTaskId = null, force = force, tasks = working)
+                            ?.let { return fail(i, it.code, it.message) }
+                        requested
+                    } else {
+                        firstFreeStartFromNow(minutes, ignoreTaskId = null, tasks = working)
+                    }
+                    working = working + StudyTask(
+                        subject = subject,
+                        topic = topic,
+                        durationMinutes = minutes,
+                        isCustom = true,
+                        taskType = studyTaskType(item.optStr("study_type")),
+                        scheduledStartTime = start,
+                        rationale = "$AI_TASK_MARKER: ${req.reason}".take(300)
+                    )
+                    created += 1
+                }
+                "move" -> {
+                    val id = item.optStr("task_id") ?: return fail(i, "MALFORMED", "no task_id.")
+                    val start = item.optStr("scheduled_start_time") ?: return fail(i, "MALFORMED", "no start time.")
+                    if (!HHMM.matches(start)) return fail(i, "INVALID_TIME", "'$start' is not a valid HH:mm time.")
+                    val task = working.firstOrNull { it.id == id }
+                        ?: return fail(i, "UNKNOWN_TASK_ID", "no task with that id in today's plan.")
+                    if (task.state != TaskState.PENDING) return fail(i, "TASK_NOT_PENDING", "that task is ${task.state}.")
+                    val requestedMinutes = if (item.has("duration_minutes") && !item.isNull("duration_minutes")) item.optInt("duration_minutes", 0) else null
+                    if (requestedMinutes != null) {
+                        if (requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                            return fail(i, "DURATION_OUT_OF_RANGE", "duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).")
+                        }
+                        if (task.learningIntent != null && requestedMinutes != task.durationMinutes) {
+                            return fail(i, "DURATION_LOCKED", "Checkmate sized that repair task itself; ask only for a new time.")
+                        }
+                    }
+                    val minutes = requestedMinutes ?: task.durationMinutes
+                    if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
+                        return fail(i, "NO_OP_ALREADY_APPLIED", "that task is already scheduled for $start.")
+                    }
+                    slotProblem(start, minutes, ignoreTaskId = task.id, force = force, tasks = working)
+                        ?.let { return fail(i, it.code, it.message) }
+                    working = working.map { if (it.id == id) it.copy(scheduledStartTime = start, durationMinutes = minutes) else it }
+                    moved += 1
+                }
+                else -> return fail(i, "UNSUPPORTED_KIND", "op must be 'create' or 'move'.")
+            }
+        }
+
+        val summary = "$created added, $moved moved"
+        if (dry) return Decision(true, "Dry run OK: batch would apply ($summary). Nothing was changed.", "DRY_RUN_OK")
+        PlanStore.saveTodayTasks(working)
+        return Decision(true, "Batch applied ($summary).", "ALLOW")
+    }
+
+    /** Pushes every snapshot right now, so the AI's next reads (plan, mastery, interventions) are fresh. */
+    private suspend fun decideSyncNow(context: Context): Decision =
+        when (GatewaySync.pushAll(context)) {
+            GatewaySync.PushResult.OK -> Decision(true, "Pushed fresh snapshots.", "ALLOW")
+            GatewaySync.PushResult.SKIPPED_NOT_CONFIGURED -> Decision(false, "The phone has no Testmate URL/token configured.", "SYNC_NOT_CONFIGURED")
+            else -> Decision(false, "Some snapshots could not be pushed (network or server error).", "SYNC_FAILED")
+        }
+
     private fun nowMinute(): Int {
         val c = Calendar.getInstance()
         return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
@@ -357,40 +539,59 @@ object GatewayRequestSync {
     }
 
     /** Unfinished tasks that already have a time, as (start, end) minutes. */
-    private fun occupiedRanges(ignoreTaskId: String?): List<Pair<Int, Int>> =
-        PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+    private fun occupiedRanges(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<Pair<Int, Int>> =
+        tasks.mapNotNull { t ->
             if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
             val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
             s to (s + t.durationMinutes)
         }
 
     /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
-    private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsToday(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
         val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
         val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
         val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
-        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId))
+        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId, tasks))
     }
 
     /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
-    private fun freeSlotsFromNow(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsFromNow(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         val now = nowMinute()
-        return freeSlotsToday(ignoreTaskId).mapNotNull {
+        return freeSlotsToday(ignoreTaskId, tasks).mapNotNull {
             val s = maxOf(it.startMinute, now)
             if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
         }
     }
 
-    private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
-        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
+    private fun firstFreeStartFromNow(
+        minutes: Int,
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): String? =
+        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId, tasks))?.let { FreeSlotCalculator.formatMinutes(it) }
 
     /**
      * Null when [startHHmm] for [minutes] is allowed today; otherwise a coded problem with a message the
      * AI can act on. With [force] the study window and blocked slots are ignored; the past, midnight and
      * other unfinished tasks are still enforced.
      */
-    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?, force: Boolean): SlotProblem? {
+    private fun slotProblem(
+        startHHmm: String,
+        minutes: Int,
+        ignoreTaskId: String?,
+        force: Boolean,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): SlotProblem? {
         if (!HHMM.matches(startHHmm)) return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
         val start = FreeSlotCalculator.parseTimeOrNull(startHHmm)
             ?: return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
@@ -406,12 +607,12 @@ object GatewayRequestSync {
             return SlotProblem("PAST_MIDNIGHT", "$startHHmm for $minutes min would run past midnight; Checkmate only plans today.")
         }
         val range = "$startHHmm-${FreeSlotCalculator.formatMinutes(end)}"
-        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
+        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId, tasks)
         val suggestionText = if (suggestion != null) " First free $minutes-minute slot today starts at $suggestion."
         else " There is no free $minutes-minute slot left today."
 
         // Overlap with another unfinished task: never overridable.
-        if (occupiedRanges(ignoreTaskId).any { start < it.second && end > it.first }) {
+        if (occupiedRanges(ignoreTaskId, tasks).any { start < it.second && end > it.first }) {
             return SlotProblem("OVERLAP", "$range overlaps another unfinished task in today's plan; force cannot override that.$suggestionText")
         }
         if (force) return null
