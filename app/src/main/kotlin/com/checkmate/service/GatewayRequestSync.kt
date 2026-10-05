@@ -56,6 +56,10 @@ import java.util.concurrent.TimeUnit
  * another unfinished task, at most [MAX_AI_TASKS_PER_DAY] AI-created tasks a day, and no
  * duplicate of a task that is still open.
  *
+ * DRY RUN: `dry_run: true` on a `study` create or `schedule_task` runs every check below and answers
+ * with policy decision DRY_RUN_OK (accepted, nothing changed) or the real rejection. It never
+ * creates or moves anything and does not count toward [MAX_AI_TASKS_PER_DAY].
+ *
  * FORCE: a `study` create or a `schedule_task` may carry `force: true` (the AI only sends it
  * when the student explicitly asked for that exact time). Force skips ONLY the study-window and
  * blocked-slot checks. It never skips: a time already in the past, running past midnight, or an
@@ -172,6 +176,9 @@ object GatewayRequestSync {
         if (due != null && due != LocalDate.now().toString()) {
             return Decision(false, "Checkmate only plans today; a task for $due can't be scheduled.", "UNSUPPORTED_DUE_DATE")
         }
+        if (p.optBoolean("dry_run", false) && p.optStr("task_type") != "study") {
+            return Decision(false, "dry_run is only supported for study tasks and schedule_task.", "DRY_RUN_UNSUPPORTED")
+        }
         if (p.optStr("task_type") == "study") return decideCreateStudyTask(req)
         val minutes = if (p.has("target_questions") && !p.isNull("target_questions")) {
             (p.optInt("target_questions", 10) * MINUTES_PER_QUESTION)
@@ -228,6 +235,15 @@ object GatewayRequestSync {
             firstFreeStartFromNow(minutes, ignoreTaskId = null)
         }
 
+        if (p.optBoolean("dry_run", false)) {
+            val whereDry = when {
+                requested != null -> "at $requested"
+                start != null -> "at $start (first free slot)"
+                else -> "unscheduled (no free ${minutes}-minute slot left today)"
+            }
+            return Decision(true, "Dry run OK: would add $subject: $topic ($minutes min) $whereDry.$forcedNote Nothing was changed.", "DRY_RUN_OK")
+        }
+
         val task = StudyTask(
             subject = subject,
             topic = topic,
@@ -276,6 +292,10 @@ object GatewayRequestSync {
         slotProblem(start, minutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
         val forcedNote = if (force) describeForce(start, minutes, ignoreTaskId = task.id) else ""
 
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would move ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+
         PlanStore.updateTaskScheduleAndDuration(task.id, start, minutes)
         return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
@@ -286,6 +306,46 @@ object GatewayRequestSync {
     }
 
     private data class SlotProblem(val code: String, val message: String)
+
+    /**
+     * Everything an outside AI needs to plan without guessing, pushed inside the today_plan snapshot:
+     * study window, blocked slots, free gaps from now, AI-task quota, and when the plan day rolls over
+     * (task ids change then). Built from the same helpers the policy checks use, so it can't drift.
+     */
+    fun constraintsSnapshot(): JSONObject {
+        val (ws, we) = studyWindow()
+        val blocked = JSONArray()
+        ConsultationProfile.load().blockedSlots.forEach {
+            blocked.put(JSONObject().put("label", it.label).put("start", it.startTime).put("end", it.endTime))
+        }
+        val free = JSONArray()
+        freeSlotsFromNow(null).forEach {
+            free.put(
+                JSONObject()
+                    .put("start", FreeSlotCalculator.formatMinutes(it.startMinute))
+                    .put("end", FreeSlotCalculator.formatMinutes(it.endMinute))
+                    .put("minutes", it.durationMinutes)
+            )
+        }
+        val used = PlanStore.getTodayTasksSnapshot_Sync().count { it.rationale.startsWith(AI_TASK_MARKER) }
+        val now = System.currentTimeMillis()
+        val midnight = Calendar.getInstance().apply {
+            add(Calendar.DAY_OF_YEAR, 1)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }
+        return JSONObject()
+            .put("study_start", FreeSlotCalculator.formatMinutes(ws))
+            .put("study_end", FreeSlotCalculator.formatMinutes(we))
+            .put("blocked_slots", blocked)
+            .put("free_slots_from_now", free)
+            .put("ai_tasks_today", used)
+            .put("ai_task_limit", MAX_AI_TASKS_PER_DAY)
+            .put("min_study_minutes", MIN_STUDY_MINUTES)
+            .put("max_study_minutes", MAX_STUDY_MINUTES)
+            .put("now_ms", now)
+            .put("rolls_over_ms", midnight.timeInMillis)
+            .put("utc_offset_minutes", java.util.TimeZone.getDefault().getOffset(now) / 60000)
+    }
 
     /** The student's study window today in minutes-from-midnight (same prefs and defaults as the planner). */
     private fun studyWindow(): Pair<Int, Int> {

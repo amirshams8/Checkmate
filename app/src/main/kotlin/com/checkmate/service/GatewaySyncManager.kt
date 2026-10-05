@@ -124,6 +124,21 @@ object GatewaySync {
         }
     }
 
+    /** Pushes only today's plan (+ constraints): one small PUT, cheap enough to repeat every couple of minutes. */
+    suspend fun pushTodayPlanOnly(): PushResult = withContext(Dispatchers.IO) {
+        val base = baseUrl()
+        val token = token()
+        if (base == null || token == null) return@withContext PushResult.SKIPPED_NOT_CONFIGURED
+        try {
+            push(base, token, "today_plan", buildTodayPlan())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "today_plan quick push failed: ${e.message}")
+            PushResult.RETRYABLE_FAILURE
+        }
+    }
+
     // ── config (same prefs + allow-list as TestmateApi; never accepts an arbitrary host) ──
     private fun baseUrl(): String? {
         val saved = CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
@@ -280,6 +295,13 @@ object GatewaySync {
             putStr("day_key", PlanStore.currentDayKey())
             put("completion_percent", PlanStore.getTodayCompletionPercent())
             put("tasks", tasks)
+            // Planning constraints for the AI (study window, blocked slots, free gaps, quota, rollover).
+            // Never lets a constraints failure block the plan snapshot itself.
+            try {
+                put("constraints", GatewayRequestSync.constraintsSnapshot())
+            } catch (e: Exception) {
+                Log.w(TAG, "constraints snapshot failed: ${e.message}")
+            }
         }
     }
 
@@ -450,6 +472,9 @@ object GatewaySyncScheduler {
     /** Doubles after a failed/offline pass up to this cap, so a dead network doesn't burn battery. */
     private const val FAST_POLL_MAX_BACKOFF_SECONDS = 120L
 
+    /** How often the poller refreshes today's plan + constraints on the server, so reads are never ~30 min stale. */
+    private const val PLAN_PUSH_SECONDS = 120L
+
     private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var pollJob: Job? = null
 
@@ -492,10 +517,15 @@ object GatewaySyncScheduler {
         val app = context.applicationContext
         pollJob = pollScope.launch {
             var wait = FAST_POLL_SECONDS
+            var lastPlanPush = 0L
             while (isActive) {
                 try {
                     val answered = GatewayRequestSync.processPending(app)
                     if (answered > 0) syncNow(app)
+                    if (System.currentTimeMillis() - lastPlanPush >= PLAN_PUSH_SECONDS * 1000L) {
+                        GatewaySync.pushTodayPlanOnly()
+                        lastPlanPush = System.currentTimeMillis()
+                    }
                     wait = FAST_POLL_SECONDS
                 } catch (e: CancellationException) {
                     throw e
