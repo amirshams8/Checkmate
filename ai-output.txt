@@ -57,6 +57,10 @@ import java.util.concurrent.TimeUnit
  * another unfinished task, at most [MAX_AI_TASKS_PER_DAY] AI-created tasks a day, and no
  * duplicate of a task that is still open.
  *
+ * DRY RUN: `dry_run: true` on a `study` create or `schedule_task` runs every check below and answers
+ * with policy decision DRY_RUN_OK (accepted, nothing changed) or the real rejection. It never
+ * creates or moves anything and does not count toward [MAX_AI_TASKS_PER_DAY].
+ *
  * FORCE: a `study` create or a `schedule_task` may carry `force: true` (the AI only sends it
  * when the student explicitly asked for that exact time). Force skips ONLY the study-window and
  * blocked-slot checks. It never skips: a time already in the past, running past midnight, or an
@@ -173,6 +177,9 @@ object GatewayRequestSync {
         if (due != null && due != LocalDate.now().toString()) {
             return Decision(false, "Checkmate only plans today; a task for $due can't be scheduled.", "UNSUPPORTED_DUE_DATE")
         }
+        if (p.optBoolean("dry_run", false) && p.optStr("task_type") != "study") {
+            return Decision(false, "dry_run is only supported for study tasks and schedule_task.", "DRY_RUN_UNSUPPORTED")
+        }
         if (p.optStr("task_type") == "study") return decideCreateStudyTask(req)
         val minutes = if (p.has("target_questions") && !p.isNull("target_questions")) {
             (p.optInt("target_questions", 10) * MINUTES_PER_QUESTION)
@@ -229,6 +236,15 @@ object GatewayRequestSync {
             firstFreeStartFromNow(minutes, ignoreTaskId = null)
         }
 
+        if (p.optBoolean("dry_run", false)) {
+            val whereDry = when {
+                requested != null -> "at $requested"
+                start != null -> "at $start (first free slot)"
+                else -> "unscheduled (no free ${minutes}-minute slot left today)"
+            }
+            return Decision(true, "Dry run OK: would add $subject: $topic ($minutes min) $whereDry.$forcedNote Nothing was changed.", "DRY_RUN_OK")
+        }
+
         val task = StudyTask(
             subject = subject,
             topic = topic,
@@ -277,6 +293,10 @@ object GatewayRequestSync {
         slotProblem(start, minutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
         val forcedNote = if (force) describeForce(start, minutes, ignoreTaskId = task.id) else ""
 
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would move ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+
         PlanStore.updateTaskScheduleAndDuration(task.id, start, minutes)
         return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
@@ -287,6 +307,46 @@ object GatewayRequestSync {
     }
 
     private data class SlotProblem(val code: String, val message: String)
+
+    /**
+     * Everything an outside AI needs to plan without guessing, pushed inside the today_plan snapshot:
+     * study window, blocked slots, free gaps from now, AI-task quota, and when the plan day rolls over
+     * (task ids change then). Built from the same helpers the policy checks use, so it can't drift.
+     */
+    fun constraintsSnapshot(): JSONObject {
+        val (ws, we) = studyWindow()
+        val blocked = JSONArray()
+        ConsultationProfile.load().blockedSlots.forEach {
+            blocked.put(JSONObject().put("label", it.label).put("start", it.startTime).put("end", it.endTime))
+        }
+        val free = JSONArray()
+        freeSlotsFromNow(null).forEach {
+            free.put(
+                JSONObject()
+                    .put("start", FreeSlotCalculator.formatMinutes(it.startMinute))
+                    .put("end", FreeSlotCalculator.formatMinutes(it.endMinute))
+                    .put("minutes", it.durationMinutes)
+            )
+        }
+        val used = PlanStore.getTodayTasksSnapshot_Sync().count { it.rationale.startsWith(AI_TASK_MARKER) }
+        val now = System.currentTimeMillis()
+        val midnight = Calendar.getInstance().apply {
+            add(Calendar.DAY_OF_YEAR, 1)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }
+        return JSONObject()
+            .put("study_start", FreeSlotCalculator.formatMinutes(ws))
+            .put("study_end", FreeSlotCalculator.formatMinutes(we))
+            .put("blocked_slots", blocked)
+            .put("free_slots_from_now", free)
+            .put("ai_tasks_today", used)
+            .put("ai_task_limit", MAX_AI_TASKS_PER_DAY)
+            .put("min_study_minutes", MIN_STUDY_MINUTES)
+            .put("max_study_minutes", MAX_STUDY_MINUTES)
+            .put("now_ms", now)
+            .put("rolls_over_ms", midnight.timeInMillis)
+            .put("utc_offset_minutes", java.util.TimeZone.getDefault().getOffset(now) / 60000)
+    }
 
     /** The student's study window today in minutes-from-midnight (same prefs and defaults as the planner). */
     private fun studyWindow(): Pair<Int, Int> {
@@ -737,6 +797,21 @@ object GatewaySync {
         }
     }
 
+    /** Pushes only today's plan (+ constraints): one small PUT, cheap enough to repeat every couple of minutes. */
+    suspend fun pushTodayPlanOnly(): PushResult = withContext(Dispatchers.IO) {
+        val base = baseUrl()
+        val token = token()
+        if (base == null || token == null) return@withContext PushResult.SKIPPED_NOT_CONFIGURED
+        try {
+            push(base, token, "today_plan", buildTodayPlan())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "today_plan quick push failed: ${e.message}")
+            PushResult.RETRYABLE_FAILURE
+        }
+    }
+
     // ── config (same prefs + allow-list as TestmateApi; never accepts an arbitrary host) ──
     private fun baseUrl(): String? {
         val saved = CheckmatePrefs.getString(TestmateApi.PREF_BASE_URL, null)?.trim()?.trimEnd('/')
@@ -893,6 +968,13 @@ object GatewaySync {
             putStr("day_key", PlanStore.currentDayKey())
             put("completion_percent", PlanStore.getTodayCompletionPercent())
             put("tasks", tasks)
+            // Planning constraints for the AI (study window, blocked slots, free gaps, quota, rollover).
+            // Never lets a constraints failure block the plan snapshot itself.
+            try {
+                put("constraints", GatewayRequestSync.constraintsSnapshot())
+            } catch (e: Exception) {
+                Log.w(TAG, "constraints snapshot failed: ${e.message}")
+            }
         }
     }
 
@@ -1063,6 +1145,9 @@ object GatewaySyncScheduler {
     /** Doubles after a failed/offline pass up to this cap, so a dead network doesn't burn battery. */
     private const val FAST_POLL_MAX_BACKOFF_SECONDS = 120L
 
+    /** How often the poller refreshes today's plan + constraints on the server, so reads are never ~30 min stale. */
+    private const val PLAN_PUSH_SECONDS = 120L
+
     private val pollScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var pollJob: Job? = null
 
@@ -1105,10 +1190,15 @@ object GatewaySyncScheduler {
         val app = context.applicationContext
         pollJob = pollScope.launch {
             var wait = FAST_POLL_SECONDS
+            var lastPlanPush = 0L
             while (isActive) {
                 try {
                     val answered = GatewayRequestSync.processPending(app)
                     if (answered > 0) syncNow(app)
+                    if (System.currentTimeMillis() - lastPlanPush >= PLAN_PUSH_SECONDS * 1000L) {
+                        GatewaySync.pushTodayPlanOnly()
+                        lastPlanPush = System.currentTimeMillis()
+                    }
                     wait = FAST_POLL_SECONDS
                 } catch (e: CancellationException) {
                     throw e
@@ -1148,6 +1238,477 @@ object GatewaySyncScheduler {
         wm.cancelUniqueWork(NOW_WORK)
         stopFastPolling()
     }
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/projection.ts =====
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { getSubjectByChapter, localDateString } from './evidence';
+import { fillSubjects } from './subject-fill';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway read-projection (FINAL_PLAN "Option C — hybrid").
+//
+// The Android app stays the source of truth for the student model, interventions and
+// today's plan. It PUSHES curated snapshots here (PUT /api/gateway/projection, device-token
+// auth); the MCP gateway only ever READS these rows. The gateway never gets arbitrary SQL
+// against anything, and keeps working while the phone is offline (with a visible
+// freshness stamp so the model can say "as of 3h ago").
+//
+// Every pushed payload is re-normalized field by field below — unknown fields are dropped,
+// strings bounded, arrays capped — so the phone can't (accidentally) smuggle internals,
+// secrets, or megabytes into what an external model eventually reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const PROJECTION_KINDS = ['student_model', 'interventions', 'today_plan', 'knowledge_graph', 'behavior', 'task_history'] as const;
+export type ProjectionKind = (typeof PROJECTION_KINDS)[number];
+export const MAX_PROJECTION_BYTES = 800_000;
+const SCHEMA_VERSION = 1;
+
+export class ProjectionError extends Error {}
+
+function str(v: unknown, max = 200): string | null {
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  return t ? t.slice(0, max) : null;
+}
+function num(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+function int(v: unknown): number {
+  const n = num(v);
+  return n === null ? 0 : Math.trunc(n);
+}
+function bool(v: unknown): boolean {
+  return v === true;
+}
+function arr(v: unknown, max: number): any[] {
+  return Array.isArray(v) ? v.slice(0, max) : [];
+}
+function epochToIso(v: unknown): string | null {
+  const n = num(v);
+  return n === null || n <= 0 ? null : new Date(n).toISOString();
+}
+
+function normalizeStudentModel(b: any) {
+  const o = b?.overall ?? {};
+  const ref = (p: any) => ({ subject: str(p?.subject), chapter: str(p?.chapter), topic: str(p?.topic) });
+  return {
+    exam: str(b?.exam, 60),
+    model_version: int(b?.model_version) || 1,
+    overall: {
+      concepts_tracked: int(o.concepts_tracked),
+      concepts_mastered: int(o.concepts_mastered),
+      concepts_weak: int(o.concepts_weak),
+      average_mastery: num(o.average_mastery),
+      total_attempts: int(o.total_attempts),
+      unresolved_error_count: int(o.unresolved_error_count)
+    },
+    concepts: arr(b?.concepts, 3000).map((c) => ({
+      concept_id: str(c?.concept_id, 120),
+      subject: str(c?.subject),
+      chapter: str(c?.chapter),
+      topic: str(c?.topic),
+      mastery: num(c?.mastery),
+      forgetting_risk: num(c?.forgetting_risk),
+      retention_decision: ['REVIEW', 'TEACH', 'MOVE_ON'].includes(c?.retention_decision) ? c.retention_decision : null,
+      attempt_count: int(c?.attempt_count),
+      recent_accuracy: num(c?.recent_accuracy),
+      lifetime_accuracy: num(c?.lifetime_accuracy),
+      error_count: int(c?.error_count),
+      last_seen_at: epochToIso(c?.last_seen_ms),
+      weak: bool(c?.weak),
+      prerequisite_issues: arr(c?.prerequisite_issues, 10).map(ref)
+    })),
+    unresolved_errors: arr(b?.unresolved_errors, 500).map((e) => ({
+      concept_id: str(e?.concept_id, 120),
+      subject: str(e?.subject),
+      chapter: str(e?.chapter),
+      topic: str(e?.topic),
+      error_type: str(e?.error_type, 40),
+      occurrences: int(e?.occurrences),
+      first_seen_at: epochToIso(e?.first_seen_ms),
+      last_seen_at: epochToIso(e?.last_seen_ms)
+    }))
+  };
+}
+
+function normalizeInterventions(b: any) {
+  return {
+    entries: arr(b?.entries, 300).map((e) => ({
+      transaction_id: str(e?.transaction_id, 80),
+      task_id: str(e?.task_id, 80),
+      trigger_type: str(e?.trigger_type, 60),
+      terminal_state: str(e?.terminal_state, 60),
+      provenance: str(e?.provenance, 60),
+      attempt_count: int(e?.attempt_count),
+      resolved_at: epochToIso(e?.resolved_ms),
+      outcome: str(e?.outcome, 300),
+      failure_reason: str(e?.failure_reason, 300)
+    }))
+  };
+}
+
+// Planning constraints the phone attaches to today's plan (study window, blocked slots, free gaps,
+// AI quota, rollover). Re-validated field by field like everything else here.
+function normalizeConstraints(c: any) {
+  if (!c || typeof c !== 'object') return null;
+  const hhmm = (v: unknown): string | null => {
+    const s = str(v, 5);
+    return s && /^([01]\d|2[0-3]):[0-5]\d$/.test(s) ? s : null;
+  };
+  return {
+    study_start: hhmm(c.study_start),
+    study_end: hhmm(c.study_end),
+    blocked_slots: arr(c.blocked_slots, 20)
+      .map((x) => ({ label: str(x?.label, 60), start: hhmm(x?.start), end: hhmm(x?.end) }))
+      .filter((x) => x.start && x.end),
+    free_slots_from_now: arr(c.free_slots_from_now, 40)
+      .map((x) => ({ start: hhmm(x?.start), end: hhmm(x?.end), minutes: int(x?.minutes) }))
+      .filter((x) => x.start && x.end),
+    ai_tasks_today: int(c.ai_tasks_today),
+    ai_task_limit: int(c.ai_task_limit),
+    min_study_minutes: int(c.min_study_minutes),
+    max_study_minutes: int(c.max_study_minutes),
+    now_ms: num(c.now_ms),
+    rolls_over_ms: num(c.rolls_over_ms),
+    utc_offset_minutes: int(c.utc_offset_minutes)
+  };
+}
+
+function normalizeTodayPlan(b: any) {
+  return {
+    day_key: str(b?.day_key, 20),
+    constraints: normalizeConstraints(b?.constraints),
+    completion_percent: num(b?.completion_percent),
+    tasks: arr(b?.tasks, 100).map((t) => ({
+      id: str(t?.id, 80),
+      subject: str(t?.subject, 80),
+      topic: str(t?.topic, 200),
+      duration_minutes: int(t?.duration_minutes),
+      state: str(t?.state, 20),
+      task_type: str(t?.task_type, 20),
+      scheduled_start_time: str(t?.scheduled_start_time, 10),
+      completed_status: str(t?.completed_status, 10),
+      learning_intent: str(t?.learning_intent, 40),
+      concept_id: str(t?.concept_id, 120),
+      rationale: str(t?.rationale, 400),
+      focus_minutes: int(t?.focus_minutes)
+    }))
+  };
+}
+
+
+// Static-ish prerequisite graph: nodes are concepts (same ids as the student model), edges say
+// "prerequisite_id must be understood before concept_id". Dangling edges are dropped.
+function normalizeKnowledgeGraph(b: any) {
+  const nodes = arr(b?.nodes, 1500)
+    .map((n) => ({ concept_id: str(n?.concept_id, 120), subject: str(n?.subject), chapter: str(n?.chapter), topic: str(n?.topic) }))
+    .filter((n) => n.concept_id);
+  const ids = new Set(nodes.map((n) => n.concept_id));
+  const edges = arr(b?.edges, 4000)
+    .map((e) => ({ concept_id: str(e?.concept_id, 120), prerequisite_id: str(e?.prerequisite_id, 120) }))
+    .filter((e) => e.concept_id && e.prerequisite_id && e.concept_id !== e.prerequisite_id && ids.has(e.concept_id as string) && ids.has(e.prerequisite_id as string));
+  return { nodes, edges };
+}
+
+// AGGREGATES ONLY (FINAL_PLAN: never raw behavior events). No app names, no timestamps of
+// individual events, no free text.
+function normalizeBehavior(b: any) {
+  const a = b?.attention ?? {};
+  const l = b?.ledger ?? {};
+  return {
+    streak_days: int(b?.streak_days),
+    consecutive_missed_days: int(b?.consecutive_missed_days),
+    week_completion_percent: int(b?.week_completion_percent),
+    recent_skip_rate_percent: int(b?.recent_skip_rate_percent),
+    total_skips_7d: int(b?.total_skips_7d),
+    today_completed: int(b?.today_completed),
+    attention: { checks_passed: int(a.checks_passed), checks_missed: int(a.checks_missed), avg_focus_minutes: int(a.avg_focus_minutes) },
+    skip_patterns: arr(b?.skip_patterns, 20).map((s) => ({ subject: str(s?.subject, 80), task_type: str(s?.task_type, 20), occurrences: int(s?.occurrences) })),
+    ledger: {
+      events: int(l.events),
+      done_7d: int(l.done_7d),
+      skipped_7d: int(l.skipped_7d),
+      done_30d: int(l.done_30d),
+      skipped_30d: int(l.skipped_30d),
+      focus_minutes_7d: int(l.focus_minutes_7d)
+    }
+  };
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function normalizeTaskHistory(b: any) {
+  return {
+    days: arr(b?.days, 30)
+      .map((d) => ({
+        date: typeof d?.date === 'string' && DATE_RE.test(d.date) ? d.date : null,
+        planned: int(d?.planned),
+        done: int(d?.done),
+        skipped: int(d?.skipped),
+        unfinished: int(d?.unfinished),
+        focus_minutes: int(d?.focus_minutes),
+        tasks: arr(d?.tasks, 80).map((t) => ({
+          id: str(t?.id, 80),
+          subject: str(t?.subject, 80),
+          topic: str(t?.topic, 200),
+          task_type: str(t?.task_type, 20),
+          state: str(t?.state, 20),
+          duration_minutes: int(t?.duration_minutes),
+          focus_minutes: int(t?.focus_minutes),
+          learning_intent: str(t?.learning_intent, 40),
+          completed_status: str(t?.completed_status, 10)
+        }))
+      }))
+      .filter((d) => d.date)
+  };
+}
+
+export function isProjectionKind(v: unknown): v is ProjectionKind {
+  return typeof v === 'string' && (PROJECTION_KINDS as readonly string[]).includes(v);
+}
+
+export async function putProjection(sb: SupabaseClient, userId: string, kind: ProjectionKind, body: any) {
+  if (!body || typeof body !== 'object') throw new ProjectionError('Body must be a JSON object');
+  const payload =
+    kind === 'student_model'
+      ? normalizeStudentModel(body)
+      : kind === 'interventions'
+        ? normalizeInterventions(body)
+        : kind === 'knowledge_graph'
+          ? normalizeKnowledgeGraph(body)
+          : kind === 'behavior'
+            ? normalizeBehavior(body)
+            : kind === 'task_history'
+              ? normalizeTaskHistory(body)
+              : normalizeTodayPlan(body);
+
+  // Phone clocks drift; refuse nonsense but tolerate a little.
+  let generatedMs = typeof body.generated_ms === 'number' ? body.generated_ms : Date.now();
+  if (!Number.isFinite(generatedMs) || generatedMs > Date.now() + 5 * 60_000) generatedMs = Date.now();
+
+  // Never let an older snapshot overwrite a newer one (retried/out-of-order pushes).
+  const { data: existing } = await sb
+    .from('gateway_projection')
+    .select('generated_at')
+    .eq('user_id', userId)
+    .eq('kind', kind)
+    .maybeSingle();
+  if (existing && new Date(existing.generated_at).getTime() > generatedMs) {
+    return { stored: false, reason: 'A newer snapshot is already stored', generated_at: existing.generated_at as string };
+  }
+
+  const { error } = await sb.from('gateway_projection').upsert(
+    {
+      user_id: userId,
+      kind,
+      payload,
+      schema_version: SCHEMA_VERSION,
+      generated_at: new Date(generatedMs).toISOString(),
+      received_at: new Date().toISOString()
+    },
+    { onConflict: 'user_id,kind' }
+  );
+  if (error) throw error;
+  if (kind === 'student_model') await recordMasteryRollup(sb, userId, payload as any, generatedMs);
+  return { stored: true, generated_at: new Date(generatedMs).toISOString() };
+}
+
+// One compact row per student-local day (the day's LAST student_model push wins), so
+// checkmate_get_mastery_trends can show movement without keeping every snapshot.
+// Best-effort: a failure here (e.g. migration 020 not applied yet) never fails the push.
+async function recordMasteryRollup(sb: SupabaseClient, userId: string, payload: any, generatedMs: number): Promise<void> {
+  try {
+    const concepts: any[] = Array.isArray(payload?.concepts) ? payload.concepts : [];
+    if (concepts.length === 0) return;
+    const { model } = fillSubjects({ concepts }, await getSubjectByChapter(sb));
+    const bySubject = new Map<string, { n: number; sum: number; weak: number }>();
+    for (const c of model.concepts as any[]) {
+      const k = c.subject ?? 'Unclassified';
+      const s = bySubject.get(k) ?? { n: 0, sum: 0, weak: 0 };
+      s.n += 1;
+      s.sum += typeof c.mastery === 'number' ? c.mastery : 0;
+      if (c.weak) s.weak += 1;
+      bySubject.set(k, s);
+    }
+    const { error } = await sb.from('gateway_mastery_history').upsert(
+      {
+        user_id: userId,
+        day: localDateString(new Date(generatedMs)),
+        generated_at: new Date(generatedMs).toISOString(),
+        concepts_tracked: payload.overall?.concepts_tracked ?? concepts.length,
+        concepts_weak: payload.overall?.concepts_weak ?? concepts.filter((c) => c.weak).length,
+        average_mastery: payload.overall?.average_mastery ?? null,
+        by_subject: Array.from(bySubject.entries()).map(([subject, s]) => ({
+          subject,
+          concepts: s.n,
+          average_mastery: s.n ? Math.round((s.sum / s.n) * 1000) / 1000 : null,
+          weak_concepts: s.weak
+        }))
+      },
+      { onConflict: 'user_id,day' }
+    );
+    if (error) console.error('[gateway/projection] mastery rollup failed:', error.message);
+  } catch (err: any) {
+    console.error('[gateway/projection] mastery rollup failed:', err?.message ?? err);
+  }
+}
+
+export interface StoredProjection<T = any> {
+  payload: T;
+  generated_at: string;
+  received_at: string;
+}
+
+export async function getProjection<T = any>(
+  sb: SupabaseClient,
+  userId: string,
+  kind: ProjectionKind
+): Promise<StoredProjection<T> | null> {
+  const { data, error } = await sb
+    .from('gateway_projection')
+    .select('payload, generated_at, received_at')
+    .eq('user_id', userId)
+    .eq('kind', kind)
+    .maybeSingle();
+  if (error || !data) return null;
+  return data as StoredProjection<T>;
+}
+
+export function freshness(generatedAt: string, staleAfterMinutes = 360) {
+  const ageMin = Math.max(0, Math.round((Date.now() - new Date(generatedAt).getTime()) / 60_000));
+  return { generated_at: generatedAt, age_minutes: ageMin, stale: ageMin > staleAfterMinutes };
+}
+
+export async function projectionStatus(sb: SupabaseClient, userId: string) {
+  const { data } = await sb
+    .from('gateway_projection')
+    .select('kind, generated_at, received_at, schema_version')
+    .eq('user_id', userId);
+  return (data ?? []).map((r: any) => ({
+    kind: r.kind,
+    generated_at: r.generated_at,
+    received_at: r.received_at,
+    schema_version: r.schema_version
+  }));
+}
+
+//===== TERMUXFILE: Testmate/lib/gateway/constraints.ts =====
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { freshness, getProjection } from './projection';
+import { MAX_OPEN_REQUESTS, MAX_REQUESTS_PER_DAY } from './requests';
+import { getTodayPlan } from './tools-lib';
+import { ToolDataUnavailable } from './types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Planning-constraint reads. The phone attaches a `constraints` block to its today_plan snapshot
+// (study window, blocked slots, free gaps, AI quota, rollover); these tools only READ it, so an
+// outside AI can see the rules before it queues a request instead of learning them from rejections.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadConstraints(sb: SupabaseClient, userId: string) {
+  const p = await getProjection(sb, userId, 'today_plan');
+  if (!p) throw new ToolDataUnavailable("Checkmate hasn't synced today's plan yet. Open the Checkmate app and retry.");
+  const c = (p.payload as any)?.constraints;
+  if (!c) {
+    throw new ToolDataUnavailable(
+      "The phone hasn't synced its schedule constraints yet. Update Checkmate and keep it open for a couple of minutes, then retry."
+    );
+  }
+  return { c, planDay: (p.payload as any).day_key as string | null, generatedAt: p.generated_at };
+}
+
+function isoOrNull(ms: unknown): string | null {
+  return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+export async function getStudyWindow(sb: SupabaseClient, userId: string) {
+  const { c, planDay, generatedAt } = await loadConstraints(sb, userId);
+  const fresh = freshness(generatedAt, 30);
+  return {
+    source: 'checkmate_planner',
+    freshness: fresh,
+    note: fresh.stale ? 'Snapshot is stale: the phone may be offline or closed, and the window or blocked slots may have changed.' : undefined,
+    plan_day: planDay,
+    as_of_phone_time: isoOrNull(c.now_ms),
+    phone_utc_offset_minutes: c.utc_offset_minutes,
+    rolls_over_at: isoOrNull(c.rolls_over_ms),
+    study_window: { start: c.study_start, end: c.study_end },
+    blocked_slots: c.blocked_slots,
+    rules: {
+      planning_day: 'today only; a new plan (new task ids) starts at rolls_over_at',
+      start_time: "must be ahead of the phone's clock",
+      duration_minutes: { min: c.min_study_minutes, max: c.max_study_minutes },
+      overlap: 'never allowed with another unfinished task, force or not',
+      force: 'force=true skips the study-window and blocked-slot checks only; use it only when the student asked for that exact time'
+    }
+  };
+}
+
+export async function getFreeSlots(sb: SupabaseClient, userId: string, args: Record<string, unknown>) {
+  const { c, planDay, generatedAt } = await loadConstraints(sb, userId);
+  const raw = Number(args.min_minutes);
+  const min = Number.isFinite(raw) ? Math.min(120, Math.max(10, Math.trunc(raw))) : 10;
+  const fresh = freshness(generatedAt, 30);
+  const slots = (c.free_slots_from_now as any[]).filter((s) => s.minutes >= min);
+  return {
+    source: 'checkmate_planner',
+    freshness: fresh,
+    note:
+      "Gaps are measured from as_of_phone_time; anything earlier has already passed." +
+      (fresh.stale ? ' Snapshot is stale, so tasks may have been added or moved since.' : ''),
+    plan_day: planDay,
+    as_of_phone_time: isoOrNull(c.now_ms),
+    min_minutes: min,
+    free_slots: slots,
+    total_free_minutes: slots.reduce((n, s) => n + s.minutes, 0)
+  };
+}
+
+export async function getQuota(sb: SupabaseClient, userId: string) {
+  const nowIso = new Date().toISOString();
+  const open = async (build: (q: any) => any) => {
+    const { count, error } = await build(sb.from('gateway_requests').select('id', { count: 'exact', head: true }).eq('user_id', userId));
+    if (error) throw error;
+    return (count as number | null) ?? 0;
+  };
+  const [openNow, last24h, openStudyCreates] = await Promise.all([
+    open((q) => q.in('status', ['pending', 'claimed']).gt('expires_at', nowIso)),
+    open((q) => q.gte('created_at', new Date(Date.now() - 86_400_000).toISOString())),
+    open((q) => q.in('status', ['pending', 'claimed']).gt('expires_at', nowIso).eq('kind', 'create_task').contains('payload', { task_type: 'study', dry_run: false }))
+  ]);
+
+  let ai: Record<string, unknown> = { note: "Daily AI-task count isn't available until the phone has synced." };
+  try {
+    const { c, generatedAt } = await loadConstraints(sb, userId);
+    const used = c.ai_tasks_today as number;
+    const limit = c.ai_task_limit as number;
+    ai = {
+      used_today: used,
+      limit,
+      remaining_after_waiting_creates: Math.max(0, limit - used - openStudyCreates),
+      freshness: freshness(generatedAt, 30)
+    };
+  } catch (e) {
+    if (!(e instanceof ToolDataUnavailable)) throw e;
+  }
+  return {
+    open_requests: { used: openNow, limit: MAX_OPEN_REQUESTS, remaining: Math.max(0, MAX_OPEN_REQUESTS - openNow) },
+    requests_last_24h: { used: last24h, limit: MAX_REQUESTS_PER_DAY, remaining: Math.max(0, MAX_REQUESTS_PER_DAY - last24h) },
+    study_creates_waiting_for_phone: openStudyCreates,
+    ai_tasks_today: ai,
+    note: 'Dry runs (dry_run=true) count toward open requests while waiting, but never toward the daily AI-task cap.'
+  };
+}
+
+export async function getTodayPlanWithRollover(sb: SupabaseClient, userId: string) {
+  const plan = await getTodayPlan(sb, userId);
+  const p = await getProjection(sb, userId, 'today_plan');
+  const rolls = isoOrNull((p?.payload as any)?.constraints?.rolls_over_ms);
+  return {
+    ...plan,
+    rolls_over_at: rolls,
+    rollover_note: rolls ? 'Task ids are only valid until rolls_over_at; re-read the plan after it.' : undefined
+  };
 }
 
 //===== TERMUXFILE: Testmate/lib/gateway/requests.ts =====
@@ -1246,12 +1807,13 @@ function validTime(v: unknown, field: string, required: boolean): string | undef
   return s;
 }
 
+// dry_run: the phone runs every policy check and answers DRY_RUN_OK or the real rejection, changing nothing.
 // force: the AI sets it only when the student explicitly asked for that exact time. The phone then
 // skips the study-window and blocked-slot checks (it still rejects the past, midnight and overlaps).
-function validForce(v: unknown): boolean {
+function validFlag(v: unknown, field: string): boolean {
   if (v === undefined || v === null || v === '' || v === false) return false;
   if (v === true) return true;
-  throw new ToolInputError('force must be true or false.');
+  throw new ToolInputError(`${field} must be true or false.`);
 }
 
 function validMinutes(v: unknown, field: string): number | undefined {
@@ -1289,7 +1851,8 @@ export async function normalizeRequest(
         task_id: cleanText(args.task_id, 'task_id', { max: 100, required: true })!,
         scheduled_start_time: validTime(args.scheduled_start_time, 'scheduled_start_time', true)!,
         duration_minutes: validMinutes(args.duration_minutes, 'duration_minutes') ?? null,
-        force: validForce(args.force)
+        force: validFlag(args.force, 'force'),
+        dry_run: validFlag(args.dry_run, 'dry_run')
       },
       reason
     };
@@ -1321,7 +1884,8 @@ export async function normalizeRequest(
           duration_minutes: validMinutes(args.duration_minutes, 'duration_minutes') ?? 45,
           scheduled_start_time: validTime(args.scheduled_start_time, 'scheduled_start_time', false) ?? null,
           due_date: validDueDate(args.due_date) ?? null,
-          force: validForce(args.force)
+          force: validFlag(args.force, 'force'),
+          dry_run: validFlag(args.dry_run, 'dry_run')
         },
         reason
       };
@@ -1630,6 +2194,7 @@ import {
   questionLevelMastery,
   upcomingTestsView
 } from './tools-lib';
+import { getFreeSlots, getQuota, getStudyWindow, getTodayPlanWithRollover } from './constraints';
 import { REQUEST_STATUSES, STUDY_TYPES, TASK_TYPES, cancelRequest, createRequest, getRequests } from './requests';
 import { Scope, ToolContext, ToolDef } from './types';
 
@@ -1901,9 +2466,19 @@ export function buildTools(): ToolDef[] {
 
     // ── Plan / interventions ───────────────────────────────────────────────
     tool('get_today_plan', "Today's plan", READ,
-      "Today's study tasks from Checkmate's planner (state, type, schedule, learning intent, rationale). Snapshot synced from the phone; check freshness.",
+      "Today's study tasks from Checkmate's planner (state, type, schedule, learning intent, rationale), plus plan_day and rolls_over_at: task ids change when the plan day rolls over, so re-read the plan after that time before using a task_id. Snapshot synced from the phone; check freshness.",
       schema(),
-      async (_a, c) => getTodayPlan(c.supabase, uid(c))),
+      async (_a, c) => getTodayPlanWithRollover(c.supabase, uid(c))),
+
+    tool('get_study_window', 'Study window and blocked slots', READ,
+      "The student's study window and blocked slots (school, coaching, etc.) plus the planning rules the phone enforces (10-120 min tasks, today only, start must be ahead of the phone's clock) and when the plan day rolls over. Call this BEFORE proposing times so you don't send a request that will be rejected. Snapshot synced from the phone; check freshness.",
+      schema(),
+      async (_a, c) => getStudyWindow(c.supabase, uid(c))),
+
+    tool('get_free_slots', 'Free slots today', READ,
+      "Open gaps left in today's plan (study window minus blocked slots minus tasks that already have a time), measured from the phone's clock when it last synced, with their lengths. Use it to fit blocks around what exists. A request with force=true may still go outside these gaps, but never over another task.",
+      schema({ min_minutes: I('Only gaps at least this long (default 10).', 10, 120) }),
+      async (a, c) => getFreeSlots(c.supabase, uid(c), a)),
 
     tool('get_intervention_history', 'Intervention history', READ,
       "What Checkmate has already tried and how each ended (outcome ledger). Use to avoid repeating recommendations that already failed or were ignored.",
@@ -2011,6 +2586,7 @@ export function buildTools(): ToolDef[] {
         study_type: { type: 'string', enum: [...STUDY_TYPES], description: 'LECTURE | PRACTICE | REVISION | READING (study tasks, default PRACTICE).' },
         duration_minutes: I('Length in minutes (study tasks): 10 to 120, default 45.', 10, 120),
         scheduled_start_time: S('Optional start time today, 24-hour HH:mm (study tasks).'),
+        dry_run: B('true = ask the phone to run every policy check and answer DRY_RUN_OK or the real rejection, without adding anything. Study tasks only. Resolves in seconds while Checkmate is open.'),
         force: B('Study tasks with a start time only. true = the student explicitly asked for exactly this time, so skip the study-window and blocked-slot checks. Overlaps with other tasks and past times are still rejected.'),
         chapter: S('Chapter the task is about (required for repair / qbank_practice, optional context for study).'),
         title: S('Optional short title for repair / qbank_practice tasks (max 120 chars).'),
@@ -2026,10 +2602,16 @@ export function buildTools(): ToolDef[] {
         task_id: S('Task id from checkmate_get_today_plan.'),
         scheduled_start_time: S('New start time today, 24-hour HH:mm.'),
         duration_minutes: I('Optional new length in minutes (10 to 120). Not allowed for Checkmate-generated repair tasks.', 10, 120),
+        dry_run: B('true = ask the phone to run every policy check and answer DRY_RUN_OK or the real rejection, without moving anything.'),
         force: B('true = the student explicitly asked for exactly this time, so skip the study-window and blocked-slot checks. Overlaps with other tasks and past times are still rejected.'),
         reason: REASON
       }, ['task_id', 'scheduled_start_time', 'reason']),
       async (a, c) => createRequest(c.supabase, c.principal, 'schedule_task', a)),
+
+    tool('get_quota', 'Request quota', PLAN,
+      "How much room is left before a request is refused: open requests used out of the limit, requests in the last 24h out of the limit, and AI-created tasks today out of the daily cap (as of the phone's last sync, plus study creates still waiting). Call before queuing a batch.",
+      schema(),
+      async (_a, c) => getQuota(c.supabase, uid(c))),
 
     requestTool('cancel_request', 'Cancel a pending request',
       'Cancel a request that Checkmate has not picked up yet. Requests already claimed, accepted or rejected cannot be cancelled.',
