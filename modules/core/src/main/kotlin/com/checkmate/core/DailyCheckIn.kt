@@ -11,6 +11,7 @@ import java.util.Calendar
 data class DailyCheckIn(
     val date:           String              = "",  // "YYYY_DDD"
     val todayTopics:    Map<String, String> = emptyMap(), // subject → topic
+    val todayTopicPicks: Map<String, String> = emptyMap(), // subject → syllabus topic under that chapter (optional narrowing)
     val yesterdayRatings: Map<String, Int>  = emptyMap(), // subject → 1..5
     val stressLevel:    Int                 = 3,
     val sleepHours:     Float               = 7f,

@@ -23,7 +23,17 @@ class DailyCheckInViewModel : ViewModel() {
         // Tapping the selected chapter again clears it, so a student can opt a subject out of the Q-bank flood.
         _checkIn.update {
             val next = if (it.todayTopics[subject] == topic) it.todayTopics - subject else it.todayTopics + (subject to topic)
-            it.copy(todayTopics = next)
+            // Chapter changed or cleared: any topic pick under the old chapter no longer applies.
+            it.copy(todayTopics = next, todayTopicPicks = it.todayTopicPicks - subject)
+        }
+    }
+
+    fun setTopicPick(subject: String, topic: String) {
+        // Optional narrowing under the picked chapter. Tapping the picked topic again clears it (back to chapter-wide).
+        _checkIn.update {
+            if (it.todayTopics[subject].isNullOrBlank()) return@update it
+            val next = if (it.todayTopicPicks[subject] == topic) it.todayTopicPicks - subject else it.todayTopicPicks + (subject to topic)
+            it.copy(todayTopicPicks = next)
         }
     }
 
@@ -44,4 +54,7 @@ class DailyCheckInViewModel : ViewModel() {
 
     fun getChaptersForSubject(exam: String, subject: String): List<String> =
         ExamSyllabus.getChaptersForSubject(exam, subject)
+
+    fun getTopicsForChapter(exam: String, subject: String, chapter: String): List<String> =
+        ExamSyllabus.getTopicsForChapter(exam, subject, chapter)
 }

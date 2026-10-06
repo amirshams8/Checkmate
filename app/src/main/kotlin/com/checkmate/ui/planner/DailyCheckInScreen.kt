@@ -93,6 +93,34 @@ fun DailyCheckInScreen(navController: NavController, vm: DailyCheckInViewModel =
                         }
                         Spacer(Modifier.height(4.dp))
                     }
+                    // Optional: narrow the flood to one syllabus topic of the picked chapter.
+                    if (selected.isNotEmpty()) {
+                        val topics = vm.getTopicsForChapter(profile.examTarget, subject, selected)
+                        if (topics.isNotEmpty()) {
+                            val pickedTopic = checkIn.todayTopicPicks[subject] ?: ""
+                            Spacer(Modifier.height(4.dp))
+                            Text("Narrow to one topic (optional)", fontSize = 11.sp, color = White60)
+                            Spacer(Modifier.height(6.dp))
+                            topics.chunked(2).forEach { row ->
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                    row.forEach { t ->
+                                        FilterChip(
+                                            selected = pickedTopic == t,
+                                            onClick  = { vm.setTopicPick(subject, t) },
+                                            label    = { Text(t, fontSize = 11.sp) },
+                                            modifier = Modifier.weight(1f),
+                                            colors   = FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = AccentGreen.copy(alpha = 0.2f),
+                                                selectedLabelColor     = AccentGreen
+                                            )
+                                        )
+                                    }
+                                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                                }
+                                Spacer(Modifier.height(4.dp))
+                            }
+                        }
+                    }
                 }
             }
         }

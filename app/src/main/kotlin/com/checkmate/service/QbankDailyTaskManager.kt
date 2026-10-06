@@ -162,7 +162,8 @@ object QbankDailyTaskManager {
         val testId: String,
         val questionCount: Int,
         val taskId: String? = null, // null only for sessions persisted before this fix; see StatsScreen's own fallback
-        val source: String = "auto" // SOURCE_AUTO (daily-target gap) or SOURCE_CHECKIN (picked in Daily Check-In)
+        val source: String = "auto", // SOURCE_AUTO (daily-target gap) or SOURCE_CHECKIN (picked in Daily Check-In)
+        val topic: String? = null // check-in syllabus topic the session is narrowed to; null = whole chapter
     )
 
     /**
@@ -186,7 +187,8 @@ object QbankDailyTaskManager {
                     testId = o.optString("testId"),
                     questionCount = o.optInt("questionCount"),
                     taskId = o.optString("taskId", "").takeIf { it.isNotBlank() },
-                    source = o.optString("source", "auto")
+                    source = o.optString("source", "auto"),
+                    topic = o.optString("topic", "").takeIf { it.isNotBlank() }
                 )
             }
         } catch (_: Exception) {
@@ -205,6 +207,7 @@ object QbankDailyTaskManager {
                 put("questionCount", s.questionCount)
                 put("taskId", s.taskId ?: "")
                 put("source", s.source)
+                put("topic", s.topic ?: "")
             })
         }
         CheckmatePrefs.putString(PREF_SESSIONS_JSON, arr.toString())
@@ -529,6 +532,7 @@ object QbankDailyTaskManager {
         val checkIn = DailyCheckIn.loadToday() ?: return@withLock
         if (checkIn.completedAt <= 0L) return@withLock
         val wanted: Map<String, String> = checkIn.todayTopics.filterValues { it.isNotBlank() }
+        val wantedTopics: Map<String, String> = checkIn.todayTopicPicks.filterValues { it.isNotBlank() }
 
         val liveTasks = PlanStore.todayTasks.value.associateBy { it.id }
         var sessions = todaysSessions().filter { it.taskId == null || it.taskId in liveTasks }
@@ -536,7 +540,7 @@ object QbankDailyTaskManager {
 
         // 1. Retire check-in sessions that no longer match the check-in (chapter changed or deselected),
         //    but only while their task is untouched — never yank something the student started.
-        sessions.filter { it.source == SOURCE_CHECKIN && wanted[it.subject] != it.chapter }.forEach { stale ->
+        sessions.filter { it.source == SOURCE_CHECKIN && (wanted[it.subject] != it.chapter || wantedTopics[it.subject] != it.topic) }.forEach { stale ->
             val task = stale.taskId?.let { liveTasks[it] }
             if (task == null || task.state == TaskState.PENDING) {
                 task?.let { PlanStore.removeTask(it.id) }
@@ -549,9 +553,10 @@ object QbankDailyTaskManager {
         // 2. Flood each selected chapter.
         val applied = loadApplied()
         for ((subject, chapter) in wanted) {
-            val key = "$subject|$chapter|${checkIn.completedAt}"
+            val topic = wantedTopics[subject]
+            val key = "$subject|$chapter|${topic ?: ""}|${checkIn.completedAt}"
             if (key in applied) continue
-            if (sessions.any { it.source == SOURCE_CHECKIN && it.subject == subject && it.chapter == chapter }) {
+            if (sessions.any { it.source == SOURCE_CHECKIN && it.subject == subject && it.chapter == chapter && it.topic == topic }) {
                 applied.add(key)
                 continue
             }
@@ -561,6 +566,7 @@ object QbankDailyTaskManager {
 
             when (val outcome = TestmateApi.startQbankPractice(
                 chapter = chapter,
+                topic = topic,
                 questionCount = CHECKIN_FLOOD_QUESTIONS,
                 checkinChapter = chapter
             )) {
@@ -577,7 +583,7 @@ object QbankDailyTaskManager {
                     }
                     val task = StudyTask(
                         subject = subject,
-                        topic = "Q-bank: $chapter",
+                        topic = "Q-bank: $chapter" + (topic?.let { " — $it" } ?: ""),
                         durationMinutes = (r.questionCount * MINUTES_PER_QUESTION).coerceAtLeast(MIN_TASK_MINUTES),
                         taskType = TaskType.PRACTICE
                     )
@@ -589,7 +595,8 @@ object QbankDailyTaskManager {
                         testId = r.testId,
                         questionCount = r.questionCount,
                         taskId = task.id,
-                        source = SOURCE_CHECKIN
+                        source = SOURCE_CHECKIN,
+                        topic = topic
                     )
                     applied.add(key)
                     changed = true
