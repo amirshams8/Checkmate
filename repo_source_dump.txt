@@ -4116,6 +4116,11 @@ import java.util.concurrent.TimeUnit
  * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
  * refusal is reported back with the real reason so the AI can see why.
  *
+ * SUPPORTED (plan edits): `update_task` and `delete_task` work ONLY on pending plain study tasks that an
+ * AI assistant itself added (never the student's own tasks, never engine/repair tasks), and
+ * `batch_schedule` applies up to [MAX_BATCH_ITEMS] creates/moves as ONE unit (all pass every check
+ * against the plan-as-it-would-be, or nothing is written). `sync_now` pushes every snapshot at once.
+ *
  * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
  * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
  * `schedule_task` (move a PENDING task in today's plan to a start time, see [decideScheduleTask]).
@@ -4152,6 +4157,7 @@ object GatewayRequestSync {
     private const val KEY_HANDLED = "gateway_request_results"
     private const val MAX_HANDLED = 20
     private const val MAX_MESSAGE = 280
+    const val MAX_BATCH_ITEMS = 12
     private const val MINUTES_PER_DAY = 24 * 60
 
     /** One processing pass at a time: the fast poller and the WorkManager worker must not race. */
@@ -4231,6 +4237,10 @@ object GatewayRequestSync {
         )
         "create_task" -> decideCreateTask(context, req)
         "schedule_task" -> decideScheduleTask(req)
+        "update_task" -> decideUpdateTask(req)
+        "delete_task" -> decideDeleteTask(req)
+        "batch_schedule" -> decideBatchSchedule(req)
+        "sync_now" -> decideSyncNow(context)
         "dismiss_task" -> Decision(
             false,
             "Checkmate does not allow tasks to be dismissed from outside the app.",
@@ -4276,12 +4286,7 @@ object GatewayRequestSync {
         if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
             return Decision(false, "A study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).", "DURATION_OUT_OF_RANGE")
         }
-        val taskType = when (p.optStr("study_type")) {
-            "LECTURE" -> TaskType.LECTURE
-            "REVISION" -> TaskType.REVISION
-            "READING" -> TaskType.READING
-            else -> TaskType.PRACTICE
-        }
+        val taskType = studyTaskType(p.optStr("study_type"))
 
         val today = PlanStore.getTodayTasksSnapshot_Sync()
         if (today.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
@@ -4369,6 +4374,183 @@ object GatewayRequestSync {
         return Decision(true, "Moved ${task.subject}: ${task.topic} to $start for $minutes min.$forcedNote", "ALLOW", task.id)
     }
 
+    // ── plan edits: update / delete / batch / sync (phone-side guards, see class doc) ───────
+
+    private fun studyTaskType(s: String?): TaskType = when (s) {
+        "LECTURE" -> TaskType.LECTURE
+        "REVISION" -> TaskType.REVISION
+        "READING" -> TaskType.READING
+        else -> TaskType.PRACTICE
+    }
+
+    /** A plain study task an AI assistant added. The only kind outside requests may edit or delete. */
+    private fun isAiStudyTask(t: StudyTask): Boolean = t.rationale.startsWith(AI_TASK_MARKER) && t.learningIntent == null
+
+    private fun decideDeleteTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be deleted from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be deleted.", "TASK_NOT_PENDING")
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would delete ${task.subject}: ${task.topic}. Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        PlanStore.removeTask(task.id)
+        return Decision(true, "Deleted ${task.subject}: ${task.topic} from today's plan.", "ALLOW", task.id)
+    }
+
+    private fun decideUpdateTask(req: Pending): Decision {
+        val p = req.payload
+        val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        val task = today.firstOrNull { it.id == id }
+            ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
+        if (!isAiStudyTask(task)) {
+            return Decision(false, "Only plain study tasks that an AI assistant added can be edited from outside the app.", "NOT_AI_TASK")
+        }
+        if (task.state != TaskState.PENDING) {
+            return Decision(false, "That task is ${task.state}; only pending tasks can be edited.", "TASK_NOT_PENDING")
+        }
+
+        val newTopic = p.optStr("topic")?.take(200) ?: task.topic
+        val requestedMinutes = if (p.has("duration_minutes") && !p.isNull("duration_minutes")) p.optInt("duration_minutes", 0) else null
+        if (requestedMinutes != null && requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+            return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
+        }
+        val newMinutes = requestedMinutes ?: task.durationMinutes
+        val requestedStart = p.optStr("scheduled_start_time")
+        if (requestedStart != null && !HHMM.matches(requestedStart)) {
+            return Decision(false, "'$requestedStart' is not a valid HH:mm time.", "INVALID_TIME")
+        }
+        val newStart = requestedStart ?: task.scheduledStartTime
+
+        if (newTopic == task.topic && newMinutes == task.durationMinutes && newStart == task.scheduledStartTime) {
+            return Decision(false, "Nothing to change: the task already has those values.", "NO_OP_ALREADY_APPLIED")
+        }
+        val force = p.optBoolean("force", false)
+        var forcedNote = ""
+        val timeChanged = newStart != task.scheduledStartTime || newMinutes != task.durationMinutes
+        if (newStart != null && timeChanged) {
+            slotProblem(newStart, newMinutes, ignoreTaskId = task.id, force = force)?.let { return Decision(false, it.message, it.code) }
+            if (force) forcedNote = describeForce(newStart, newMinutes, ignoreTaskId = task.id)
+        }
+        if (p.optBoolean("dry_run", false)) {
+            return Decision(true, "Dry run OK: would update ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote Nothing was changed.", "DRY_RUN_OK", task.id)
+        }
+        // One write for topic + length + time, so the plan never shows a half-applied edit.
+        PlanStore.saveTodayTasks(
+            today.map { if (it.id == task.id) it.copy(topic = newTopic, durationMinutes = newMinutes, scheduledStartTime = newStart) else it }
+        )
+        return Decision(true, "Updated ${task.subject}: $newTopic (${newMinutes} min${newStart?.let { " at $it" } ?: ""}).$forcedNote", "ALLOW", task.id)
+    }
+
+    /**
+     * All-or-nothing day plan. Every item is checked against the plan as it WOULD look after the earlier
+     * items (so two items can't claim the same slot), with the same rules as a single create / move.
+     * Any failure rejects the whole batch and writes nothing; success is a single plan write.
+     */
+    private fun decideBatchSchedule(req: Pending): Decision {
+        val p = req.payload
+        val items = p.optJSONArray("items") ?: return Decision(false, "The request has no items.", "MALFORMED")
+        if (items.length() < 1 || items.length() > MAX_BATCH_ITEMS) {
+            return Decision(false, "A batch needs 1-$MAX_BATCH_ITEMS items (got ${items.length()}).", "MALFORMED")
+        }
+        val dry = p.optBoolean("dry_run", false)
+        var working: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+        var created = 0
+        var moved = 0
+
+        fun fail(i: Int, code: String, message: String) =
+            Decision(false, "Batch rejected, nothing was applied. Item ${i + 1}: $message", code)
+
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: return fail(i, "MALFORMED", "not an object.")
+            val force = item.optBoolean("force", false)
+            when (item.optStr("op")) {
+                "create" -> {
+                    val subject = item.optStr("subject") ?: return fail(i, "MALFORMED", "no subject.")
+                    val topic = item.optStr("topic") ?: return fail(i, "MALFORMED", "no topic.")
+                    val minutes = item.optInt("duration_minutes", DEFAULT_STUDY_MINUTES)
+                    if (minutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                        return fail(i, "DURATION_OUT_OF_RANGE", "a study task must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $minutes).")
+                    }
+                    if (working.count { it.rationale.startsWith(AI_TASK_MARKER) } >= MAX_AI_TASKS_PER_DAY) {
+                        return fail(i, "DAILY_AI_TASK_LIMIT", "already $MAX_AI_TASKS_PER_DAY AI-requested tasks today.")
+                    }
+                    if (working.any {
+                            it.state != TaskState.DONE && it.state != TaskState.SKIPPED &&
+                                norm(it.subject) == norm(subject) && norm(it.topic) == norm(topic)
+                        }
+                    ) {
+                        return fail(i, "ALREADY_PLANNED", "the plan already has an open task for $subject: $topic.")
+                    }
+                    val requested = item.optStr("scheduled_start_time")
+                    val start: String? = if (requested != null) {
+                        slotProblem(requested, minutes, ignoreTaskId = null, force = force, tasks = working)
+                            ?.let { return fail(i, it.code, it.message) }
+                        requested
+                    } else {
+                        firstFreeStartFromNow(minutes, ignoreTaskId = null, tasks = working)
+                    }
+                    working = working + StudyTask(
+                        subject = subject,
+                        topic = topic,
+                        durationMinutes = minutes,
+                        isCustom = true,
+                        taskType = studyTaskType(item.optStr("study_type")),
+                        scheduledStartTime = start,
+                        rationale = "$AI_TASK_MARKER: ${req.reason}".take(300)
+                    )
+                    created += 1
+                }
+                "move" -> {
+                    val id = item.optStr("task_id") ?: return fail(i, "MALFORMED", "no task_id.")
+                    val start = item.optStr("scheduled_start_time") ?: return fail(i, "MALFORMED", "no start time.")
+                    if (!HHMM.matches(start)) return fail(i, "INVALID_TIME", "'$start' is not a valid HH:mm time.")
+                    val task = working.firstOrNull { it.id == id }
+                        ?: return fail(i, "UNKNOWN_TASK_ID", "no task with that id in today's plan.")
+                    if (task.state != TaskState.PENDING) return fail(i, "TASK_NOT_PENDING", "that task is ${task.state}.")
+                    val requestedMinutes = if (item.has("duration_minutes") && !item.isNull("duration_minutes")) item.optInt("duration_minutes", 0) else null
+                    if (requestedMinutes != null) {
+                        if (requestedMinutes !in MIN_STUDY_MINUTES..MAX_STUDY_MINUTES) {
+                            return fail(i, "DURATION_OUT_OF_RANGE", "duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).")
+                        }
+                        if (task.learningIntent != null && requestedMinutes != task.durationMinutes) {
+                            return fail(i, "DURATION_LOCKED", "Checkmate sized that repair task itself; ask only for a new time.")
+                        }
+                    }
+                    val minutes = requestedMinutes ?: task.durationMinutes
+                    if (start == task.scheduledStartTime && minutes == task.durationMinutes) {
+                        return fail(i, "NO_OP_ALREADY_APPLIED", "that task is already scheduled for $start.")
+                    }
+                    slotProblem(start, minutes, ignoreTaskId = task.id, force = force, tasks = working)
+                        ?.let { return fail(i, it.code, it.message) }
+                    working = working.map { if (it.id == id) it.copy(scheduledStartTime = start, durationMinutes = minutes) else it }
+                    moved += 1
+                }
+                else -> return fail(i, "UNSUPPORTED_KIND", "op must be 'create' or 'move'.")
+            }
+        }
+
+        val summary = "$created added, $moved moved"
+        if (dry) return Decision(true, "Dry run OK: batch would apply ($summary). Nothing was changed.", "DRY_RUN_OK")
+        PlanStore.saveTodayTasks(working)
+        return Decision(true, "Batch applied ($summary).", "ALLOW")
+    }
+
+    /** Pushes every snapshot right now, so the AI's next reads (plan, mastery, interventions) are fresh. */
+    private suspend fun decideSyncNow(context: Context): Decision =
+        when (GatewaySync.pushAll(context)) {
+            GatewaySync.PushResult.OK -> Decision(true, "Pushed fresh snapshots.", "ALLOW")
+            GatewaySync.PushResult.SKIPPED_NOT_CONFIGURED -> Decision(false, "The phone has no Testmate URL/token configured.", "SYNC_NOT_CONFIGURED")
+            else -> Decision(false, "Some snapshots could not be pushed (network or server error).", "SYNC_FAILED")
+        }
+
     private fun nowMinute(): Int {
         val c = Calendar.getInstance()
         return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
@@ -4426,40 +4608,59 @@ object GatewayRequestSync {
     }
 
     /** Unfinished tasks that already have a time, as (start, end) minutes. */
-    private fun occupiedRanges(ignoreTaskId: String?): List<Pair<Int, Int>> =
-        PlanStore.getTodayTasksSnapshot_Sync().mapNotNull { t ->
+    private fun occupiedRanges(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<Pair<Int, Int>> =
+        tasks.mapNotNull { t ->
             if (t.id == ignoreTaskId || t.state == TaskState.DONE || t.state == TaskState.SKIPPED) return@mapNotNull null
             val s = t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: return@mapNotNull null
             s to (s + t.durationMinutes)
         }
 
     /** Free time today: study window minus blocked slots minus every OTHER unfinished task that already has a time. */
-    private fun freeSlotsToday(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsToday(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         // Same prefs and defaults HomeViewModel.findNextFreeSlot reads, so both agree on "today's window".
         val studyStart = CheckmatePrefs.getString("study_start", "06:00") ?: "06:00"
         val studyEnd = CheckmatePrefs.getString("study_end", "22:00") ?: "22:00"
         val free = FreeSlotCalculator.computeFreeSlots(ConsultationProfile.load().blockedSlots, studyStart, studyEnd)
-        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId))
+        return FreeSlotCalculator.subtractOccupied(free, occupiedRanges(ignoreTaskId, tasks))
     }
 
     /** Free slots with the part that already passed cut off, for "first slot from now" searches. */
-    private fun freeSlotsFromNow(ignoreTaskId: String?): List<FreeSlotCalculator.FreeSlot> {
+    private fun freeSlotsFromNow(
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): List<FreeSlotCalculator.FreeSlot> {
         val now = nowMinute()
-        return freeSlotsToday(ignoreTaskId).mapNotNull {
+        return freeSlotsToday(ignoreTaskId, tasks).mapNotNull {
             val s = maxOf(it.startMinute, now)
             if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
         }
     }
 
-    private fun firstFreeStartFromNow(minutes: Int, ignoreTaskId: String?): String? =
-        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId))?.let { FreeSlotCalculator.formatMinutes(it) }
+    private fun firstFreeStartFromNow(
+        minutes: Int,
+        ignoreTaskId: String?,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): String? =
+        FreeSlotCalculator.firstFitStart(minutes, freeSlotsFromNow(ignoreTaskId, tasks))?.let { FreeSlotCalculator.formatMinutes(it) }
 
     /**
      * Null when [startHHmm] for [minutes] is allowed today; otherwise a coded problem with a message the
      * AI can act on. With [force] the study window and blocked slots are ignored; the past, midnight and
      * other unfinished tasks are still enforced.
      */
-    private fun slotProblem(startHHmm: String, minutes: Int, ignoreTaskId: String?, force: Boolean): SlotProblem? {
+    private fun slotProblem(
+        startHHmm: String,
+        minutes: Int,
+        ignoreTaskId: String?,
+        force: Boolean,
+        tasks: List<StudyTask> = PlanStore.getTodayTasksSnapshot_Sync()
+    ): SlotProblem? {
         if (!HHMM.matches(startHHmm)) return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
         val start = FreeSlotCalculator.parseTimeOrNull(startHHmm)
             ?: return SlotProblem("INVALID_TIME", "'$startHHmm' is not a valid HH:mm time.")
@@ -4475,12 +4676,12 @@ object GatewayRequestSync {
             return SlotProblem("PAST_MIDNIGHT", "$startHHmm for $minutes min would run past midnight; Checkmate only plans today.")
         }
         val range = "$startHHmm-${FreeSlotCalculator.formatMinutes(end)}"
-        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId)
+        val suggestion = firstFreeStartFromNow(minutes, ignoreTaskId, tasks)
         val suggestionText = if (suggestion != null) " First free $minutes-minute slot today starts at $suggestion."
         else " There is no free $minutes-minute slot left today."
 
         // Overlap with another unfinished task: never overridable.
-        if (occupiedRanges(ignoreTaskId).any { start < it.second && end > it.first }) {
+        if (occupiedRanges(ignoreTaskId, tasks).any { start < it.second && end > it.first }) {
             return SlotProblem("OVERLAP", "$range overlaps another unfinished task in today's plan; force cannot override that.$suggestionText")
         }
         if (force) return null
@@ -7157,18 +7358,27 @@ package com.checkmate.service
 
 import android.content.Context
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.DailyCheckIn
 import com.checkmate.core.DebugTrail
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateDailyTargetOutcome
 import com.checkmate.testmate.TestmateQbankPracticeOutcome
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -7228,6 +7438,15 @@ import java.util.Locale
  *     wired into [PlanStore], so the daily Q-bank target never showed up on the
  *     Home tasks tab at all. Not a regression, a missing wire.
  *
+ * DAILY CHECK-IN FLOOD: the chapter the student picks per subject in the Daily Check-In (Step 1) overrides
+ * the server's "#1 gap" choice for that subject. On check-in submit ([applyCheckInTopicsAsync]) — and
+ * retried from [generateIfNeeded] — each selected (subject, chapter) starts a Q-bank session via
+ * [TestmateApi.startQbankPractice] with `checkinChapter`, [CHECKIN_FLOOD_QUESTIONS] questions, drawn from
+ * every bank question tagged for that check-in chapter (Testmate questions.checkin_chapter; tagged by
+ * scripts/tag-checkin-chapters.ts). Those sessions are [SOURCE_CHECKIN]; the auto flow below skips any
+ * subject a live check-in session already covers (Biology covers Botany + Zoology) and retires an
+ * untouched auto session for it. Re-doing the check-in with another chapter retires the old pending one.
+ *
  * A subject with a target but nothing in `coverage_gaps` for it (syllabus_chapters
  * not yet seeded server-side, or that subject's bank is fully drained) is skipped
  * for the day rather than retried every cycle — there's no chapter to send.
@@ -7253,6 +7472,23 @@ object QbankDailyTaskManager {
     const val PREF_LAST_ERROR_AT = "qbank_daily_last_error_at"
 
     private val SUBJECTS = listOf("Physics", "Chemistry", "Botany", "Zoology")
+
+    const val SOURCE_AUTO = "auto"
+    const val SOURCE_CHECKIN = "checkin"
+
+    /** How many questions a check-in chapter floods into Q-bank (the server default is 20; "flood" = double+). */
+    private const val CHECKIN_FLOOD_QUESTIONS = 40
+
+    // Which (subject|chapter|checkInCompletedAt) check-in sessions were already created today. Keyed by the
+    // check-in's own completion time so deleting a flooded task sticks (the 15-min loop must not resurrect
+    // it) while re-submitting the check-in is a fresh request.
+    private const val PREF_CHECKIN_APPLIED_JSON = "qbank_checkin_applied_json"
+    private const val PREF_CHECKIN_APPLIED_DAY = "qbank_checkin_applied_day"
+    private const val CHECKIN_RETRY_MS = 30L * 60_000L
+
+    private val checkInMutex = Mutex()
+    private val checkInLastAttempt = mutableMapOf<String, Long>()
+    private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Roughly NEET MCQ pacing (~1 min/question) — same reasoning
     // RetentionCheckManager.RETENTION_QUESTION_COUNT's own duration note applies
@@ -7281,7 +7517,8 @@ object QbankDailyTaskManager {
         val sessionId: String,
         val testId: String,
         val questionCount: Int,
-        val taskId: String? = null // null only for sessions persisted before this fix; see StatsScreen's own fallback
+        val taskId: String? = null, // null only for sessions persisted before this fix; see StatsScreen's own fallback
+        val source: String = "auto" // SOURCE_AUTO (daily-target gap) or SOURCE_CHECKIN (picked in Daily Check-In)
     )
 
     /**
@@ -7304,7 +7541,8 @@ object QbankDailyTaskManager {
                     sessionId = o.optString("sessionId"),
                     testId = o.optString("testId"),
                     questionCount = o.optInt("questionCount"),
-                    taskId = o.optString("taskId", "").takeIf { it.isNotBlank() }
+                    taskId = o.optString("taskId", "").takeIf { it.isNotBlank() },
+                    source = o.optString("source", "auto")
                 )
             }
         } catch (_: Exception) {
@@ -7322,6 +7560,7 @@ object QbankDailyTaskManager {
                 put("testId", s.testId)
                 put("questionCount", s.questionCount)
                 put("taskId", s.taskId ?: "")
+                put("source", s.source)
             })
         }
         CheckmatePrefs.putString(PREF_SESSIONS_JSON, arr.toString())
@@ -7367,7 +7606,25 @@ object QbankDailyTaskManager {
      * "already have one today" check below make a repeat call a cheap no-op once
      * today's sessions exist.
      */
-    suspend fun generateIfNeeded(context: Context) = generateIfNeededInternal(context, force = false)
+    suspend fun generateIfNeeded(context: Context) {
+        // Check-in picks first, so the auto flow below sees them and skips the subjects they cover.
+        applyCheckInTopicsInternal(force = false)
+        generateIfNeededInternal(context, force = false)
+    }
+
+    /**
+     * Fire-and-forget: called when the Daily Check-In is submitted. Runs on its own scope (not the
+     * screen's), so leaving the check-in screen right away cannot cancel it.
+     */
+    fun applyCheckInTopicsAsync() {
+        bgScope.launch {
+            try {
+                applyCheckInTopicsInternal(force = true)
+            } catch (e: Exception) {
+                DebugTrail.e(TAG, "applyCheckInTopics failed: ${e.message}")
+            }
+        }
+    }
 
     /**
      * Manual override for Settings → Test Platform's "Force refresh Q-bank targets"
@@ -7387,7 +7644,10 @@ object QbankDailyTaskManager {
     // Home. Same signature at 12:32:50/12:32:57. NonCancellable lets a manual force run
     // finish (it is bounded by the Testmate client's own timeouts).
     suspend fun forceGenerateNow(context: Context) =
-        withContext(NonCancellable) { generateIfNeededInternal(context, force = true) }
+        withContext(NonCancellable) {
+            applyCheckInTopicsInternal(force = true)
+            generateIfNeededInternal(context, force = true)
+        }
 
     private suspend fun generateIfNeededInternal(context: Context, force: Boolean) {
         val today = todayKey()
@@ -7492,7 +7752,11 @@ object QbankDailyTaskManager {
                     saveSessions(liveSessions)
                 }
 
-                val existing = liveSessions.associateBy { it.subject }.toMutableMap()
+                // Check-in sessions are managed by applyCheckInTopicsInternal; the auto map only holds auto ones
+                // (a started auto session and a check-in session for one subject can coexist).
+                val checkInSessions = liveSessions.filter { it.source == SOURCE_CHECKIN }
+                val coveredByCheckIn: Set<String> = checkInSessions.flatMap { autoSubjectsCoveredBy(it.subject) }.toSet()
+                val existing = liveSessions.filter { it.source != SOURCE_CHECKIN }.associateBy { it.subject }.toMutableMap()
                 var anyCreated = false
                 var lastFailure: String? = null
 
@@ -7501,6 +7765,11 @@ object QbankDailyTaskManager {
                         // Was silent — made "why no Physics task?" unanswerable from the trail.
                         DebugTrail.d(TAG, "generateIfNeeded: $subject already has a live session today — skipping")
                         continue // already have today's session
+                    }
+
+                    if (subject in coveredByCheckIn) {
+                        DebugTrail.d(TAG, "generateIfNeeded: $subject is covered by today's Daily Check-In chapter — skipping auto pick")
+                        continue
                     }
 
                     val subjectCoverage = target.subjectBreakdown.find { it.subject == subject }
@@ -7565,7 +7834,7 @@ object QbankDailyTaskManager {
                 }
 
                 if (anyCreated) {
-                    saveSessions(existing.values.toList())
+                    saveSessions(checkInSessions + existing.values.toList())
                 }
                 if (lastFailure != null) {
                     recordError(lastFailure)
@@ -7581,6 +7850,115 @@ object QbankDailyTaskManager {
                 }
             }
         }
+    }
+
+    // ── Daily Check-In flood ────────────────────────────────────────────────
+
+    /** Q-bank subjects a check-in subject stands in for (Biology = Botany + Zoology). */
+    private fun autoSubjectsCoveredBy(checkInSubject: String): Set<String> =
+        if (checkInSubject == "Biology") setOf("Botany", "Zoology") else setOf(checkInSubject)
+
+    private fun loadApplied(): MutableSet<String> {
+        if (CheckmatePrefs.getString(PREF_CHECKIN_APPLIED_DAY, null) != todayKey()) return mutableSetOf()
+        val raw = CheckmatePrefs.getString(PREF_CHECKIN_APPLIED_JSON, null) ?: return mutableSetOf()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }.toMutableSet()
+        } catch (_: Exception) {
+            mutableSetOf()
+        }
+    }
+
+    private fun saveApplied(keys: Set<String>) {
+        CheckmatePrefs.putString(PREF_CHECKIN_APPLIED_JSON, JSONArray(keys.toList()).toString())
+        CheckmatePrefs.putString(PREF_CHECKIN_APPLIED_DAY, todayKey())
+    }
+
+    /**
+     * For every (subject, chapter) the student picked in today's completed Daily Check-In, make sure a
+     * [SOURCE_CHECKIN] Q-bank session + StudyTask exists. NEET only (the check-in chapter vocabulary and
+     * Testmate's tag map are NEET's). Cheap no-op once everything is applied; failures retry at most every
+     * [CHECKIN_RETRY_MS] unless [force] (check-in submit / Settings force-refresh).
+     */
+    private suspend fun applyCheckInTopicsInternal(force: Boolean) = checkInMutex.withLock {
+        if (ConsultationProfile.load().examTarget != "NEET") return@withLock
+        val checkIn = DailyCheckIn.loadToday() ?: return@withLock
+        if (checkIn.completedAt <= 0L) return@withLock
+        val wanted: Map<String, String> = checkIn.todayTopics.filterValues { it.isNotBlank() }
+
+        val liveTasks = PlanStore.todayTasks.value.associateBy { it.id }
+        var sessions = todaysSessions().filter { it.taskId == null || it.taskId in liveTasks }
+        var changed = false
+
+        // 1. Retire check-in sessions that no longer match the check-in (chapter changed or deselected),
+        //    but only while their task is untouched — never yank something the student started.
+        sessions.filter { it.source == SOURCE_CHECKIN && wanted[it.subject] != it.chapter }.forEach { stale ->
+            val task = stale.taskId?.let { liveTasks[it] }
+            if (task == null || task.state == TaskState.PENDING) {
+                task?.let { PlanStore.removeTask(it.id) }
+                sessions = sessions - stale
+                changed = true
+                DebugTrail.d(TAG, "applyCheckIn: retired ${stale.subject}/${stale.chapter} (check-in changed)")
+            }
+        }
+
+        // 2. Flood each selected chapter.
+        val applied = loadApplied()
+        for ((subject, chapter) in wanted) {
+            val key = "$subject|$chapter|${checkIn.completedAt}"
+            if (key in applied) continue
+            if (sessions.any { it.source == SOURCE_CHECKIN && it.subject == subject && it.chapter == chapter }) {
+                applied.add(key)
+                continue
+            }
+            val now = System.currentTimeMillis()
+            if (!force && now - (checkInLastAttempt[key] ?: 0L) < CHECKIN_RETRY_MS) continue
+            checkInLastAttempt[key] = now
+
+            when (val outcome = TestmateApi.startQbankPractice(
+                chapter = chapter,
+                questionCount = CHECKIN_FLOOD_QUESTIONS,
+                checkinChapter = chapter
+            )) {
+                is TestmateQbankPracticeOutcome.Success -> {
+                    val r = outcome.result
+                    // The check-in pick replaces the auto pick: drop untouched auto sessions for the subjects it covers.
+                    val covered = autoSubjectsCoveredBy(subject)
+                    sessions.filter { it.source == SOURCE_AUTO && it.subject in covered }.forEach { auto ->
+                        val autoTask = auto.taskId?.let { liveTasks[it] }
+                        if (autoTask == null || autoTask.state == TaskState.PENDING) {
+                            autoTask?.let { PlanStore.removeTask(it.id) }
+                            sessions = sessions - auto
+                        }
+                    }
+                    val task = StudyTask(
+                        subject = subject,
+                        topic = "Q-bank: $chapter",
+                        durationMinutes = (r.questionCount * MINUTES_PER_QUESTION).coerceAtLeast(MIN_TASK_MINUTES),
+                        taskType = TaskType.PRACTICE
+                    )
+                    PlanStore.createTask(task)
+                    sessions = sessions + QbankDailySession(
+                        subject = subject,
+                        chapter = chapter,
+                        sessionId = r.sessionId,
+                        testId = r.testId,
+                        questionCount = r.questionCount,
+                        taskId = task.id,
+                        source = SOURCE_CHECKIN
+                    )
+                    applied.add(key)
+                    changed = true
+                    DebugTrail.d(TAG, "applyCheckIn: $subject -> $chapter session=${r.sessionId} q=${r.questionCount} reused=${r.reused} task=${task.id}")
+                }
+                is TestmateQbankPracticeOutcome.Error -> {
+                    recordError("Check-in $chapter: ${outcome.message}")
+                    DebugTrail.e(TAG, "applyCheckIn: startQbankPractice failed for $subject/$chapter: ${outcome.message}")
+                }
+            }
+        }
+        saveApplied(applied)
+        if (changed) saveSessions(sessions)
     }
 
     private fun recordError(message: String) {
@@ -13394,6 +13772,9 @@ fun DailyCheckInScreen(navController: NavController, vm: DailyCheckInViewModel =
         Text("STEP 1 — TODAY'S TOPICS", fontSize = 11.sp, fontWeight = FontWeight.Bold,
             letterSpacing = 2.sp, color = White60,
             modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 6.dp))
+        Text("Tap a chapter to load its questions into today's Q-bank. Tap it again to clear.",
+            fontSize = 11.sp, color = White60,
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 8.dp))
 
         subjects.forEach { subject ->
             val chapters = ExamSyllabus.getChaptersForSubject(profile.examTarget, subject)
@@ -13520,6 +13901,7 @@ package com.checkmate.ui.planner
 import androidx.lifecycle.ViewModel
 import com.checkmate.core.DailyCheckIn
 import com.checkmate.core.ExamSyllabus
+import com.checkmate.service.QbankDailyTaskManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13536,7 +13918,11 @@ class DailyCheckInViewModel : ViewModel() {
     val submitted: StateFlow<Boolean> = _submitted.asStateFlow()
 
     fun setTopicForSubject(subject: String, topic: String) {
-        _checkIn.update { it.copy(todayTopics = it.todayTopics + (subject to topic)) }
+        // Tapping the selected chapter again clears it, so a student can opt a subject out of the Q-bank flood.
+        _checkIn.update {
+            val next = if (it.todayTopics[subject] == topic) it.todayTopics - subject else it.todayTopics + (subject to topic)
+            it.copy(todayTopics = next)
+        }
     }
 
     fun setYesterdayRating(subject: String, rating: Int) {
@@ -13549,6 +13935,8 @@ class DailyCheckInViewModel : ViewModel() {
     fun submit() {
         val done = _checkIn.value.copy(completedAt = System.currentTimeMillis())
         DailyCheckIn.saveToday(done)
+        // Flood each picked chapter into today's Q-bank (own scope: survives leaving this screen).
+        QbankDailyTaskManager.applyCheckInTopicsAsync()
         _submitted.value = true
     }
 
@@ -41010,13 +41398,19 @@ object TestmateApi {
      * chapter's past Q-bank misses) — WRONG/SKIPPED alone aren't valid here, unlike
      * [createTargetedTest]'s pool. [questionCount] omitted/null lets the server
      * apply its own default (20 for NEW; uncapped for WRONG_SKIPPED).
+     *
+     * [checkinChapter] (a Daily Check-In chapter name, e.g. "Kinematics") switches the NEW pool to every
+     * question tagged for that check-in chapter (see Testmate lib/checkin-topics.ts); the server then also
+     * uses the check-in name as the session's chapter label. [chapter] must still be non-blank here, so
+     * callers pass the same name for both.
      */
     suspend fun startQbankPractice(
         chapter: String,
         topic: String? = null,
         pool: TestmateQuestionPool = TestmateQuestionPool.NEW,
         questionCount: Int? = null,
-        durationSeconds: Int? = null
+        durationSeconds: Int? = null,
+        checkinChapter: String? = null
     ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -41041,6 +41435,7 @@ object TestmateApi {
             put("pool", pool.name)
             questionCount?.let { put("question_count", it) }
             durationSeconds?.let { put("duration_seconds", it) }
+            checkinChapter?.takeIf { it.isNotBlank() }?.let { put("checkin_chapter", it) }
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
 
