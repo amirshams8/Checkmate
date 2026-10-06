@@ -55,6 +55,9 @@ fun DailyCheckInScreen(navController: NavController, vm: DailyCheckInViewModel =
         Text("STEP 1 — TODAY'S TOPICS", fontSize = 11.sp, fontWeight = FontWeight.Bold,
             letterSpacing = 2.sp, color = White60,
             modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 6.dp))
+        Text("Tap a chapter to load its questions into today's Q-bank. Tap it again to clear.",
+            fontSize = 11.sp, color = White60,
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 8.dp))
 
         subjects.forEach { subject ->
             val chapters = ExamSyllabus.getChaptersForSubject(profile.examTarget, subject)

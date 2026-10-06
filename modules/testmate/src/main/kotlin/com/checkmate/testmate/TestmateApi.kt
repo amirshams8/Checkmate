@@ -308,13 +308,19 @@ object TestmateApi {
      * chapter's past Q-bank misses) — WRONG/SKIPPED alone aren't valid here, unlike
      * [createTargetedTest]'s pool. [questionCount] omitted/null lets the server
      * apply its own default (20 for NEW; uncapped for WRONG_SKIPPED).
+     *
+     * [checkinChapter] (a Daily Check-In chapter name, e.g. "Kinematics") switches the NEW pool to every
+     * question tagged for that check-in chapter (see Testmate lib/checkin-topics.ts); the server then also
+     * uses the check-in name as the session's chapter label. [chapter] must still be non-blank here, so
+     * callers pass the same name for both.
      */
     suspend fun startQbankPractice(
         chapter: String,
         topic: String? = null,
         pool: TestmateQuestionPool = TestmateQuestionPool.NEW,
         questionCount: Int? = null,
-        durationSeconds: Int? = null
+        durationSeconds: Int? = null,
+        checkinChapter: String? = null
     ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -339,6 +345,7 @@ object TestmateApi {
             put("pool", pool.name)
             questionCount?.let { put("question_count", it) }
             durationSeconds?.let { put("duration_seconds", it) }
+            checkinChapter?.takeIf { it.isNotBlank() }?.let { put("checkin_chapter", it) }
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
 

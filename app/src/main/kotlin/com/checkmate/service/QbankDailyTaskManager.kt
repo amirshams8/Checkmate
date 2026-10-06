@@ -2,18 +2,27 @@ package com.checkmate.service
 
 import android.content.Context
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.DailyCheckIn
 import com.checkmate.core.DebugTrail
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.model.StudyTask
+import com.checkmate.planner.model.TaskState
 import com.checkmate.planner.model.TaskType
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateDailyTargetOutcome
 import com.checkmate.testmate.TestmateQbankPracticeOutcome
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -73,6 +82,15 @@ import java.util.Locale
  *     wired into [PlanStore], so the daily Q-bank target never showed up on the
  *     Home tasks tab at all. Not a regression, a missing wire.
  *
+ * DAILY CHECK-IN FLOOD: the chapter the student picks per subject in the Daily Check-In (Step 1) overrides
+ * the server's "#1 gap" choice for that subject. On check-in submit ([applyCheckInTopicsAsync]) — and
+ * retried from [generateIfNeeded] — each selected (subject, chapter) starts a Q-bank session via
+ * [TestmateApi.startQbankPractice] with `checkinChapter`, [CHECKIN_FLOOD_QUESTIONS] questions, drawn from
+ * every bank question tagged for that check-in chapter (Testmate questions.checkin_chapter; tagged by
+ * scripts/tag-checkin-chapters.ts). Those sessions are [SOURCE_CHECKIN]; the auto flow below skips any
+ * subject a live check-in session already covers (Biology covers Botany + Zoology) and retires an
+ * untouched auto session for it. Re-doing the check-in with another chapter retires the old pending one.
+ *
  * A subject with a target but nothing in `coverage_gaps` for it (syllabus_chapters
  * not yet seeded server-side, or that subject's bank is fully drained) is skipped
  * for the day rather than retried every cycle — there's no chapter to send.
@@ -98,6 +116,23 @@ object QbankDailyTaskManager {
     const val PREF_LAST_ERROR_AT = "qbank_daily_last_error_at"
 
     private val SUBJECTS = listOf("Physics", "Chemistry", "Botany", "Zoology")
+
+    const val SOURCE_AUTO = "auto"
+    const val SOURCE_CHECKIN = "checkin"
+
+    /** How many questions a check-in chapter floods into Q-bank (the server default is 20; "flood" = double+). */
+    private const val CHECKIN_FLOOD_QUESTIONS = 40
+
+    // Which (subject|chapter|checkInCompletedAt) check-in sessions were already created today. Keyed by the
+    // check-in's own completion time so deleting a flooded task sticks (the 15-min loop must not resurrect
+    // it) while re-submitting the check-in is a fresh request.
+    private const val PREF_CHECKIN_APPLIED_JSON = "qbank_checkin_applied_json"
+    private const val PREF_CHECKIN_APPLIED_DAY = "qbank_checkin_applied_day"
+    private const val CHECKIN_RETRY_MS = 30L * 60_000L
+
+    private val checkInMutex = Mutex()
+    private val checkInLastAttempt = mutableMapOf<String, Long>()
+    private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Roughly NEET MCQ pacing (~1 min/question) — same reasoning
     // RetentionCheckManager.RETENTION_QUESTION_COUNT's own duration note applies
@@ -126,7 +161,8 @@ object QbankDailyTaskManager {
         val sessionId: String,
         val testId: String,
         val questionCount: Int,
-        val taskId: String? = null // null only for sessions persisted before this fix; see StatsScreen's own fallback
+        val taskId: String? = null, // null only for sessions persisted before this fix; see StatsScreen's own fallback
+        val source: String = "auto" // SOURCE_AUTO (daily-target gap) or SOURCE_CHECKIN (picked in Daily Check-In)
     )
 
     /**
@@ -149,7 +185,8 @@ object QbankDailyTaskManager {
                     sessionId = o.optString("sessionId"),
                     testId = o.optString("testId"),
                     questionCount = o.optInt("questionCount"),
-                    taskId = o.optString("taskId", "").takeIf { it.isNotBlank() }
+                    taskId = o.optString("taskId", "").takeIf { it.isNotBlank() },
+                    source = o.optString("source", "auto")
                 )
             }
         } catch (_: Exception) {
@@ -167,6 +204,7 @@ object QbankDailyTaskManager {
                 put("testId", s.testId)
                 put("questionCount", s.questionCount)
                 put("taskId", s.taskId ?: "")
+                put("source", s.source)
             })
         }
         CheckmatePrefs.putString(PREF_SESSIONS_JSON, arr.toString())
@@ -212,7 +250,25 @@ object QbankDailyTaskManager {
      * "already have one today" check below make a repeat call a cheap no-op once
      * today's sessions exist.
      */
-    suspend fun generateIfNeeded(context: Context) = generateIfNeededInternal(context, force = false)
+    suspend fun generateIfNeeded(context: Context) {
+        // Check-in picks first, so the auto flow below sees them and skips the subjects they cover.
+        applyCheckInTopicsInternal(force = false)
+        generateIfNeededInternal(context, force = false)
+    }
+
+    /**
+     * Fire-and-forget: called when the Daily Check-In is submitted. Runs on its own scope (not the
+     * screen's), so leaving the check-in screen right away cannot cancel it.
+     */
+    fun applyCheckInTopicsAsync() {
+        bgScope.launch {
+            try {
+                applyCheckInTopicsInternal(force = true)
+            } catch (e: Exception) {
+                DebugTrail.e(TAG, "applyCheckInTopics failed: ${e.message}")
+            }
+        }
+    }
 
     /**
      * Manual override for Settings → Test Platform's "Force refresh Q-bank targets"
@@ -232,7 +288,10 @@ object QbankDailyTaskManager {
     // Home. Same signature at 12:32:50/12:32:57. NonCancellable lets a manual force run
     // finish (it is bounded by the Testmate client's own timeouts).
     suspend fun forceGenerateNow(context: Context) =
-        withContext(NonCancellable) { generateIfNeededInternal(context, force = true) }
+        withContext(NonCancellable) {
+            applyCheckInTopicsInternal(force = true)
+            generateIfNeededInternal(context, force = true)
+        }
 
     private suspend fun generateIfNeededInternal(context: Context, force: Boolean) {
         val today = todayKey()
@@ -337,7 +396,11 @@ object QbankDailyTaskManager {
                     saveSessions(liveSessions)
                 }
 
-                val existing = liveSessions.associateBy { it.subject }.toMutableMap()
+                // Check-in sessions are managed by applyCheckInTopicsInternal; the auto map only holds auto ones
+                // (a started auto session and a check-in session for one subject can coexist).
+                val checkInSessions = liveSessions.filter { it.source == SOURCE_CHECKIN }
+                val coveredByCheckIn: Set<String> = checkInSessions.flatMap { autoSubjectsCoveredBy(it.subject) }.toSet()
+                val existing = liveSessions.filter { it.source != SOURCE_CHECKIN }.associateBy { it.subject }.toMutableMap()
                 var anyCreated = false
                 var lastFailure: String? = null
 
@@ -346,6 +409,11 @@ object QbankDailyTaskManager {
                         // Was silent — made "why no Physics task?" unanswerable from the trail.
                         DebugTrail.d(TAG, "generateIfNeeded: $subject already has a live session today — skipping")
                         continue // already have today's session
+                    }
+
+                    if (subject in coveredByCheckIn) {
+                        DebugTrail.d(TAG, "generateIfNeeded: $subject is covered by today's Daily Check-In chapter — skipping auto pick")
+                        continue
                     }
 
                     val subjectCoverage = target.subjectBreakdown.find { it.subject == subject }
@@ -410,7 +478,7 @@ object QbankDailyTaskManager {
                 }
 
                 if (anyCreated) {
-                    saveSessions(existing.values.toList())
+                    saveSessions(checkInSessions + existing.values.toList())
                 }
                 if (lastFailure != null) {
                     recordError(lastFailure)
@@ -426,6 +494,115 @@ object QbankDailyTaskManager {
                 }
             }
         }
+    }
+
+    // ── Daily Check-In flood ────────────────────────────────────────────────
+
+    /** Q-bank subjects a check-in subject stands in for (Biology = Botany + Zoology). */
+    private fun autoSubjectsCoveredBy(checkInSubject: String): Set<String> =
+        if (checkInSubject == "Biology") setOf("Botany", "Zoology") else setOf(checkInSubject)
+
+    private fun loadApplied(): MutableSet<String> {
+        if (CheckmatePrefs.getString(PREF_CHECKIN_APPLIED_DAY, null) != todayKey()) return mutableSetOf()
+        val raw = CheckmatePrefs.getString(PREF_CHECKIN_APPLIED_JSON, null) ?: return mutableSetOf()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }.toMutableSet()
+        } catch (_: Exception) {
+            mutableSetOf()
+        }
+    }
+
+    private fun saveApplied(keys: Set<String>) {
+        CheckmatePrefs.putString(PREF_CHECKIN_APPLIED_JSON, JSONArray(keys.toList()).toString())
+        CheckmatePrefs.putString(PREF_CHECKIN_APPLIED_DAY, todayKey())
+    }
+
+    /**
+     * For every (subject, chapter) the student picked in today's completed Daily Check-In, make sure a
+     * [SOURCE_CHECKIN] Q-bank session + StudyTask exists. NEET only (the check-in chapter vocabulary and
+     * Testmate's tag map are NEET's). Cheap no-op once everything is applied; failures retry at most every
+     * [CHECKIN_RETRY_MS] unless [force] (check-in submit / Settings force-refresh).
+     */
+    private suspend fun applyCheckInTopicsInternal(force: Boolean) = checkInMutex.withLock {
+        if (ConsultationProfile.load().examTarget != "NEET") return@withLock
+        val checkIn = DailyCheckIn.loadToday() ?: return@withLock
+        if (checkIn.completedAt <= 0L) return@withLock
+        val wanted: Map<String, String> = checkIn.todayTopics.filterValues { it.isNotBlank() }
+
+        val liveTasks = PlanStore.todayTasks.value.associateBy { it.id }
+        var sessions = todaysSessions().filter { it.taskId == null || it.taskId in liveTasks }
+        var changed = false
+
+        // 1. Retire check-in sessions that no longer match the check-in (chapter changed or deselected),
+        //    but only while their task is untouched — never yank something the student started.
+        sessions.filter { it.source == SOURCE_CHECKIN && wanted[it.subject] != it.chapter }.forEach { stale ->
+            val task = stale.taskId?.let { liveTasks[it] }
+            if (task == null || task.state == TaskState.PENDING) {
+                task?.let { PlanStore.removeTask(it.id) }
+                sessions = sessions - stale
+                changed = true
+                DebugTrail.d(TAG, "applyCheckIn: retired ${stale.subject}/${stale.chapter} (check-in changed)")
+            }
+        }
+
+        // 2. Flood each selected chapter.
+        val applied = loadApplied()
+        for ((subject, chapter) in wanted) {
+            val key = "$subject|$chapter|${checkIn.completedAt}"
+            if (key in applied) continue
+            if (sessions.any { it.source == SOURCE_CHECKIN && it.subject == subject && it.chapter == chapter }) {
+                applied.add(key)
+                continue
+            }
+            val now = System.currentTimeMillis()
+            if (!force && now - (checkInLastAttempt[key] ?: 0L) < CHECKIN_RETRY_MS) continue
+            checkInLastAttempt[key] = now
+
+            when (val outcome = TestmateApi.startQbankPractice(
+                chapter = chapter,
+                questionCount = CHECKIN_FLOOD_QUESTIONS,
+                checkinChapter = chapter
+            )) {
+                is TestmateQbankPracticeOutcome.Success -> {
+                    val r = outcome.result
+                    // The check-in pick replaces the auto pick: drop untouched auto sessions for the subjects it covers.
+                    val covered = autoSubjectsCoveredBy(subject)
+                    sessions.filter { it.source == SOURCE_AUTO && it.subject in covered }.forEach { auto ->
+                        val autoTask = auto.taskId?.let { liveTasks[it] }
+                        if (autoTask == null || autoTask.state == TaskState.PENDING) {
+                            autoTask?.let { PlanStore.removeTask(it.id) }
+                            sessions = sessions - auto
+                        }
+                    }
+                    val task = StudyTask(
+                        subject = subject,
+                        topic = "Q-bank: $chapter",
+                        durationMinutes = (r.questionCount * MINUTES_PER_QUESTION).coerceAtLeast(MIN_TASK_MINUTES),
+                        taskType = TaskType.PRACTICE
+                    )
+                    PlanStore.createTask(task)
+                    sessions = sessions + QbankDailySession(
+                        subject = subject,
+                        chapter = chapter,
+                        sessionId = r.sessionId,
+                        testId = r.testId,
+                        questionCount = r.questionCount,
+                        taskId = task.id,
+                        source = SOURCE_CHECKIN
+                    )
+                    applied.add(key)
+                    changed = true
+                    DebugTrail.d(TAG, "applyCheckIn: $subject -> $chapter session=${r.sessionId} q=${r.questionCount} reused=${r.reused} task=${task.id}")
+                }
+                is TestmateQbankPracticeOutcome.Error -> {
+                    recordError("Check-in $chapter: ${outcome.message}")
+                    DebugTrail.e(TAG, "applyCheckIn: startQbankPractice failed for $subject/$chapter: ${outcome.message}")
+                }
+            }
+        }
+        saveApplied(applied)
+        if (changed) saveSessions(sessions)
     }
 
     private fun recordError(message: String) {
