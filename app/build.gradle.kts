@@ -25,11 +25,13 @@ android {
         versionCode = 1
         versionName = "1.0"
 
-        // Telegram bot token — set in local.properties, never commit that file
+        // Relay key for the Cloudflare Worker /tg routes — set in local.properties as relay_key
+        // (falls back to telegram_bot_token so the existing CI step keeps working unchanged),
+        // never commit that file. The Telegram bot token itself lives only in the Worker.
         buildConfigField(
             "String",
-            "TELEGRAM_BOT_TOKEN",
-            "\"${localProps.getProperty("telegram_bot_token", "")}\""
+            "RELAY_KEY",
+            "\"${localProps.getProperty("relay_key", localProps.getProperty("telegram_bot_token", ""))}\""
         )
 
         // Testing backlog item 1 (baseline smoke test): AndroidJUnitRunner is the

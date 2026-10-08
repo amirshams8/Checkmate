@@ -10,29 +10,32 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * TelegramAlertBot — sends screenshot + caption to guardian via Telegram Bot API.
+ * TelegramAlertBot — sends screenshot + caption to guardian via the Cloudflare Worker relay.
  *
- * Bot token: set telegram_bot_token in local.properties (never commit that file).
- * Bakes into BuildConfig.TELEGRAM_BOT_TOKEN at compile time.
+ * The Telegram bot token no longer lives in the app. It is a Worker secret; the app only
+ * talks to the Worker's /tg/send and /tg/photo routes, authenticated with a rotatable relay
+ * key (relay_key in local.properties -> BuildConfig.RELAY_KEY). Public API is unchanged, so
+ * no call site needs to change.
  *
  * Guardian onboarding:
- *   1. Guardian opens Telegram → searches your bot → sends /start
+ *   1. Guardian opens Telegram -> searches the bot -> sends /start
  *   2. Guardian messages @userinfobot to get their chat_id
- *   3. Student enters that chat_id in Settings → Guardian Telegram Chat ID
+ *   3. Student enters that chat_id in Settings -> Guardian Telegram Chat ID
  *
  * Call sendAlert() / uploadPhotoAndGetFileId() from a background thread — both block on network.
  */
 object TelegramAlertBot {
 
     private const val TAG = "TelegramAlertBot"
-    private val BOT_TOKEN get() = BuildConfig.TELEGRAM_BOT_TOKEN
-    private val BASE_URL  get() = "https://api.telegram.org/bot$BOT_TOKEN"
+    private const val RELAY_BASE = "https://steep-band-1bd0.amirshamse8.workers.dev"
+    private val RELAY_KEY get() = BuildConfig.RELAY_KEY
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -48,8 +51,8 @@ object TelegramAlertBot {
      * Must be called from a background thread.
      */
     fun sendAlert(context: Context, caption: String, screenshotUri: Uri? = null) {
-        if (BOT_TOKEN.isBlank()) {
-            Log.e(TAG, "BOT_TOKEN not set in local.properties — skipping Telegram alert")
+        if (RELAY_KEY.isBlank()) {
+            Log.e(TAG, "relay_key not set in local.properties — skipping Telegram alert")
             return
         }
         val chatId = getChatId() ?: run {
@@ -60,7 +63,7 @@ object TelegramAlertBot {
         if (screenshotUri != null) {
             val tmp = copyUriToTempFile(context, screenshotUri)
             if (tmp != null) {
-                val sent = sendPhoto(chatId, caption, tmp)
+                val sent = sendPhoto(chatId, caption, tmp) != null
                 tmp.delete()
                 if (sent) return
                 Log.w(TAG, "sendPhoto failed — falling back to text")
@@ -73,15 +76,13 @@ object TelegramAlertBot {
     /**
      * Uploads a screenshot to the guardian's chat with the given caption and
      * returns Telegram's file_id for the largest photo size, or null on failure.
-     *
-     * The returned file_id can be reused later (e.g. by the Cloudflare worker)
-     * to re-send the same image via sendPhoto without re-uploading bytes.
+     * The file_id is reusable by the Worker to re-send the same image.
      *
      * Must be called from a background thread.
      */
     fun uploadPhotoAndGetFileId(context: Context, caption: String, screenshotUri: Uri): String? {
-        if (BOT_TOKEN.isBlank()) {
-            Log.e(TAG, "BOT_TOKEN not set in local.properties — skipping status photo upload")
+        if (RELAY_KEY.isBlank()) {
+            Log.e(TAG, "relay_key not set in local.properties — skipping status photo upload")
             return null
         }
         val chatId = getChatId() ?: run {
@@ -91,7 +92,7 @@ object TelegramAlertBot {
 
         val tmp = copyUriToTempFile(context, screenshotUri) ?: return null
         return try {
-            sendPhotoForFileId(chatId, caption, tmp)
+            sendPhoto(chatId, caption, tmp)
         } finally {
             tmp.delete()
         }
@@ -99,84 +100,49 @@ object TelegramAlertBot {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    private fun sendPhoto(chatId: String, caption: String, photo: File): Boolean {
+    /** Returns the file_id on success (may be empty string if Worker omitted it), null on failure. */
+    private fun sendPhoto(chatId: String, caption: String, photo: File): String? {
         return try {
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("chat_id", chatId)
                 .addFormDataPart("caption", caption)
-                .addFormDataPart(
-                    "photo", photo.name,
-                    photo.asRequestBody("image/png".toMediaType())
-                )
+                .addFormDataPart("photo", photo.name, photo.asRequestBody("image/png".toMediaType()))
                 .build()
 
-            val response = client.newCall(
-                Request.Builder().url("$BASE_URL/sendPhoto").post(body).build()
-            ).execute()
-            val ok = response.isSuccessful
-            Log.d(TAG, "sendPhoto: ${response.code}")
-            response.close()
-            ok
+            client.newCall(
+                Request.Builder()
+                    .url("$RELAY_BASE/tg/photo")
+                    .addHeader("X-Relay-Key", RELAY_KEY)
+                    .post(body)
+                    .build()
+            ).execute().use { response ->
+                val bodyStr = response.body?.string()
+                Log.d(TAG, "sendPhoto: ${response.code}")
+                if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
+                val json = JSONObject(bodyStr)
+                if (!json.optBoolean("ok", false)) return null
+                json.optString("fileId", "")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "sendPhoto exception: ${e.message}")
-            false
-        }
-    }
-
-    /**
-     * Same as sendPhoto, but parses the response and returns the file_id of the
-     * largest photo size (last entry in the "photo" array), or null on failure.
-     */
-    private fun sendPhotoForFileId(chatId: String, caption: String, photo: File): String? {
-        return try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("chat_id", chatId)
-                .addFormDataPart("caption", caption)
-                .addFormDataPart(
-                    "photo", photo.name,
-                    photo.asRequestBody("image/png".toMediaType())
-                )
-                .build()
-
-            val response = client.newCall(
-                Request.Builder().url("$BASE_URL/sendPhoto").post(body).build()
-            ).execute()
-
-            val bodyStr = response.body?.string()
-            Log.d(TAG, "sendPhotoForFileId: ${response.code}")
-            response.close()
-
-            if (!response.isSuccessful || bodyStr.isNullOrBlank()) return null
-
-            val json = JSONObject(bodyStr)
-            if (!json.optBoolean("ok", false)) return null
-
-            val photoArray = json.getJSONObject("result").optJSONArray("photo") ?: return null
-            if (photoArray.length() == 0) return null
-
-            // Last entry = largest resolution
-            photoArray.getJSONObject(photoArray.length() - 1).optString("file_id", null)
-        } catch (e: Exception) {
-            Log.e(TAG, "sendPhotoForFileId exception: ${e.message}")
             null
         }
     }
 
     private fun sendText(chatId: String, text: String) {
         try {
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("chat_id", chatId)
-                .addFormDataPart("text", text)
-                .build()
-
-            val response = client.newCall(
-                Request.Builder().url("$BASE_URL/sendMessage").post(body).build()
-            ).execute()
-            Log.d(TAG, "sendText: ${response.code}")
-            response.close()
+            val payload = JSONObject().apply {
+                put("chat_id", chatId)
+                put("text", text)
+            }
+            client.newCall(
+                Request.Builder()
+                    .url("$RELAY_BASE/tg/send")
+                    .addHeader("X-Relay-Key", RELAY_KEY)
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+            ).execute().use { Log.d(TAG, "sendText: ${it.code}") }
         } catch (e: Exception) {
             Log.e(TAG, "sendText exception: ${e.message}")
         }
