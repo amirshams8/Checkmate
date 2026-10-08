@@ -185,6 +185,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── engine
 │   │   │   │   │   │   │   │   │   ├── ErrorEngine.kt
 │   │   │   │   │   │   │   │   │   ├── LearningDecisionEngine.kt
+│   │   │   │   │   │   │   │   │   ├── LeitnerSchedule.kt
 │   │   │   │   │   │   │   │   │   ├── MasteryEngine.kt
 │   │   │   │   │   │   │   │   │   ├── RetentionEngine.kt
 │   │   │   │   │   │   │   │   ├── graph
@@ -246,6 +247,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── SubjectScoreCalculatorTest.kt
 │   │   │   │   │   │   │   │   ├── engine
 │   │   │   │   │   │   │   │   │   ├── LearningDecisionEngineTest.kt
+│   │   │   │   │   │   │   │   │   ├── LeitnerScheduleTest.kt
 │   │   │   │   │   │   │   │   │   ├── MasteryEngineTest.kt
 │   │   │   │   │   │   │   │   │   ├── RetentionEngineTest.kt
 │   │   │   │   │   │   │   │   ├── testmate
@@ -3110,6 +3112,7 @@ import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
@@ -3248,6 +3251,10 @@ object GapTaskManager {
         resolveActiveConceptState(context)
         createTargetedTestIfNeeded(context)
 
+        // Retention checks spawn on their own pass: not behind the once-a-day repair gate,
+        // not blocked by an open gap-repair task, and not limited to high-mastery concepts.
+        generateRetentionIfNeeded(context, force)
+
         val todayKey = GapTaskLedger.todayKey()
         if (!force && GapTaskLedger.hasGeneratedToday(todayKey)) return
 
@@ -3299,6 +3306,51 @@ object GapTaskManager {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
             GapTaskLedger.markGeneratedToday(todayKey)
+        }
+    }
+
+    private const val MAX_NEW_RETENTION_PER_DAY = 2
+    private const val MAX_OPEN_RETENTION = 3
+
+    /**
+     * Independent retention spawn pass (runs every 15-min cycle, throttled to ~hourly by
+     * [RetentionTaskLedger.shouldAttemptGeneration]). Builds a retention-only report so
+     * repair candidates/tasks can neither outrank nor block it; concepts qualify at any
+     * mastery once Leitner-due (see [LearningDecisionEngine.retentionReportFrom]). Capped per day
+     * and by open tasks so the plan can't flood. [force] only bypasses the throttle.
+     * Never throws — a failure here must not stop the repair loop below it.
+     */
+    private suspend fun generateRetentionIfNeeded(context: Context, force: Boolean) {
+        try {
+            val now = System.currentTimeMillis()
+            val todayKey = GapTaskLedger.todayKey()
+            if (RetentionTaskLedger.createdTodayCount(todayKey) >= MAX_NEW_RETENTION_PER_DAY) return
+            if (RetentionTaskLedger.freshOpenCount(now) >= MAX_OPEN_RETENTION) return
+            if (!RetentionTaskLedger.shouldAttemptGeneration(now, force)) return
+            RetentionTaskLedger.markGenerationAttempt(now)
+
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val retentionReport = LearningDecisionEngine.retentionReportFrom(
+                report, studentModel, estimates, now,
+                nextDueAtFor = { RetentionTaskLedger.nextDueAtFor(it) }
+            )
+            if (retentionReport.candidates.isEmpty()) {
+                DebugTrail.d(TAG, "generateRetentionIfNeeded: no retention-eligible concepts")
+                return
+            }
+            DebugTrail.d(TAG, "generateRetentionIfNeeded: candidates = " +
+                retentionReport.candidates.joinToString { "${it.conceptId}:%.2f".format(it.priorityScore) })
+            val result = LearningInterventionOrchestrator.from(context).executeTopCandidate(retentionReport)
+            DebugTrail.d(TAG, "generateRetentionIfNeeded: outcome=${result.outcome}")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "generateRetentionIfNeeded failed: ${e.message}", e)
         }
     }
 
@@ -8362,6 +8414,18 @@ object RetentionCheckManager {
                 )
                 RetentionTaskLedger.markEvidenceImported(session.taskId)
                 DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
+                // Leitner box update — AFTER markEvidenceImported so a retry can never apply the same
+                // evidence twice. Skips are excluded from `answered`; fewer than 2 answered leaves
+                // the box untouched (see LeitnerSchedule.evaluate).
+                session.conceptId?.let { conceptId ->
+                    try {
+                        val answered = result.breakdown.count { it.selectedAnswer != null }
+                        val correct = result.breakdown.count { it.selectedAnswer != null && it.isCorrect == true }
+                        RetentionTaskLedger.recordEvidence(conceptId, answered, correct, System.currentTimeMillis())
+                    } catch (e: Exception) {
+                        DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
+                    }
+                }
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
             }
@@ -24479,6 +24543,13 @@ object LearningDecisionEngine {
 
     private const val DIAGNOSTIC_MINUTES = 15
     private const val RETENTION_TEST_MINUTES = 10
+
+    /** How many retention candidates [retentionReportFrom] returns — more than one so the
+     *  orchestrator's per-concept "already has an unresolved check" rejection can fall
+     *  through to the next concept instead of ending the walk. */
+    private const val MAX_RETENTION_CANDIDATES = 5
+
+    private const val MS_PER_DAY = 86_400_000.0
     private const val MOCK_MINUTES = 60
     private const val MAX_TARGETED_SET_MINUTES = 90
 
@@ -24579,6 +24650,74 @@ object LearningDecisionEngine {
             generatedAt = System.currentTimeMillis(),
             candidates = ranked
         )
+    }
+
+    /**
+     * Retention-only [DecisionReport], built independently of [decideFromReport]'s top-5
+     * repair-dominated ranking so retention can never be starved by (or blocked behind)
+     * gap-repair candidates/tasks. A concept qualifies when it has real attempts, a
+     * subject + chapter to build a Testmate session from, and is Leitner-due ([LeitnerSchedule]):
+     * [nextDueAtFor] (the persisted next-due time recorded when a retention check's evidence was
+     * imported) has passed, or — for a concept never checked — lastSeen plus the box-1 interval
+     * has. Any mastery qualifies, including below 83%. The decay equation
+     * ([RetentionEngine.retentionScore], mastery x e^(-days/halfLife)) is NOT the scheduler; it
+     * only ranks the due concepts (lowest decayed mastery first).
+     * Ranked by lowest decayed mastery (highest priorityScore first), then by the estimator's own expectedGain.
+     * Feed the result straight to `LearningInterventionOrchestrator.executeTopCandidate`;
+     * an all-retention report already bypasses the single-active-gap-concept guard.
+     */
+    fun retentionReportFrom(
+        report: PerformanceAnalyzer.PerformanceReport,
+        studentModel: StudentModel,
+        estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
+        now: Long = System.currentTimeMillis(),
+        nextDueAtFor: (conceptId: String) -> Long? = { null }
+    ): DecisionReport {
+        val gainByConceptId = estimates.associate { it.conceptId to it.expectedGain }
+        val candidates = studentModel.concepts.values
+            .filter { isRetentionDue(it, now, nextDueAtFor) }
+            .map { snapshot ->
+                val lastSeen = snapshot.lastSeen ?: now
+                val daysSince = (now - lastSeen).coerceAtLeast(0L) / MS_PER_DAY
+                val decayedMastery = snapshot.mastery * RetentionEngine.retentionScore(snapshot.lastSeen, 1.0, now)
+                val label = snapshot.topic ?: snapshot.chapter ?: "this concept"
+                CandidateIntervention(
+                    intent = LearningInterventionIntent.SCHEDULE_RETENTION_TEST,
+                    conceptId = snapshot.conceptId,
+                    subject = snapshot.subject,
+                    chapter = snapshot.chapter,
+                    topic = snapshot.topic,
+                    durationMinutes = RETENTION_TEST_MINUTES,
+                    expectedGain = gainByConceptId[snapshot.conceptId] ?: 0.0,
+                    priorityScore = 1.0 - decayedMastery,
+                    rationale = "$label (%.0f%% mastery, ~%.0f%% after %.0f days of decay) — a short recall check before it fades."
+                        .format(snapshot.mastery * 100, decayedMastery * 100, daysSince)
+                )
+            }
+            .sortedWith(
+                compareByDescending<CandidateIntervention> { it.priorityScore }
+                    .thenByDescending { it.expectedGain }
+            )
+            .take(MAX_RETENTION_CANDIDATES)
+
+        return DecisionReport(
+            studentId = studentModel.studentId,
+            examType = report.examType,
+            generatedAt = now,
+            candidates = candidates
+        )
+    }
+
+    private fun isRetentionDue(
+        snapshot: ConceptSnapshot,
+        now: Long,
+        nextDueAtFor: (String) -> Long?
+    ): Boolean {
+        val lastSeen = snapshot.lastSeen ?: return false
+        if (snapshot.attemptCount <= 0) return false
+        if (snapshot.subject.isNullOrBlank() || snapshot.chapter.isNullOrBlank()) return false
+        val dueAt = nextDueAtFor(snapshot.conceptId) ?: LeitnerSchedule.initialDueAt(lastSeen)
+        return now >= dueAt
     }
 
     /**
@@ -24852,6 +24991,60 @@ object LearningDecisionEngine {
         }
 
         return out
+    }
+}
+
+
+//===== FILE: modules/learning/src/main/kotlin/com/checkmate/learning/engine/LeitnerSchedule.kt =====
+package com.checkmate.learning.engine
+
+/**
+ * Concept-level Leitner retention scheduler (pure logic — state lives in the planner's
+ * RetentionTaskLedger). Exam-oriented box intervals (2 / 4 / 7 / 14 days) sized for a
+ * ~month-out test, not a universal long-term SRS curve; the table is configurable.
+ *
+ * Leitner decides WHETHER a concept is due; the decay equation
+ * ([RetentionEngine.retentionScore]) only ranks the due concepts.
+ *
+ * Evidence rules ([evaluate]): SKIPPED neither promotes nor demotes; fewer than
+ * [MIN_ANSWERED] answered questions is inconclusive (box unchanged, short retry delay);
+ * otherwise >= [PASS_THRESHOLD] correct promotes one box (capped at [MAX_BOX]) and anything
+ * lower drops the concept back to box 1.
+ */
+object LeitnerSchedule {
+
+    val INTERVAL_DAYS: List<Int> = listOf(2, 4, 7, 14)
+    const val MIN_BOX = 1
+    const val MAX_BOX = 4
+    const val PASS_THRESHOLD = 0.8
+    const val MIN_ANSWERED = 2
+
+    /** Inconclusive check (too few answered): box untouched, but nextDueAt is pushed out this
+     *  many days so a skipped check doesn't re-spawn every cycle. */
+    const val INCONCLUSIVE_RETRY_DAYS = 1
+
+    private const val MS_PER_DAY = 86_400_000L
+
+    data class Outcome(val box: Int, val nextDueAt: Long, val decided: Boolean)
+
+    fun intervalMs(box: Int): Long =
+        INTERVAL_DAYS[box.coerceIn(MIN_BOX, MAX_BOX) - 1] * MS_PER_DAY
+
+    /** Due time for a concept with no persisted state yet: lastSeen + the box-1 interval. */
+    fun initialDueAt(lastSeen: Long): Long = lastSeen + intervalMs(MIN_BOX)
+
+    /**
+     * [answered] must exclude skipped/unanswered questions; [correct] is the answered-and-correct
+     * subset.
+     */
+    fun evaluate(currentBox: Int, answered: Int, correct: Int, now: Long): Outcome {
+        val box = currentBox.coerceIn(MIN_BOX, MAX_BOX)
+        if (answered < MIN_ANSWERED) {
+            return Outcome(box, now + INCONCLUSIVE_RETRY_DAYS * MS_PER_DAY, decided = false)
+        }
+        val rate = correct.toDouble() / answered
+        val newBox = if (rate >= PASS_THRESHOLD) minOf(box + 1, MAX_BOX) else MIN_BOX
+        return Outcome(newBox, now + intervalMs(newBox), decided = true)
     }
 }
 
@@ -30212,6 +30405,8 @@ class SubjectScoreCalculatorTest {
 //===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LearningDecisionEngineTest.kt =====
 package com.checkmate.learning.engine
 
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.model.ConceptSnapshot
 import com.checkmate.learning.model.ErrorPatternSnapshot
 import com.checkmate.learning.model.OverallLearningState
@@ -30457,6 +30652,127 @@ class LearningDecisionEngineTest {
         assertTrue(report.candidates.size <= 5)
         val scores = report.candidates.map { it.priorityScore }
         assertEquals(scores.sortedDescending(), scores)
+    }
+
+    @Test
+    fun `retentionReportFrom spawns a retention check for a stale concept below the mastery threshold`() {
+        val now = 20L * 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-low", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val retention = LearningDecisionEngine.retentionReportFrom(report, model, estimates, now)
+
+        val low = retention.candidates.firstOrNull { it.conceptId == "c-low" }
+        assertTrue(low != null)
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, low!!.intent)
+        assertTrue(retention.candidates.all {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+        })
+    }
+
+    @Test
+    fun `retentionReportFrom honours a persisted nextDueAt over lastSeen`() {
+        val now = 20L * 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-box", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val notYet = LearningDecisionEngine.retentionReportFrom(
+            report, model, estimates, now, nextDueAtFor = { now + 86_400_000L }
+        )
+        assertTrue(notYet.candidates.isEmpty())
+
+        val overdue = LearningDecisionEngine.retentionReportFrom(
+            report, model, estimates, now, nextDueAtFor = { if (it == "c-box") now - 1L else now + 86_400_000L }
+        )
+        assertEquals(listOf("c-box"), overdue.candidates.map { it.conceptId })
+    }
+
+    @Test
+    fun `retentionReportFrom skips concepts still inside the first Leitner interval`() {
+        val now = 1_000L + 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-fresh", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val retention = LearningDecisionEngine.retentionReportFrom(report, model, estimates, now)
+
+        assertTrue(retention.candidates.isEmpty())
+    }
+}
+
+
+//===== FILE: modules/learning/src/test/kotlin/com/checkmate/learning/engine/LeitnerScheduleTest.kt =====
+package com.checkmate.learning.engine
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class LeitnerScheduleTest {
+
+    private val day = 86_400_000L
+
+    @Test
+    fun `initial due date is lastSeen plus the box-1 interval`() {
+        assertEquals(1_000L + 2 * day, LeitnerSchedule.initialDueAt(1_000L))
+    }
+
+    @Test
+    fun `pass with enough answers promotes one box and uses that box's interval`() {
+        val out = LeitnerSchedule.evaluate(currentBox = 1, answered = 5, correct = 4, now = 0L)
+        assertTrue(out.decided)
+        assertEquals(2, out.box)
+        assertEquals(4 * day, out.nextDueAt)
+    }
+
+    @Test
+    fun `fail drops back to box 1`() {
+        val out = LeitnerSchedule.evaluate(currentBox = 3, answered = 5, correct = 3, now = 0L)
+        assertTrue(out.decided)
+        assertEquals(1, out.box)
+        assertEquals(2 * day, out.nextDueAt)
+    }
+
+    @Test
+    fun `promotion is capped at the top box`() {
+        val out = LeitnerSchedule.evaluate(currentBox = 4, answered = 4, correct = 4, now = 0L)
+        assertEquals(4, out.box)
+        assertEquals(14 * day, out.nextDueAt)
+    }
+
+    @Test
+    fun `zero or one answered is inconclusive and leaves the box unchanged`() {
+        val none = LeitnerSchedule.evaluate(currentBox = 3, answered = 0, correct = 0, now = 0L)
+        val one = LeitnerSchedule.evaluate(currentBox = 3, answered = 1, correct = 1, now = 0L)
+        assertFalse(none.decided)
+        assertFalse(one.decided)
+        assertEquals(3, none.box)
+        assertEquals(3, one.box)
+        assertEquals(1 * day, one.nextDueAt)
+    }
+
+    @Test
+    fun `exactly 80 percent promotes`() {
+        val out = LeitnerSchedule.evaluate(currentBox = 1, answered = 5, correct = 4, now = 0L)
+        assertEquals(2, out.box)
     }
 }
 
@@ -35303,6 +35619,9 @@ class LearningInterventionOrchestrator(
         val retentionOnly = report.candidates.isNotEmpty() && report.candidates.all {
             it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
         }
+        // Retention candidates are never blocked by an unresolved gap-repair task — only
+        // the non-retention ones are. Narrowed below when a blocking task exists.
+        var walkCandidates = report.candidates
         val activeConceptId = GapTaskLedger.activeConceptId()
         if (activeConceptId != null && !retentionOnly) {
             val blockingTask = activeUnresolvedTask()
@@ -35332,16 +35651,25 @@ class LearningInterventionOrchestrator(
                         timestamp = now
                     )
                 }
-                olog("executeTopCandidate: BLOCKED by unresolved active task ${blockingTask.id} " +
-                    "(state=${blockingTask.state}) — no candidate evaluated")
-                return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
+                val retentionCandidates = report.candidates.filter {
+                    it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+                }
+                if (retentionCandidates.isEmpty()) {
+                    olog("executeTopCandidate: BLOCKED by unresolved active task ${blockingTask.id} " +
+                        "(state=${blockingTask.state}) — no candidate evaluated")
+                    return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
+                }
+                olog("executeTopCandidate: non-retention candidates BLOCKED by unresolved active task " +
+                    "${blockingTask.id} (state=${blockingTask.state}) — still walking " +
+                    "${retentionCandidates.size} retention candidate(s)")
+                walkCandidates = retentionCandidates
             } else {
                 olog("executeTopCandidate: active concept $activeConceptId has no unresolved task — not blocking")
             }
         }
 
-        report.candidates.forEachIndexed { index, candidate ->
-            val rank = index + 1
+        walkCandidates.forEachIndexed { _, candidate ->
+            val rank = report.candidates.indexOf(candidate) + 1
 
             val conceptId = candidate.conceptId
             // "Covered" means the gap was repaired — which is exactly when a retention check
@@ -36410,6 +36738,7 @@ package com.checkmate.planner.intervention
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.LeitnerSchedule
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36480,6 +36809,14 @@ object RetentionTaskLedger {
     // are capped so a long-lived install doesn't grow this pref forever — same reasoning
     // as GapTaskLedger.WarningLogEntry's own MAX_WARNING_LOG_ENTRIES cap.
     private const val MAX_RESOLVED_KEPT = 30
+
+    // An unresolved entry older than this no longer blocks a NEW retention check for the
+    // same concept — a check the student skipped/abandoned days ago must not suppress
+    // retention for that concept forever.
+    private const val STALE_UNRESOLVED_MS = 3L * 24 * 60 * 60 * 1000
+
+    private const val KEY_LAST_GENERATION_ATTEMPT = "retention_last_generation_attempt_ms"
+    private const val GENERATION_INTERVAL_MS = 60L * 60 * 1000
 
     @Serializable
     data class RetentionSession(
@@ -36552,8 +36889,28 @@ object RetentionTaskLedger {
      * fresh daily re-rank can't pile up a second retention check for the same concept while
      * the first one's Testmate session is still unsubmitted.
      */
-    fun hasUnresolvedForConcept(conceptId: String): Boolean =
-        all().any { it.conceptId == conceptId && !it.evidenceImported }
+    fun hasUnresolvedForConcept(conceptId: String, now: Long = System.currentTimeMillis()): Boolean =
+        all().any {
+            it.conceptId == conceptId && !it.evidenceImported && now - it.createdAt < STALE_UNRESOLVED_MS
+        }
+
+    /** Retention tasks created for [dayKey] (any state) — daily spawn cap. */
+    fun createdTodayCount(dayKey: String): Int = all().count { it.dayKey == dayKey }
+
+    /** Unresolved, non-stale retention tasks — open-task cap. */
+    fun freshOpenCount(now: Long = System.currentTimeMillis()): Int =
+        all().count { !it.evidenceImported && now - it.createdAt < STALE_UNRESOLVED_MS }
+
+    /** Throttle for the (StudentModel-building) retention generation pass. */
+    fun shouldAttemptGeneration(now: Long, force: Boolean): Boolean {
+        if (force) return true
+        val last = CheckmatePrefs.getString(KEY_LAST_GENERATION_ATTEMPT, null)?.toLongOrNull() ?: 0L
+        return now - last >= GENERATION_INTERVAL_MS
+    }
+
+    fun markGenerationAttempt(now: Long) {
+        CheckmatePrefs.putString(KEY_LAST_GENERATION_ATTEMPT, now.toString())
+    }
 
     /** Entries with no Testmate session created yet — [com.checkmate.service.RetentionCheckManager]
      *  drives these through [com.checkmate.testmate.TestmateApi.createTargetedTest]. */
@@ -36595,6 +36952,62 @@ object RetentionTaskLedger {
     }
 
     fun entry(taskId: String): RetentionSession? = all().firstOrNull { it.taskId == taskId }
+
+    // ---- Concept-level Leitner boxes ([LeitnerSchedule]) ----
+    // One entry per concept, persisted at evidence-import time. nextDueAt is stored explicitly
+    // so a later change to the interval table never silently moves existing reviews.
+
+    @Serializable
+    data class LeitnerEntry(
+        val conceptId: String,
+        val box: Int = LeitnerSchedule.MIN_BOX,
+        val lastSeen: Long,
+        val nextDueAt: Long,
+        val answeredCount: Int = 0,
+        val correctCount: Int = 0
+    )
+
+    private const val KEY_LEITNER = "retention_leitner_boxes"
+
+    private fun allLeitner(): List<LeitnerEntry> =
+        CheckmatePrefs.getString(KEY_LEITNER, null)?.let {
+            try {
+                json.decodeFromString<List<LeitnerEntry>>(it)
+            } catch (e: Exception) {
+                Log.e(TAG, "corrupt leitner list, resetting: ${e.message}", e)
+                emptyList()
+            }
+        } ?: emptyList()
+
+    /** Persisted next-due time for [conceptId], or null if it has never had a retention check
+     *  evidence-imported (the scheduler then falls back to lastSeen + the box-1 interval). */
+    fun nextDueAtFor(conceptId: String): Long? =
+        allLeitner().firstOrNull { it.conceptId == conceptId }?.nextDueAt
+
+    fun boxFor(conceptId: String): Int =
+        allLeitner().firstOrNull { it.conceptId == conceptId }?.box ?: LeitnerSchedule.MIN_BOX
+
+    /**
+     * Applies one retention check's evidence to [conceptId]'s box. [answered] excludes skips;
+     * [correct] is the answered-and-correct subset. See [LeitnerSchedule.evaluate] for the
+     * promote/demote/inconclusive rules (skips never promote or demote).
+     */
+    fun recordEvidence(conceptId: String, answered: Int, correct: Int, now: Long) {
+        val existing = allLeitner()
+        val current = existing.firstOrNull { it.conceptId == conceptId }
+        val outcome = LeitnerSchedule.evaluate(current?.box ?: LeitnerSchedule.MIN_BOX, answered, correct, now)
+        val updated = LeitnerEntry(
+            conceptId = conceptId,
+            box = outcome.box,
+            lastSeen = now,
+            nextDueAt = outcome.nextDueAt,
+            answeredCount = (current?.answeredCount ?: 0) + answered,
+            correctCount = (current?.correctCount ?: 0) + correct
+        )
+        CheckmatePrefs.putString(KEY_LEITNER, json.encodeToString(existing.filter { it.conceptId != conceptId } + updated))
+        Log.d(TAG, "leitner: concept=$conceptId answered=$answered correct=$correct decided=${outcome.decided} " +
+            "box=${current?.box ?: LeitnerSchedule.MIN_BOX}->${outcome.box} nextDueAt=${outcome.nextDueAt}")
+    }
 }
 
 
