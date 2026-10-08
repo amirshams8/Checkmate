@@ -313,6 +313,9 @@ object TestmateApi {
      * question tagged for that check-in chapter (see Testmate lib/checkin-topics.ts); the server then also
      * uses the check-in name as the session's chapter label. [chapter] must still be non-blank here, so
      * callers pass the same name for both.
+     *
+     * [topics] narrows the session to SEVERAL syllabus topics at once (one combined session; the server
+     * labels it with the sorted topics joined by " | "). It is merged with [topic] when both are given.
      */
     suspend fun startQbankPractice(
         chapter: String,
@@ -320,7 +323,8 @@ object TestmateApi {
         pool: TestmateQuestionPool = TestmateQuestionPool.NEW,
         questionCount: Int? = null,
         durationSeconds: Int? = null,
-        checkinChapter: String? = null
+        checkinChapter: String? = null,
+        topics: List<String>? = null
     ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -342,6 +346,9 @@ object TestmateApi {
             // Same "null"-string guard as createTargetedTest's topic — see that
             // function's own BUGFIX comment.
             topic?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }?.let { put("topic", it) }
+            topics?.filter { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { list -> put("topics", org.json.JSONArray(list)) }
             put("pool", pool.name)
             questionCount?.let { put("question_count", it) }
             durationSeconds?.let { put("duration_seconds", it) }

@@ -97,15 +97,15 @@ fun DailyCheckInScreen(navController: NavController, vm: DailyCheckInViewModel =
                     if (selected.isNotEmpty()) {
                         val topics = vm.getTopicsForChapter(profile.examTarget, subject, selected)
                         if (topics.isNotEmpty()) {
-                            val pickedTopic = checkIn.todayTopicPicks[subject] ?: ""
+                            val pickedTopics = checkIn.todayTopicSets[subject].orEmpty()
                             Spacer(Modifier.height(4.dp))
-                            Text("Narrow to one topic (optional)", fontSize = 11.sp, color = White60)
+                            Text("Narrow to topics (optional, pick several)", fontSize = 11.sp, color = White60)
                             Spacer(Modifier.height(6.dp))
                             topics.chunked(2).forEach { row ->
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                                     row.forEach { t ->
                                         FilterChip(
-                                            selected = pickedTopic == t,
+                                            selected = t in pickedTopics,
                                             onClick  = { vm.setTopicPick(subject, t) },
                                             label    = { Text(t, fontSize = 11.sp) },
                                             modifier = Modifier.weight(1f),

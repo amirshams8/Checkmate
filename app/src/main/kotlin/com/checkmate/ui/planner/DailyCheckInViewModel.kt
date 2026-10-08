@@ -24,16 +24,19 @@ class DailyCheckInViewModel : ViewModel() {
         _checkIn.update {
             val next = if (it.todayTopics[subject] == topic) it.todayTopics - subject else it.todayTopics + (subject to topic)
             // Chapter changed or cleared: any topic pick under the old chapter no longer applies.
-            it.copy(todayTopics = next, todayTopicPicks = it.todayTopicPicks - subject)
+            it.copy(todayTopics = next, todayTopicSets = it.todayTopicSets - subject)
         }
     }
 
     fun setTopicPick(subject: String, topic: String) {
-        // Optional narrowing under the picked chapter. Tapping the picked topic again clears it (back to chapter-wide).
+        // Optional narrowing under the picked chapter; several topics can be picked. Tapping a picked topic
+        // again removes it, and an empty set goes back to chapter-wide.
         _checkIn.update {
             if (it.todayTopics[subject].isNullOrBlank()) return@update it
-            val next = if (it.todayTopicPicks[subject] == topic) it.todayTopicPicks - subject else it.todayTopicPicks + (subject to topic)
-            it.copy(todayTopicPicks = next)
+            val current = it.todayTopicSets[subject].orEmpty()
+            val updated = if (topic in current) current - topic else current + topic
+            val next = if (updated.isEmpty()) it.todayTopicSets - subject else it.todayTopicSets + (subject to updated)
+            it.copy(todayTopicSets = next)
         }
     }
 

@@ -532,7 +532,12 @@ object QbankDailyTaskManager {
         val checkIn = DailyCheckIn.loadToday() ?: return@withLock
         if (checkIn.completedAt <= 0L) return@withLock
         val wanted: Map<String, String> = checkIn.todayTopics.filterValues { it.isNotBlank() }
-        val wantedTopics: Map<String, String> = checkIn.todayTopicPicks.filterValues { it.isNotBlank() }
+        // subject -> picked syllabus topics (deduped, sorted). One combined session covers all of a subject's picks;
+        // its stored `topic` is the same " | "-joined key the server uses as the session's topic label.
+        val wantedTopicLists: Map<String, List<String>> = checkIn.todayTopicSets
+            .mapValues { (_, v) -> v.filter { it.isNotBlank() }.distinct().sorted() }
+            .filterValues { it.isNotEmpty() }
+        val wantedTopics: Map<String, String> = wantedTopicLists.mapValues { (_, v) -> v.joinToString(" | ") }
 
         val liveTasks = PlanStore.todayTasks.value.associateBy { it.id }
         var sessions = todaysSessions().filter { it.taskId == null || it.taskId in liveTasks }
@@ -554,6 +559,7 @@ object QbankDailyTaskManager {
         val applied = loadApplied()
         for ((subject, chapter) in wanted) {
             val topic = wantedTopics[subject]
+            val topicList = wantedTopicLists[subject].orEmpty()
             val key = "$subject|$chapter|${topic ?: ""}|${checkIn.completedAt}"
             if (key in applied) continue
             if (sessions.any { it.source == SOURCE_CHECKIN && it.subject == subject && it.chapter == chapter && it.topic == topic }) {
@@ -566,7 +572,7 @@ object QbankDailyTaskManager {
 
             when (val outcome = TestmateApi.startQbankPractice(
                 chapter = chapter,
-                topic = topic,
+                topics = topicList.takeIf { it.isNotEmpty() },
                 questionCount = CHECKIN_FLOOD_QUESTIONS,
                 checkinChapter = chapter
             )) {
@@ -583,7 +589,7 @@ object QbankDailyTaskManager {
                     }
                     val task = StudyTask(
                         subject = subject,
-                        topic = "Q-bank: $chapter" + (topic?.let { " — $it" } ?: ""),
+                        topic = "Q-bank: $chapter" + (topicList.takeIf { it.isNotEmpty() }?.let { " — ${it.joinToString(", ")}" } ?: ""),
                         durationMinutes = (r.questionCount * MINUTES_PER_QUESTION).coerceAtLeast(MIN_TASK_MINUTES),
                         taskType = TaskType.PRACTICE
                     )
