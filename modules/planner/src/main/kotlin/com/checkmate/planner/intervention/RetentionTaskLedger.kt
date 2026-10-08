@@ -3,6 +3,7 @@ package com.checkmate.planner.intervention
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.learning.engine.LearningDecisionEngine
+import com.checkmate.learning.engine.LeitnerSchedule
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -73,6 +74,14 @@ object RetentionTaskLedger {
     // are capped so a long-lived install doesn't grow this pref forever — same reasoning
     // as GapTaskLedger.WarningLogEntry's own MAX_WARNING_LOG_ENTRIES cap.
     private const val MAX_RESOLVED_KEPT = 30
+
+    // An unresolved entry older than this no longer blocks a NEW retention check for the
+    // same concept — a check the student skipped/abandoned days ago must not suppress
+    // retention for that concept forever.
+    private const val STALE_UNRESOLVED_MS = 3L * 24 * 60 * 60 * 1000
+
+    private const val KEY_LAST_GENERATION_ATTEMPT = "retention_last_generation_attempt_ms"
+    private const val GENERATION_INTERVAL_MS = 60L * 60 * 1000
 
     @Serializable
     data class RetentionSession(
@@ -145,8 +154,28 @@ object RetentionTaskLedger {
      * fresh daily re-rank can't pile up a second retention check for the same concept while
      * the first one's Testmate session is still unsubmitted.
      */
-    fun hasUnresolvedForConcept(conceptId: String): Boolean =
-        all().any { it.conceptId == conceptId && !it.evidenceImported }
+    fun hasUnresolvedForConcept(conceptId: String, now: Long = System.currentTimeMillis()): Boolean =
+        all().any {
+            it.conceptId == conceptId && !it.evidenceImported && now - it.createdAt < STALE_UNRESOLVED_MS
+        }
+
+    /** Retention tasks created for [dayKey] (any state) — daily spawn cap. */
+    fun createdTodayCount(dayKey: String): Int = all().count { it.dayKey == dayKey }
+
+    /** Unresolved, non-stale retention tasks — open-task cap. */
+    fun freshOpenCount(now: Long = System.currentTimeMillis()): Int =
+        all().count { !it.evidenceImported && now - it.createdAt < STALE_UNRESOLVED_MS }
+
+    /** Throttle for the (StudentModel-building) retention generation pass. */
+    fun shouldAttemptGeneration(now: Long, force: Boolean): Boolean {
+        if (force) return true
+        val last = CheckmatePrefs.getString(KEY_LAST_GENERATION_ATTEMPT, null)?.toLongOrNull() ?: 0L
+        return now - last >= GENERATION_INTERVAL_MS
+    }
+
+    fun markGenerationAttempt(now: Long) {
+        CheckmatePrefs.putString(KEY_LAST_GENERATION_ATTEMPT, now.toString())
+    }
 
     /** Entries with no Testmate session created yet — [com.checkmate.service.RetentionCheckManager]
      *  drives these through [com.checkmate.testmate.TestmateApi.createTargetedTest]. */
@@ -188,4 +217,60 @@ object RetentionTaskLedger {
     }
 
     fun entry(taskId: String): RetentionSession? = all().firstOrNull { it.taskId == taskId }
+
+    // ---- Concept-level Leitner boxes ([LeitnerSchedule]) ----
+    // One entry per concept, persisted at evidence-import time. nextDueAt is stored explicitly
+    // so a later change to the interval table never silently moves existing reviews.
+
+    @Serializable
+    data class LeitnerEntry(
+        val conceptId: String,
+        val box: Int = LeitnerSchedule.MIN_BOX,
+        val lastSeen: Long,
+        val nextDueAt: Long,
+        val answeredCount: Int = 0,
+        val correctCount: Int = 0
+    )
+
+    private const val KEY_LEITNER = "retention_leitner_boxes"
+
+    private fun allLeitner(): List<LeitnerEntry> =
+        CheckmatePrefs.getString(KEY_LEITNER, null)?.let {
+            try {
+                json.decodeFromString<List<LeitnerEntry>>(it)
+            } catch (e: Exception) {
+                Log.e(TAG, "corrupt leitner list, resetting: ${e.message}", e)
+                emptyList()
+            }
+        } ?: emptyList()
+
+    /** Persisted next-due time for [conceptId], or null if it has never had a retention check
+     *  evidence-imported (the scheduler then falls back to lastSeen + the box-1 interval). */
+    fun nextDueAtFor(conceptId: String): Long? =
+        allLeitner().firstOrNull { it.conceptId == conceptId }?.nextDueAt
+
+    fun boxFor(conceptId: String): Int =
+        allLeitner().firstOrNull { it.conceptId == conceptId }?.box ?: LeitnerSchedule.MIN_BOX
+
+    /**
+     * Applies one retention check's evidence to [conceptId]'s box. [answered] excludes skips;
+     * [correct] is the answered-and-correct subset. See [LeitnerSchedule.evaluate] for the
+     * promote/demote/inconclusive rules (skips never promote or demote).
+     */
+    fun recordEvidence(conceptId: String, answered: Int, correct: Int, now: Long) {
+        val existing = allLeitner()
+        val current = existing.firstOrNull { it.conceptId == conceptId }
+        val outcome = LeitnerSchedule.evaluate(current?.box ?: LeitnerSchedule.MIN_BOX, answered, correct, now)
+        val updated = LeitnerEntry(
+            conceptId = conceptId,
+            box = outcome.box,
+            lastSeen = now,
+            nextDueAt = outcome.nextDueAt,
+            answeredCount = (current?.answeredCount ?: 0) + answered,
+            correctCount = (current?.correctCount ?: 0) + correct
+        )
+        CheckmatePrefs.putString(KEY_LEITNER, json.encodeToString(existing.filter { it.conceptId != conceptId } + updated))
+        Log.d(TAG, "leitner: concept=$conceptId answered=$answered correct=$correct decided=${outcome.decided} " +
+            "box=${current?.box ?: LeitnerSchedule.MIN_BOX}->${outcome.box} nextDueAt=${outcome.nextDueAt}")
+    }
 }

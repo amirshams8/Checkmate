@@ -121,6 +121,13 @@ object LearningDecisionEngine {
 
     private const val DIAGNOSTIC_MINUTES = 15
     private const val RETENTION_TEST_MINUTES = 10
+
+    /** How many retention candidates [retentionReportFrom] returns — more than one so the
+     *  orchestrator's per-concept "already has an unresolved check" rejection can fall
+     *  through to the next concept instead of ending the walk. */
+    private const val MAX_RETENTION_CANDIDATES = 5
+
+    private const val MS_PER_DAY = 86_400_000.0
     private const val MOCK_MINUTES = 60
     private const val MAX_TARGETED_SET_MINUTES = 90
 
@@ -221,6 +228,74 @@ object LearningDecisionEngine {
             generatedAt = System.currentTimeMillis(),
             candidates = ranked
         )
+    }
+
+    /**
+     * Retention-only [DecisionReport], built independently of [decideFromReport]'s top-5
+     * repair-dominated ranking so retention can never be starved by (or blocked behind)
+     * gap-repair candidates/tasks. A concept qualifies when it has real attempts, a
+     * subject + chapter to build a Testmate session from, and is Leitner-due ([LeitnerSchedule]):
+     * [nextDueAtFor] (the persisted next-due time recorded when a retention check's evidence was
+     * imported) has passed, or — for a concept never checked — lastSeen plus the box-1 interval
+     * has. Any mastery qualifies, including below 83%. The decay equation
+     * ([RetentionEngine.retentionScore], mastery x e^(-days/halfLife)) is NOT the scheduler; it
+     * only ranks the due concepts (lowest decayed mastery first).
+     * Ranked by lowest decayed mastery (highest priorityScore first), then by the estimator's own expectedGain.
+     * Feed the result straight to `LearningInterventionOrchestrator.executeTopCandidate`;
+     * an all-retention report already bypasses the single-active-gap-concept guard.
+     */
+    fun retentionReportFrom(
+        report: PerformanceAnalyzer.PerformanceReport,
+        studentModel: StudentModel,
+        estimates: List<ScoreGainEstimator.ScoreGainEstimate>,
+        now: Long = System.currentTimeMillis(),
+        nextDueAtFor: (conceptId: String) -> Long? = { null }
+    ): DecisionReport {
+        val gainByConceptId = estimates.associate { it.conceptId to it.expectedGain }
+        val candidates = studentModel.concepts.values
+            .filter { isRetentionDue(it, now, nextDueAtFor) }
+            .map { snapshot ->
+                val lastSeen = snapshot.lastSeen ?: now
+                val daysSince = (now - lastSeen).coerceAtLeast(0L) / MS_PER_DAY
+                val decayedMastery = snapshot.mastery * RetentionEngine.retentionScore(snapshot.lastSeen, 1.0, now)
+                val label = snapshot.topic ?: snapshot.chapter ?: "this concept"
+                CandidateIntervention(
+                    intent = LearningInterventionIntent.SCHEDULE_RETENTION_TEST,
+                    conceptId = snapshot.conceptId,
+                    subject = snapshot.subject,
+                    chapter = snapshot.chapter,
+                    topic = snapshot.topic,
+                    durationMinutes = RETENTION_TEST_MINUTES,
+                    expectedGain = gainByConceptId[snapshot.conceptId] ?: 0.0,
+                    priorityScore = 1.0 - decayedMastery,
+                    rationale = "$label (%.0f%% mastery, ~%.0f%% after %.0f days of decay) — a short recall check before it fades."
+                        .format(snapshot.mastery * 100, decayedMastery * 100, daysSince)
+                )
+            }
+            .sortedWith(
+                compareByDescending<CandidateIntervention> { it.priorityScore }
+                    .thenByDescending { it.expectedGain }
+            )
+            .take(MAX_RETENTION_CANDIDATES)
+
+        return DecisionReport(
+            studentId = studentModel.studentId,
+            examType = report.examType,
+            generatedAt = now,
+            candidates = candidates
+        )
+    }
+
+    private fun isRetentionDue(
+        snapshot: ConceptSnapshot,
+        now: Long,
+        nextDueAtFor: (String) -> Long?
+    ): Boolean {
+        val lastSeen = snapshot.lastSeen ?: return false
+        if (snapshot.attemptCount <= 0) return false
+        if (snapshot.subject.isNullOrBlank() || snapshot.chapter.isNullOrBlank()) return false
+        val dueAt = nextDueAtFor(snapshot.conceptId) ?: LeitnerSchedule.initialDueAt(lastSeen)
+        return now >= dueAt
     }
 
     /**

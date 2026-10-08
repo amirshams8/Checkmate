@@ -365,6 +365,9 @@ class LearningInterventionOrchestrator(
         val retentionOnly = report.candidates.isNotEmpty() && report.candidates.all {
             it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
         }
+        // Retention candidates are never blocked by an unresolved gap-repair task — only
+        // the non-retention ones are. Narrowed below when a blocking task exists.
+        var walkCandidates = report.candidates
         val activeConceptId = GapTaskLedger.activeConceptId()
         if (activeConceptId != null && !retentionOnly) {
             val blockingTask = activeUnresolvedTask()
@@ -394,16 +397,25 @@ class LearningInterventionOrchestrator(
                         timestamp = now
                     )
                 }
-                olog("executeTopCandidate: BLOCKED by unresolved active task ${blockingTask.id} " +
-                    "(state=${blockingTask.state}) — no candidate evaluated")
-                return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
+                val retentionCandidates = report.candidates.filter {
+                    it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+                }
+                if (retentionCandidates.isEmpty()) {
+                    olog("executeTopCandidate: BLOCKED by unresolved active task ${blockingTask.id} " +
+                        "(state=${blockingTask.state}) — no candidate evaluated")
+                    return OrchestrationResult(OrchestrationOutcome.NoExecutableCandidate, rejections)
+                }
+                olog("executeTopCandidate: non-retention candidates BLOCKED by unresolved active task " +
+                    "${blockingTask.id} (state=${blockingTask.state}) — still walking " +
+                    "${retentionCandidates.size} retention candidate(s)")
+                walkCandidates = retentionCandidates
             } else {
                 olog("executeTopCandidate: active concept $activeConceptId has no unresolved task — not blocking")
             }
         }
 
-        report.candidates.forEachIndexed { index, candidate ->
-            val rank = index + 1
+        walkCandidates.forEachIndexed { _, candidate ->
+            val rank = report.candidates.indexOf(candidate) + 1
 
             val conceptId = candidate.conceptId
             // "Covered" means the gap was repaired — which is exactly when a retention check

@@ -21,6 +21,7 @@ import com.checkmate.learning.tutor.TutorSessionLedger
 import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
+import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.planner.model.StudyTask
 import com.checkmate.planner.model.TaskState
 import com.checkmate.psyche.BehaviorLedger
@@ -159,6 +160,10 @@ object GapTaskManager {
         resolveActiveConceptState(context)
         createTargetedTestIfNeeded(context)
 
+        // Retention checks spawn on their own pass: not behind the once-a-day repair gate,
+        // not blocked by an open gap-repair task, and not limited to high-mastery concepts.
+        generateRetentionIfNeeded(context, force)
+
         val todayKey = GapTaskLedger.todayKey()
         if (!force && GapTaskLedger.hasGeneratedToday(todayKey)) return
 
@@ -210,6 +215,51 @@ object GapTaskManager {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
         } finally {
             GapTaskLedger.markGeneratedToday(todayKey)
+        }
+    }
+
+    private const val MAX_NEW_RETENTION_PER_DAY = 2
+    private const val MAX_OPEN_RETENTION = 3
+
+    /**
+     * Independent retention spawn pass (runs every 15-min cycle, throttled to ~hourly by
+     * [RetentionTaskLedger.shouldAttemptGeneration]). Builds a retention-only report so
+     * repair candidates/tasks can neither outrank nor block it; concepts qualify at any
+     * mastery once Leitner-due (see [LearningDecisionEngine.retentionReportFrom]). Capped per day
+     * and by open tasks so the plan can't flood. [force] only bypasses the throttle.
+     * Never throws — a failure here must not stop the repair loop below it.
+     */
+    private suspend fun generateRetentionIfNeeded(context: Context, force: Boolean) {
+        try {
+            val now = System.currentTimeMillis()
+            val todayKey = GapTaskLedger.todayKey()
+            if (RetentionTaskLedger.createdTodayCount(todayKey) >= MAX_NEW_RETENTION_PER_DAY) return
+            if (RetentionTaskLedger.freshOpenCount(now) >= MAX_OPEN_RETENTION) return
+            if (!RetentionTaskLedger.shouldAttemptGeneration(now, force)) return
+            RetentionTaskLedger.markGenerationAttempt(now)
+
+            val studentModel = withContext(Dispatchers.IO) { StudentModelBuilder.build(context) }
+            if (studentModel.concepts.isEmpty()) return
+
+            val profile = ConsultationProfile.load()
+            val report = PerformanceAnalyzer.analyze(studentModel, profile.examTarget)
+            val estimates = ScoreGainEstimator.rankFromReport(report, studentModel)
+            val retentionReport = LearningDecisionEngine.retentionReportFrom(
+                report, studentModel, estimates, now,
+                nextDueAtFor = { RetentionTaskLedger.nextDueAtFor(it) }
+            )
+            if (retentionReport.candidates.isEmpty()) {
+                DebugTrail.d(TAG, "generateRetentionIfNeeded: no retention-eligible concepts")
+                return
+            }
+            DebugTrail.d(TAG, "generateRetentionIfNeeded: candidates = " +
+                retentionReport.candidates.joinToString { "${it.conceptId}:%.2f".format(it.priorityScore) })
+            val result = LearningInterventionOrchestrator.from(context).executeTopCandidate(retentionReport)
+            DebugTrail.d(TAG, "generateRetentionIfNeeded: outcome=${result.outcome}")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "generateRetentionIfNeeded failed: ${e.message}", e)
         }
     }
 

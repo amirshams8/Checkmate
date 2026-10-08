@@ -177,6 +177,18 @@ object RetentionCheckManager {
                 )
                 RetentionTaskLedger.markEvidenceImported(session.taskId)
                 DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
+                // Leitner box update — AFTER markEvidenceImported so a retry can never apply the same
+                // evidence twice. Skips are excluded from `answered`; fewer than 2 answered leaves
+                // the box untouched (see LeitnerSchedule.evaluate).
+                session.conceptId?.let { conceptId ->
+                    try {
+                        val answered = result.breakdown.count { it.selectedAnswer != null }
+                        val correct = result.breakdown.count { it.selectedAnswer != null && it.isCorrect == true }
+                        RetentionTaskLedger.recordEvidence(conceptId, answered, correct, System.currentTimeMillis())
+                    } catch (e: Exception) {
+                        DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
+                    }
+                }
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
             }

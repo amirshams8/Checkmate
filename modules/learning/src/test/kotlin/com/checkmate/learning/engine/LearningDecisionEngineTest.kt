@@ -1,5 +1,7 @@
 package com.checkmate.learning.engine
 
+import com.checkmate.learning.analytics.PerformanceAnalyzer
+import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.model.ConceptSnapshot
 import com.checkmate.learning.model.ErrorPatternSnapshot
 import com.checkmate.learning.model.OverallLearningState
@@ -245,5 +247,67 @@ class LearningDecisionEngineTest {
         assertTrue(report.candidates.size <= 5)
         val scores = report.candidates.map { it.priorityScore }
         assertEquals(scores.sortedDescending(), scores)
+    }
+
+    @Test
+    fun `retentionReportFrom spawns a retention check for a stale concept below the mastery threshold`() {
+        val now = 20L * 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-low", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val retention = LearningDecisionEngine.retentionReportFrom(report, model, estimates, now)
+
+        val low = retention.candidates.firstOrNull { it.conceptId == "c-low" }
+        assertTrue(low != null)
+        assertEquals(LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST, low!!.intent)
+        assertTrue(retention.candidates.all {
+            it.intent == LearningDecisionEngine.LearningInterventionIntent.SCHEDULE_RETENTION_TEST
+        })
+    }
+
+    @Test
+    fun `retentionReportFrom honours a persisted nextDueAt over lastSeen`() {
+        val now = 20L * 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-box", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val notYet = LearningDecisionEngine.retentionReportFrom(
+            report, model, estimates, now, nextDueAtFor = { now + 86_400_000L }
+        )
+        assertTrue(notYet.candidates.isEmpty())
+
+        val overdue = LearningDecisionEngine.retentionReportFrom(
+            report, model, estimates, now, nextDueAtFor = { if (it == "c-box") now - 1L else now + 86_400_000L }
+        )
+        assertEquals(listOf("c-box"), overdue.candidates.map { it.conceptId })
+    }
+
+    @Test
+    fun `retentionReportFrom skips concepts still inside the first Leitner interval`() {
+        val now = 1_000L + 86_400_000L
+        val model = studentModel(
+            filler() + concept(
+                id = "c-fresh", subject = "Physics", chapter = "Laws of Motion", topic = "Laws of Motion",
+                mastery = 0.5, attemptCount = 8
+            )
+        )
+        val report = PerformanceAnalyzer.analyze(model, "NEET")
+        val estimates = ScoreGainEstimator.rankFromReport(report, model)
+
+        val retention = LearningDecisionEngine.retentionReportFrom(report, model, estimates, now)
+
+        assertTrue(retention.candidates.isEmpty())
     }
 }
