@@ -9,6 +9,7 @@ import com.checkmate.learning.model.LearningIds
 import com.checkmate.learning.student.StudentModelBuilder
 import com.checkmate.planner.FreeSlotCalculator
 import com.checkmate.planner.PlanStore
+import com.checkmate.planner.intervention.GapTaskLedger
 import com.checkmate.planner.intervention.LearningInterventionOrchestrator
 import com.checkmate.planner.intervention.PolicyValidator
 import com.checkmate.planner.model.StudyTask
@@ -47,8 +48,12 @@ import java.util.concurrent.TimeUnit
  * still applies (one unresolved gap task at a time, covered concepts, escrow, policy), and a
  * refusal is reported back with the real reason so the AI can see why.
  *
- * SUPPORTED (plan edits): `update_task` and `delete_task` work ONLY on pending plain study tasks that an
- * AI assistant itself added (never the student's own tasks, never engine/repair tasks), and
+ * SUPPORTED (plan edits): `delete_task` works on any PENDING task (the same rule as the student's own
+ * delete in the app: ledgers are released exactly as [com.checkmate.ui.home.HomeViewModel.removeTask]
+ * does, so a removed repair/qbank task doesn't strand its concept or subject). `update_task` works on
+ * any PENDING task too, but an engine-owned task (repair/retention/qbank: not custom, or carrying a
+ * learning intent) can only be moved in time, never retitled or resized, mirroring the in-app edit rule
+ * and [decideScheduleTask]. Started, paused and finished tasks are never touched. And
  * `batch_schedule` applies up to [MAX_BATCH_ITEMS] creates/moves as ONE unit (all pass every check
  * against the plan-as-it-would-be, or nothing is written). `sync_now` pushes every snapshot at once.
  *
@@ -314,23 +319,23 @@ object GatewayRequestSync {
         else -> TaskType.PRACTICE
     }
 
-    /** A plain study task an AI assistant added. The only kind outside requests may edit or delete. */
-    private fun isAiStudyTask(t: StudyTask): Boolean = t.rationale.startsWith(AI_TASK_MARKER) && t.learningIntent == null
+    /** Checkmate's own engine task (repair / retention / qbank). Time may move; topic and length are Checkmate's. */
+    private fun isEngineTask(t: StudyTask): Boolean = !t.isCustom || t.learningIntent != null
 
     private fun decideDeleteTask(req: Pending): Decision {
         val p = req.payload
         val id = p.optStr("task_id") ?: return Decision(false, "The request has no task_id.", "MALFORMED")
         val task = PlanStore.getTodayTasksSnapshot_Sync().firstOrNull { it.id == id }
             ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
-        if (!isAiStudyTask(task)) {
-            return Decision(false, "Only plain study tasks that an AI assistant added can be deleted from outside the app.", "NOT_AI_TASK")
-        }
         if (task.state != TaskState.PENDING) {
             return Decision(false, "That task is ${task.state}; only pending tasks can be deleted.", "TASK_NOT_PENDING")
         }
         if (p.optBoolean("dry_run", false)) {
             return Decision(true, "Dry run OK: would delete ${task.subject}: ${task.topic}. Nothing was changed.", "DRY_RUN_OK", task.id)
         }
+        // Same release sequence as HomeViewModel.removeTask, so an outside delete behaves exactly like the student's own.
+        GapTaskLedger.releaseIfActiveTask(task.id)
+        QbankDailyTaskManager.releaseIfSessionTask(task.id)
         PlanStore.removeTask(task.id)
         return Decision(true, "Deleted ${task.subject}: ${task.topic} from today's plan.", "ALLOW", task.id)
     }
@@ -341,9 +346,6 @@ object GatewayRequestSync {
         val today = PlanStore.getTodayTasksSnapshot_Sync()
         val task = today.firstOrNull { it.id == id }
             ?: return Decision(false, "No task with that id in today's plan (it may belong to another day or have been removed).", "UNKNOWN_TASK_ID")
-        if (!isAiStudyTask(task)) {
-            return Decision(false, "Only plain study tasks that an AI assistant added can be edited from outside the app.", "NOT_AI_TASK")
-        }
         if (task.state != TaskState.PENDING) {
             return Decision(false, "That task is ${task.state}; only pending tasks can be edited.", "TASK_NOT_PENDING")
         }
@@ -354,6 +356,14 @@ object GatewayRequestSync {
             return Decision(false, "Duration must be $MIN_STUDY_MINUTES-$MAX_STUDY_MINUTES minutes (got $requestedMinutes).", "DURATION_OUT_OF_RANGE")
         }
         val newMinutes = requestedMinutes ?: task.durationMinutes
+        if (isEngineTask(task)) {
+            if (newTopic != task.topic) {
+                return Decision(false, "Checkmate wrote this task's topic itself; ask only for a new time.", "TOPIC_LOCKED")
+            }
+            if (newMinutes != task.durationMinutes) {
+                return Decision(false, "Checkmate sized this task itself; ask only for a new time, not a new length.", "DURATION_LOCKED")
+            }
+        }
         val requestedStart = p.optStr("scheduled_start_time")
         if (requestedStart != null && !HHMM.matches(requestedStart)) {
             return Decision(false, "'$requestedStart' is not a valid HH:mm time.", "INVALID_TIME")
