@@ -254,9 +254,12 @@ object UninstallGuard {
     // targetsCheckmate. Matching on these labels means the whole Developer
     // Options screen is guarded, not just the moment a toggle is flipped —
     // same "block the screen outright" precedent as "app info" in GUARD_KEYWORDS.
+    // "wireless debugging" is intentionally NOT listed: the owner needs it on for adb-based
+    // development/self-repair (grant WRITE_SECURE_SETTINGS, Jarvis). The Wireless debugging
+    // page itself no longer trips the guard; the main Developer Options list still does
+    // because it also shows the "USB debugging" row.
     val DEV_OPTIONS_KEYWORDS = listOf(
         "usb debugging",
-        "wireless debugging",
         "disable adb authorisation timeout",
         "disable adb authorization timeout"
     )
