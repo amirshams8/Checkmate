@@ -267,7 +267,8 @@ class AppAutomationService : AccessibilityService() {
         // 3rd try before acting.
         if (WorkModeManager.isInPostSkipLockdown() &&
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            pkg in WorkModeManager.getEscalationWatchlist()
+            pkg in WorkModeManager.getEscalationWatchlist() &&
+            pkg !in WorkModeManager.essentialPackages(applicationContext)
         ) {
             performGlobalAction(GLOBAL_ACTION_HOME)
             DistractionGuard.recordAppAttempt(this, pkg)
@@ -281,7 +282,9 @@ class AppAutomationService : AccessibilityService() {
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
 
             val blockedApps = WorkModeManager.getBlockedApps()
-            if (pkg in blockedApps) {
+            // essentialPackages() (launcher, dialer, Settings, Checkmate, ChatGPT, Claude) was
+            // defined but never consulted, so those exemptions never took effect.
+            if (pkg in blockedApps && pkg !in WorkModeManager.essentialPackages(applicationContext)) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
                 // Record attempt — alert guardian on 3rd
                 DistractionGuard.recordAppAttempt(this, pkg)
