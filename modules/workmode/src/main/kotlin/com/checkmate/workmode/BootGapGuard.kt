@@ -154,6 +154,14 @@ object BootGapGuard {
         Thread({ runLoop(app) }, "BootGapGuard").apply { isDaemon = true }.start()
     }
 
+    /** True once AppAutomationService has connected in this process (and not since died). */
+    fun isAccessibilityLive(): Boolean = accessibilityConnected
+
+    /** Call from AppAutomationService.onDestroy(): the watchdog is no longer live. */
+    fun onAccessibilityDisconnected() {
+        accessibilityConnected = false
+    }
+
     /**
      * Call from AppAutomationService.onServiceConnected(): the normal watchdog is live, so
      * the gap is over. Releases any overlay and flushes the deferred guardian alert.
@@ -368,7 +376,7 @@ object BootGapGuard {
         }
     }
 
-    private fun hasUsageAccess(app: Context): Boolean {
+    internal fun hasUsageAccess(app: Context): Boolean {
         val appOps = app.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
         val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             appOps.unsafeCheckOpNoThrow(

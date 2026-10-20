@@ -692,6 +692,7 @@ class AppAutomationService : AccessibilityService() {
 
     override fun onDestroy() {
         removeTouchBlocker()
+        BootGapGuard.onAccessibilityDisconnected()
         super.onDestroy()
     }
 }

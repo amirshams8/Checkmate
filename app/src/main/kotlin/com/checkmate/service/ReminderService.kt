@@ -131,6 +131,8 @@ class ReminderService : Service() {
                 step("RetentionCheckManager.evidencePoll") { RetentionCheckManager.evidencePollIfNeeded(applicationContext) }
                 // Mentor v2 (spec 3.5): best-effort remote-override poll — see OVERRIDE_URL note.
                 step("pollRemoteOverride") { pollRemoteOverride() }
+                // Watchdog health: self-repair, else alert the guardian (throttled to once per 6h).
+                step("watchdogCheck") { WatchdogMonitor.check(applicationContext) }
                 DebugTrail.d(TAG, "cycle END — sleeping 15 min")
                 delay(15 * 60 * 1000L) // check every 15 min
             }

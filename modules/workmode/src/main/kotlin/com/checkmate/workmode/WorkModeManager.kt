@@ -61,6 +61,7 @@ object WorkModeManager {
     // here rather than left to whatever the guardian remembers to type into
     // essential_apps_extra. Add more fixed exemptions the same way if needed.
     private const val CHATGPT_PKG = "com.openai.chatgpt"
+    private const val CLAUDE_PKG = "com.anthropic.claude"
 
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
@@ -368,6 +369,7 @@ object WorkModeManager {
 
         // Fixed doubt-solving exemption.
         result.add(CHATGPT_PKG)
+        result.add(CLAUDE_PKG)
 
         // Guardian-extendable list — same comma-separated storage pattern as
         // "escalation_watchlist" above.

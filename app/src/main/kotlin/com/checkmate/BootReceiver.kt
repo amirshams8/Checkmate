@@ -53,6 +53,12 @@ class BootReceiver : BroadcastReceiver() {
         // first and try/catch-wrapped so nothing later in this receiver can keep it from
         // arming, and it can never take the rest of the boot self-heal down with it.
         try {
+            com.checkmate.workmode.AccessibilityRepair.ensureEnabled(context)
+            com.checkmate.workmode.ForegroundPinGate.start(context)
+        } catch (e: Exception) {
+            Log.w("BootReceiver", "accessibility repair / PIN gate failed", e)
+        }
+        try {
             BootGapGuard.start(context)
         } catch (e: Exception) {
             Log.w("BootReceiver", "BootGapGuard failed to start", e)

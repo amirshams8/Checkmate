@@ -27,8 +27,10 @@ import com.checkmate.service.ScreenCaptureManager
 import com.checkmate.service.StudyStateSyncManager
 import com.checkmate.service.WorkModeTaskReconciler
 import com.checkmate.workmode.BootGapGuard
+import com.checkmate.workmode.AccessibilityRepair
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
+import com.checkmate.workmode.ForegroundPinGate
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
@@ -49,6 +51,20 @@ class CheckmateApp : Application() {
         // process can. It runs on its own threads, so the main thread being busy in this
         // method doesn't stall it. Only arms within a fresh-boot window, so ordinary
         // process restarts mid-day are untouched. try/catch so it can never break startup.
+        // Self-repair first (no-op without WRITE_SECURE_SETTINGS): if the watchdog was dropped,
+        // put it back before BootGapGuard decides whether there is a gap to cover.
+        try {
+            AccessibilityRepair.ensureEnabled(this)
+        } catch (e: Exception) {
+            Log.w("CheckmateApp", "AccessibilityRepair failed", e)
+        }
+        // Always-on PIN gate for the battery / Settings screens (independent of accessibility).
+        try {
+            ForegroundPinGate.start(this)
+        } catch (e: Exception) {
+            Log.w("CheckmateApp", "ForegroundPinGate failed to start", e)
+        }
+
         try {
             BootGapGuard.startIfFreshBoot(this)
         } catch (e: Exception) {

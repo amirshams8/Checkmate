@@ -459,6 +459,26 @@ object GuardianNotifier {
    }
 
    /**
+    * Periodic (WatchdogMonitor) counterpart of [notifyAccessibilityWatchdogDisabled]: the
+    * watchdog is off right now, not necessarily right after a reboot — e.g. Checkmate was
+    * force-stopped, which makes Android drop the service. [canSelfRepair] says whether
+    * WRITE_SECURE_SETTINGS is granted (if it is, a failed repair is unusual).
+    */
+   fun notifyWatchdogStillOff(context: Context, canSelfRepair: Boolean) {
+       val candidateName = ConsultationProfile.candidateDisplayName()
+       val msg = "🚨 Checkmate Alert: $candidateName's accessibility watchdog is OFF as of " +
+                 "${timeNow()} on ${dateToday()}. Checkmate may have been force-stopped or the " +
+                 "service switched off. " +
+                 (if (canSelfRepair) "Automatic re-enable was attempted and failed."
+                  else "Automatic re-enable is unavailable (WRITE_SECURE_SETTINGS not granted); " +
+                       "turn it back on in Settings → Accessibility.")
+       Log.w(TAG, "Accessibility watchdog found off (periodic check), canSelfRepair=$canSelfRepair")
+       if (TelegramAlertBot.getChatId() != null) {
+           Thread { TelegramAlertBot.sendAlert(context, msg) }.start()
+       }
+   }
+
+   /**
     * Generates a fresh 6-digit guardian PIN, stores only its hash on-device
     * (UninstallGuard.storeNewPinHash), and sends the plaintext PIN to the
     * guardian's Telegram chat — the only place it's ever visible. Whoever
