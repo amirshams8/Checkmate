@@ -27,8 +27,9 @@ import java.security.SecureRandom
  * None of this can survive Safe Mode, `adb uninstall`, or a factory reset —
  * those are OS-level and no on-device app can intercept them. Developer
  * Options is the one on-device path that leads there without a factory
- * reset or physical Safe Mode boot, so it's guarded too (see
- * DEV_OPTIONS_KEYWORDS below) even though it never mentions "Checkmate".
+ * reset or physical Safe Mode boot; it is intentionally left unguarded
+ * (see the note above DEVICE_ADMIN_PROMPT_KEYWORDS) so the owner keeps
+ * unrestricted adb access.
  */
 object UninstallGuard {
 
@@ -245,30 +246,11 @@ object UninstallGuard {
         return DEVICE_ADMIN_PROMPT_KEYWORDS.any { lower.contains(it) }
     }
 
-    // Developer Options rows that expose an ADB path. Enabling USB or Wireless
-    // debugging lets a student later run `adb uninstall`/`adb shell pm disable`
-    // from a computer, which bypasses the accessibility-service watchdog and
-    // the device-admin uninstall block entirely — neither of those OS-level
-    // paths ever surfaces "Checkmate" on screen, so like the device-admin
-    // prompt above this is matched name-agnostically rather than gated on
-    // targetsCheckmate. Matching on these labels means the whole Developer
-    // Options screen is guarded, not just the moment a toggle is flipped —
-    // same "block the screen outright" precedent as "app info" in GUARD_KEYWORDS.
-    // "wireless debugging" is intentionally NOT listed: the owner needs it on for adb-based
-    // development/self-repair (grant WRITE_SECURE_SETTINGS, Jarvis). The Wireless debugging
-    // page itself no longer trips the guard; the main Developer Options list still does
-    // because it also shows the "USB debugging" row.
-    val DEV_OPTIONS_KEYWORDS = listOf(
-        "usb debugging",
-        "disable adb authorisation timeout",
-        "disable adb authorization timeout"
-    )
-
-    /** True if this window is a Developer Options screen exposing USB/Wireless debugging. */
-    fun isDeveloperOptionsScreen(visibleText: String): Boolean {
-        val lower = visibleText.lowercase()
-        return DEV_OPTIONS_KEYWORDS.any { lower.contains(it) }
-    }
+    // Developer Options is intentionally NOT guarded: the owner needs unrestricted
+    // access to USB/Wireless debugging for adb-based development/self-repair (grant
+    // WRITE_SECURE_SETTINGS, Jarvis). Removing this guard does mean Developer Options
+    // is a possible on-device path to an `adb uninstall`/`adb shell pm disable` that
+    // skips the rest of this watchdog — a deliberate tradeoff, not an oversight.
 
     /**
      * Injected by CheckmateApp.onCreate so :workmode (and :automation, which

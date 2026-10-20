@@ -434,7 +434,8 @@ class AppAutomationService : AccessibilityService() {
         val isKnownSettingsSurface = pkg in UninstallGuard.WATCHED_PACKAGES
         val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate, isKnownSettingsSurface)
         val isDeviceAdminPrompt  = UninstallGuard.isDeviceAdminPrompt(text)
-        val isDevOptionsScreen   = UninstallGuard.isDeveloperOptionsScreen(text)
+        // Developer Options is intentionally unguarded — see UninstallGuard's note.
+        val isDevOptionsScreen   = false
 
         // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual keyword that
         // matched (or null) is the single most useful fact for this investigation: it
