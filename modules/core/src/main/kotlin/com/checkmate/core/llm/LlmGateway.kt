@@ -52,7 +52,7 @@ object LlmGateway {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .build()
 
     object VibeBuildModels {
@@ -249,38 +249,84 @@ object LlmGateway {
         }
     }
 
+    // FIX 1.6: Gemini mentor replies were randomly blank. Live-reproduced on-device:
+    // "gemini-flash-latest" returns HTTP 503 "high demand" in bursts, and with default thinking
+    // a reply can take ~45s. callGemini() made ONE attempt on ONE model and turned any
+    // non-200 into "" -> Mentor showed "No response. Check your API key in Settings." even
+    // though the key was valid (confirmed 200 via direct curl). Now: ordered model fallback,
+    // short retry on transient codes (429/500/503/504), thinkingLevel "low" to cut latency,
+    // and text parts are joined while skipping any "thought" parts.
+    private val GEMINI_MODELS = listOf(
+        "gemini-flash-latest",
+        "gemini-3-flash-preview",
+        "gemini-flash-lite-latest"
+    )
+    private val GEMINI_TRANSIENT = setOf(429, 500, 502, 503, 504)
+
     private fun callGemini(prompt: String, system: String, apiKey: String): String {
         val fullPrompt = if (system.isNotBlank()) "$system\n\n$prompt" else prompt
-        val body = JSONObject().apply {
+        fun bodyFor(withThinkingCfg: Boolean) = JSONObject().apply {
             put("contents", JSONArray().put(
                 JSONObject().put("parts", JSONArray().put(JSONObject().put("text", fullPrompt)))
             ))
+            if (withThinkingCfg) {
+                put("generationConfig", JSONObject().put(
+                    "thinkingConfig", JSONObject().put("thinkingLevel", "low")
+                ))
+            }
         }.toString().toRequestBody("application/json".toMediaType())
 
-        // FIX: gemini-1.5-flash-latest was retired by Google — all Gemini 1.0/1.5 models now
-        // return a hard 404 on every request. Switched to the "gemini-flash-latest" alias,
-        // which Google auto-updates to whatever the current stable Flash release is (currently
-        // Gemini 3.x), so this won't silently rot again next time a version gets retired.
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=$apiKey"
-        val req = Request.Builder().url(url)
-            .addHeader("Content-Type", "application/json")
-            .post(body).build()
-
-        return try {
-            val resp    = client.newCall(req).execute()
-            val bodyStr = resp.body?.string() ?: "{}"
-            if (!resp.isSuccessful) {
-                Log.e(TAG, "Gemini HTTP ${resp.code} body=$bodyStr")
-                return ""
+        for (model in GEMINI_MODELS) {
+            var withThinkingCfg = true
+            var attempt = 0
+            while (attempt < 2) {
+                attempt++
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                val req = Request.Builder().url(url)
+                    .addHeader("Content-Type", "application/json")
+                    .post(bodyFor(withThinkingCfg)).build()
+                try {
+                    val resp    = client.newCall(req).execute()
+                    val bodyStr = resp.body?.string() ?: "{}"
+                    if (resp.isSuccessful) {
+                        val text = parseGeminiText(bodyStr)
+                        if (text.isNotBlank()) return text
+                        Log.w(TAG, "Gemini $model returned 200 but no text (safety/empty) — trying next model")
+                        break
+                    }
+                    Log.e(TAG, "Gemini HTTP ${resp.code} model=$model attempt=$attempt body=$bodyStr")
+                    if (resp.code == 400 && withThinkingCfg && bodyStr.contains("hinking", ignoreCase = true)) {
+                        withThinkingCfg = false   // model doesn't accept thinkingLevel — retry plain
+                        attempt--
+                        continue
+                    }
+                    if (resp.code in GEMINI_TRANSIENT) {
+                        if (attempt < 2) { Thread.sleep(1500L * attempt); continue }
+                        break                     // still busy — fall through to next model
+                    }
+                    break                         // 400/401/403/404: next model (a bad key fails all, cheaply)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Gemini call failed model=$model attempt=$attempt: ${e.message}")
+                    if (attempt < 2) { Thread.sleep(1000L); continue }
+                    break
+                }
             }
-            val json = JSONObject(bodyStr)
-            json.getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts").getJSONObject(0)
-                .getString("text").trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "Gemini call failed: ${e.message}")
-            ""
         }
+        return ""
+    }
+
+    private fun parseGeminiText(bodyStr: String): String = try {
+        val parts = JSONObject(bodyStr).getJSONArray("candidates").getJSONObject(0)
+            .getJSONObject("content").getJSONArray("parts")
+        buildString {
+            for (i in 0 until parts.length()) {
+                val part = parts.getJSONObject(i)
+                if (part.optBoolean("thought", false)) continue
+                append(part.optString("text", ""))
+            }
+        }.trim()
+    } catch (e: Exception) {
+        Log.e(TAG, "Gemini parse failed: ${e.message}")
+        ""
     }
 }
