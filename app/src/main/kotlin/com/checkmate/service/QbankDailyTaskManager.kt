@@ -431,7 +431,8 @@ object QbankDailyTaskManager {
 
                     when (val practiceOutcome = TestmateApi.startQbankPractice(
                         chapter = chapter,
-                        questionCount = subjectCoverage.coverageTarget
+                        questionCount = subjectCoverage.coverageTarget,
+                        origin = "test_prep"
                     )) {
                         is TestmateQbankPracticeOutcome.Success -> {
                             val r = practiceOutcome.result
@@ -452,7 +453,7 @@ object QbankDailyTaskManager {
                             // gap-repair slot, it's a plain coverage-practice task.
                             val task = StudyTask(
                                 subject = subject,
-                                topic = "Q-bank: $chapter",
+                                topic = "Q-bank (test prep): $chapter",
                                 durationMinutes = (r.questionCount * MINUTES_PER_QUESTION)
                                     .coerceAtLeast(MIN_TASK_MINUTES),
                                 taskType = TaskType.PRACTICE
@@ -580,7 +581,7 @@ object QbankDailyTaskManager {
                     val r = outcome.result
                     val task = StudyTask(
                         subject = subject,
-                        topic = "Q-bank: $chapter" + (topicList.takeIf { it.isNotEmpty() }?.let { " — ${it.joinToString(", ")}" } ?: ""),
+                        topic = "Q-bank (check-in): $chapter" + (topicList.takeIf { it.isNotEmpty() }?.let { " — ${it.joinToString(", ")}" } ?: ""),
                         durationMinutes = (r.questionCount * MINUTES_PER_QUESTION).coerceAtLeast(MIN_TASK_MINUTES),
                         taskType = TaskType.PRACTICE
                     )

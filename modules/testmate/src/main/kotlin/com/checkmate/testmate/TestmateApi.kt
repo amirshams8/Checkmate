@@ -324,7 +324,8 @@ object TestmateApi {
         questionCount: Int? = null,
         durationSeconds: Int? = null,
         checkinChapter: String? = null,
-        topics: List<String>? = null
+        topics: List<String>? = null,
+        origin: String? = null // "test_prep" for the FT-schedule auto pick; check-in sessions are tagged server-side
     ): TestmateQbankPracticeOutcome = withContext(Dispatchers.IO) {
         val base = baseUrl() ?: return@withContext TestmateQbankPracticeOutcome.Error(
             "Set the Testmate base URL in Settings → Test Platform first."
@@ -353,6 +354,7 @@ object TestmateApi {
             questionCount?.let { put("question_count", it) }
             durationSeconds?.let { put("duration_seconds", it) }
             checkinChapter?.takeIf { it.isNotBlank() }?.let { put("checkin_chapter", it) }
+            origin?.takeIf { it.isNotBlank() }?.let { put("origin", it) }
         }
         val body = payload.toString().toRequestBody("application/json".toMediaType())
 
