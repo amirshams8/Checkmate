@@ -24,6 +24,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    the accessibility watchdog is NOT live, since the precise text-based guard handles
  *    Settings otherwise and a blanket Settings lock would be needlessly harsh.
  *
+ *  - [UNINSTALL_SURFACES] (system package-installer / uninstall-confirmation dialog, which is
+ *    where launcher long-press "Uninstall" and Settings "Uninstall" both end up): only while
+ *    the accessibility watchdog is NOT live.
+ *  - Work Mode blocked apps (and the post-skip escalation watchlist): only while the
+ *    accessibility watchdog is NOT live. AppAutomationService normally bounces these with
+ *    GLOBAL_ACTION_HOME; when that service is unbound/stopped the same blocklist used to be
+ *    wide open. This is the accessibility-free "app lock" for that case.
+ *
  * Correct guardian PIN -> UninstallGuard's normal 2-minute unlock window, gate stands down.
  * If no PIN has ever been generated there is nothing to type, so the battery screen is
  * bounced Home and Settings is left alone (no self-lockout).
@@ -47,6 +55,21 @@ object ForegroundPinGate {
     /** Gated regardless of accessibility state. */
     val ALWAYS_GATED = setOf("com.oplus.battery")
 
+    /** Hosts of the uninstall-confirmation dialog. Gated only while accessibility is down. */
+    val UNINSTALL_SURFACES = setOf(
+        "com.google.android.packageinstaller",
+        "com.android.packageinstaller",
+        "com.oplus.appdetail",
+        "com.coloros.packageinstaller"
+    )
+
+    const val REASON_GUARD = "guard"
+    const val REASON_BLOCKED_APP = "blocked_app"
+
+    private const val ESSENTIAL_CACHE_MS = 30_000L
+    @Volatile private var essentialCache: Set<String> = emptySet()
+    @Volatile private var essentialCacheAt = 0L
+
     private val running = AtomicBoolean(false)
 
     /** Idempotent. Safe to call from Application.onCreate / BootReceiver / services. */
@@ -58,7 +81,26 @@ object ForegroundPinGate {
 
     private fun isGated(pkg: String): Boolean =
         pkg in ALWAYS_GATED ||
-            (!BootGapGuard.isAccessibilityLive() && pkg in UninstallGuard.WATCHED_PACKAGES)
+            (!BootGapGuard.isAccessibilityLive() &&
+                (pkg in UninstallGuard.WATCHED_PACKAGES || pkg in UNINSTALL_SURFACES))
+
+    private fun essential(app: Context): Set<String> {
+        val now = SystemClock.elapsedRealtime()
+        if (now - essentialCacheAt > ESSENTIAL_CACHE_MS || essentialCache.isEmpty()) {
+            essentialCache = try { WorkModeManager.essentialPackages(app) } catch (_: Exception) { essentialCache }
+            essentialCacheAt = now
+        }
+        return essentialCache
+    }
+
+    /** Accessibility-free app lock: a Work Mode blocked app (or post-skip watchlist app) is in
+     *  front while the accessibility watchdog that would normally bounce it is not live. */
+    private fun isBlockedAppGated(app: Context, pkg: String): Boolean {
+        if (BootGapGuard.isAccessibilityLive()) return false
+        if (pkg in essential(app)) return false
+        if (WorkModeManager.isEnforcing() && pkg in WorkModeManager.getBlockedApps()) return true
+        return WorkModeManager.isInPostSkipLockdown() && pkg in WorkModeManager.getEscalationWatchlist()
+    }
 
     private fun loop(app: Context) {
         val usm = app.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
@@ -85,11 +127,13 @@ object ForegroundPinGate {
                     cursor = now - 1_000L
 
                     val pkg = foregroundPkg
-                    if (pkg != null && isGated(pkg) && !UninstallGuard.isUnlocked() && !UninstallGuard.hasRemoteOverride()) {
+                    val blockedApp = pkg != null && !isGated(pkg) && isBlockedAppGated(app, pkg)
+                    if (pkg != null && (isGated(pkg) || blockedApp) && !UninstallGuard.isUnlocked() && !UninstallGuard.hasRemoteOverride()) {
                         if (t - lastFiredAt >= REFIRE_MS) {
                             fireStreak = if (t - lastFiredAt <= ESCALATE_WITHIN_MS) fireStreak + 1 else 1
                             lastFiredAt = t
-                            fire(app, pkg, escalate = fireStreak >= 2)
+                            if (blockedApp) DistractionGuard.recordAppAttempt(app, pkg)
+                            fire(app, pkg, escalate = fireStreak >= 2, blockedApp = blockedApp)
                         }
                     } else {
                         fireStreak = 0
@@ -129,13 +173,14 @@ object ForegroundPinGate {
         return result
     }
 
-    private fun fire(app: Context, pkg: String, escalate: Boolean) {
+    private fun fire(app: Context, pkg: String, escalate: Boolean, blockedApp: Boolean = false) {
         val hasPin = UninstallGuard.hasPinConfigured()
-        UninstallGuard.logDebugTrail("PIN_GATE_FIRED pkg=$pkg hasPin=$hasPin escalate=$escalate")
+        UninstallGuard.logDebugTrail("PIN_GATE_FIRED pkg=$pkg hasPin=$hasPin escalate=$escalate blockedApp=$blockedApp")
 
         if (!hasPin) {
-            // Nothing to type: bounce the battery screen, leave blanket-gated Settings alone.
-            if (pkg in ALWAYS_GATED) goHome(app)
+            // Nothing to type: bounce the battery screen and blocked apps, leave blanket-gated
+            // Settings / installer alone (no self-lockout).
+            if (pkg in ALWAYS_GATED || blockedApp) goHome(app)
             return
         }
         try {
@@ -149,6 +194,7 @@ object ForegroundPinGate {
                             Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
                     )
                     .putExtra("gated_pkg", pkg)
+                    .putExtra("reason", if (blockedApp) REASON_BLOCKED_APP else REASON_GUARD)
             )
         } catch (e: Exception) {
             Log.w(TAG, "gate activity start failed", e)
@@ -159,7 +205,7 @@ object ForegroundPinGate {
         // activity never made it on screen: don't leave the screen exposed.
         if (escalate) goHome(app)
 
-        if (UninstallGuard.shouldAlert()) {
+        if (!blockedApp && UninstallGuard.shouldAlert()) {
             UninstallGuard.listener?.onGuardedScreenBlocked(app, "pin_gate_opened")
         }
     }

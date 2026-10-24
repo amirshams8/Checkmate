@@ -37,14 +37,16 @@ class PinGateActivity : Activity() {
             setPadding(pad, pad, pad, pad)
         }
 
+        val blockedApp = intent?.getStringExtra("reason") == "blocked_app"
         root.addView(TextView(this).apply {
-            text = "Guardian PIN required"
+            text = if (blockedApp) "App locked" else "Guardian PIN required"
             textSize = 22f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
         })
         root.addView(TextView(this).apply {
-            text = "This screen can stop or disable Checkmate."
+            text = if (blockedApp) "This app is blocked right now. Guardian PIN required to open it."
+                   else "This screen can stop or disable Checkmate."
             textSize = 14f
             setTextColor(Color.parseColor("#FFB0B3BA"))
             gravity = Gravity.CENTER
