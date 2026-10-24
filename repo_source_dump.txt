@@ -4276,6 +4276,8 @@ import java.util.concurrent.TimeUnit
  * and [decideScheduleTask]. Started, paused and finished tasks are never touched. And
  * `batch_schedule` applies up to [MAX_BATCH_ITEMS] creates/moves as ONE unit (all pass every check
  * against the plan-as-it-would-be, or nothing is written). `sync_now` pushes every snapshot at once.
+ * `realign_schedule` re-times every PENDING task back-to-back in its current order from a start time (default
+ * now), with no task ids in the request, so it can't go stale after a Testmate submit regenerates ids.
  *
  * SUPPORTED: `request_repair`; `create_task` with task_type repair or qbank_practice (through
  * the orchestrator) or `study` (a plain study block, see [decideCreateStudyTask]); and
@@ -4396,6 +4398,7 @@ object GatewayRequestSync {
         "update_task" -> decideUpdateTask(req)
         "delete_task" -> decideDeleteTask(req)
         "batch_schedule" -> decideBatchSchedule(req)
+        "realign_schedule" -> decideRealignSchedule(req)
         "sync_now" -> decideSyncNow(context)
         "dismiss_task" -> Decision(
             false,
@@ -4702,6 +4705,94 @@ object GatewayRequestSync {
         if (dry) return Decision(true, "Dry run OK: batch would apply ($summary). Nothing was changed.", "DRY_RUN_OK")
         PlanStore.saveTodayTasks(working)
         return Decision(true, "Batch applied ($summary).", "ALLOW")
+    }
+
+    /**
+     * Re-times today's PENDING tasks back-to-back, in their current order, from `start_time` (default: the
+     * next 5-minute mark after now). The request carries NO task ids, so it can't go stale when a Testmate
+     * submit regenerates them (the failure that made batch_schedule reject "no task with that id").
+     * Every task keeps its own length, so Checkmate-sized (DURATION_LOCKED) tasks stay legal; ACTIVE and
+     * PAUSED tasks stay where they are and count as busy time. Same slot rules as a move: study window and
+     * blocked slots (skipped only by `force`), never the past, midnight or another unfinished task.
+     * All-or-nothing: if any task has no room, nothing is written and the rejection names it.
+     */
+    private fun decideRealignSchedule(req: Pending): Decision {
+        val p = req.payload
+        val force = p.optBoolean("force", false)
+        val dry = p.optBoolean("dry_run", false)
+        val now = nowMinute()
+
+        val requested = p.optStr("start_time")
+        val cursor0: Int = if (requested != null) {
+            if (!HHMM.matches(requested)) return Decision(false, "'$requested' is not a valid HH:mm time.", "INVALID_TIME")
+            val s = FreeSlotCalculator.parseTimeOrNull(requested)
+                ?: return Decision(false, "'$requested' is not a valid HH:mm time.", "INVALID_TIME")
+            if (s <= now) {
+                return Decision(
+                    false,
+                    "$requested is not ahead of the current time (${FreeSlotCalculator.formatMinutes(now)}); choose a later time today.",
+                    "TIME_IN_PAST"
+                )
+            }
+            s
+        } else {
+            ((now / 5) + 1) * 5
+        }
+
+        val today = PlanStore.getTodayTasksSnapshot_Sync()
+        // Stable sort: timed tasks by start time, untimed ones after them in plan order.
+        val ordered = today
+            .filter { it.state == TaskState.PENDING }
+            .sortedBy { t -> t.scheduledStartTime?.let { FreeSlotCalculator.parseTimeOrNull(it) } ?: Int.MAX_VALUE }
+        if (ordered.isEmpty()) return Decision(false, "No pending tasks in today's plan to realign.", "NOTHING_TO_REALIGN")
+
+        // Pending tasks give up their old slots; ACTIVE/PAUSED ones stay put and block time.
+        val fixed = today.map { if (it.state == TaskState.PENDING) it.copy(scheduledStartTime = null) else it }
+        val free: List<FreeSlotCalculator.FreeSlot> = if (force) {
+            FreeSlotCalculator.subtractOccupied(listOf(FreeSlotCalculator.FreeSlot(0, MINUTES_PER_DAY)), occupiedRanges(null, fixed))
+        } else {
+            freeSlotsToday(null, fixed)
+        }
+
+        var cursor = cursor0
+        val placed = LinkedHashMap<String, Int>()
+        for (t in ordered) {
+            val slots = free.mapNotNull {
+                val s = maxOf(it.startMinute, cursor)
+                if (it.endMinute > s) FreeSlotCalculator.FreeSlot(s, it.endMinute) else null
+            }
+            val start = FreeSlotCalculator.firstFitStart(t.durationMinutes, slots)
+                ?: return Decision(
+                    false,
+                    "Realign rejected, nothing was applied. No room for ${t.subject}: ${t.topic} (${t.durationMinutes} min) " +
+                        "after ${FreeSlotCalculator.formatMinutes(cursor)}; ${placed.size} of ${ordered.size} tasks fit." +
+                        (if (force) "" else " An earlier start_time or force=true may help."),
+                    "NO_ROOM"
+                )
+            placed[t.id] = start
+            cursor = start + t.durationMinutes
+        }
+
+        val changed = ordered.count { FreeSlotCalculator.formatMinutes(placed.getValue(it.id)) != it.scheduledStartTime }
+        if (changed == 0) {
+            return Decision(false, "Every pending task is already lined up from ${FreeSlotCalculator.formatMinutes(cursor0)}.", "NO_OP_ALREADY_APPLIED")
+        }
+
+        val (ws, we) = studyWindow()
+        val forcedUsed = force && ordered.any {
+            val s = placed.getValue(it.id)
+            val e = s + it.durationMinutes
+            blockedOverlap(s, e) != null || s < ws || e > we
+        }
+        val forcedNote = if (forcedUsed) " (forced: study window / blocked slot overridden)" else ""
+        val lineup = ordered.joinToString("; ") { "${FreeSlotCalculator.formatMinutes(placed.getValue(it.id))} ${it.subject}: ${it.topic}" }
+        val head = "${ordered.size} tasks from ${FreeSlotCalculator.formatMinutes(cursor0)}, last ends ${FreeSlotCalculator.formatMinutes(cursor)}.$forcedNote"
+
+        if (dry) return Decision(true, "Dry run OK: would realign $head Nothing was changed. $lineup", "DRY_RUN_OK")
+        PlanStore.saveTodayTasks(
+            today.map { t -> placed[t.id]?.let { t.copy(scheduledStartTime = FreeSlotCalculator.formatMinutes(it)) } ?: t }
+        )
+        return Decision(true, "Realigned $head $lineup", "ALLOW")
     }
 
     /** Pushes every snapshot right now, so the AI's next reads (plan, mastery, interventions) are fresh. */
