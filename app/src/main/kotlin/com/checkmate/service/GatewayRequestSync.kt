@@ -966,8 +966,10 @@ object GatewayRequestSync {
         return saved
     }
 
+    // Same per-device switch as GatewaySync (see GatewaySync.PREF_ENABLED): off = never claim requests.
     private fun token(): String? =
-        CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
+        if (!CheckmatePrefs.getBoolean(GatewaySync.PREF_ENABLED, true)) null
+        else CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
 
     private fun JSONObject.optStr(key: String): String? =
         if (has(key) && !isNull(key)) optString(key).trim().takeIf { it.isNotBlank() && it != "null" } else null

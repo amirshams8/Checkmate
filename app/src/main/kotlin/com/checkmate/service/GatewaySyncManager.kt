@@ -150,8 +150,18 @@ object GatewaySync {
         return saved
     }
 
+    /**
+     * Per-device switch (Settings -> Test Platform). Default ON. When OFF this device neither pushes
+     * snapshots to the gateway nor answers AI requests (every push/poll path bails out when [token]
+     * is null), but keeps its Testmate token for tests/Q-bank and keeps task sync via the sync code.
+     * Exists so a second device on the same sync code (e.g. a tablet) can mirror the plan without
+     * competing with the phone as the gateway planner.
+     */
+    const val PREF_ENABLED = "gateway_enabled"
+
     private fun token(): String? =
-        CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
+        if (!CheckmatePrefs.getBoolean(PREF_ENABLED, true)) null
+        else CheckmatePrefs.getString(TestmateApi.PREF_TOKEN, null)?.trim()?.takeIf { it.isNotBlank() }
 
     private fun push(base: String, token: String, kind: String, payload: JSONObject): PushResult {
         payload.put("generated_ms", System.currentTimeMillis())

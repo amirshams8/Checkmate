@@ -1083,6 +1083,41 @@ private fun TestmateSettings() {
     var lastErrorAt by remember {
         mutableStateOf(CheckmatePrefs.getLong(GapTaskManager.PREF_TESTMATE_LAST_ERROR_AT, 0L))
     }
+    // Per-device gateway switch: off = this device doesn't push plan snapshots or answer AI
+    // planning requests (task sync and Testmate access are unaffected). See GatewaySync.PREF_ENABLED.
+    var gatewayEnabled by remember {
+        mutableStateOf(CheckmatePrefs.getBoolean(com.checkmate.service.GatewaySync.PREF_ENABLED, true))
+    }
+    Row(
+        modifier          = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("Gateway sync (AI planning)", fontSize = 14.sp, color = White90)
+            Text(
+                if (gatewayEnabled)
+                    "This device pushes its plan and answers AI scheduling requests"
+                else
+                    "Off — this device only mirrors tasks via the sync code; another device does the AI planning",
+                fontSize = 11.sp, color = White60
+            )
+        }
+        Switch(
+            checked         = gatewayEnabled,
+            onCheckedChange = {
+                gatewayEnabled = it
+                CheckmatePrefs.putBoolean(com.checkmate.service.GatewaySync.PREF_ENABLED, it)
+            },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor   = BgDark,
+                checkedTrackColor   = AccentGreen,
+                uncheckedThumbColor = White60,
+                uncheckedTrackColor = White10
+            )
+        )
+    }
+    HorizontalDivider(color = White10)
+
     if (lastError != null) {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
             Row(verticalAlignment = Alignment.Top) {
