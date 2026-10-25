@@ -2,16 +2,21 @@ package com.checkmate.automation
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.ScrollGuard
@@ -215,6 +220,159 @@ class AppAutomationService : AccessibilityService() {
         }
     }
 
+    // ── Blocked-app bounce + floating-window cover ──────────────────────────────
+    // LOOPHOLE (OnePlus/ColorOS floating windows): a blocked app opened — or pulled
+    // back up — as a floating window survived the single GLOBAL_ACTION_HOME this
+    // service used to send (Home does not close a floating window), and from then
+    // on it only emitted CONTENT_CHANGED, which the blocked-app check ignored. With
+    // a bit of effort the app was fully usable. Three layers now close it:
+    //   1. bounceBlockedApp(): Home twice, a beat apart (the first press can just
+    //      minimize/shrink the floating window; the second sends it away).
+    //   2. sweepBlockedWindows(): walks every visible accessibility window, not just
+    //      the active one, and finds blocked packages wherever they are drawn.
+    //   3. A touch-swallowing cover (TYPE_ACCESSIBILITY_OVERLAY) fitted exactly to the
+    //      surviving window's bounds, so it cannot be used even if the OEM refuses to
+    //      close it. It follows the window while it is moved/resized and is removed
+    //      the moment the window is gone.
+    private val BOUNCE_DEBOUNCE_MS = 900L
+    private val SWEEP_REPEAT_BOUNCE_MS = 3000L
+    private val DOUBLE_HOME_DELAY_MS = 350L
+    private val WINDOW_SWEEP_MIN_MS = 250L
+    private val WINDOW_SWEEP_RECHECK_MS = 700L
+
+    private val lastBounceAt = mutableMapOf<String, Long>()
+    private var lastWindowSweepAt = 0L
+    private var floatCoverView: TextView? = null
+    private val floatCoverRect = Rect()
+    private val sweepAgainRunnable = Runnable { sweepBlockedWindows(force = true) }
+
+    /**
+     * Sends the user Home twice for a blocked package and records the attempt.
+     * Debounced per package so event bursts from one foregrounding count once.
+     */
+    private fun bounceBlockedApp(pkg: String, minGapMs: Long) {
+        val now = SystemClock.uptimeMillis()
+        val last = lastBounceAt[pkg] ?: 0L
+        if (now - last < minGapMs) return
+        lastBounceAt[pkg] = now
+
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        touchBlockerHandler.postDelayed({ performGlobalAction(GLOBAL_ACTION_HOME) }, DOUBLE_HOME_DELAY_MS)
+        // Record attempt — alert guardian on 3rd
+        DistractionGuard.recordAppAttempt(this, pkg)
+    }
+
+    /**
+     * Looks at every visible window (not only the active one) for a blocked
+     * package. If found: bounce it, and cover it if it is not a plain full-screen
+     * window. Reschedules itself while a cover is up so a window that closes
+     * without an event can never leave a stuck cover behind.
+     */
+    private fun sweepBlockedWindows(force: Boolean = false) {
+        try {
+            val nowMs = SystemClock.uptimeMillis()
+            if (!force && nowMs - lastWindowSweepAt < WINDOW_SWEEP_MIN_MS) return
+            lastWindowSweepAt = nowMs
+            touchBlockerHandler.removeCallbacks(sweepAgainRunnable)
+
+            val blocked = WorkModeManager.getBlockedApps()
+            if (!WorkModeManager.isEnforcing() || blocked.isEmpty()) {
+                removeFloatCover()
+                return
+            }
+            val essential = WorkModeManager.essentialPackages(applicationContext)
+
+            var offender: String? = null
+            val union = Rect()
+            val tmp = Rect()
+            for (w in windows) {
+                val root = w.root ?: continue
+                val p = root.packageName?.toString()
+                @Suppress("DEPRECATION")
+                root.recycle()
+                if (p == null || p !in blocked || p in essential) continue
+                w.getBoundsInScreen(tmp)
+                if (tmp.isEmpty) continue
+                if (offender == null) union.set(tmp) else union.union(tmp)
+                offender = p
+            }
+
+            if (offender == null) {
+                removeFloatCover()
+                return
+            }
+
+            bounceBlockedApp(offender, SWEEP_REPEAT_BOUNCE_MS)
+
+            val dm = resources.displayMetrics
+            val screenArea = dm.widthPixels.toLong() * dm.heightPixels.toLong()
+            val isNearFullScreen = union.width().toLong() * union.height().toLong() >= screenArea * 9 / 10
+            if (isNearFullScreen) {
+                // A normal full-screen app: Home removes it, a cover would only flash.
+                removeFloatCover()
+            } else {
+                showFloatCover(union)
+            }
+            // Keep watching until the offending window is really gone.
+            touchBlockerHandler.postDelayed(sweepAgainRunnable, WINDOW_SWEEP_RECHECK_MS)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "sweepBlockedWindows failed", e)
+        }
+    }
+
+    private fun showFloatCover(r: Rect) {
+        val lp = WindowManager.LayoutParams(
+            r.width(),
+            r.height(),
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.OPAQUE
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = r.left
+        lp.y = r.top
+
+        val existing = floatCoverView
+        if (existing == null) {
+            val tv = TextView(this).apply {
+                text = "Blocked by Checkmate"
+                setTextColor(Color.WHITE)
+                setBackgroundColor(0xFF111111.toInt())
+                gravity = Gravity.CENTER
+                textSize = 16f
+            }
+            try {
+                windowManager.addView(tv, lp)
+                floatCoverView = tv
+                floatCoverRect.set(r)
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "float cover failed to add", e)
+            }
+        } else if (r != floatCoverRect) {
+            try {
+                windowManager.updateViewLayout(existing, lp)
+                floatCoverRect.set(r)
+            } catch (e: Exception) {
+                Log.w(GUARD_TAG, "float cover failed to update", e)
+            }
+        }
+    }
+
+    private fun removeFloatCover() {
+        touchBlockerHandler.removeCallbacks(sweepAgainRunnable)
+        val view = floatCoverView ?: return
+        floatCoverView = null
+        floatCoverRect.setEmpty()
+        try {
+            windowManager.removeView(view)
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "float cover failed to remove", e)
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
@@ -228,6 +386,17 @@ class AppAutomationService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+
+        // TYPE_WINDOWS_CHANGED carries no package name, so it has to be handled
+        // before the packageName guard below. It fires when a window is added,
+        // moved, resized or removed — which is exactly what a OnePlus/ColorOS
+        // floating window does, and the only signal we get when a blocked app
+        // that is already running is dragged back up into a floating window.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            if (WorkModeManager.isEnforcing() || floatCoverView != null) sweepBlockedWindows()
+            return
+        }
+
         val pkg = event.packageName?.toString() ?: return
 
         // ── Hardcoded schedule reconciliation ──────────────────────────────────
@@ -285,11 +454,26 @@ class AppAutomationService : AccessibilityService() {
             // essentialPackages() (launcher, dialer, Settings, Checkmate, ChatGPT, Claude) was
             // defined but never consulted, so those exemptions never took effect.
             if (pkg in blockedApps && pkg !in WorkModeManager.essentialPackages(applicationContext)) {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                // Record attempt — alert guardian on 3rd
-                DistractionGuard.recordAppAttempt(this, pkg)
+                // Double Home press (see bounceBlockedApp), then record the attempt —
+                // alert guardian on 3rd.
+                bounceBlockedApp(pkg, BOUNCE_DEBOUNCE_MS)
+                // A single Home does not dismiss a OnePlus/ColorOS floating window, so
+                // also cover any blocked window that survives it.
+                sweepBlockedWindows(force = true)
                 return
             }
+        }
+
+        // ── Work Mode: blocked app, floating-window loophole ─────────────────
+        // A blocked app opened as a floating window keeps emitting CONTENT_CHANGED
+        // (never STATE_CHANGED once it is up), and Home leaves the window alive. Any
+        // activity from a blocked package, or any window switch, re-checks the full
+        // window list. Throttled inside sweepBlockedWindows().
+        if (WorkModeManager.isEnforcing() &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+                    pkg in WorkModeManager.getBlockedApps()))) {
+            sweepBlockedWindows()
         }
 
         // ── Work Mode: blocked website check ─────────────────────────────────
@@ -692,10 +876,12 @@ class AppAutomationService : AccessibilityService() {
     override fun onInterrupt() {
         Log.d(TAG, "Service interrupted")
         removeTouchBlocker()
+        removeFloatCover()
     }
 
     override fun onDestroy() {
         removeTouchBlocker()
+        removeFloatCover()
         BootGapGuard.onAccessibilityDisconnected()
         super.onDestroy()
     }
