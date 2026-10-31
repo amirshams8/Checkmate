@@ -1,5 +1,6 @@
 package com.checkmate.learning.engine
 
+import com.checkmate.learning.analytics.ConceptWeightage
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
@@ -253,7 +254,7 @@ object LearningDecisionEngine {
     ): DecisionReport {
         val gainByConceptId = estimates.associate { it.conceptId to it.expectedGain }
         val candidates = studentModel.concepts.values
-            .filter { isRetentionDue(it, now, nextDueAtFor) }
+            .filter { isRetentionDue(it, report.examType, now, nextDueAtFor) }
             .map { snapshot ->
                 val lastSeen = snapshot.lastSeen ?: now
                 val daysSince = (now - lastSeen).coerceAtLeast(0L) / MS_PER_DAY
@@ -262,7 +263,7 @@ object LearningDecisionEngine {
                 CandidateIntervention(
                     intent = LearningInterventionIntent.SCHEDULE_RETENTION_TEST,
                     conceptId = snapshot.conceptId,
-                    subject = snapshot.subject,
+                    subject = resolvedSubject(snapshot, report.examType),
                     chapter = snapshot.chapter,
                     topic = snapshot.topic,
                     durationMinutes = RETENTION_TEST_MINUTES,
@@ -286,14 +287,35 @@ object LearningDecisionEngine {
         )
     }
 
+    /**
+     * BUGFIX (retention checks never spawn — subject is NULL for every real-imported concept):
+     * both Question writers (TestResultNormalizer, TargetedTestEvidenceImporter) never set
+     * `subject`, so MasteryEngine.recomputeAll copies null into concepts.subject and
+     * [ConceptSnapshot.subject] is null for essentially every practised concept. The raw
+     * `subject.isNullOrBlank()` gate in [isRetentionDue] therefore dropped every concept before
+     * the Leitner due-date check was ever reached ("no retention-eligible concepts" in the trail).
+     * [PerformanceAnalyzer] already solved the identical problem by resolving the subject through
+     * [ConceptWeightage.resolveWeightage]; this reuses that same resolution instead of inventing
+     * a new one. Falls back to the raw subject, and is null only when neither is available.
+     */
+    private fun resolvedSubject(snapshot: ConceptSnapshot, examType: String): String? {
+        snapshot.subject?.takeIf { it.isNotBlank() }?.let { return it }
+        val chapterKey = snapshot.chapter ?: snapshot.topic ?: ""
+        val topicKey = snapshot.topic ?: snapshot.chapter ?: ""
+        return ConceptWeightage.resolveWeightage(examType, snapshot.subject, chapterKey, topicKey)
+            .subjectResolved
+            ?.takeIf { it.isNotBlank() }
+    }
+
     private fun isRetentionDue(
         snapshot: ConceptSnapshot,
+        examType: String,
         now: Long,
         nextDueAtFor: (String) -> Long?
     ): Boolean {
         val lastSeen = snapshot.lastSeen ?: return false
         if (snapshot.attemptCount <= 0) return false
-        if (snapshot.subject.isNullOrBlank() || snapshot.chapter.isNullOrBlank()) return false
+        if (resolvedSubject(snapshot, examType).isNullOrBlank() || snapshot.chapter.isNullOrBlank()) return false
         val dueAt = nextDueAtFor(snapshot.conceptId) ?: LeitnerSchedule.initialDueAt(lastSeen)
         return now >= dueAt
     }

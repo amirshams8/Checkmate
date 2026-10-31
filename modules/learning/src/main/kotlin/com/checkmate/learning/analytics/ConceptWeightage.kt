@@ -120,6 +120,20 @@ object ConceptWeightage {
             // figure. Revisit if/when PYQWeightage ever gets topic-level (not just
             // chapter-level) granularity.
             normalize("Breathing & Exchange of Gases") to "Human Physiology",
+            // "Body Fluids & Circulation" is likewise a real topic WITHIN the canonical
+            // "Human Physiology" NTA unit, not a chapter of its own. Same DELIBERATE
+            // COARSE-BUCKET ALIAS treatment as Breathing above (listed in
+            // COARSE_BUCKET_ALIASES so confidence is forced to ESTIMATED): it
+            // over-attributes the whole unit's weight to one sub-topic. Added because
+            // it was the one practised concept resolveWeightage returned UNRESOLVED for,
+            // which made isRetentionDue drop it (blank resolved subject).
+            normalize("Body Fluids & Circulation") to "Human Physiology",
+            // BUGFIX (retention check never spawned for this chapter): "Body Fluids & Circulation"
+            // is a real topic WITHIN the canonical "Human Physiology" NTA unit, same shape as
+            // Breathing above. It had no exact key, alias or >=0.6 token overlap, so it resolved
+            // UNRESOLVED and was dropped from retention scheduling and subject rollups. Also listed in
+            // COARSE_BUCKET_ALIASES so its confidence is forced to ESTIMATED.
+            normalize("Body Fluids & Circulation") to "Human Physiology",
             // "Structural Organisation in Animals: Animal Tissues" is a real topic
             // WITHIN the canonical "Structural Organisation In Animals And Plants"
             // chapter (see ExamSyllabus — that chapter also covers plant
@@ -185,6 +199,7 @@ object ConceptWeightage {
      */
     private val COARSE_BUCKET_ALIASES: Set<String> = setOf(
         normalize("Breathing & Exchange of Gases"),
+        normalize("Body Fluids & Circulation"),
         normalize("Biomolecules-II (Proteins, types & functions), Lipids, Nucleic acids, Enzymes, Cofactors"),
         normalize("Structural Organisation in Animals: Animal Tissues")
     )
