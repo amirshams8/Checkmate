@@ -2,6 +2,8 @@ package com.checkmate.planner.intervention
 
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
+import org.json.JSONObject
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.engine.LeitnerSchedule
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -146,6 +148,19 @@ object RetentionTaskLedger {
         save(existing + entry)
         Log.d(TAG, "record: taskId=$taskId concept=${candidate.conceptId} chapter=${candidate.chapter}")
         bumpVersion()
+        // Telemetry (sidecar API.md): the Testmate session must exist within 60 s of the task.
+        // Missing values are omitted, never invented.
+        TelemetryClient.expect(
+            event = "RETENTION_CREATED", traceId = "retention-$taskId",
+            expect = "SESSION_STARTED", withinMs = 60_000L,
+            payload = JSONObject().apply {
+                put("task_id", taskId); put("day_key", dayKey)
+                entry.conceptId?.let { put("concept_id", it) }
+                entry.subject?.let { put("subject", it) }
+                entry.chapter?.let { put("chapter", it) }
+                entry.topic?.let { put("topic", it) }
+            }
+        )
     }
 
     /**
@@ -217,6 +232,10 @@ object RetentionTaskLedger {
     }
 
     fun entry(taskId: String): RetentionSession? = all().firstOrNull { it.taskId == taskId }
+
+    /** Read-only views for telemetry snapshots. */
+    fun allSessions(): List<RetentionSession> = all()
+    fun leitnerCount(): Int = allLeitner().size
 
     // ---- Concept-level Leitner boxes ([LeitnerSchedule]) ----
     // One entry per concept, persisted at evidence-import time. nextDueAt is stored explicitly

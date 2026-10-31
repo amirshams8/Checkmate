@@ -3,6 +3,10 @@ package com.checkmate.service
 import android.content.Context
 import com.checkmate.core.DebugTrail
 import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.TelemetryClient
+import com.checkmate.planner.intervention.GapTaskLedger
+import org.json.JSONArray
+import org.json.JSONObject
 import com.checkmate.planner.intervention.RetentionTaskLedger
 import com.checkmate.testmate.TestmateApi
 import com.checkmate.testmate.TestmateQuestionPool
@@ -37,6 +41,41 @@ import com.checkmate.testmate.TestmateTargetedTestOutcome
 object RetentionCheckManager {
 
     private const val TAG = "RetentionCheckManager"
+
+    /** State snapshot attached to failure events (sidecar API.md / DEBUG_SNAPSHOT shape). */
+    private fun snapshot(): JSONObject = JSONObject().apply {
+        put("ts_ms", System.currentTimeMillis())
+        put("retention_sessions", JSONArray().apply {
+            RetentionTaskLedger.allSessions().forEach { s ->
+                put(JSONObject().apply {
+                    put("taskId", s.taskId); put("dayKey", s.dayKey)
+                    s.conceptId?.let { put("conceptId", it) }
+                    s.subject?.let { put("subject", it) }
+                    s.chapter?.let { put("chapter", it) }
+                    s.topic?.let { put("topic", it) }
+                    s.testmateTestId?.let { put("testmateTestId", it) }
+                    s.testmateSessionId?.let { put("testmateSessionId", it) }
+                    put("evidenceImported", s.evidenceImported); put("createdAt", s.createdAt)
+                })
+            }
+        })
+        put("leitner_count", RetentionTaskLedger.leitnerCount())
+        GapTaskLedger.activeConceptId()?.let { put("active_gap_concept_id", it) }
+        GapTaskLedger.activeTaskId()?.let { put("active_gap_task_id", it) }
+        put("debug_trail_tail", JSONArray(DebugTrail.read().lines().takeLast(20)))
+    }
+
+    private fun failed(taskId: String, chapter: String?, topic: String?, message: String?) =
+        TelemetryClient.emit(
+            "SESSION_START_FAILED", "retention-$taskId", status = "error",
+            payload = JSONObject().apply {
+                put("task_id", taskId)
+                chapter?.let { put("chapter", it) }
+                topic?.let { put("topic", it) }
+                message?.let { put("error", it) }
+                put("snapshot", snapshot())
+            }
+        )
 
     // A retention check is a short recall probe, not a full repair set — sized to match
     // LearningDecisionEngine.RETENTION_TEST_MINUTES (10 min), the StudyTask duration a
@@ -73,6 +112,7 @@ object RetentionCheckManager {
             val chapter = session.chapter?.takeIf { it.isNotBlank() }
             if (chapter == null) {
                 DebugTrail.w(TAG, "createRetentionTestsIfNeeded: taskId=${session.taskId} has no chapter recorded, skipping")
+                failed(session.taskId, null, session.topic, "no chapter recorded")
                 continue
             }
             // Same "only forward topic when it's genuinely distinct from chapter" rule
@@ -109,6 +149,7 @@ object RetentionCheckManager {
                 )
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "createTargetedTest threw for taskId=${session.taskId}: ${e.message}", e)
+                failed(session.taskId, chapter, topic, e.message)
                 continue
             }
 
@@ -118,9 +159,18 @@ object RetentionCheckManager {
                         session.taskId, outcome.test.testId, outcome.test.sessionId
                     )
                     DebugTrail.d(TAG, "retention test ready: taskId=${session.taskId} session=${outcome.test.sessionId}")
+                    TelemetryClient.emit(
+                        "SESSION_STARTED", "retention-${session.taskId}",
+                        payload = JSONObject().apply {
+                            put("task_id", session.taskId)
+                            put("test_id", outcome.test.testId)
+                            put("session_id", outcome.test.sessionId)
+                        }
+                    )
                 }
                 is TestmateTargetedTestOutcome.Error -> {
                     DebugTrail.w(TAG, "createTargetedTest error for taskId=${session.taskId}: ${outcome.message}")
+                    failed(session.taskId, chapter, topic, outcome.message)
                 }
             }
         }
@@ -177,6 +227,19 @@ object RetentionCheckManager {
                 )
                 RetentionTaskLedger.markEvidenceImported(session.taskId)
                 DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
+                TelemetryClient.emit(
+                    "RETENTION_EVIDENCE_IMPORTED", "retention-${session.taskId}",
+                    payload = JSONObject().apply {
+                        put("task_id", session.taskId); put("session_id", sessionId)
+                        session.conceptId?.let {
+                            put("concept_id", it)
+                            put("leitner_box", RetentionTaskLedger.boxFor(it))
+                            RetentionTaskLedger.nextDueAtFor(it)?.let { due -> put("next_due_at", due) }
+                        }
+                        put("answered", result.breakdown.count { it.selectedAnswer != null })
+                        put("correct", result.breakdown.count { it.selectedAnswer != null && it.isCorrect == true })
+                    }
+                )
                 // Leitner box update — AFTER markEvidenceImported so a retry can never apply the same
                 // evidence twice. Skips are excluded from `answered`; fewer than 2 answered leaves
                 // the box untouched (see LeitnerSchedule.evaluate).
@@ -191,6 +254,14 @@ object RetentionCheckManager {
                 }
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
+                TelemetryClient.emit(
+                    "RETENTION_EVIDENCE_ERROR", "retention-${session.taskId}", status = "error",
+                    payload = JSONObject().apply {
+                        put("task_id", session.taskId); put("session_id", sessionId)
+                        e.message?.let { put("error", it) }
+                        put("snapshot", snapshot())
+                    }
+                )
             }
         }
     }
