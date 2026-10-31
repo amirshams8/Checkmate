@@ -3,6 +3,7 @@ package com.checkmate.service
 import android.content.Context
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.model.LearningIds
@@ -145,6 +146,12 @@ object GatewayRequestSync {
 
         var reported = 0
         for (req in pending) {
+            // Telemetry: one trace per gateway request. Pending until the report below lands;
+            // if it never does, the sidecar expires it into an alert.
+            TelemetryClient.expect(
+                "GW_REQUEST_RECEIVED", "gw-${req.id}", expect = "GW_REQUEST_REPORTED", withinMs = 180_000L,
+                payload = JSONObject().put("kind", req.kind)
+            )
             // A request already decided on a previous run whose report never reached the server
             // is re-reported as-is. It must NOT be run again: that could create a second task.
             val decision = handled(req.id) ?: try {
@@ -156,7 +163,21 @@ object GatewayRequestSync {
                 Decision(false, "Checkmate hit an internal error handling this request.", "INTERNAL_ERROR")
                     .also { remember(req.id, it) }
             }
-            if (report(base, token, req.id, decision)) reported += 1
+            TelemetryClient.emit(
+                "GW_REQUEST_DECIDED", "gw-${req.id}",
+                status = if (decision.policyDecision == "INTERNAL_ERROR") "error" else "ok",
+                payload = JSONObject().put("kind", req.kind).put("accepted", decision.accepted)
+                    .put("policy_decision", decision.policyDecision)
+            )
+            if (report(base, token, req.id, decision)) {
+                reported += 1
+                TelemetryClient.emit("GW_REQUEST_REPORTED", "gw-${req.id}")
+            } else {
+                TelemetryClient.emit(
+                    "GW_REPORT_FAILED", "gw-${req.id}", status = "error",
+                    payload = JSONObject().put("kind", req.kind)
+                )
+            }
         }
         return reported
     }
@@ -863,8 +884,10 @@ object GatewayRequestSync {
             client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     Log.w(TAG, "pull: HTTP ${resp.code}")
+                    markPullDown("http_${resp.code}")
                     return null
                 }
+                markPullUp()
                 val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("requests") ?: return emptyList()
                 (0 until arr.length()).mapNotNull { i ->
                     val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -882,8 +905,25 @@ object GatewayRequestSync {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "pull failed: ${e.message}")
+            markPullDown(e.javaClass.simpleName)
             null
         }
+    }
+
+    /** Telemetry: report the request-queue pull only when it flips between up and down, not on
+     *  every ~2 minute poll. */
+    @Volatile private var pullDown = false
+
+    private fun markPullDown(reason: String) {
+        if (pullDown) return
+        pullDown = true
+        TelemetryClient.emit("GW_PULL_FAILED", null, status = "error", payload = JSONObject().put("reason", reason))
+    }
+
+    private fun markPullUp() {
+        if (!pullDown) return
+        pullDown = false
+        TelemetryClient.emit("GW_PULL_RECOVERED", null)
     }
 
     private fun report(base: String, token: String, id: String, d: Decision): Boolean {

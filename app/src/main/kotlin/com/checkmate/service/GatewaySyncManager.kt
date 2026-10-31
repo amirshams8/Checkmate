@@ -13,6 +13,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.StudentModel
@@ -117,11 +118,20 @@ object GatewaySync {
                 PushResult.RETRYABLE_FAILURE
             }
         }
-        when {
+        val overall = when {
             PushResult.REJECTED in results -> PushResult.REJECTED
             PushResult.RETRYABLE_FAILURE in results -> PushResult.RETRYABLE_FAILURE
             else -> PushResult.OK
         }
+        // Telemetry: one event per full push (periodic worker cadence, not the 2-minute plan poll).
+        val perKind = JSONObject()
+        kinds.forEachIndexed { i, k -> perKind.put(k, results[i].name) }
+        TelemetryClient.emit(
+            "SYNC_PUSH_ALL", "sync-all",
+            status = if (overall == PushResult.OK) "ok" else "error",
+            payload = JSONObject().put("result", overall.name).put("kinds", perKind)
+        )
+        overall
     }
 
     /** Pushes only today's plan (+ constraints): one small PUT, cheap enough to repeat every couple of minutes. */
@@ -130,12 +140,31 @@ object GatewaySync {
         val token = token()
         if (base == null || token == null) return@withContext PushResult.SKIPPED_NOT_CONFIGURED
         try {
-            push(base, token, "today_plan", buildTodayPlan())
+            push(base, token, "today_plan", buildTodayPlan()).also { notePlanPush(it) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "today_plan quick push failed: ${e.message}")
+            notePlanPush(PushResult.RETRYABLE_FAILURE)
             PushResult.RETRYABLE_FAILURE
+        }
+    }
+
+    /** Telemetry for the 2-minute plan poll: only the up/down transitions, never every poll. */
+    @Volatile private var planPushDown = false
+
+    private fun notePlanPush(r: PushResult) {
+        if (r == PushResult.OK) {
+            if (planPushDown) {
+                planPushDown = false
+                TelemetryClient.emit("SYNC_PLAN_RECOVERED", "sync-plan")
+            }
+        } else if (!planPushDown) {
+            planPushDown = true
+            TelemetryClient.emit(
+                "SYNC_PLAN_FAILED", "sync-plan", status = "error",
+                payload = JSONObject().put("result", r.name)
+            )
         }
     }
 

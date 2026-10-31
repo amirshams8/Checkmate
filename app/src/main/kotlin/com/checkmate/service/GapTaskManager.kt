@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.checkmate.core.DebugTrail
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.learning.analytics.ConceptWeightage
@@ -218,10 +219,21 @@ object GapTaskManager {
             // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
             // startFromCandidate's own doc for which intents this actually applies to.
             (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
-                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
+                ?.let { created ->
+                    TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis())
+                    TelemetryClient.emit(
+                        "REPAIR_TASK_CREATED", "repair-${created.taskId}",
+                        payload = org.json.JSONObject().put("intent", created.candidate.intent.toString())
+                            .put("rank", created.rank)
+                    )
+                }
             createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+            TelemetryClient.emit(
+                "REPAIR_GENERATE_FAILED", null, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
         } finally {
             GapTaskLedger.markGeneratedToday(todayKey)
         }
@@ -737,6 +749,10 @@ object GapTaskManager {
         } catch (e: Exception) {
             DebugTrail.e(TAG, "createTargetedTest threw: ${e.message}", e)
             recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
+            TelemetryClient.emit(
+                "TARGETED_TEST_FAILED", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
             return
         }
 
@@ -756,10 +772,22 @@ object GapTaskManager {
                 }
                 GapTaskLedger.markActiveTestmateSessionChecked(todayKey)
                 clearTestmateError()
+                // Only a NEW session is news; an unchanged same-day re-verify would spam the table.
+                if (outcome.test.sessionId != existingSession) {
+                    TelemetryClient.emit(
+                        "TARGETED_TEST_READY", GapTaskLedger.activeTaskId()?.let { "repair-$it" },
+                        payload = org.json.JSONObject().put("session_id", outcome.test.sessionId)
+                            .put("test_id", outcome.test.testId)
+                    )
+                }
             }
             is TestmateTargetedTestOutcome.Error -> {
                 DebugTrail.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
                 recordTestmateError(outcome.message)
+                TelemetryClient.emit(
+                    "TARGETED_TEST_FAILED", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                    payload = org.json.JSONObject().put("error", outcome.message.take(120))
+                )
             }
         }
     }
@@ -899,8 +927,17 @@ object GapTaskManager {
                 attemptCount = result.attemptedCount,
                 correctCount = result.correctCount
             )
+            TelemetryClient.emit(
+                "REPAIR_EVIDENCE_IMPORTED", GapTaskLedger.activeTaskId()?.let { "repair-$it" },
+                payload = org.json.JSONObject().put("attempted", result.attemptedCount)
+                    .put("correct", result.correctCount)
+            )
         } catch (e: Exception) {
             DebugTrail.e(TAG, "evidence import failed: ${e.message}", e)
+            TelemetryClient.emit(
+                "REPAIR_EVIDENCE_ERROR", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
         }
     }
 
@@ -999,6 +1036,10 @@ days running — this is the escalated warning, not the first nudge. Rules:
         GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
         GapTaskLedger.markEscalatedToday(todayKey)
         DebugTrail.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+        TelemetryClient.emit(
+            "ESCALATION_SENT", "repair-$taskId",
+            payload = org.json.JSONObject().put("tier", tier).put("days_served", daysServed)
+        )
     }
 
     private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {

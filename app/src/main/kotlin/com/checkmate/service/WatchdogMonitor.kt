@@ -2,6 +2,7 @@ package com.checkmate.service
 
 import android.content.Context
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.workmode.AccessibilityRepair
 
 /**
@@ -19,6 +20,11 @@ object WatchdogMonitor {
         val now = System.currentTimeMillis()
         if (now - CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L) < ALERT_EVERY_MS) return
         CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
-        GuardianNotifier.notifyWatchdogStillOff(context, AccessibilityRepair.canRepair(context))
+        val canRepair = AccessibilityRepair.canRepair(context)
+        TelemetryClient.emit(
+            "WATCHDOG_OFF", "watchdog", status = "error",
+            payload = org.json.JSONObject().put("can_self_repair", canRepair)
+        )
+        GuardianNotifier.notifyWatchdogStillOff(context, canRepair)
     }
 }
