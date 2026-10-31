@@ -104,8 +104,11 @@ object DayHistorySyncManager {
                     "${checklists.length()} checklist days, ${checkins.length()} check-ins)"
             )
             response.close()
+            if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("SYNC_DAYHISTORY_PUSH")
+            else com.checkmate.core.SyncTelemetry.failed("SYNC_DAYHISTORY_PUSH", detail = "http_${response.code}")
         } catch (e: Exception) {
             Log.w(TAG, "pushHistory exception: ${e.message}")
+            com.checkmate.core.SyncTelemetry.failed("SYNC_DAYHISTORY_PUSH", e)
         }
     }
 

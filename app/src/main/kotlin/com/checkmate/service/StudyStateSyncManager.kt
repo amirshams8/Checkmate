@@ -83,8 +83,11 @@ object StudyStateSyncManager {
             val response = client.newCall(Request.Builder().url(STATE_URL).post(body).build()).execute()
             Log.d(TAG, "pushState: ${response.code}")
             response.close()
+            if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("SYNC_STUDYSTATE_PUSH")
+            else com.checkmate.core.SyncTelemetry.failed("SYNC_STUDYSTATE_PUSH", detail = "http_${response.code}")
         } catch (e: Exception) {
             Log.w(TAG, "pushState exception: ${e.message}")
+            com.checkmate.core.SyncTelemetry.failed("SYNC_STUDYSTATE_PUSH", e)
         }
     }
 

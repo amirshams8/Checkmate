@@ -613,10 +613,14 @@ object QbankDailyTaskManager {
     private fun recordError(message: String) {
         CheckmatePrefs.putString(PREF_LAST_ERROR, message)
         CheckmatePrefs.putLong(PREF_LAST_ERROR_AT, System.currentTimeMillis())
+        // Telemetry: reported once per outage (see SyncTelemetry), not on every 15-minute retry.
+        com.checkmate.core.SyncTelemetry.failed("QBANK_DAILY", detail = message.take(120))
     }
 
     private fun clearError() {
         CheckmatePrefs.remove(PREF_LAST_ERROR)
         CheckmatePrefs.remove(PREF_LAST_ERROR_AT)
+        com.checkmate.core.SyncTelemetry.ok("QBANK_DAILY")
+        com.checkmate.core.TelemetryClient.emit("QBANK_DAILY_GENERATED", "qbank-daily")
     }
 }

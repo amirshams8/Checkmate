@@ -89,8 +89,11 @@ object OutcomeLedgerSyncManager {
                 val response = client.newCall(Request.Builder().url(OUTCOMES_URL).post(body).build()).execute()
                 Log.d(TAG, "pushLedger: ${response.code} (${entries.size} entries)")
                 response.close()
+                if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("SYNC_OUTCOME_PUSH")
+                else com.checkmate.core.SyncTelemetry.failed("SYNC_OUTCOME_PUSH", detail = "http_${response.code}")
             } catch (e: Exception) {
                 Log.w(TAG, "pushLedger exception: ${e.message}")
+                com.checkmate.core.SyncTelemetry.failed("SYNC_OUTCOME_PUSH", e)
             }
         }
     }

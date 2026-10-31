@@ -80,8 +80,11 @@ object BehaviorLedgerSyncManager {
                 val response = client.newCall(Request.Builder().url(BEHAVIOR_URL).post(body).build()).execute()
                 Log.d(TAG, "pushLedger: ${response.code} (${events.size} events)")
                 response.close()
+                if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("SYNC_BEHAVIOR_PUSH")
+                else com.checkmate.core.SyncTelemetry.failed("SYNC_BEHAVIOR_PUSH", detail = "http_${response.code}")
             } catch (e: Exception) {
                 Log.w(TAG, "pushLedger exception: ${e.message}")
+                com.checkmate.core.SyncTelemetry.failed("SYNC_BEHAVIOR_PUSH", e)
             }
         }
     }

@@ -83,8 +83,11 @@ object TaskSyncManager {
             val response = client.newCall(Request.Builder().url(TASKS_URL).post(body).build()).execute()
             Log.d(TAG, "pushTasks: ${response.code}")
             response.close()
+            if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("SYNC_TASKS_PUSH")
+            else com.checkmate.core.SyncTelemetry.failed("SYNC_TASKS_PUSH", detail = "http_${response.code}")
         } catch (e: Exception) {
             Log.w(TAG, "pushTasks exception: ${e.message}")
+            com.checkmate.core.SyncTelemetry.failed("SYNC_TASKS_PUSH", e)
         }
     }
 

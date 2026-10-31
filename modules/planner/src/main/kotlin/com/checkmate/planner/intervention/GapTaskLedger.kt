@@ -194,6 +194,10 @@ object GapTaskLedger {
         CheckmatePrefs.putString(KEY_COVERED_CONCEPT_IDS, updated.joinToString(","))
         recordWarningOutcome(conceptId)
         if (CheckmatePrefs.getString(KEY_ACTIVE_CONCEPT_ID, null) == conceptId) {
+            com.checkmate.core.TelemetryClient.emit(
+                "REPAIR_CONCEPT_COVERED", activeTaskId()?.let { "repair-$it" },
+                payload = org.json.JSONObject().put("covered_total", updated.size)
+            )
             clearActive()
         }
         bumpVersion()
@@ -437,6 +441,10 @@ object GapTaskLedger {
         // recordServed) so a later overwrite is traceable to whichever call did it, instead
         // of only ever seeing round=1 at createTargetedTestIfNeeded with no history behind it.
         Log.d(TAG, "resetForNextRound: round $roundBefore -> $roundAfter for concept=${activeConceptId()}")
+        com.checkmate.core.TelemetryClient.emit(
+            "REPAIR_ROUND_ADVANCED", activeTaskId()?.let { "repair-$it" },
+            payload = org.json.JSONObject().put("round_before", roundBefore).put("round_after", roundAfter)
+        )
         // BUGFIX (r1-result-on-r2-screen, background-loop case): this is the write that
         // used to leave HomeScreen stranded — see the [version] field's own doc. Bumping
         // here means HomeViewModel is notified the moment the session/round fields go

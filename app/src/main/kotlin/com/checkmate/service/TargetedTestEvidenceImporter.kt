@@ -172,6 +172,12 @@ object TargetedTestEvidenceImporter {
                 "classified, ${recomputedMastery.size} concept(s) recomputed"
         )
 
+        com.checkmate.core.TelemetryClient.emit(
+            "TARGETED_EVIDENCE_WRITTEN", "evidence-$sessionId",
+            payload = org.json.JSONObject().put("questions", questions.size).put("attempts", attempts.size)
+                .put("events", events.size).put("concepts_recomputed", recomputedMastery.size)
+        )
+
         return ImportResult(
             alreadyImported = false,
             questionsWritten = questions.size,

@@ -106,8 +106,11 @@ object StatusReporter {
             ).execute()
             Log.d(TAG, "pushStatus: ${response.code}")
             response.close()
+            if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("HEALTH_STATUS_PUSH")
+            else com.checkmate.core.SyncTelemetry.failed("HEALTH_STATUS_PUSH", detail = "http_${response.code}")
         } catch (e: Exception) {
             Log.e(TAG, "pushStatus exception: ${e.message}")
+            com.checkmate.core.SyncTelemetry.failed("HEALTH_STATUS_PUSH", e)
         }
     }
 
@@ -136,8 +139,11 @@ object StatusReporter {
             ).execute()
             Log.d(TAG, "pushUsageReport: ${response.code}")
             response.close()
+            if (response.isSuccessful) com.checkmate.core.SyncTelemetry.ok("HEALTH_USAGE_PUSH")
+            else com.checkmate.core.SyncTelemetry.failed("HEALTH_USAGE_PUSH", detail = "http_${response.code}")
         } catch (e: Exception) {
             Log.e(TAG, "pushUsageReport exception: ${e.message}")
+            com.checkmate.core.SyncTelemetry.failed("HEALTH_USAGE_PUSH", e)
         }
     }
 }
