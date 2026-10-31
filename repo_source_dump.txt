@@ -3195,6 +3195,7 @@ import android.content.Context
 import android.util.Log
 import com.checkmate.core.DebugTrail
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.llm.LlmGateway
 import com.checkmate.learning.analytics.ConceptWeightage
@@ -3409,10 +3410,21 @@ object GapTaskManager {
             // own "terminal session is free, non-terminal is AlreadyActive" semantics, and
             // startFromCandidate's own doc for which intents this actually applies to.
             (orchestrationResult.outcome as? LearningInterventionOrchestrator.OrchestrationOutcome.Created)
-                ?.let { created -> TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis()) }
+                ?.let { created ->
+                    TutorSessionLedger.startFromCandidate(created.candidate, System.currentTimeMillis())
+                    TelemetryClient.emit(
+                        "REPAIR_TASK_CREATED", "repair-${created.taskId}",
+                        payload = org.json.JSONObject().put("intent", created.candidate.intent.toString())
+                            .put("rank", created.rank)
+                    )
+                }
             createTargetedTestIfNeeded(context)
         } catch (e: Exception) {
             DebugTrail.e(TAG, "generateIfNeeded failed: ${e.message}", e)
+            TelemetryClient.emit(
+                "REPAIR_GENERATE_FAILED", null, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
         } finally {
             GapTaskLedger.markGeneratedToday(todayKey)
         }
@@ -3928,6 +3940,10 @@ object GapTaskManager {
         } catch (e: Exception) {
             DebugTrail.e(TAG, "createTargetedTest threw: ${e.message}", e)
             recordTestmateError("Unexpected error: ${e.message ?: "unknown"}")
+            TelemetryClient.emit(
+                "TARGETED_TEST_FAILED", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
             return
         }
 
@@ -3947,10 +3963,22 @@ object GapTaskManager {
                 }
                 GapTaskLedger.markActiveTestmateSessionChecked(todayKey)
                 clearTestmateError()
+                // Only a NEW session is news; an unchanged same-day re-verify would spam the table.
+                if (outcome.test.sessionId != existingSession) {
+                    TelemetryClient.emit(
+                        "TARGETED_TEST_READY", GapTaskLedger.activeTaskId()?.let { "repair-$it" },
+                        payload = org.json.JSONObject().put("session_id", outcome.test.sessionId)
+                            .put("test_id", outcome.test.testId)
+                    )
+                }
             }
             is TestmateTargetedTestOutcome.Error -> {
                 DebugTrail.w(TAG, "createTargetedTest error for concept=$conceptId: ${outcome.message}")
                 recordTestmateError(outcome.message)
+                TelemetryClient.emit(
+                    "TARGETED_TEST_FAILED", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                    payload = org.json.JSONObject().put("error", outcome.message.take(120))
+                )
             }
         }
     }
@@ -4090,8 +4118,17 @@ object GapTaskManager {
                 attemptCount = result.attemptedCount,
                 correctCount = result.correctCount
             )
+            TelemetryClient.emit(
+                "REPAIR_EVIDENCE_IMPORTED", GapTaskLedger.activeTaskId()?.let { "repair-$it" },
+                payload = org.json.JSONObject().put("attempted", result.attemptedCount)
+                    .put("correct", result.correctCount)
+            )
         } catch (e: Exception) {
             DebugTrail.e(TAG, "evidence import failed: ${e.message}", e)
+            TelemetryClient.emit(
+                "REPAIR_EVIDENCE_ERROR", GapTaskLedger.activeTaskId()?.let { "repair-$it" }, status = "error",
+                payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
+            )
         }
     }
 
@@ -4190,6 +4227,10 @@ days running — this is the escalated warning, not the first nudge. Rules:
         GapTaskLedger.logWarningSent(conceptId, todayKey, daysServed, tier)
         GapTaskLedger.markEscalatedToday(todayKey)
         DebugTrail.d(TAG, "escalation sent: tier=$tier daysServed=$daysServed concept=$conceptId")
+        TelemetryClient.emit(
+            "ESCALATION_SENT", "repair-$taskId",
+            payload = org.json.JSONObject().put("tier", tier).put("days_served", daysServed)
+        )
     }
 
     private suspend fun buildEscalationMessage(tier: Int, daysServed: Int): String {
@@ -4233,6 +4274,7 @@ package com.checkmate.service
 import android.content.Context
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.LearningDecisionEngine
 import com.checkmate.learning.model.LearningIds
@@ -4375,6 +4417,12 @@ object GatewayRequestSync {
 
         var reported = 0
         for (req in pending) {
+            // Telemetry: one trace per gateway request. Pending until the report below lands;
+            // if it never does, the sidecar expires it into an alert.
+            TelemetryClient.expect(
+                "GW_REQUEST_RECEIVED", "gw-${req.id}", expect = "GW_REQUEST_REPORTED", withinMs = 180_000L,
+                payload = JSONObject().put("kind", req.kind)
+            )
             // A request already decided on a previous run whose report never reached the server
             // is re-reported as-is. It must NOT be run again: that could create a second task.
             val decision = handled(req.id) ?: try {
@@ -4386,7 +4434,21 @@ object GatewayRequestSync {
                 Decision(false, "Checkmate hit an internal error handling this request.", "INTERNAL_ERROR")
                     .also { remember(req.id, it) }
             }
-            if (report(base, token, req.id, decision)) reported += 1
+            TelemetryClient.emit(
+                "GW_REQUEST_DECIDED", "gw-${req.id}",
+                status = if (decision.policyDecision == "INTERNAL_ERROR") "error" else "ok",
+                payload = JSONObject().put("kind", req.kind).put("accepted", decision.accepted)
+                    .put("policy_decision", decision.policyDecision)
+            )
+            if (report(base, token, req.id, decision)) {
+                reported += 1
+                TelemetryClient.emit("GW_REQUEST_REPORTED", "gw-${req.id}")
+            } else {
+                TelemetryClient.emit(
+                    "GW_REPORT_FAILED", "gw-${req.id}", status = "error",
+                    payload = JSONObject().put("kind", req.kind)
+                )
+            }
         }
         return reported
     }
@@ -5093,8 +5155,10 @@ object GatewayRequestSync {
             client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     Log.w(TAG, "pull: HTTP ${resp.code}")
+                    markPullDown("http_${resp.code}")
                     return null
                 }
+                markPullUp()
                 val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("requests") ?: return emptyList()
                 (0 until arr.length()).mapNotNull { i ->
                     val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -5112,8 +5176,25 @@ object GatewayRequestSync {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "pull failed: ${e.message}")
+            markPullDown(e.javaClass.simpleName)
             null
         }
+    }
+
+    /** Telemetry: report the request-queue pull only when it flips between up and down, not on
+     *  every ~2 minute poll. */
+    @Volatile private var pullDown = false
+
+    private fun markPullDown(reason: String) {
+        if (pullDown) return
+        pullDown = true
+        TelemetryClient.emit("GW_PULL_FAILED", null, status = "error", payload = JSONObject().put("reason", reason))
+    }
+
+    private fun markPullUp() {
+        if (!pullDown) return
+        pullDown = false
+        TelemetryClient.emit("GW_PULL_RECOVERED", null)
     }
 
     private fun report(base: String, token: String, id: String, d: Decision): Boolean {
@@ -5222,6 +5303,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.learning.engine.MasteryEngine
 import com.checkmate.learning.model.StudentModel
@@ -5326,11 +5408,20 @@ object GatewaySync {
                 PushResult.RETRYABLE_FAILURE
             }
         }
-        when {
+        val overall = when {
             PushResult.REJECTED in results -> PushResult.REJECTED
             PushResult.RETRYABLE_FAILURE in results -> PushResult.RETRYABLE_FAILURE
             else -> PushResult.OK
         }
+        // Telemetry: one event per full push (periodic worker cadence, not the 2-minute plan poll).
+        val perKind = JSONObject()
+        kinds.forEachIndexed { i, k -> perKind.put(k, results[i].name) }
+        TelemetryClient.emit(
+            "SYNC_PUSH_ALL", "sync-all",
+            status = if (overall == PushResult.OK) "ok" else "error",
+            payload = JSONObject().put("result", overall.name).put("kinds", perKind)
+        )
+        overall
     }
 
     /** Pushes only today's plan (+ constraints): one small PUT, cheap enough to repeat every couple of minutes. */
@@ -5339,12 +5430,31 @@ object GatewaySync {
         val token = token()
         if (base == null || token == null) return@withContext PushResult.SKIPPED_NOT_CONFIGURED
         try {
-            push(base, token, "today_plan", buildTodayPlan())
+            push(base, token, "today_plan", buildTodayPlan()).also { notePlanPush(it) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "today_plan quick push failed: ${e.message}")
+            notePlanPush(PushResult.RETRYABLE_FAILURE)
             PushResult.RETRYABLE_FAILURE
+        }
+    }
+
+    /** Telemetry for the 2-minute plan poll: only the up/down transitions, never every poll. */
+    @Volatile private var planPushDown = false
+
+    private fun notePlanPush(r: PushResult) {
+        if (r == PushResult.OK) {
+            if (planPushDown) {
+                planPushDown = false
+                TelemetryClient.emit("SYNC_PLAN_RECOVERED", "sync-plan")
+            }
+        } else if (!planPushDown) {
+            planPushDown = true
+            TelemetryClient.emit(
+                "SYNC_PLAN_FAILED", "sync-plan", status = "error",
+                payload = JSONObject().put("result", r.name)
+            )
         }
     }
 
@@ -10150,6 +10260,7 @@ package com.checkmate.service
 
 import android.content.Context
 import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
 import com.checkmate.workmode.AccessibilityRepair
 
 /**
@@ -10167,7 +10278,12 @@ object WatchdogMonitor {
         val now = System.currentTimeMillis()
         if (now - CheckmatePrefs.getLong(KEY_LAST_ALERT, 0L) < ALERT_EVERY_MS) return
         CheckmatePrefs.putLong(KEY_LAST_ALERT, now)
-        GuardianNotifier.notifyWatchdogStillOff(context, AccessibilityRepair.canRepair(context))
+        val canRepair = AccessibilityRepair.canRepair(context)
+        TelemetryClient.emit(
+            "WATCHDOG_OFF", "watchdog", status = "error",
+            payload = org.json.JSONObject().put("can_self_repair", canRepair)
+        )
+        GuardianNotifier.notifyWatchdogStillOff(context, canRepair)
     }
 }
 
