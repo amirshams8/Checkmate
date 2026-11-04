@@ -932,6 +932,11 @@ object GapTaskManager {
                 payload = org.json.JSONObject().put("attempted", result.attemptedCount)
                     .put("correct", result.correctCount)
             )
+            // AUTO-CLEAR (claude9, per sir): evidence just landed, so resolve the repair
+            // task right now instead of waiting for the student to press DONE or for a
+            // manual repair-session report import. Runs AFTER the telemetry emit above
+            // because resolveDoneConcept may reset the ledger.
+            autoResolveAfterEvidence(context)
         } catch (e: Exception) {
             DebugTrail.e(TAG, "evidence import failed: ${e.message}", e)
             TelemetryClient.emit(
@@ -939,6 +944,17 @@ object GapTaskManager {
                 payload = org.json.JSONObject().put("error", e.javaClass.simpleName)
             )
         }
+    }
+
+    /** Marks the active repair task DONE (evidence already imported) and runs the normal
+     *  threshold check via [resolveDoneConcept]. Safe to call repeatedly; no-op when the
+     *  ledger has no active concept/task/dayKey. */
+    private suspend fun autoResolveAfterEvidence(context: Context) {
+        val conceptId = GapTaskLedger.activeConceptId() ?: return
+        val taskId = GapTaskLedger.activeTaskId() ?: return
+        val dayKey = GapTaskLedger.activeTaskDayKey() ?: return
+        PlanStore.markTaskInDay(dayKey, taskId, TaskState.DONE)
+        resolveDoneConcept(context, conceptId, dayKey)
     }
 
     // ── Escalating skip/stall warning ───────────────────────────────────────
