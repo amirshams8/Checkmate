@@ -80,6 +80,11 @@ enum class TestmateQuestionPool {
     SKIPPED,
     /** WRONG + SKIPPED combined — the default; matches the doc's own example. */
     WRONG_SKIPPED,
+    /** Previously answered correctly (latest attempt) — pure recall probe. */
+    CORRECT,
+    /** Retention-check mix: mostly previously-correct questions (oldest-attempted first),
+     *  topped up with wrong/skipped. Used by RetentionCheckManager. */
+    RETENTION,
     /** Never attempted by this student before, same chapter/topic — used as a standalone
      *  pool request, or automatically by the server as backfill when WRONG/SKIPPED/
      *  WRONG_SKIPPED don't have enough candidates to fill questionCount. */

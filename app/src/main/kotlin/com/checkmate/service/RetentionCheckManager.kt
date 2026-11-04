@@ -93,7 +93,10 @@ object RetentionCheckManager {
     // (testmate2.vercel.app) — that's a Testmate-side change, out of scope for this
     // Checkmate-client-only pass, and NOT something to route around with client-side
     // filtering of Testmate's response (Testmate selects the question set server-side).
-    private val RETENTION_POOL = TestmateQuestionPool.WRONG_SKIPPED
+    // UPDATE (claude8): Testmate's /api/tests/targeted now has a RETENTION pool (commit 8820f0c):
+    // mostly previously-correct questions, oldest-attempted first, topped up with wrong/skipped.
+    // The honest-gap note above is closed by this change.
+    private val RETENTION_POOL = TestmateQuestionPool.RETENTION
 
     /**
      * For every RETENTION CHECK task that doesn't have a Testmate session yet, requests one.
