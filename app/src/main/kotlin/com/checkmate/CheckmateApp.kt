@@ -5,7 +5,9 @@ import android.content.Context
 import android.util.Log
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
+import com.checkmate.core.TelemetryClient
 import com.checkmate.core.tts.CheckmateTTS
+import org.json.JSONObject
 import com.checkmate.planner.intervention.InterventionGuardianBridge
 import com.checkmate.planner.intervention.InterventionGuardianGateway
 import com.checkmate.planner.intervention.InterventionNotificationBridge
@@ -41,6 +43,36 @@ class CheckmateApp : Application() {
     override fun onCreate() {
         super.onCreate()
         CheckmatePrefs.init(this)
+
+        // CRASH TELEMETRY (sir's request, msg 3438): forward every uncaught exception to the
+        // sidecar (TelemetryClient, source=checkmate) as an APP_CRASH event, so a crash shows
+        // up in diag_tail without needing logcat/adb. Installed first, before any other init
+        // below, so an exception thrown by that init is still caught. Always chains to the
+        // previous handler (the OS default) afterward — this never swallows a crash or changes
+        // how the process dies, it only reports it first. TelemetryClient.emit() is normally
+        // fire-and-forget on its own background thread, but the process is about to be killed
+        // by the chained handler, so this gives that thread a short, bounded window (500 ms) to
+        // actually flush the HTTP POST before we hand off — acceptable here since the app is
+        // already crashing and nothing else is waiting on this thread.
+        try {
+            val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                try {
+                    val payload = JSONObject()
+                        .put("thread", thread.name)
+                        .put("exception", throwable.javaClass.name)
+                        .put("message", (throwable.message ?: "").take(500))
+                        .put("stack", Log.getStackTraceString(throwable).take(4000))
+                    TelemetryClient.emit("APP_CRASH", null, status = "error", payload = payload)
+                    Thread.sleep(500)
+                } catch (_: Throwable) {
+                    // telemetry must never block or alter crash handling
+                }
+                previousHandler?.uncaughtException(thread, throwable)
+            }
+        } catch (e: Exception) {
+            Log.w("CheckmateApp", "crash telemetry hook failed to install", e)
+        }
 
         // BUGFIX (Force Stop still reachable for ~30s after a restart — v2): the first
         // fix armed BootGapGuard from BootReceiver, but BOOT_COMPLETED is delivered only
