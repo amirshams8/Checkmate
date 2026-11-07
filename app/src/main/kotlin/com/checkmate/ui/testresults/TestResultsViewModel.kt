@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.ConsultationProfile
+import com.checkmate.core.TelemetryClient
 import com.checkmate.learning.analytics.PerformanceAnalyzer
 import com.checkmate.learning.analytics.ScoreGainEstimator
 import com.checkmate.learning.analytics.ScorePredictor
@@ -173,7 +174,7 @@ class TestResultsViewModel : ViewModel() {
                 // Persistence has committed — this is final regardless of what
                 // buildPerformanceReport below does with it.
                 _state.update { it.copy(importing = false, importResult = result, importError = null) }
-                buildPerformanceReport(context, result.examType, result.alreadyImported)
+                buildPerformanceReport(context, result.examType, result.alreadyImported, source)
             } catch (e: Exception) {
                 Log.e(TAG, "Report import failed: ${e.message}", e)
                 _state.update {
@@ -226,7 +227,9 @@ class TestResultsViewModel : ViewModel() {
      * no path back to importReport's own try/catch and can't turn a successful
      * import into a failed one.
      */
-    private fun buildPerformanceReport(context: Context, examType: String?, alreadyImported: Boolean) {
+    private fun buildPerformanceReport(
+        context: Context, examType: String?, alreadyImported: Boolean, source: String
+    ) {
         if (examType == null) {
             // DIAGNOSTIC (surgical trace for "import succeeds but no task appears"):
             // this branch alone means orchestration never even had a decisionReport to
@@ -262,6 +265,54 @@ class TestResultsViewModel : ViewModel() {
                             "stake=${it.marksAtStakeTotal} gap=${it.marksAtStakeGap}"
                     }} candidates=${decisionReport.candidates.size}"
                 )
+                // RICHER TELEMETRY (sir 4668/4704/4716: "report.md import doesn't create any
+                // repair candidate" / "for external report" / "I think it's due to repair
+                // candidate being full, ie max 10"). The DIAGNOSTIC log above only ever showed
+                // the FINAL candidate count, never which estimate got cut or why, so the "pool
+                // full" theory was unverifiable from logcat (which this device suppresses for
+                // non-system apps anyway — see executeTopIntervention's own note). This reports
+                // the full estimate ranking through TelemetryClient (reaches the Termux sidecar,
+                // not just on-device prefs) so a silent drop is visible without a repro session:
+                // every ScoreGainEstimator estimate, each one's own examRelevance/expectedGain,
+                // and whether it actually made the final decisionReport.candidates cut — so
+                // "zero expectedGain" (examRelevance=0 -> UNRESOLVED PYQ weightage, e.g. an
+                // external-report chapter name that doesn't match ExamSyllabus) can be told
+                // apart from "positive gain but pushed out by CONCEPT_CANDIDATE_POOL=10 or
+                // MAX_CANDIDATES=5" (LearningDecisionEngine's own two caps) at a glance.
+                run {
+                    val finalConceptIds = decisionReport.candidates.mapNotNull { it.conceptId }.toSet()
+                    val estimateRows = org.json.JSONArray()
+                    estimates.forEachIndexed { rank, e ->
+                        estimateRows.put(
+                            org.json.JSONObject()
+                                .put("rank", rank)
+                                .put("conceptId", e.conceptId)
+                                .put("chapter", e.chapter)
+                                .put("topic", e.topic)
+                                .put("mastery", e.mastery)
+                                .put("examRelevance", e.examRelevance)
+                                .put("expectedGain", e.expectedGain)
+                                .put("inPool10", rank < 10)
+                                .put("inFinalCandidates", e.conceptId in finalConceptIds)
+                        )
+                    }
+                    val zeroGainCount = estimates.count { it.expectedGain <= 0.0 }
+                    val zeroExamRelevanceCount = estimates.count { it.examRelevance <= 0.0 }
+                    val payload = org.json.JSONObject()
+                        .put("source", source)
+                        .put("examType", examType)
+                        .put("estimateCount", estimates.size)
+                        .put("candidateCount", decisionReport.candidates.size)
+                        .put("zeroExpectedGainCount", zeroGainCount)
+                        .put("zeroExamRelevanceCount", zeroExamRelevanceCount)
+                        .put("estimates", estimateRows)
+                    CheckmatePrefs.putString("debug_last_candidate_diagnostic", payload.toString())
+                    TelemetryClient.emit(
+                        "REPAIR_CANDIDATE_DIAGNOSTIC", traceId = examType,
+                        status = if (decisionReport.candidates.isEmpty()) "empty" else "ok",
+                        payload = payload
+                    )
+                }
                 _state.update {
                     it.copy(
                         analyzing = false, performanceReport = report,
