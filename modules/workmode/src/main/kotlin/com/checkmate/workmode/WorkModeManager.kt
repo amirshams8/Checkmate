@@ -8,6 +8,8 @@ import android.telecom.TelecomManager
 import com.checkmate.core.CheckmatePrefs
 import com.checkmate.core.CheckmateState
 import com.checkmate.core.StudyMode
+import com.checkmate.core.TelemetryClient
+import org.json.JSONObject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -103,6 +105,11 @@ object WorkModeManager {
         CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, source)
         _isActive.value = true
         startService(context)
+        TelemetryClient.emit(
+            "WORKMODE_ACTIVATED", null,
+            payload = JSONObject().put("source", source)
+                .put("in_window", WorkModeSchedule.isWithinScheduledWindow())
+        )
     }
 
     /**
@@ -126,12 +133,17 @@ object WorkModeManager {
             // natural-end auto-release check never matches, and blocking silently
             // continues past the hardcoded window until manually toggled off.
             CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
+            TelemetryClient.emit(
+                "WORKMODE_DEACTIVATE_REFUSED", null, status = "refused",
+                payload = JSONObject().put("reason", "scheduled_window_in_force")
+            )
             return false
         }
         CheckmateState.setMode(context, StudyMode.NORMAL)
         CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, "")
         _isActive.value = false
         context.stopService(Intent(context, WorkModeService::class.java))
+        TelemetryClient.emit("WORKMODE_DEACTIVATED", null)
         return true
     }
 
@@ -207,6 +219,10 @@ object WorkModeManager {
             .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
         val until = System.currentTimeMillis() + minutes * 60 * 1000L
         CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+        TelemetryClient.emit(
+            "POST_SKIP_LOCKDOWN_STARTED", null,
+            payload = JSONObject().put("minutes", minutes).put("until_ms", until)
+        )
     }
 
     /** True while a post-skip lockdown window is active. AppAutomationService checks this
