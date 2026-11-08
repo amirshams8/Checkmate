@@ -2,18 +2,14 @@ package com.checkmate.planner.intervention
 
 /**
  * RetentionClearPolicy — pure decision for auto-clearing a RETENTION CHECK task once its
- * Testmate evidence has been imported, with no manual report import or manual "Done" tap.
+ * submitted Testmate result has been imported, with no manual report import or manual "Done" tap.
  *
- * Before this, [com.checkmate.service.RetentionCheckManager.evidencePollIfNeeded] imported
- * the evidence and updated the Leitner box but never marked the retention StudyTask DONE, so
- * a submitted retention test could stay PENDING (and later look overdue). Repair tasks
- * already auto-clear via GapTaskManager.autoResolveAfterEvidence.
- *
- * Rule: the task is cleared (DONE) as soon as the student actually answered at least one
- * question — the check happened. Whether the concept is back above the mastery threshold is
- * reported (telemetry) but does not keep the task open: when mastery is still below the
- * threshold, RetentionEngine/LearningDecisionEngine re-queue the concept on their own next
- * pass, same as before.
+ * Rule (Sir's decision): the task is cleared (DONE) only when the student actually answered at
+ * least one question AND the concept's mastery is at or above the mastery threshold (0.83).
+ * Below the threshold — or when mastery cannot be read — the task stays open, so a retention
+ * check that did not demonstrate recall is not silently closed. The reason is reported in the
+ * RETENTION_RESOLVED telemetry. (Earlier behaviour cleared on any answered question and only
+ * logged the mastery; that is replaced by this rule.)
  *
  * Android-free so it runs as a plain JVM unit test.
  */
@@ -34,6 +30,13 @@ object RetentionClearPolicy {
         else -> Outcome.BELOW_THRESHOLD
     }
 
-    /** The StudyTask is marked DONE for every outcome except [Outcome.NOT_SUBMITTED]. */
-    fun shouldMarkDone(outcome: Outcome): Boolean = outcome != Outcome.NOT_SUBMITTED
+    /** The StudyTask is marked DONE only for [Outcome.MASTERED]; every other outcome leaves it open. */
+    fun shouldMarkDone(outcome: Outcome): Boolean = outcome == Outcome.MASTERED
+
+    /** Short machine-readable reason a task was left open, or null when it is cleared. */
+    fun notClearedReason(outcome: Outcome, mastery: Double?): String? = when (outcome) {
+        Outcome.MASTERED -> null
+        Outcome.NOT_SUBMITTED -> "nothing_answered"
+        Outcome.BELOW_THRESHOLD -> if (mastery == null) "mastery_unknown" else "below_threshold"
+    }
 }

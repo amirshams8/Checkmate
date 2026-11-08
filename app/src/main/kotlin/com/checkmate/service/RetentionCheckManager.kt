@@ -107,12 +107,13 @@ object RetentionCheckManager {
     private val RETENTION_POOL = TestmateQuestionPool.RETENTION
 
     /**
-     * Marks the retention StudyTask DONE once its Testmate evidence is imported and the student
-     * actually answered something, and emits RETENTION_RESOLVED {mastery, threshold, outcome}.
+     * Marks the retention StudyTask DONE only when the student answered something AND the
+     * concept's mastery is at or above [MasteryEngine.MASTERY_THRESHOLD] (see
+     * [RetentionClearPolicy]); below the threshold, or with mastery unreadable, the task stays
+     * open. Emits RETENTION_RESOLVED {mastery, threshold, outcome, task_marked_done, reason}.
      * Mastery is read the same way GapTaskManager.resolveDoneConcept reads it (masteryDao
-     * getByConcept) and only reported: below the threshold the task is still DONE and the
-     * decision engine re-queues the concept on its own pass. Never throws — a failure here must
-     * not undo the evidence import above it.
+     * getByConcept). No manual report import or Done tap is involved. Never throws — a failure
+     * here must not undo the evidence import above it.
      */
     private suspend fun autoClearRetentionTask(
         context: Context,
@@ -136,7 +137,8 @@ object RetentionCheckManager {
             if (RetentionClearPolicy.shouldMarkDone(outcome)) {
                 marked = PlanStore.markTaskInDay(session.dayKey, session.taskId, TaskState.DONE)
             }
-            DebugTrail.d(TAG, "autoClear: taskId=${session.taskId} outcome=$outcome mastery=$mastery marked=$marked")
+            val reason = RetentionClearPolicy.notClearedReason(outcome, mastery)
+            DebugTrail.d(TAG, "autoClear: taskId=${session.taskId} outcome=$outcome mastery=$mastery marked=$marked reason=$reason")
             TelemetryClient.emit(
                 "RETENTION_RESOLVED", "retention-${session.taskId}",
                 payload = JSONObject().apply {
@@ -147,6 +149,7 @@ object RetentionCheckManager {
                     put("answered", answered)
                     put("outcome", outcome.name.lowercase())
                     put("task_marked_done", marked)
+                    reason?.let { put("reason", it) }
                 }
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -313,9 +316,10 @@ object RetentionCheckManager {
                         DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
                     }
                 }
-                // Auto-clear: the evidence is in, so the retention task no longer needs a manual
-                // Done tap (repair tasks already do this in GapTaskManager.autoResolveAfterEvidence).
-                // After markEvidenceImported, so a retry never re-runs it for the same session.
+                // Auto-clear: the submitted result is in, so a retention task that reached the
+                // mastery threshold needs no manual Done tap or report import; below the threshold
+                // it stays open (RetentionClearPolicy). After markEvidenceImported, so a retry
+                // never re-runs it for the same session.
                 autoClearRetentionTask(
                     context, session,
                     answered = result.breakdown.count { it.selectedAnswer != null }
