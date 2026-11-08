@@ -4,7 +4,15 @@ import android.content.Context
 import com.checkmate.core.DebugTrail
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.TelemetryClient
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
+import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.RetentionClearPolicy
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import com.checkmate.planner.intervention.RetentionTaskLedger
@@ -97,6 +105,56 @@ object RetentionCheckManager {
     // mostly previously-correct questions, oldest-attempted first, topped up with wrong/skipped.
     // The honest-gap note above is closed by this change.
     private val RETENTION_POOL = TestmateQuestionPool.RETENTION
+
+    /**
+     * Marks the retention StudyTask DONE once its Testmate evidence is imported and the student
+     * actually answered something, and emits RETENTION_RESOLVED {mastery, threshold, outcome}.
+     * Mastery is read the same way GapTaskManager.resolveDoneConcept reads it (masteryDao
+     * getByConcept) and only reported: below the threshold the task is still DONE and the
+     * decision engine re-queues the concept on its own pass. Never throws — a failure here must
+     * not undo the evidence import above it.
+     */
+    private suspend fun autoClearRetentionTask(
+        context: Context,
+        session: RetentionTaskLedger.RetentionSession,
+        answered: Int
+    ) {
+        try {
+            val mastery = session.conceptId?.let { conceptId ->
+                try {
+                    withContext(Dispatchers.IO) {
+                        LearningDatabase.getInstance(context).masteryDao()
+                            .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+                    }?.mastery
+                } catch (e: Exception) {
+                    DebugTrail.w(TAG, "autoClear mastery lookup failed for concept=$conceptId: ${e.message}")
+                    null
+                }
+            }
+            val outcome = RetentionClearPolicy.decide(answered, mastery, MasteryEngine.MASTERY_THRESHOLD)
+            var marked = false
+            if (RetentionClearPolicy.shouldMarkDone(outcome)) {
+                marked = PlanStore.markTaskInDay(session.dayKey, session.taskId, TaskState.DONE)
+            }
+            DebugTrail.d(TAG, "autoClear: taskId=${session.taskId} outcome=$outcome mastery=$mastery marked=$marked")
+            TelemetryClient.emit(
+                "RETENTION_RESOLVED", "retention-${session.taskId}",
+                payload = JSONObject().apply {
+                    put("task_id", session.taskId)
+                    session.conceptId?.let { put("concept_id", it) }
+                    mastery?.let { put("mastery", it) }
+                    put("threshold", MasteryEngine.MASTERY_THRESHOLD)
+                    put("answered", answered)
+                    put("outcome", outcome.name.lowercase())
+                    put("task_marked_done", marked)
+                }
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "autoClearRetentionTask failed for taskId=${session.taskId}: ${e.message}", e)
+        }
+    }
 
     /**
      * For every RETENTION CHECK task that doesn't have a Testmate session yet, requests one.
@@ -255,6 +313,13 @@ object RetentionCheckManager {
                         DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
                     }
                 }
+                // Auto-clear: the evidence is in, so the retention task no longer needs a manual
+                // Done tap (repair tasks already do this in GapTaskManager.autoResolveAfterEvidence).
+                // After markEvidenceImported, so a retry never re-runs it for the same session.
+                autoClearRetentionTask(
+                    context, session,
+                    answered = result.breakdown.count { it.selectedAnswer != null }
+                )
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
                 TelemetryClient.emit(
