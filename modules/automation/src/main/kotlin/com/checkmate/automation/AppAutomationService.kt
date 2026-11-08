@@ -20,6 +20,7 @@ import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DomainPolicy
+import com.checkmate.workmode.LockdownSweepRequest
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
 import com.checkmate.workmode.TrustedTime
@@ -396,6 +397,15 @@ class AppAutomationService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+
+        // A post-skip lockdown was just opened by the overdue path (OverdueEnforcementCoordinator)
+        // and the student may already be inside a watchlist app that is not emitting window
+        // changes. Run one forced sweep now; it bounces whatever watchlist app is in front and
+        // is a no-op when nothing offending is on screen or the lockdown is already over.
+        if (LockdownSweepRequest.consume(SystemClock.elapsedRealtime()) &&
+            WorkModeManager.isInPostSkipLockdown()) {
+            sweepBlockedWindows(force = true)
+        }
 
         // TYPE_WINDOWS_CHANGED carries no package name, so it has to be handled
         // before the packageName guard below. It fires when a window is added,

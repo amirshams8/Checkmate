@@ -1,9 +1,11 @@
 package com.checkmate.service
 
 import android.content.Context
+import android.os.SystemClock
 import com.checkmate.core.AppUsageTracker
 import com.checkmate.planner.intervention.OverdueEnforcementGateway
 import com.checkmate.planner.model.StudyTask
+import com.checkmate.workmode.LockdownSweepRequest
 import com.checkmate.workmode.WorkModeManager
 import java.time.LocalDate
 import java.time.LocalTime
@@ -50,6 +52,12 @@ object OverdueEnforcementCoordinator : OverdueEnforcementGateway {
         // deliberately NOT calling PlanStore.markTask anywhere in this file — this task is
         // still PENDING and stays PENDING; only the enforcement layer changes.
         WorkModeManager.startPostSkipLockdown(context)
+
+        // BUGFIX (lockdown, app already in front): the student may already be inside a
+        // watchlist app when this fires, and a quiet app emits no window-state event for
+        // AppAutomationService to bounce on. Ask the service for one forced window sweep on
+        // its next accessibility event; it bounces whatever watchlist app is in front.
+        LockdownSweepRequest.request(SystemClock.elapsedRealtime())
 
         WorkModeManager.markOverdueEnforcementApplied(task.id)
     }
