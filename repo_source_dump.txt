@@ -388,6 +388,8 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── DomainPolicy.kt
 │   │   │   │   │   │   │   │   ├── ForegroundPinGate.kt
 │   │   │   │   │   │   │   │   ├── HolidaySchedule.kt
+│   │   │   │   │   │   │   │   ├── KillGapGuard.kt
+│   │   │   │   │   │   │   │   ├── KillGapPolicy.kt
 │   │   │   │   │   │   │   │   ├── LockdownSweepRequest.kt
 │   │   │   │   │   │   │   │   ├── LockdownWindow.kt
 │   │   │   │   │   │   │   │   ├── ScrollGuard.kt
@@ -405,6 +407,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   ├── checkmate
 │   │   │   │   │   │   │   ├── workmode
 │   │   │   │   │   │   │   │   ├── DomainPolicyTest.kt
+│   │   │   │   │   │   │   │   ├── KillGapPolicyTest.kt
 │   │   │   │   │   │   │   │   ├── LockdownSweepRequestTest.kt
 │   │   │   │   │   │   │   │   ├── LockdownWindowTest.kt
 │   │   │   │   │   │   │   │   ├── SweepPolicyTest.kt
@@ -1324,6 +1327,9 @@ class TestmateScreenSmokeTest {
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- T8b: lets KillGapGuard.batteryExemptionIntent() open the direct "don't optimise
+         Checkmate" prompt (the System Booster / battery manager exemption helper). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- Granted once via adb (pm grant com.checkmate android.permission.WRITE_SECURE_SETTINGS) so
          Checkmate can re-enable its own accessibility watchdog; see AccessibilityRepair. -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
@@ -1715,6 +1721,7 @@ import com.checkmate.workmode.AccessibilityRepair
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.ForegroundPinGate
+import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
@@ -1767,6 +1774,10 @@ class CheckmateApp : Application() {
         // process restarts mid-day are untouched. try/catch so it can never break startup.
         // Self-repair first (no-op without WRITE_SECURE_SETTINGS): if the watchdog was dropped,
         // put it back before BootGapGuard decides whether there is a gap to cover.
+        // T8b: KillGapGuard must look BEFORE that repair, while the "service was dropped /
+        // process was force-stopped" evidence is still visible. It only queues a reaction;
+        // applyPending() runs at the end of onCreate once everything it needs is initialised.
+        KillGapGuard.checkOnStart(this)
         try {
             AccessibilityRepair.ensureEnabled(this)
         } catch (e: Exception) {
@@ -1924,6 +1935,10 @@ class CheckmateApp : Application() {
                 }.start()
             }
         }
+
+        // T8b: now that the guardian-alert listener above is wired, carry out the reaction
+        // KillGapGuard.checkOnStart queued (lockdown, alarm re-arm, forced sweep, alert).
+        KillGapGuard.applyPending(this)
     }
 }
 
@@ -20371,6 +20386,7 @@ import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DomainPolicy
+import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.LockdownSweepRequest
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
@@ -20744,6 +20760,8 @@ class AppAutomationService : AccessibilityService() {
         // job is done, and lets it flush the deferred guardian alert now that WhatsApp
         // automation can actually complete.
         BootGapGuard.onAccessibilityConnected(applicationContext)
+        // T8b: the watchdog is live again; start (or resume) its heartbeat.
+        KillGapGuard.heartbeat(applicationContext)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -20780,6 +20798,8 @@ class AppAutomationService : AccessibilityService() {
             lastScheduleCheckAt = now
             TrustedTime.refreshIfNeeded(applicationContext)
             WorkModeManager.evaluateSchedule(applicationContext)
+            // T8b: liveness heartbeat for KillGapGuard (throttled inside).
+            KillGapGuard.heartbeat(applicationContext)
         }
 
         // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
@@ -21265,6 +21285,8 @@ class AppAutomationService : AccessibilityService() {
         removeTouchBlocker()
         removeFloatCover()
         BootGapGuard.onAccessibilityDisconnected()
+        // T8b: orderly shutdown (e.g. disabled through the guardian-PIN-gated path), not a kill.
+        KillGapGuard.onServiceDestroyed()
         super.onDestroy()
     }
 }
@@ -44860,6 +44882,291 @@ object HolidaySchedule {
 }
 
 
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/KillGapGuard.kt =====
+package com.checkmate.workmode
+
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.Settings
+import android.util.Log
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.TelemetryClient
+import com.checkmate.workmode.KillGapPolicy.Verdict
+import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * KillGapGuard — notices that Checkmate was killed from outside while it should have been
+ * enforcing, and reacts as soon as its process is running again.
+ *
+ * BUGFIX (T8b, System Booster "Boost now" loophole): "Boost now" force-stops Checkmate. That
+ * kills the process, cancels every alarm and job, and makes Android drop the accessibility
+ * service from ENABLED_ACCESSIBILITY_SERVICES; a force-stopped app receives no broadcast, so
+ * nothing inside it can run until the user (or an external watchdog) starts it again. This
+ * guard therefore cannot prevent the kill. What it adds is detection on the next process start
+ * plus a proportionate reaction, so a kill is no longer a silent way out:
+ *
+ *  1. The accessibility service writes a heartbeat ([heartbeat], from its 30 s tick) and marks
+ *     a clean shutdown from onDestroy ([onServiceDestroyed]).
+ *  2. [checkOnStart] runs first thing in CheckmateApp.onCreate (before AccessibilityRepair
+ *     re-enables the service, so the dropped state is still visible). It feeds
+ *     [KillGapPolicy] with the heartbeat, clean flag, boot count, PIN state, enabled state,
+ *     enforcement state and, on API 30+, Android's own process-exit history
+ *     (REASON_USER_REQUESTED = force stop / task killer).
+ *  3. On [Verdict.KILL_SUSPECTED] it logs KILL_GAP_DETECTED (debug trail + telemetry) and
+ *     queues the reaction. [applyPending] runs at the END of CheckmateApp.onCreate (the guardian
+ *     alert listener is wired by then): opens a post-skip lockdown, asks the service for a forced
+ *     window sweep, re-arms the daily Work Mode alarms and sends the usual guardian alert.
+ *
+ * Not covered, by design of Android: nothing runs while the app stays force-stopped. An
+ * external restorer (Termux watchdog, JarvisMerged self-heal) or the user reopening Checkmate
+ * is what brings the process back; the zero-code mitigation is to exempt Checkmate in the
+ * booster's protected list and from battery optimization (see [batteryExemptionIntent]).
+ */
+object KillGapGuard {
+
+    private const val TAG = "KillGapGuard"
+
+    private const val KEY_LAST_ALIVE = "kill_gap_last_alive_ms"
+    private const val KEY_CLEAN = "kill_gap_clean_shutdown"
+    private const val KEY_BOOT_COUNT = "kill_gap_boot_count"
+    private const val KEY_HANDLED_EXIT_TS = "kill_gap_handled_exit_ts"
+    private const val KEY_HANDLED_ALIVE = "kill_gap_handled_alive_ms"
+
+    private const val HEARTBEAT_MIN_INTERVAL_MS = 30_000L
+    private const val ALERT_REASON = "accessibility_killed_gap"
+
+    @Volatile private var lastHeartbeatElapsed = 0L
+    private val pending = AtomicBoolean(false)
+
+    /** Call from AppAutomationService's periodic tick and onServiceConnected. Cheap, throttled. */
+    fun heartbeat(context: Context) {
+        val e = SystemClock.elapsedRealtime()
+        if (lastHeartbeatElapsed != 0L && e - lastHeartbeatElapsed < HEARTBEAT_MIN_INTERVAL_MS) return
+        lastHeartbeatElapsed = e
+        CheckmatePrefs.putLong(KEY_LAST_ALIVE, TrustedTime.nowMillis())
+        CheckmatePrefs.putBoolean(KEY_CLEAN, false)
+        CheckmatePrefs.putInt(KEY_BOOT_COUNT, bootCount(context))
+    }
+
+    /** Call from AppAutomationService.onDestroy(): the service shut down in an orderly way
+     *  (for example it was disabled through the guardian-PIN-gated path), not killed. */
+    fun onServiceDestroyed() {
+        CheckmatePrefs.putBoolean(KEY_CLEAN, true)
+    }
+
+    /**
+     * Call first thing in CheckmateApp.onCreate, BEFORE AccessibilityRepair.ensureEnabled.
+     * Returns the verdict (also logged). Never throws.
+     */
+    fun checkOnStart(context: Context): Verdict? {
+        return try {
+            val app = context.applicationContext
+            val lastAlive = CheckmatePrefs.getLong(KEY_LAST_ALIVE, 0L)
+            val now = TrustedTime.nowMillis()
+            val exitTs = newestUserRequestedExit(app)
+            val handledExit = CheckmatePrefs.getLong(KEY_HANDLED_EXIT_TS, 0L)
+            val newExit = exitTs > handledExit
+            if (newExit) CheckmatePrefs.putLong(KEY_HANDLED_EXIT_TS, exitTs)
+
+            // Same heartbeat already reported once: don't alert again on every restart.
+            if (lastAlive != 0L && lastAlive == CheckmatePrefs.getLong(KEY_HANDLED_ALIVE, 0L) && !newExit) {
+                return Verdict.GAP_TOO_SHORT
+            }
+
+            val savedBoot = CheckmatePrefs.getInt(KEY_BOOT_COUNT, -1)
+            val rebooted = savedBoot != -1 && bootCount(app) != savedBoot
+
+            val verdict = KillGapPolicy.evaluate(
+                lastAliveMs = lastAlive,
+                nowMs = now,
+                cleanShutdown = CheckmatePrefs.getBoolean(KEY_CLEAN, false),
+                rebooted = rebooted,
+                pinUnlocked = UninstallGuard.isUnlocked() || UninstallGuard.hasRemoteOverride(),
+                userRequestedExit = newExit,
+                serviceEnabled = BootGapGuard.isAccessibilityServiceEnabled(app),
+                windowActive = WorkModeManager.isEnforcing() || WorkModeManager.isInPostSkipLockdown()
+            )
+
+            val gapMs = if (lastAlive > 0L) now - lastAlive else -1L
+            UninstallGuard.logDebugTrail("KILL_GAP_CHECK verdict=$verdict gapMs=$gapMs userRequestedExit=$newExit")
+
+            if (verdict == Verdict.KILL_SUSPECTED) {
+                CheckmatePrefs.putLong(KEY_HANDLED_ALIVE, lastAlive)
+                UninstallGuard.logDebugTrail("KILL_GAP_DETECTED gapMs=$gapMs userRequestedExit=$newExit")
+                TelemetryClient.emit(
+                    "KILL_GAP_DETECTED", null, status = "violation",
+                    payload = JSONObject()
+                        .put("gap_ms", gapMs)
+                        .put("user_requested_exit", newExit)
+                        .put("service_enabled", BootGapGuard.isAccessibilityServiceEnabled(app))
+                )
+                pending.set(true)
+            }
+            verdict
+        } catch (e: Exception) {
+            Log.w(TAG, "kill-gap check failed", e)
+            null
+        }
+    }
+
+    /**
+     * Call at the END of CheckmateApp.onCreate (after WorkModeManager.init, the alarm re-arm and
+     * the UninstallGuard listener wiring). Does nothing unless [checkOnStart] queued a reaction.
+     */
+    fun applyPending(context: Context) {
+        if (!pending.getAndSet(false)) return
+        val app = context.applicationContext
+        try {
+            // Re-arm the four daily boundary alarms: a force stop cancelled them.
+            WorkModeScheduleReceiver.scheduleDailyAlarms(app)
+            // Re-assert enforcement: open the timed lockdown and sweep whatever is in front.
+            WorkModeManager.evaluateSchedule(app)
+            WorkModeManager.startPostSkipLockdown(app)
+            LockdownSweepRequest.request(SystemClock.elapsedRealtime())
+            UninstallGuard.logDebugTrail("KILL_GAP_REACTED lockdown+alarms")
+        } catch (e: Exception) {
+            Log.w(TAG, "kill-gap reaction failed", e)
+            UninstallGuard.logDebugTrail("KILL_GAP_REACT_FAILED ${e.javaClass.simpleName}")
+        }
+        try {
+            if (UninstallGuard.shouldAlert()) UninstallGuard.listener?.onGuardedScreenBlocked(app, ALERT_REASON)
+        } catch (e: Exception) {
+            Log.w(TAG, "kill-gap alert failed", e)
+        }
+    }
+
+    // ── Battery optimisation exemption (zero-code mitigation helper) ─────────
+
+    /** True when Android is already told not to battery-optimise Checkmate. */
+    fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return pm.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
+    /**
+     * Intent for the exemption: the direct per-app prompt when the manifest declares
+     * REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, otherwise the system's list screen. The caller
+     * starts it from a visible Activity (FLAG_ACTIVITY_NEW_TASK is set so a Context works too).
+     */
+    fun batteryExemptionIntent(context: Context): Intent {
+        val direct = context.packageManager.checkPermission(
+            "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", context.packageName
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        return (if (direct)
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
+        else
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /** Timestamp of the newest "user requested" process exit (force stop / task killer), or 0. */
+    private fun newestUserRequestedExit(app: Context): Long {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return 0L
+        return try {
+            val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            am.getHistoricalProcessExitReasons(app.packageName, 0, 10)
+                .filter { it.reason == ApplicationExitInfo.REASON_USER_REQUESTED }
+                .maxOfOrNull { it.timestamp } ?: 0L
+        } catch (e: Exception) {
+            Log.w(TAG, "exit history unavailable", e)
+            0L
+        }
+    }
+
+    private fun bootCount(context: Context): Int = try {
+        Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+    } catch (e: Exception) { -1 }
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/KillGapPolicy.kt =====
+package com.checkmate.workmode
+
+/**
+ * KillGapPolicy — pure decision helper for [KillGapGuard].
+ *
+ * Question it answers: "was Checkmate's accessibility watchdog just killed from outside
+ * (System Booster "Boost now", Force Stop, a task killer) while enforcement mattered?"
+ *
+ * Why this exists (T8b, "Boost now" loophole): a Force Stop makes Android drop the
+ * accessibility service from ENABLED_ACCESSIBILITY_SERVICES and cancels every alarm and job,
+ * and a force-stopped app receives nothing until the user opens it again. So Checkmate cannot
+ * stop the kill; it can only notice it the next time its process starts and then re-assert
+ * enforcement and tell the guardian. This policy decides whether a process start counts as
+ * "after a kill". It is free of Android and prefs access so it is unit tested on the JVM.
+ *
+ * Two independent kill signals:
+ *  - Route A, [userRequestedExit]: Android's own process-exit history (API 30+) says the last
+ *    exit was "user requested" (force stop / task killer). Precise, and it still fires when a
+ *    watchdog re-enabled the service before the process came back.
+ *  - Route B, heartbeat gap: the service stopped heartbeating for at least [GAP_THRESHOLD_MS],
+ *    was never shut down cleanly, and is no longer in the enabled-services list. Used on
+ *    devices without exit history.
+ *
+ * Neither route fires for: no heartbeat ever written, a clean service shutdown (the service's
+ * onDestroy ran, e.g. disabled with the guardian PIN), a reboot (BootGapGuard's job), an active
+ * guardian PIN unlock, or when no enforcement window / lockdown is active.
+ */
+object KillGapPolicy {
+
+    /** Heartbeat silence that counts as "the service stopped running" on route B. */
+    const val GAP_THRESHOLD_MS = 120_000L
+
+    enum class Verdict {
+        KILL_SUSPECTED,
+        NO_HEARTBEAT,
+        CLEAN_SHUTDOWN,
+        REBOOTED,
+        PIN_UNLOCKED,
+        GAP_TOO_SHORT,
+        STILL_ENABLED,
+        NO_ENFORCEMENT_WINDOW
+    }
+
+    /**
+     * @param lastAliveMs   last heartbeat the service wrote (0 = never)
+     * @param nowMs         same clock as [lastAliveMs]
+     * @param cleanShutdown the service's onDestroy ran after that heartbeat
+     * @param rebooted      the device rebooted since that heartbeat
+     * @param pinUnlocked   a guardian PIN unlock (or remote override) is active now
+     * @param userRequestedExit Android's exit history shows a new "user requested" exit
+     * @param serviceEnabled the service is currently in the enabled-accessibility list
+     * @param windowActive  Work Mode enforcement or a post-skip lockdown is active now
+     */
+    fun evaluate(
+        lastAliveMs: Long,
+        nowMs: Long,
+        cleanShutdown: Boolean,
+        rebooted: Boolean,
+        pinUnlocked: Boolean,
+        userRequestedExit: Boolean,
+        serviceEnabled: Boolean,
+        windowActive: Boolean,
+        thresholdMs: Long = GAP_THRESHOLD_MS
+    ): Verdict {
+        if (lastAliveMs <= 0L) return Verdict.NO_HEARTBEAT
+        if (cleanShutdown) return Verdict.CLEAN_SHUTDOWN
+        if (rebooted) return Verdict.REBOOTED
+        if (pinUnlocked) return Verdict.PIN_UNLOCKED
+        if (!userRequestedExit) {
+            if (nowMs - lastAliveMs < thresholdMs) return Verdict.GAP_TOO_SHORT
+            if (serviceEnabled) return Verdict.STILL_ENABLED
+        }
+        if (!windowActive) return Verdict.NO_ENFORCEMENT_WINDOW
+        return Verdict.KILL_SUSPECTED
+    }
+}
+
+
 //===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/LockdownSweepRequest.kt =====
 package com.checkmate.workmode
 
@@ -46452,6 +46759,87 @@ class DomainPolicyTest {
         assertNull(DomainPolicy.match("youtube.com.evil.example", domains))
         assertEquals("x.com", DomainPolicy.match("m.x.com", domains))
         assertNull(DomainPolicy.match("netflix.com", domains))
+    }
+}
+
+
+//===== FILE: modules/workmode/src/test/kotlin/com/checkmate/workmode/KillGapPolicyTest.kt =====
+package com.checkmate.workmode
+
+import com.checkmate.workmode.KillGapPolicy.Verdict
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class KillGapPolicyTest {
+
+    private val now = 1_000_000L
+    private val old = now - 10 * 60_000L
+
+    private fun eval(
+        last: Long = old,
+        clean: Boolean = false,
+        rebooted: Boolean = false,
+        pin: Boolean = false,
+        exit: Boolean = false,
+        enabled: Boolean = false,
+        window: Boolean = true
+    ) = KillGapPolicy.evaluate(last, now, clean, rebooted, pin, exit, enabled, window)
+
+    @Test
+    fun routeB_longGap_serviceDropped_inWindow_isKill() {
+        assertEquals(Verdict.KILL_SUSPECTED, eval())
+    }
+
+    @Test
+    fun routeA_userRequestedExit_isKillEvenIfServiceWasRestoredAndGapShort() {
+        // Watchdog re-added the service within seconds: enabled again, gap tiny.
+        assertEquals(Verdict.KILL_SUSPECTED, eval(last = now - 5_000L, exit = true, enabled = true))
+    }
+
+    @Test
+    fun noHeartbeatEverIsIgnored() {
+        assertEquals(Verdict.NO_HEARTBEAT, eval(last = 0L, exit = true))
+    }
+
+    @Test
+    fun cleanShutdownIsNotAKill() {
+        assertEquals(Verdict.CLEAN_SHUTDOWN, eval(clean = true, exit = true))
+    }
+
+    @Test
+    fun rebootIsLeftToBootGapGuard() {
+        assertEquals(Verdict.REBOOTED, eval(rebooted = true, exit = true))
+    }
+
+    @Test
+    fun guardianPinUnlockSuppresses() {
+        assertEquals(Verdict.PIN_UNLOCKED, eval(pin = true, exit = true))
+    }
+
+    @Test
+    fun shortGapWithoutExitSignalIsIgnored() {
+        assertEquals(Verdict.GAP_TOO_SHORT, eval(last = now - 30_000L))
+    }
+
+    @Test
+    fun gapExactlyAtThresholdCounts() {
+        assertEquals(Verdict.KILL_SUSPECTED, eval(last = now - KillGapPolicy.GAP_THRESHOLD_MS))
+    }
+
+    @Test
+    fun longGapButServiceStillEnabledIsBenignOsKill() {
+        assertEquals(Verdict.STILL_ENABLED, eval(enabled = true))
+    }
+
+    @Test
+    fun noEnforcementWindowMeansNoReaction() {
+        assertEquals(Verdict.NO_ENFORCEMENT_WINDOW, eval(window = false))
+        assertEquals(Verdict.NO_ENFORCEMENT_WINDOW, eval(exit = true, window = false))
+    }
+
+    @Test
+    fun clockGoingBackwardsDoesNotCountAsGap() {
+        assertEquals(Verdict.GAP_TOO_SHORT, eval(last = now + 60_000L))
     }
 }
 
