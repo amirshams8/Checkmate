@@ -217,7 +217,9 @@ object WorkModeManager {
     fun startPostSkipLockdown(context: Context) {
         val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
             .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
-        val until = System.currentTimeMillis() + minutes * 60 * 1000L
+        // TrustedTime, not the raw device clock: moving Settings > Date & time forward by the
+        // window length used to end the lockdown at once (see LockdownWindow).
+        val until = LockdownWindow.untilMs(TrustedTime.nowMillis(), minutes)
         CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
         TelemetryClient.emit(
             "POST_SKIP_LOCKDOWN_STARTED", null,
@@ -229,7 +231,7 @@ object WorkModeManager {
      *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
      *  grace period for apps on [getEscalationWatchlist]. */
     fun isInPostSkipLockdown(): Boolean =
-        System.currentTimeMillis() < CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L)
+        LockdownWindow.isActive(TrustedTime.nowMillis(), CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L))
 
     /**
      * Returns [getBlockedApps] plus a fixed distraction-prone watchlist (extendable via
