@@ -386,6 +386,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── ForegroundPinGate.kt
 │   │   │   │   │   │   │   │   ├── HolidaySchedule.kt
 │   │   │   │   │   │   │   │   ├── ScrollGuard.kt
+│   │   │   │   │   │   │   │   ├── SweepPolicy.kt
 │   │   │   │   │   │   │   │   ├── TrustedTime.kt
 │   │   │   │   │   │   │   │   ├── UninstallAlertListener.kt
 │   │   │   │   │   │   │   │   ├── UninstallGuard.kt
@@ -393,6 +394,12 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   ├── WorkModeSchedule.kt
 │   │   │   │   │   │   │   │   ├── WorkModeScheduleReceiver.kt
 │   │   │   │   │   │   │   │   ├── WorkModeService.kt
+│   │   │   ├── test
+│   │   │   │   ├── kotlin
+│   │   │   │   │   ├── com
+│   │   │   │   │   │   ├── checkmate
+│   │   │   │   │   │   │   ├── workmode
+│   │   │   │   │   │   │   │   ├── SweepPolicyTest.kt
 ├── gradle/wrapper
 │   ├── gradle-wrapper.properties
 ├── .github
@@ -20283,6 +20290,7 @@ import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.SweepPolicy
 import com.checkmate.workmode.TrustedTime
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
@@ -20538,8 +20546,16 @@ class AppAutomationService : AccessibilityService() {
             lastWindowSweepAt = nowMs
             touchBlockerHandler.removeCallbacks(sweepAgainRunnable)
 
-            val blocked = WorkModeManager.getBlockedApps()
-            if (!WorkModeManager.isEnforcing() || blocked.isEmpty()) {
+            // Targets = blocked list while enforcing, plus the escalation watchlist while a
+            // post-skip lockdown is active (SweepPolicy) — a lockdown outside the scheduled
+            // window used to leave floating copies of watchlist apps unswept.
+            val blocked = SweepPolicy.sweepTargets(
+                enforcing = WorkModeManager.isEnforcing(),
+                inLockdown = WorkModeManager.isInPostSkipLockdown(),
+                blocked = WorkModeManager.getBlockedApps(),
+                watchlist = WorkModeManager.getEscalationWatchlist()
+            )
+            if (blocked.isEmpty()) {
                 removeFloatCover()
                 return
             }
@@ -20656,7 +20672,8 @@ class AppAutomationService : AccessibilityService() {
         // floating window does, and the only signal we get when a blocked app
         // that is already running is dragged back up into a floating window.
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
-            if (WorkModeManager.isEnforcing() || floatCoverView != null) sweepBlockedWindows()
+            if (SweepPolicy.sweepActive(WorkModeManager.isEnforcing(), WorkModeManager.isInPostSkipLockdown()) ||
+                floatCoverView != null) sweepBlockedWindows()
             return
         }
 
@@ -20702,8 +20719,10 @@ class AppAutomationService : AccessibilityService() {
             pkg in WorkModeManager.getEscalationWatchlist() &&
             pkg !in WorkModeManager.essentialPackages(applicationContext)
         ) {
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            DistractionGuard.recordAppAttempt(this, pkg)
+            // Double Home + attempt record (bounceBlockedApp), then sweep: a single Home
+            // does not close a OnePlus/ColorOS floating window.
+            bounceBlockedApp(pkg, BOUNCE_DEBOUNCE_MS)
+            sweepBlockedWindows(force = true)
             return
         }
 
@@ -20732,10 +20751,15 @@ class AppAutomationService : AccessibilityService() {
         // (never STATE_CHANGED once it is up), and Home leaves the window alive. Any
         // activity from a blocked package, or any window switch, re-checks the full
         // window list. Throttled inside sweepBlockedWindows().
-        if (WorkModeManager.isEnforcing() &&
+        val sweepEnforcing = WorkModeManager.isEnforcing()
+        val sweepLockdown = WorkModeManager.isInPostSkipLockdown()
+        if (SweepPolicy.sweepActive(sweepEnforcing, sweepLockdown) &&
             (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
                 (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
-                    pkg in WorkModeManager.getBlockedApps()))) {
+                    pkg in SweepPolicy.sweepTargets(
+                        sweepEnforcing, sweepLockdown,
+                        WorkModeManager.getBlockedApps(), WorkModeManager.getEscalationWatchlist()
+                    )))) {
             sweepBlockedWindows()
         }
 
@@ -43619,6 +43643,7 @@ dependencies {
     implementation(project(":modules:core"))
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    testImplementation("junit:junit:4.13.2")
 }
 
 
@@ -44685,6 +44710,48 @@ object ScrollGuard {
     @Synchronized
     fun onAppBackgrounded(packageName: String) {
         sessions.remove(packageName)
+    }
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/SweepPolicy.kt =====
+package com.checkmate.workmode
+
+/**
+ * SweepPolicy — pure decision helper for AppAutomationService's all-windows sweep.
+ *
+ * BUGFIX (post-skip lockdown floating-window bypass): the window sweep (the layer that
+ * catches a blocked app opened or pulled up as a floating window, where a single Home
+ * does not close it) was gated on WorkModeManager.isEnforcing() and only looked at
+ * getBlockedApps(). A post-skip lockdown (WorkModeManager.startPostSkipLockdown, opened
+ * by an explicit Skip or by the overdue-PENDING enforcement) outside the scheduled window
+ * therefore bounced a watchlist app once, but a floating copy of it survived and was fully
+ * usable. The sweep now also runs, and also targets the escalation watchlist, while a
+ * lockdown is active.
+ *
+ * Kept free of Android and prefs access so it can be unit tested on the JVM.
+ */
+object SweepPolicy {
+
+    /** True when the window sweep must run: Work Mode enforcement OR a post-skip lockdown. */
+    fun sweepActive(enforcing: Boolean, inLockdown: Boolean): Boolean = enforcing || inLockdown
+
+    /**
+     * Packages the sweep treats as offenders: the blocked list while enforcing, plus the
+     * escalation watchlist while a post-skip lockdown is active. Empty when neither applies.
+     * Essential packages (launcher, dialer, Settings, Checkmate...) are exempted by the
+     * caller, same as before.
+     */
+    fun sweepTargets(
+        enforcing: Boolean,
+        inLockdown: Boolean,
+        blocked: Set<String>,
+        watchlist: Set<String>
+    ): Set<String> {
+        val result = mutableSetOf<String>()
+        if (enforcing) result += blocked
+        if (inLockdown) result += watchlist
+        return result
     }
 }
 
@@ -46019,6 +46086,62 @@ class WorkModeService : Service() {
 
     override fun onDestroy() { super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
+}
+
+
+//===== FILE: modules/workmode/src/test/kotlin/com/checkmate/workmode/SweepPolicyTest.kt =====
+package com.checkmate.workmode
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class SweepPolicyTest {
+
+    private val blocked = setOf("com.game.a")
+    private val watchlist = setOf("com.game.a", "com.instagram.android")
+
+    @Test
+    fun lockdownOutsideEnforcementStillSweeps() {
+        // The bug: lockdown active, not enforcing (e.g. the 15:10-19:00 gap) -> no sweep.
+        assertTrue(SweepPolicy.sweepActive(enforcing = false, inLockdown = true))
+    }
+
+    @Test
+    fun lockdownOutsideEnforcementTargetsWatchlistApp() {
+        val targets = SweepPolicy.sweepTargets(
+            enforcing = false, inLockdown = true, blocked = blocked, watchlist = watchlist
+        )
+        assertTrue("com.instagram.android" in targets)
+    }
+
+    @Test
+    fun enforcementWithoutLockdownTargetsOnlyBlockedList() {
+        val targets = SweepPolicy.sweepTargets(
+            enforcing = true, inLockdown = false, blocked = blocked, watchlist = watchlist
+        )
+        assertEquals(blocked, targets)
+        assertFalse("com.instagram.android" in targets)
+    }
+
+    @Test
+    fun neitherEnforcingNorLockdownSweepsNothing() {
+        assertFalse(SweepPolicy.sweepActive(enforcing = false, inLockdown = false))
+        assertTrue(
+            SweepPolicy.sweepTargets(
+                enforcing = false, inLockdown = false, blocked = blocked, watchlist = watchlist
+            ).isEmpty()
+        )
+    }
+
+    @Test
+    fun bothActiveTargetsUnion() {
+        val targets = SweepPolicy.sweepTargets(
+            enforcing = true, inLockdown = true, blocked = blocked, watchlist = watchlist
+        )
+        assertEquals(blocked + watchlist, targets)
+    }
 }
 
 
