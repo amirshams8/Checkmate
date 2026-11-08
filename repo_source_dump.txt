@@ -303,6 +303,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── PlanStoreTaskMutator.kt
 │   │   │   │   │   │   │   │   │   ├── PolicyValidator.kt
 │   │   │   │   │   │   │   │   │   ├── ReplanDayLedger.kt
+│   │   │   │   │   │   │   │   │   ├── RetentionClearPolicy.kt
 │   │   │   │   │   │   │   │   │   ├── RetentionTaskLedger.kt
 │   │   │   │   │   │   │   │   │   ├── TaskEscrow.kt
 │   │   │   │   │   │   │   │   │   ├── TaskMutator.kt
@@ -330,6 +331,7 @@ FILE TREE (SELECTED FOLDERS)
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerStatsTest.kt
 │   │   │   │   │   │   │   │   │   ├── OutcomeLedgerTest.kt
 │   │   │   │   │   │   │   │   │   ├── PolicyValidatorTest.kt
+│   │   │   │   │   │   │   │   │   ├── RetentionClearPolicyTest.kt
 │   │   │   │   │   │   │   │   │   ├── TaskEscrowTest.kt
 │   │   │   │   │   │   │   │   │   ├── TriggerEvaluatorTest.kt
 │   ├── psyche
@@ -8669,7 +8671,15 @@ import android.content.Context
 import com.checkmate.core.DebugTrail
 import com.checkmate.core.ConsultationProfile
 import com.checkmate.core.TelemetryClient
+import com.checkmate.learning.engine.MasteryEngine
+import com.checkmate.learning.model.LearningIds
+import com.checkmate.learning.repository.LearningDatabase
+import com.checkmate.planner.PlanStore
 import com.checkmate.planner.intervention.GapTaskLedger
+import com.checkmate.planner.intervention.RetentionClearPolicy
+import com.checkmate.planner.model.TaskState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import com.checkmate.planner.intervention.RetentionTaskLedger
@@ -8762,6 +8772,56 @@ object RetentionCheckManager {
     // mostly previously-correct questions, oldest-attempted first, topped up with wrong/skipped.
     // The honest-gap note above is closed by this change.
     private val RETENTION_POOL = TestmateQuestionPool.RETENTION
+
+    /**
+     * Marks the retention StudyTask DONE once its Testmate evidence is imported and the student
+     * actually answered something, and emits RETENTION_RESOLVED {mastery, threshold, outcome}.
+     * Mastery is read the same way GapTaskManager.resolveDoneConcept reads it (masteryDao
+     * getByConcept) and only reported: below the threshold the task is still DONE and the
+     * decision engine re-queues the concept on its own pass. Never throws — a failure here must
+     * not undo the evidence import above it.
+     */
+    private suspend fun autoClearRetentionTask(
+        context: Context,
+        session: RetentionTaskLedger.RetentionSession,
+        answered: Int
+    ) {
+        try {
+            val mastery = session.conceptId?.let { conceptId ->
+                try {
+                    withContext(Dispatchers.IO) {
+                        LearningDatabase.getInstance(context).masteryDao()
+                            .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+                    }?.mastery
+                } catch (e: Exception) {
+                    DebugTrail.w(TAG, "autoClear mastery lookup failed for concept=$conceptId: ${e.message}")
+                    null
+                }
+            }
+            val outcome = RetentionClearPolicy.decide(answered, mastery, MasteryEngine.MASTERY_THRESHOLD)
+            var marked = false
+            if (RetentionClearPolicy.shouldMarkDone(outcome)) {
+                marked = PlanStore.markTaskInDay(session.dayKey, session.taskId, TaskState.DONE)
+            }
+            DebugTrail.d(TAG, "autoClear: taskId=${session.taskId} outcome=$outcome mastery=$mastery marked=$marked")
+            TelemetryClient.emit(
+                "RETENTION_RESOLVED", "retention-${session.taskId}",
+                payload = JSONObject().apply {
+                    put("task_id", session.taskId)
+                    session.conceptId?.let { put("concept_id", it) }
+                    mastery?.let { put("mastery", it) }
+                    put("threshold", MasteryEngine.MASTERY_THRESHOLD)
+                    put("answered", answered)
+                    put("outcome", outcome.name.lowercase())
+                    put("task_marked_done", marked)
+                }
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            DebugTrail.e(TAG, "autoClearRetentionTask failed for taskId=${session.taskId}: ${e.message}", e)
+        }
+    }
 
     /**
      * For every RETENTION CHECK task that doesn't have a Testmate session yet, requests one.
@@ -8920,6 +8980,13 @@ object RetentionCheckManager {
                         DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
                     }
                 }
+                // Auto-clear: the evidence is in, so the retention task no longer needs a manual
+                // Done tap (repair tasks already do this in GapTaskManager.autoResolveAfterEvidence).
+                // After markEvidenceImported, so a retry never re-runs it for the same session.
+                autoClearRetentionTask(
+                    context, session,
+                    answered = result.breakdown.count { it.selectedAnswer != null }
+                )
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
                 TelemetryClient.emit(
@@ -37973,6 +38040,48 @@ object ReplanDayLedger {
 }
 
 
+//===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/RetentionClearPolicy.kt =====
+package com.checkmate.planner.intervention
+
+/**
+ * RetentionClearPolicy — pure decision for auto-clearing a RETENTION CHECK task once its
+ * Testmate evidence has been imported, with no manual report import or manual "Done" tap.
+ *
+ * Before this, [com.checkmate.service.RetentionCheckManager.evidencePollIfNeeded] imported
+ * the evidence and updated the Leitner box but never marked the retention StudyTask DONE, so
+ * a submitted retention test could stay PENDING (and later look overdue). Repair tasks
+ * already auto-clear via GapTaskManager.autoResolveAfterEvidence.
+ *
+ * Rule: the task is cleared (DONE) as soon as the student actually answered at least one
+ * question — the check happened. Whether the concept is back above the mastery threshold is
+ * reported (telemetry) but does not keep the task open: when mastery is still below the
+ * threshold, RetentionEngine/LearningDecisionEngine re-queue the concept on their own next
+ * pass, same as before.
+ *
+ * Android-free so it runs as a plain JVM unit test.
+ */
+object RetentionClearPolicy {
+
+    enum class Outcome {
+        /** Nothing answered (all skipped / empty) — leave the task as it is. */
+        NOT_SUBMITTED,
+        /** Answered, and mastery is at or above the threshold. */
+        MASTERED,
+        /** Answered, but mastery is unknown or still below the threshold. */
+        BELOW_THRESHOLD
+    }
+
+    fun decide(answered: Int, mastery: Double?, threshold: Double): Outcome = when {
+        answered <= 0 -> Outcome.NOT_SUBMITTED
+        mastery != null && mastery >= threshold -> Outcome.MASTERED
+        else -> Outcome.BELOW_THRESHOLD
+    }
+
+    /** The StudyTask is marked DONE for every outcome except [Outcome.NOT_SUBMITTED]. */
+    fun shouldMarkDone(outcome: Outcome): Boolean = outcome != Outcome.NOT_SUBMITTED
+}
+
+
 //===== FILE: modules/planner/src/main/kotlin/com/checkmate/planner/intervention/RetentionTaskLedger.kt =====
 package com.checkmate.planner.intervention
 
@@ -41283,6 +41392,54 @@ class PolicyValidatorTest {
     private fun assertRejectedWith(result: PolicyResult, reason: RejectionReason) {
         assertTrue("expected Rejected but was $result", result is PolicyResult.Rejected)
         assertEquals(reason, (result as PolicyResult.Rejected).reason)
+    }
+}
+
+
+//===== FILE: modules/planner/src/test/kotlin/com/checkmate/planner/intervention/RetentionClearPolicyTest.kt =====
+package com.checkmate.planner.intervention
+
+import com.checkmate.planner.intervention.RetentionClearPolicy.Outcome
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class RetentionClearPolicyTest {
+
+    private val threshold = 0.83
+
+    @Test
+    fun nothingAnsweredDoesNotClear() {
+        val o = RetentionClearPolicy.decide(answered = 0, mastery = 0.95, threshold = threshold)
+        assertEquals(Outcome.NOT_SUBMITTED, o)
+        assertFalse(RetentionClearPolicy.shouldMarkDone(o))
+    }
+
+    @Test
+    fun answeredAtThresholdIsMasteredAndClears() {
+        val o = RetentionClearPolicy.decide(answered = 8, mastery = 0.83, threshold = threshold)
+        assertEquals(Outcome.MASTERED, o)
+        assertTrue(RetentionClearPolicy.shouldMarkDone(o))
+    }
+
+    @Test
+    fun answeredAboveThresholdIsMastered() {
+        assertEquals(Outcome.MASTERED, RetentionClearPolicy.decide(10, 0.9, threshold))
+    }
+
+    @Test
+    fun answeredBelowThresholdStillClearsTheTask() {
+        val o = RetentionClearPolicy.decide(answered = 8, mastery = 0.6, threshold = threshold)
+        assertEquals(Outcome.BELOW_THRESHOLD, o)
+        assertTrue(RetentionClearPolicy.shouldMarkDone(o))
+    }
+
+    @Test
+    fun answeredWithUnknownMasteryClearsAsBelowThreshold() {
+        val o = RetentionClearPolicy.decide(answered = 3, mastery = null, threshold = threshold)
+        assertEquals(Outcome.BELOW_THRESHOLD, o)
+        assertTrue(RetentionClearPolicy.shouldMarkDone(o))
     }
 }
 
