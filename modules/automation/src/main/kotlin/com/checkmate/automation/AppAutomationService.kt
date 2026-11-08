@@ -19,6 +19,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
+import com.checkmate.workmode.DomainPolicy
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
 import com.checkmate.workmode.TrustedTime
@@ -494,7 +495,8 @@ class AppAutomationService : AccessibilityService() {
         }
 
         // ── Work Mode: blocked website check ─────────────────────────────────
-        if (WorkModeManager.isEnforcing() && pkg in BROWSER_PACKAGES) {
+        if (DomainPolicy.urlCheckActive(WorkModeManager.isEnforcing(), WorkModeManager.isInPostSkipLockdown()) &&
+            pkg in BROWSER_PACKAGES) {
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 checkAndBlockUrl(pkg)
@@ -755,10 +757,12 @@ class AppAutomationService : AccessibilityService() {
         val hostname = parseHostname(url) ?: return
         Log.d(TAG, "Browser $browserPkg → hostname=$hostname")
 
-        val blockedDomains = WorkModeManager.getBlockedDomains()
-        val matched = blockedDomains.firstOrNull { blocked ->
-            hostname == blocked || hostname.endsWith(".$blocked")
-        } ?: return
+        val blockedDomains = DomainPolicy.blockedDomains(
+            enforcing = WorkModeManager.isEnforcing(),
+            inLockdown = WorkModeManager.isInPostSkipLockdown(),
+            blocked = WorkModeManager.getBlockedDomains()
+        )
+        val matched = DomainPolicy.match(hostname, blockedDomains) ?: return
 
         Log.w(TAG, "Blocked domain matched: $matched — going back")
         performGlobalAction(GLOBAL_ACTION_BACK)
