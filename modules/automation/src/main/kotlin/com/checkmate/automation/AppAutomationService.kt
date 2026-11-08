@@ -20,6 +20,7 @@ import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.ScrollGuard
+import com.checkmate.workmode.SweepPolicy
 import com.checkmate.workmode.TrustedTime
 import com.checkmate.workmode.UninstallGuard
 import com.checkmate.workmode.WorkModeManager
@@ -275,8 +276,16 @@ class AppAutomationService : AccessibilityService() {
             lastWindowSweepAt = nowMs
             touchBlockerHandler.removeCallbacks(sweepAgainRunnable)
 
-            val blocked = WorkModeManager.getBlockedApps()
-            if (!WorkModeManager.isEnforcing() || blocked.isEmpty()) {
+            // Targets = blocked list while enforcing, plus the escalation watchlist while a
+            // post-skip lockdown is active (SweepPolicy) — a lockdown outside the scheduled
+            // window used to leave floating copies of watchlist apps unswept.
+            val blocked = SweepPolicy.sweepTargets(
+                enforcing = WorkModeManager.isEnforcing(),
+                inLockdown = WorkModeManager.isInPostSkipLockdown(),
+                blocked = WorkModeManager.getBlockedApps(),
+                watchlist = WorkModeManager.getEscalationWatchlist()
+            )
+            if (blocked.isEmpty()) {
                 removeFloatCover()
                 return
             }
@@ -393,7 +402,8 @@ class AppAutomationService : AccessibilityService() {
         // floating window does, and the only signal we get when a blocked app
         // that is already running is dragged back up into a floating window.
         if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
-            if (WorkModeManager.isEnforcing() || floatCoverView != null) sweepBlockedWindows()
+            if (SweepPolicy.sweepActive(WorkModeManager.isEnforcing(), WorkModeManager.isInPostSkipLockdown()) ||
+                floatCoverView != null) sweepBlockedWindows()
             return
         }
 
@@ -439,8 +449,10 @@ class AppAutomationService : AccessibilityService() {
             pkg in WorkModeManager.getEscalationWatchlist() &&
             pkg !in WorkModeManager.essentialPackages(applicationContext)
         ) {
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            DistractionGuard.recordAppAttempt(this, pkg)
+            // Double Home + attempt record (bounceBlockedApp), then sweep: a single Home
+            // does not close a OnePlus/ColorOS floating window.
+            bounceBlockedApp(pkg, BOUNCE_DEBOUNCE_MS)
+            sweepBlockedWindows(force = true)
             return
         }
 
@@ -469,10 +481,15 @@ class AppAutomationService : AccessibilityService() {
         // (never STATE_CHANGED once it is up), and Home leaves the window alive. Any
         // activity from a blocked package, or any window switch, re-checks the full
         // window list. Throttled inside sweepBlockedWindows().
-        if (WorkModeManager.isEnforcing() &&
+        val sweepEnforcing = WorkModeManager.isEnforcing()
+        val sweepLockdown = WorkModeManager.isInPostSkipLockdown()
+        if (SweepPolicy.sweepActive(sweepEnforcing, sweepLockdown) &&
             (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
                 (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
-                    pkg in WorkModeManager.getBlockedApps()))) {
+                    pkg in SweepPolicy.sweepTargets(
+                        sweepEnforcing, sweepLockdown,
+                        WorkModeManager.getBlockedApps(), WorkModeManager.getEscalationWatchlist()
+                    )))) {
             sweepBlockedWindows()
         }
 
