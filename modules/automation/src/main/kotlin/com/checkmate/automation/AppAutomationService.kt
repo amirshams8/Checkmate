@@ -20,6 +20,7 @@ import android.widget.TextView
 import com.checkmate.workmode.BootGapGuard
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DomainPolicy
+import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.LockdownSweepRequest
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
@@ -393,6 +394,8 @@ class AppAutomationService : AccessibilityService() {
         // job is done, and lets it flush the deferred guardian alert now that WhatsApp
         // automation can actually complete.
         BootGapGuard.onAccessibilityConnected(applicationContext)
+        // T8b: the watchdog is live again; start (or resume) its heartbeat.
+        KillGapGuard.heartbeat(applicationContext)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -429,6 +432,8 @@ class AppAutomationService : AccessibilityService() {
             lastScheduleCheckAt = now
             TrustedTime.refreshIfNeeded(applicationContext)
             WorkModeManager.evaluateSchedule(applicationContext)
+            // T8b: liveness heartbeat for KillGapGuard (throttled inside).
+            KillGapGuard.heartbeat(applicationContext)
         }
 
         // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────
@@ -914,6 +919,8 @@ class AppAutomationService : AccessibilityService() {
         removeTouchBlocker()
         removeFloatCover()
         BootGapGuard.onAccessibilityDisconnected()
+        // T8b: orderly shutdown (e.g. disabled through the guardian-PIN-gated path), not a kill.
+        KillGapGuard.onServiceDestroyed()
         super.onDestroy()
     }
 }

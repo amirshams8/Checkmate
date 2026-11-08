@@ -33,6 +33,7 @@ import com.checkmate.workmode.AccessibilityRepair
 import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DistractionListener
 import com.checkmate.workmode.ForegroundPinGate
+import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.UninstallAlertListener
 import com.checkmate.workmode.UninstallGuard
@@ -85,6 +86,10 @@ class CheckmateApp : Application() {
         // process restarts mid-day are untouched. try/catch so it can never break startup.
         // Self-repair first (no-op without WRITE_SECURE_SETTINGS): if the watchdog was dropped,
         // put it back before BootGapGuard decides whether there is a gap to cover.
+        // T8b: KillGapGuard must look BEFORE that repair, while the "service was dropped /
+        // process was force-stopped" evidence is still visible. It only queues a reaction;
+        // applyPending() runs at the end of onCreate once everything it needs is initialised.
+        KillGapGuard.checkOnStart(this)
         try {
             AccessibilityRepair.ensureEnabled(this)
         } catch (e: Exception) {
@@ -242,5 +247,9 @@ class CheckmateApp : Application() {
                 }.start()
             }
         }
+
+        // T8b: now that the guardian-alert listener above is wired, carry out the reaction
+        // KillGapGuard.checkOnStart queued (lockdown, alarm re-arm, forced sweep, alert).
+        KillGapGuard.applyPending(this)
     }
 }
