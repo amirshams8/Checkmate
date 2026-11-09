@@ -50,6 +50,29 @@ class RetentionClearPolicyTest {
     }
 
     @Test
+    fun submittedAccuracyIsCorrectOverAnswered() {
+        assertEquals(0.9, RetentionClearPolicy.submittedAccuracy(10, 9)!!, 1e-9)
+        assertNull(RetentionClearPolicy.submittedAccuracy(0, 0))
+        // correct can never exceed answered
+        assertEquals(1.0, RetentionClearPolicy.submittedAccuracy(4, 7)!!, 1e-9)
+    }
+
+    @Test
+    fun resolveMasteryPrefersStoredThenFallsBackToSubmittedAccuracy() {
+        assertEquals(0.5, RetentionClearPolicy.resolveMastery(0.5, 10, 10)!!, 1e-9)
+        assertEquals(0.9, RetentionClearPolicy.resolveMastery(null, 10, 9)!!, 1e-9)
+        assertNull(RetentionClearPolicy.resolveMastery(null, 0, 0))
+    }
+
+    @Test
+    fun clearWithoutImportUsesSubmittedAccuracy() {
+        val high = RetentionClearPolicy.resolveMastery(null, answered = 10, correct = 9)
+        assertTrue(RetentionClearPolicy.shouldMarkDone(RetentionClearPolicy.decide(10, high, threshold)))
+        val low = RetentionClearPolicy.resolveMastery(null, answered = 10, correct = 8)
+        assertFalse(RetentionClearPolicy.shouldMarkDone(RetentionClearPolicy.decide(10, low, threshold)))
+    }
+
+    @Test
     fun answeredWithUnknownMasteryDoesNotClear() {
         val o = RetentionClearPolicy.decide(answered = 3, mastery = null, threshold = threshold)
         assertEquals(Outcome.BELOW_THRESHOLD, o)

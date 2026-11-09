@@ -24,6 +24,19 @@ object RetentionClearPolicy {
         BELOW_THRESHOLD
     }
 
+    /** Accuracy of the submitted answers (correct / answered), or null when nothing was answered. */
+    fun submittedAccuracy(answered: Int, correct: Int): Double? =
+        if (answered <= 0) null else correct.coerceIn(0, answered).toDouble() / answered
+
+    /**
+     * The mastery value the clear decision uses. Prefers the stored mastery row ([storedMastery]),
+     * which is only passed when the evidence import for this submit has landed, so it is fresh.
+     * When there is none (import failed or not yet run, or no row for the concept) it falls back to
+     * [submittedAccuracy], so the clear never depends on the import succeeding.
+     */
+    fun resolveMastery(storedMastery: Double?, answered: Int, correct: Int): Double? =
+        storedMastery ?: submittedAccuracy(answered, correct)
+
     fun decide(answered: Int, mastery: Double?, threshold: Double): Outcome = when {
         answered <= 0 -> Outcome.NOT_SUBMITTED
         mastery != null && mastery >= threshold -> Outcome.MASTERED

@@ -96,7 +96,9 @@ object RetentionTaskLedger {
         val testmateTestId: String? = null,
         val testmateSessionId: String? = null,
         val evidenceImported: Boolean = false,
-        val createdAt: Long = System.currentTimeMillis()
+        val createdAt: Long = System.currentTimeMillis(),
+        /** True once the task was auto-marked DONE, so the clear never runs twice for a session. */
+        val cleared: Boolean = false
     )
 
     // Same reactive-change-signal shape as GapTaskLedger.version — CheckmatePrefs writes
@@ -227,6 +229,13 @@ object RetentionTaskLedger {
      *  entry eventually age out instead of tracking it forever. */
     fun markEvidenceImported(taskId: String) {
         val updated = all().map { if (it.taskId == taskId) it.copy(evidenceImported = true) else it }
+        save(updated)
+        bumpVersion()
+    }
+
+    /** Records that the retention task was auto-cleared (marked DONE); see [RetentionSession.cleared]. */
+    fun markCleared(taskId: String) {
+        val updated = all().map { if (it.taskId == taskId) it.copy(cleared = true) else it }
         save(updated)
         bumpVersion()
     }

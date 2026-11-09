@@ -110,32 +110,46 @@ object RetentionCheckManager {
      * Marks the retention StudyTask DONE only when the student answered something AND the
      * concept's mastery is at or above [MasteryEngine.MASTERY_THRESHOLD] (see
      * [RetentionClearPolicy]); below the threshold, or with mastery unreadable, the task stays
-     * open. Emits RETENTION_RESOLVED {mastery, threshold, outcome, task_marked_done, reason}.
-     * Mastery is read the same way GapTaskManager.resolveDoneConcept reads it (masteryDao
-     * getByConcept). No manual report import or Done tap is involved. Never throws — a failure
-     * here must not undo the evidence import above it.
+     * open. Emits RETENTION_RESOLVED {mastery, mastery_source, import_landed, threshold, outcome,
+     * task_marked_done, reason}. Mastery is the stored row (masteryDao getByConcept, same as
+     * GapTaskManager.resolveDoneConcept) when this submit's evidence import landed, else the
+     * accuracy of the submitted answers, so the clear does not depend on the import. No manual
+     * report import or Done tap is involved. Runs at most once per task (RetentionTaskLedger.cleared).
+     * Never throws — a failure here must not undo the evidence import.
      */
     private suspend fun autoClearRetentionTask(
         context: Context,
         session: RetentionTaskLedger.RetentionSession,
-        answered: Int
+        answered: Int,
+        correct: Int,
+        importLanded: Boolean
     ) {
         try {
-            val mastery = session.conceptId?.let { conceptId ->
-                try {
-                    withContext(Dispatchers.IO) {
-                        LearningDatabase.getInstance(context).masteryDao()
-                            .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
-                    }?.mastery
-                } catch (e: Exception) {
-                    DebugTrail.w(TAG, "autoClear mastery lookup failed for concept=$conceptId: ${e.message}")
-                    null
+            // Never clear the same task twice (e.g. a failed import being retried every cycle).
+            if (RetentionTaskLedger.entry(session.taskId)?.cleared == true) return
+            // The stored mastery row is only trusted when this submit's evidence import landed (it is
+            // then fresh). Otherwise the decision falls back to the accuracy of the submitted answers,
+            // so the clear does not depend on the import succeeding.
+            val storedMastery = if (importLanded) {
+                session.conceptId?.let { conceptId ->
+                    try {
+                        withContext(Dispatchers.IO) {
+                            LearningDatabase.getInstance(context).masteryDao()
+                                .getByConcept(LearningIds.LOCAL_STUDENT_ID, conceptId)
+                        }?.mastery
+                    } catch (e: Exception) {
+                        DebugTrail.w(TAG, "autoClear mastery lookup failed for concept=$conceptId: ${e.message}")
+                        null
+                    }
                 }
-            }
+            } else null
+            val mastery = RetentionClearPolicy.resolveMastery(storedMastery, answered, correct)
+            val masterySource = if (storedMastery != null) "stored" else "submitted_accuracy"
             val outcome = RetentionClearPolicy.decide(answered, mastery, MasteryEngine.MASTERY_THRESHOLD)
             var marked = false
             if (RetentionClearPolicy.shouldMarkDone(outcome)) {
                 marked = PlanStore.markTaskInDay(session.dayKey, session.taskId, TaskState.DONE)
+                if (marked) RetentionTaskLedger.markCleared(session.taskId)
             }
             val reason = RetentionClearPolicy.notClearedReason(outcome, mastery)
             DebugTrail.d(TAG, "autoClear: taskId=${session.taskId} outcome=$outcome mastery=$mastery marked=$marked reason=$reason")
@@ -147,6 +161,9 @@ object RetentionCheckManager {
                     mastery?.let { put("mastery", it) }
                     put("threshold", MasteryEngine.MASTERY_THRESHOLD)
                     put("answered", answered)
+                    put("correct", correct)
+                    put("mastery_source", masterySource)
+                    put("import_landed", importLanded)
                     put("outcome", outcome.name.lowercase())
                     put("task_marked_done", marked)
                     reason?.let { put("reason", it) }
@@ -275,6 +292,9 @@ object RetentionCheckManager {
                 continue // submitted but no per-question data yet
             }
 
+            val answeredCount = result.breakdown.count { it.selectedAnswer != null }
+            val correctCount = result.breakdown.count { it.selectedAnswer != null && it.isCorrect == true }
+            var importLanded = false
             try {
                 val exam = ConsultationProfile.load().examTarget
                 TargetedTestEvidenceImporter.import(
@@ -290,6 +310,7 @@ object RetentionCheckManager {
                     source = "testmate_retention"
                 )
                 RetentionTaskLedger.markEvidenceImported(session.taskId)
+                importLanded = true
                 DebugTrail.d(TAG, "retention evidence imported: taskId=${session.taskId} session=$sessionId")
                 TelemetryClient.emit(
                     "RETENTION_EVIDENCE_IMPORTED", "retention-${session.taskId}",
@@ -316,14 +337,8 @@ object RetentionCheckManager {
                         DebugTrail.e(TAG, "leitner record failed for concept=$conceptId: ${e.message}", e)
                     }
                 }
-                // Auto-clear: the submitted result is in, so a retention task that reached the
-                // mastery threshold needs no manual Done tap or report import; below the threshold
-                // it stays open (RetentionClearPolicy). After markEvidenceImported, so a retry
-                // never re-runs it for the same session.
-                autoClearRetentionTask(
-                    context, session,
-                    answered = result.breakdown.count { it.selectedAnswer != null }
-                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 DebugTrail.e(TAG, "retention evidence import failed for taskId=${session.taskId}: ${e.message}", e)
                 TelemetryClient.emit(
@@ -335,6 +350,12 @@ object RetentionCheckManager {
                     }
                 )
             }
+            // Auto-clear runs on the submitted result itself, NOT inside the import above: an import
+            // that fails or throws must not block it. DONE only when mastery >= threshold (stored
+            // mastery if the import landed, else accuracy of the submitted answers); below it the task
+            // stays open and a failed import is retried next cycle, which re-evaluates the clear.
+            // RetentionTaskLedger.cleared stops it from ever clearing the same task twice.
+            autoClearRetentionTask(context, session, answeredCount, correctCount, importLanded)
         }
     }
 }
