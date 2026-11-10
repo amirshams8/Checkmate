@@ -47,7 +47,7 @@ import kotlinx.coroutines.launch
 // Wraps any Work Mode-related settings (Blocked Apps, Blocked Websites, the
 // Focus Cycle toggles) that must not be editable by the student while
 // blocking is enforced — either because a focus session is running or
-// because the hardcoded 19:00-02:00 window (WorkModeSchedule) is live.
+// because the hardcoded 18:00-07:00 window (WorkModeSchedule) is live.
 // Shows a PIN-unlock prompt instead of [content] until a correct guardian
 // PIN is entered, reusing UninstallGuard's existing PIN/hash/lockout flow
 // so there's still exactly one PIN, and the student never sees it either
@@ -160,7 +160,7 @@ private fun HolidaySettings() {
         Text("Holidays", fontSize = 12.sp, color = White60, modifier = Modifier.padding(bottom = 4.dp))
         Text(
             "On a marked holiday, the ${WorkModeSchedule.LABEL} window is replaced by a " +
-                "single reduced lock from 1:00 AM \u2013 3:10 PM for that day only \u2014 not " +
+                "single reduced lock from 1:00 AM \u2013 4:30 PM for that day only \u2014 not " +
                 "removed entirely. Every other day is unaffected.",
             fontSize = 11.sp, color = White30, modifier = Modifier.padding(bottom = 8.dp)
         )

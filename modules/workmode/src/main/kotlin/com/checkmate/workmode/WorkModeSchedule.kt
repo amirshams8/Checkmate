@@ -6,17 +6,17 @@ import java.util.Calendar
  * WorkModeSchedule — the hardcoded daily Block Mode window.
  *
  * Checkmate enforces Work Mode (app + website blocking, plus the Work Mode
- * settings lock in WorkModeLockGate) every day from 19:00 (7 PM) to 07:00
+ * settings lock in WorkModeLockGate) every day from 18:00 (6 PM) to 07:00
  * (7 AM) the following morning — on top of whatever task-based sessions the
  * student starts manually.
  *
  * UPDATE: the usual hardcoded window's end was moved from 02:00 to 05:00,
- * and then to 07:00 (still starts 19:00). Every day additionally gets a
- * second, earlier lock window — 01:00 to 15:10 — so every non-holiday day
- * the student is locked out almost all day with only a short 15:10-19:00
- * gap before the usual 19:00-07:00 window takes back over ("locked twice"
- * per day). Previously this extra window only applied on Sunday and
- * Wednesday; it now applies every day.
+ * and then to 07:00. Per Sir (msg 5958) the free window is now exactly
+ * 16:30-18:00: the usual window starts at 18:00 and the extra lock window
+ * runs 01:00 to 16:30, so every non-holiday day the student is locked out
+ * almost all day with only a short 16:30-18:00 gap before the usual
+ * 18:00-07:00 window takes back over ("locked twice" per day). Previously
+ * the gap was 15:10-19:00.
  *
  * This window is intentionally a compile-time constant. There is no
  * Settings screen, SharedPrefs key, or remote config that can change it —
@@ -27,15 +27,15 @@ import java.util.Calendar
  * The ONE exception is [HolidaySchedule]: specific calendar dates a guardian
  * has explicitly marked exempt (see that file's doc for why it's gated
  * behind a guardian PIN unlock rather than being freely editable). On a
- * marked holiday, the usual 19:00-07:00 window is replaced by a single
- * reduced 01:00-15:10 lock instead — a holiday eases the schedule for the
+ * marked holiday, the usual 18:00-07:00 window is replaced by a single
+ * reduced 01:00-16:30 lock instead — a holiday eases the schedule for the
  * day, it doesn't remove it. Every other day, this schedule behaves exactly
  * as before.
  */
 object WorkModeSchedule {
 
-    /** 24h clock hour the usual daily window begins (7 PM), every day. */
-    const val START_HOUR = 19
+    /** 24h clock hour the usual daily window begins (6 PM), every day. */
+    const val START_HOUR = 18
 
     /**
      * 24h clock hour the usual daily window ends, on the next calendar day
@@ -47,21 +47,21 @@ object WorkModeSchedule {
     const val SPECIAL_START_HOUR = 1
     const val SPECIAL_START_MINUTE = 0
 
-    /** 24h clock hour/minute the extra lock window ends (3:10 PM), every day. */
-    const val SPECIAL_END_HOUR = 15
-    const val SPECIAL_END_MINUTE = 10
+    /** 24h clock hour/minute the extra lock window ends (4:30 PM), every day. */
+    const val SPECIAL_END_HOUR = 16
+    const val SPECIAL_END_MINUTE = 30
 
     /** Human-readable label for display in Settings only — not configurable from there. */
     const val LABEL =
-        "7:00 PM \u2013 3:10 PM daily, with a 3:10 PM \u2013 7:00 PM gap"
+        "6:00 PM \u2013 4:30 PM daily, with a 4:30 PM \u2013 6:00 PM gap"
 
     /**
      * True if [cal] (defaults to the trusted, tamper-resistant "now" — see
      * TrustedTime — NOT the raw device clock) falls inside a locked window:
-     *  - the usual 19:00-07:00 window, every day, OR
-     *  - the extra 01:00-15:10 window, every day.
+     *  - the usual 18:00-07:00 window, every day, OR
+     *  - the extra 01:00-16:30 window, every day.
      *  - EXCEPT on a guardian-marked holiday (HolidaySchedule.isHoliday): the usual
-     *    19:00-07:00 window is replaced by a single reduced 01:00-15:10 lock, same
+     *    18:00-07:00 window is replaced by a single reduced 01:00-16:30 lock, same
      *    hours as the regular extra window. A holiday eases the schedule for the
      *    day — it doesn't remove structure from it entirely.
      *
@@ -87,8 +87,8 @@ object WorkModeSchedule {
             return afterSpecialStart && beforeSpecialEnd
         }
 
-        // Guardian-marked holiday: the usual 19:00-07:00 window is replaced by just
-        // the reduced 01:00-15:10 window — see HolidaySchedule's doc for why this can
+        // Guardian-marked holiday: the usual 18:00-07:00 window is replaced by just
+        // the reduced 01:00-16:30 window — see HolidaySchedule's doc for why this can
         // only be set behind a guardian PIN unlock.
         if (HolidaySchedule.isHoliday(cal)) return withinSpecialWindow()
 
@@ -96,8 +96,8 @@ object WorkModeSchedule {
         // 00:00..(END_HOUR-1):59. Applies every day of the week.
         if (hour >= START_HOUR || hour < END_HOUR) return true
 
-        // Extra window: 01:00 (inclusive) to 15:10 (exclusive), every non-holiday day
-        // — leaves the 15:10-19:00 gap free before the usual window resumes.
+        // Extra window: 01:00 (inclusive) to 16:30 (exclusive), every non-holiday day
+        // — leaves the 16:30-18:00 gap free before the usual window resumes.
         if (withinSpecialWindow()) return true
 
         return false
@@ -105,7 +105,7 @@ object WorkModeSchedule {
 
     /**
      * Milliseconds from [cal] (defaults to now) until the next boundary
-     * clock-time (01:00, 07:00, 15:10, or 19:00). Used only for
+     * clock-time (01:00, 07:00, 16:30, or 18:00). Used only for
      * logging/diagnostics — the actual enforcement alarms are four fixed
      * daily clock-time alarms registered by WorkModeScheduleReceiver, not a
      * self-rescheduling "next boundary" alarm, so a missed tick can't drift

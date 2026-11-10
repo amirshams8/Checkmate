@@ -424,7 +424,7 @@ class AppAutomationService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
 
         // ── Hardcoded schedule reconciliation ──────────────────────────────────
-        // Keeps Work Mode's forced 19:00-05:00 window (plus the extra Sun/Wed 01:00-15:10 window) enforced even if the
+        // Keeps Work Mode's forced 18:00-07:00 window (plus the extra daily 01:00-16:30 window) enforced even if the
         // student never starts a task, or if the process restarted mid-window
         // and lost its in-memory isActive flag.
         val now = System.currentTimeMillis()

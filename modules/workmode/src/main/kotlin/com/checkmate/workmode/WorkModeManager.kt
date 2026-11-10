@@ -119,7 +119,7 @@ object WorkModeManager {
      * schedule (WorkModeSchedule) is currently in force and no guardian PIN
      * unlock is active. This is what closes the "mark the task done/skip it,
      * then browse freely until the next one" loophole during the
-     * 19:00-02:00 window: block mode isn't tied to any single task while
+     * 18:00-07:00 window: block mode isn't tied to any single task while
      * the schedule says it should be on.
      */
     fun deactivate(context: Context): Boolean {
@@ -153,7 +153,7 @@ object WorkModeManager {
 
     /**
      * True whenever app/website blocking must be enforced right now —
-     * either a manual/task session is active, or the hardcoded 19:00-02:00
+     * either a manual/task session is active, or the hardcoded 18:00-07:00
      * window is live. AppAutomationService keys blocking decisions off
      * this instead of the raw [isActive] flag, so the hardcoded window
      * can't be bypassed just by never starting a task, or by the
@@ -172,7 +172,7 @@ object WorkModeManager {
      * gate is a guardian PIN unlock — the same UninstallGuard mechanism
      * that gates uninstall protection, so there's still exactly one PIN,
      * and the student never sees it either way. Tying this to enforcement
-     * state alone used to leave a window (outside 19:00-02:00, no active
+     * state alone used to leave a window (outside 18:00-07:00, no active
      * session) where these were freely editable; that loophole is now closed.
      */
     // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —

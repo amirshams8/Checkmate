@@ -78,7 +78,7 @@ object WorkModeTaskReconciler {
             // No live task, and WE were the one holding Work Mode open — never stomp on a
             // MANUAL guardian toggle or the hardcoded SCHEDULE window, both legitimately
             // independent of any single task's state. deactivate() itself still re-checks
-            // WorkModeSchedule and refuses to actually turn off if the 19:00-02:00 window
+            // WorkModeSchedule and refuses to actually turn off if the 18:00-07:00 window
             // is live, same guard markDone/markSkip already rely on.
             WorkModeManager.deactivate(context)
         }

@@ -12,7 +12,7 @@ class SweepPolicyTest {
 
     @Test
     fun lockdownOutsideEnforcementStillSweeps() {
-        // The bug: lockdown active, not enforcing (e.g. the 15:10-19:00 gap) -> no sweep.
+        // The bug: lockdown active, not enforcing (e.g. the 16:30-18:00 gap) -> no sweep.
         assertTrue(SweepPolicy.sweepActive(enforcing = false, inLockdown = true))
     }
 
