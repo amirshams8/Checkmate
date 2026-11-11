@@ -203,8 +203,24 @@ object UninstallGuard {
         // com.oplus.phonemanager/.opt.SystemOptActivity). It can force-stop / freeze / clear
         // data for other apps, so its screens get the same guarded-screen watch (and the
         // accessibility-off PIN gate in ForegroundPinGate) as Settings.
-        "com.oplus.phonemanager"
+        "com.oplus.phonemanager",
+        "com.coloros.phonemanager"
     )
+
+    // PHONE BOOSTER LOOPHOLE FIX: ColorOS/OxygenOS Phone Manager (the "Phone Booster" /
+    // "Boost now" / app-freeze / clear-data screens) can force-stop Checkmate, but its
+    // screens never mention "Checkmate" by name (Boost now kills everything in one tap, and
+    // its per-app rows use wording like "Freeze"/"Clear"/"Stop" instead of "force stop"), so
+    // the text-gated looksLikeGuardedScreen() above never matched and the watchdog stayed
+    // silent. These packages are therefore guarded name-agnostically: any window of theirs
+    // that is actually in front, with no guardian unlock active, is bounced Home + alerted.
+    // Legit use stays possible through the normal guardian PIN / remote-override window.
+    val ALWAYS_GUARDED_PACKAGES = setOf(
+        "com.oplus.phonemanager",
+        "com.coloros.phonemanager"
+    )
+
+    fun isAlwaysGuardedPackage(pkg: String): Boolean = pkg in ALWAYS_GUARDED_PACKAGES
 
     // LOOPHOLE FIX (Force Stop reachable via a Battery/App-info card that doesn't run
     // under "com.android.settings" — e.g. a floating "app info" bubble hosted by

@@ -218,6 +218,13 @@ class AppAutomationService : AccessibilityService() {
     // event happened to arm it or what the numbers coincidentally line up to.
     private var guardConfirmedUntil = 0L
 
+    // PHONE BOOSTER LOOPHOLE FIX: debounce for the name-agnostic always-guarded surfaces
+    // (UninstallGuard.ALWAYS_GUARDED_PACKAGES). Phone Manager keeps emitting content-change
+    // events while it animates away after the Home bounce; without this each one would count
+    // as a fresh attempt and walk the consecutive-attempt counter into a false hard lock.
+    private val ALWAYS_GUARDED_DEBOUNCE_MS = 1500L
+    private var lastAlwaysGuardedAt = 0L
+
     private fun releaseIfNotConfirmedGuarded() {
         if (System.currentTimeMillis() >= guardConfirmedUntil) {
             removeTouchBlocker()
@@ -648,6 +655,15 @@ class AppAutomationService : AccessibilityService() {
         val text = collectAllText(root, pkg)
         val lower = text.lowercase()
 
+        // Phone Booster / Phone Manager: guarded by package alone — its screens don't name
+        // Checkmate. Only counts when that package's window is genuinely the active one
+        // (rootInActiveWindow can resolve to Home right after a bounce) and not within the
+        // debounce window of the previous fire.
+        val nowUp = SystemClock.uptimeMillis()
+        val isAlwaysGuardedSurface = UninstallGuard.isAlwaysGuardedPackage(pkg) &&
+            root.packageName?.toString() == pkg &&
+            nowUp - lastAlwaysGuardedAt >= ALWAYS_GUARDED_DEBOUNCE_MS
+
         val targetsCheckmate = lower.contains("checkmate") || lower.contains(SELF_PKG.lowercase())
         val isKnownSettingsSurface = pkg in UninstallGuard.WATCHED_PACKAGES
         val isNamedGuardedScreen = UninstallGuard.looksLikeGuardedScreen(text, targetsCheckmate, isKnownSettingsSurface)
@@ -669,7 +685,7 @@ class AppAutomationService : AccessibilityService() {
                 "matchedKeyword=$matchedKeyword textSnippet=${text.take(200).replace("\n", " ")}"
         )
 
-        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen) {
+        if (!isNamedGuardedScreen && !isDeviceAdminPrompt && !isDevOptionsScreen && !isAlwaysGuardedSurface) {
             // Confirmed not guarded (e.g. ordinary Wi-Fi/Bluetooth browsing, or
             // swiping down the notification drawer) — drop *our own* pre-check
             // block immediately instead of waiting out its timer, so normal
@@ -700,15 +716,20 @@ class AppAutomationService : AccessibilityService() {
         // covers so no later "not guarded" classification from an unrelated event
         // (e.g. a notification-drawer swipe) can tear this block down early.
         guardConfirmedUntil = touchBlockUntil
+        if (isAlwaysGuardedSurface) lastAlwaysGuardedAt = nowUp
 
         // TEMP DEBUG (see UninstallGuard.logDebugTrail doc) — the actual fire event,
         // paired with matchedKeyword from the SCAN line just above it in the trail.
-        UninstallGuard.logDebugTrail("GUARDED_FIRED pkg=$pkg hardLock=$hardLock matchedKeyword=$matchedKeyword")
+        UninstallGuard.logDebugTrail("GUARDED_FIRED pkg=$pkg hardLock=$hardLock matchedKeyword=$matchedKeyword alwaysGuarded=$isAlwaysGuardedSurface")
 
         performGlobalAction(GLOBAL_ACTION_HOME)
 
         if (UninstallGuard.shouldAlert()) {
-            val reason = if (hardLock) "repeated_disable_attempt_hard_lock" else "settings_screen_blocked"
+            val reason = when {
+                hardLock -> "repeated_disable_attempt_hard_lock"
+                isAlwaysGuardedSurface && !isNamedGuardedScreen -> "phone_booster_blocked"
+                else -> "settings_screen_blocked"
+            }
             UninstallGuard.listener?.onGuardedScreenBlocked(applicationContext, reason)
         }
     }

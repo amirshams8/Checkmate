@@ -25,7 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * screen comes up without an active guardian unlock, puts PinGateActivity on top of it.
  *
  * Gated:
- *  - [ALWAYS_GATED] (the OnePlus/ColorOS battery screen that hosts Force stop): always.
+ *  - [ALWAYS_GATED] (the OnePlus/ColorOS battery screen that hosts Force stop, plus the
+ *    Phone Manager / Phone Booster app, whose "Boost now" kills Checkmate): always.
  *  - everything in [UninstallGuard.WATCHED_PACKAGES] (Settings and OEM forks): only while
  *    the accessibility watchdog is NOT live, since the precise text-based guard handles
  *    Settings otherwise and a blanket Settings lock would be needlessly harsh.
@@ -59,7 +60,7 @@ object ForegroundPinGate {
     private const val NO_ACCESS_RETRY_MS = 10_000L
 
     /** Gated regardless of accessibility state. */
-    val ALWAYS_GATED = setOf("com.oplus.battery")
+    val ALWAYS_GATED = setOf("com.oplus.battery") + UninstallGuard.ALWAYS_GUARDED_PACKAGES
 
     /** Hosts of the uninstall-confirmation dialog. Gated only while accessibility is down. */
     val UNINSTALL_SURFACES = setOf(
