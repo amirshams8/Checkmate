@@ -104,6 +104,21 @@ object WorkModeSchedule {
     }
 
     /**
+     * True once the free period is over: inside the usual 18:00-07:00 window on a
+     * non-holiday day. Used for apps that must stay reachable during the daytime lock and
+     * the 16:30-18:00 free gap but are blocked from 18:00 onward (e.g. Phone Manager).
+     * On a guardian-marked holiday the usual window doesn't apply, so this is false.
+     * Uses the trusted clock, same as [isWithinScheduledWindow].
+     */
+    fun isAfterFreePeriod(
+        cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
+    ): Boolean {
+        if (HolidaySchedule.isHoliday(cal)) return false
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        return hour >= START_HOUR || hour < END_HOUR
+    }
+
+    /**
      * Milliseconds from [cal] (defaults to now) until the next boundary
      * clock-time (01:00, 07:00, 16:30, or 18:00). Used only for
      * logging/diagnostics — the actual enforcement alarms are four fixed

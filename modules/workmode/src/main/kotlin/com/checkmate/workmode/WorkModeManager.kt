@@ -39,6 +39,16 @@ object WorkModeManager {
         "com.reddit.frontpage"
     )
 
+    // Hardcoded additions to the blocklist, merged into getBlockedApps() so they survive the
+    // Blocked Apps picker rewriting "blocked_apps" and remote profile syncs. They are only
+    // blocked AFTER the free period (see WorkModeSchedule.isAfterFreePeriod) — i.e. during the
+    // usual 18:00-07:00 window — and stay reachable during the daytime lock and the free gap.
+    // Phone Manager (ColorOS/OxygenOS system app) can force-stop / freeze / clear data of other
+    // apps. Package confirmed on-device via `dumpsys window | grep mCurrentFocus`.
+    private val AFTER_FREE_PERIOD_BLOCKED_APPS = setOf(
+        "com.oplus.phonemanager"
+    )
+
     // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
     private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
     private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
@@ -412,7 +422,9 @@ object WorkModeManager {
      */
     fun getBlockedApps(): Set<String> {
         val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
-        return saved.split(",").filter { it.isNotBlank() }.toSet()
+        val base = saved.split(",").filter { it.isNotBlank() }.toSet()
+        // Hardcoded additions only apply once the free period is over (usual window).
+        return if (WorkModeSchedule.isAfterFreePeriod()) base + AFTER_FREE_PERIOD_BLOCKED_APPS else base
     }
 
     /**
