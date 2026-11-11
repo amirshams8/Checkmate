@@ -1,1 +1,611 @@
-testshshsh
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeManager.kt =====
+package com.checkmate.workmode
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.provider.Settings as AndroidSettings
+import android.telecom.TelecomManager
+import com.checkmate.core.CheckmatePrefs
+import com.checkmate.core.CheckmateState
+import com.checkmate.core.StudyMode
+import com.checkmate.core.TelemetryClient
+import org.json.JSONObject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object WorkModeManager {
+
+    private const val KEY_ACTIVE_SOURCE = "work_mode_active_source"
+    private const val SOURCE_MANUAL   = "manual"
+    private const val SOURCE_SCHEDULE = "schedule"
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown window.
+    private const val KEY_LOCKDOWN_UNTIL     = "post_skip_lockdown_until"
+    private const val DEFAULT_LOCKDOWN_MIN   = 45
+    private const val KEY_LOCKDOWN_MINUTES   = "post_skip_lockdown_minutes"
+    // Fixed default watchlist for the escalation window — deliberately broader than the
+    // permanent blocklist since it's temporary. Guardian can extend it via
+    // "escalation_watchlist" (comma-separated package names), same storage pattern as
+    // getBlockedApps()/getBlockedDomains(). Package names, not labels — matched directly
+    // against AccessibilityEvent.packageName in AppAutomationService.
+    private val DEFAULT_ESCALATION_WATCHLIST = setOf(
+        "com.instagram.android",
+        "com.google.android.youtube",
+        "com.zhiliaoapp.musically",   // TikTok
+        "com.snapchat.android",
+        "com.facebook.katana",
+        "com.twitter.android",
+        "com.reddit.frontpage"
+    )
+
+    // Hardcoded additions to the blocklist, merged into getBlockedApps() so they survive the
+    // Blocked Apps picker rewriting "blocked_apps" and remote profile syncs. They are only
+    // blocked AFTER the free period (see WorkModeSchedule.isAfterFreePeriod) — i.e. during the
+    // usual 18:00-07:00 window — and stay reachable during the daytime lock and the free gap.
+    // Phone Manager (ColorOS/OxygenOS system app) can force-stop / freeze / clear data of other
+    // apps. Package confirmed on-device via `dumpsys window | grep mCurrentFocus`.
+    private val AFTER_FREE_PERIOD_BLOCKED_APPS = setOf(
+        "com.oplus.phonemanager"
+    )
+
+    // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.
+    private const val KEY_ESCALATION_THRESHOLD = "escalation_skip_threshold"
+    private const val DEFAULT_ESCALATION_THRESHOLD = 0.4f
+
+    // BUGFIX (silent delay never enforced): idempotency ledger for overdue-PENDING
+    // enforcement, plus the dynamically-detected top-time-consuming app for the current
+    // overdue window. See hasAppliedOverdueEnforcement/markOverdueEnforcementApplied/
+    // retainOverdueEnforcementOnly/setOverdueTopApp for the actual logic; these two keys
+    // are just the storage, same CheckmatePrefs idiom as KEY_LOCKDOWN_UNTIL above.
+    private const val KEY_OVERDUE_ESCALATED_TASK_IDS = "overdue_escalated_task_ids"
+    private const val KEY_OVERDUE_TOP_APP            = "overdue_top_app_pkg"
+
+    // LOOPHOLE FIX (adaptive app block over-blocking): guardian-extendable exemption list,
+    // same comma-separated storage idiom as "escalation_watchlist". Use this for anything
+    // that can't be resolved dynamically via PackageManager (see essentialPackages()) — e.g.
+    // a doubt-solving app, or a device-specific system app that slips past the dynamic
+    // resolution below.
+    private const val KEY_ESSENTIAL_EXTRA = "essential_apps_extra"
+
+    // Fixed exemption: kept reachable during Work Mode for doubt-solving. Not resolvable
+    // dynamically (there's no Intent category for "the doubt-solving app"), so it's hardcoded
+    // here rather than left to whatever the guardian remembers to type into
+    // essential_apps_extra. Add more fixed exemptions the same way if needed.
+    private const val CHATGPT_PKG = "com.openai.chatgpt"
+    private const val GOOGLE_PKG = "com.google.android.googlequicksearchbox"
+    private const val GEMINI_PKG = "com.google.android.apps.bard"
+    private const val PW_PKG = "xyz.penpencil.physicswala"           // PhysicsWallah
+    private const val YTMUSIC_PKG = "com.google.android.apps.youtube.music"
+    private const val FIIO_PKG = "com.fiio.control"                  // FiiO Control
+    private const val HIKCONNECT_PKG = "com.connect.enduser"         // Hik-Connect camera app
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    /**
+     * Call once from CheckmateApp.onCreate and BootReceiver, after
+     * CheckmatePrefs.init()/CheckmateState.init(). Syncs the in-memory flag
+     * with whatever was persisted before this process started — previously
+     * _isActive always reset to false on a fresh process even if the
+     * student had an active session, which silently turned off app
+     * blocking until the app UI was reopened. Also immediately reconciles
+     * against the hardcoded schedule.
+     */
+    fun init(context: Context) {
+        TrustedTime.refreshIfNeeded(context)
+        _isActive.value = CheckmateState.currentMode == StudyMode.STUDY
+        // BUGFIX (Work Mode notification/service didn't survive reboot): the line above
+        // correctly restores the STATE (so isEnforcing()/blocking work immediately either
+        // way), but WorkModeService itself — the foreground "Work Mode — ON" notification —
+        // is only ever started from activate(), which evaluateSchedule() below only calls
+        // when it's turning Work Mode ON from OFF. A manually/task-activated session that
+        // was already ON before the reboot left _isActive true here without ever calling
+        // activate() again, so the service (and its notification) just silently didn't come
+        // back — blocking kept working, but there was no persistent notification and no
+        // running WorkModeService until the next manual toggle or schedule boundary.
+        // startService() is idempotent (re-delivers onStartCommand to an already-running
+        // service), so it's safe to call unconditionally here.
+        if (_isActive.value) startService(context)
+        evaluateSchedule(context)
+    }
+
+    fun activate(context: Context, source: String = SOURCE_MANUAL) {
+        CheckmateState.setMode(context, StudyMode.STUDY)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, source)
+        _isActive.value = true
+        startService(context)
+        TelemetryClient.emit(
+            "WORKMODE_ACTIVATED", null,
+            payload = JSONObject().put("source", source)
+                .put("in_window", WorkModeSchedule.isWithinScheduledWindow())
+        )
+    }
+
+    /**
+     * Turns Work Mode off. Returns true if it actually turned off.
+     *
+     * Returns false — and leaves blocking ON — if the hardcoded daily
+     * schedule (WorkModeSchedule) is currently in force and no guardian PIN
+     * unlock is active. This is what closes the "mark the task done/skip it,
+     * then browse freely until the next one" loophole during the
+     * 18:00-07:00 window: block mode isn't tied to any single task while
+     * the schedule says it should be on.
+     */
+    fun deactivate(context: Context): Boolean {
+        DistractionGuard.reset()
+        if (WorkModeSchedule.isWithinScheduledWindow() && !UninstallGuard.isUnlocked()) {
+            // Whatever session requested this deactivate (e.g. a manual task
+            // finishing) is over, but the hardcoded schedule is still in force.
+            // Hand the active-source tag back to "schedule" so evaluateSchedule()
+            // can auto-release Work Mode once the window itself ends — otherwise
+            // this stays tagged as the task's source (e.g. "manual") forever, the
+            // natural-end auto-release check never matches, and blocking silently
+            // continues past the hardcoded window until manually toggled off.
+            CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, SOURCE_SCHEDULE)
+            TelemetryClient.emit(
+                "WORKMODE_DEACTIVATE_REFUSED", null, status = "refused",
+                payload = JSONObject().put("reason", "scheduled_window_in_force")
+            )
+            return false
+        }
+        CheckmateState.setMode(context, StudyMode.NORMAL)
+        CheckmatePrefs.putString(KEY_ACTIVE_SOURCE, "")
+        _isActive.value = false
+        context.stopService(Intent(context, WorkModeService::class.java))
+        TelemetryClient.emit("WORKMODE_DEACTIVATED", null)
+        return true
+    }
+
+    fun toggle(context: Context) {
+        if (_isActive.value) deactivate(context) else activate(context)
+    }
+
+    /**
+     * True whenever app/website blocking must be enforced right now —
+     * either a manual/task session is active, or the hardcoded 18:00-07:00
+     * window is live. AppAutomationService keys blocking decisions off
+     * this instead of the raw [isActive] flag, so the hardcoded window
+     * can't be bypassed just by never starting a task, or by the
+     * accessibility-service process restarting and losing in-memory state.
+     */
+    fun isEnforcing(): Boolean = _isActive.value || WorkModeSchedule.isWithinScheduledWindow()
+
+    /**
+     * True when Work Mode settings (Blocked Apps, Blocked Websites, Focus
+     * Cycle toggles, Guardian Telegram Chat ID) must be read-only in the UI.
+     *
+     * Locked permanently as soon as a guardian PIN exists — NOT just while
+     * a session/the hardcoded window is enforcing. Before any PIN has been
+     * generated (first launch / initial setup) these stay open so the
+     * guardian can configure them once. After that, the only way past this
+     * gate is a guardian PIN unlock — the same UninstallGuard mechanism
+     * that gates uninstall protection, so there's still exactly one PIN,
+     * and the student never sees it either way. Tying this to enforcement
+     * state alone used to leave a window (outside 18:00-07:00, no active
+     * session) where these were freely editable; that loophole is now closed.
+     */
+    // Mentor v2 (spec 3.5): second, independent gate on top of the existing PIN mechanism —
+    // even a correct guardian PIN unlock doesn't reopen settings while the recent skip rate
+    // is over threshold. This is deliberate escalation, not a bug: a guardian who's just
+    // unlocked settings during a bad week should still see them locked back down once the
+    // unlock window (UNLOCK_WINDOW_MS in UninstallGuard) lapses, same as before — the new
+    // clause only matters while skipRateExceedsThreshold() is true, which requires an actual
+    // sustained skip pattern (see DEFAULT_ESCALATION_THRESHOLD), not a one-off.
+    // Recommended mitigation for the "guardian genuinely needs in during an escalation"
+    // case: UninstallGuard.grantRemoteOverride() (Telegram-command driven, see that file) —
+    // it bypasses this gate entirely rather than fighting it.
+    fun settingsLocked(): Boolean =
+        UninstallGuard.hasPinConfigured() &&
+        !UninstallGuard.hasRemoteOverride() &&
+        (!UninstallGuard.isUnlocked() || skipRateExceedsThreshold())
+
+    /**
+     * Mentor v2 (spec 3.5): reads the skip rate PsycheEngine.refreshBehaviorSummaryCache()
+     * writes into "recent_skip_rate" (a plain CheckmatePrefs bridge, same pattern as the
+     * "behavior_summary" cache — :modules:workmode has no dependency on :modules:psyche, so
+     * this avoids adding one). Threshold is configurable via "escalation_skip_threshold";
+     * defaults to DEFAULT_ESCALATION_THRESHOLD.
+     */
+    fun skipRateExceedsThreshold(): Boolean {
+        val rate = CheckmatePrefs.getString("recent_skip_rate", "0")?.toFloatOrNull() ?: 0f
+        val threshold = CheckmatePrefs.getString(KEY_ESCALATION_THRESHOLD, null)?.toFloatOrNull()
+            ?: DEFAULT_ESCALATION_THRESHOLD
+        return rate > threshold
+    }
+
+    // Mentor v2 (spec 3.4): post-skip escalation lockdown.
+
+    /** Opens a timed lockdown window starting now. Call from HomeViewModel.markSkip() —
+     *  and, as of the overdue-enforcement fix, from `app`'s OverdueEnforcementCoordinator
+     *  for a badly-overdue still-PENDING task. Deliberately the same function for both:
+     *  it's the identical consequence (temporary lockdown + escalation watchlist), just
+     *  reached by two different triggers — an explicit Skip tap, or silence past
+     *  threshold. Neither caller may pair this with a TaskState change other than what
+     *  that caller already legitimately does on its own terms (markSkip marks SKIPPED
+     *  for its own reasons; the overdue path must NOT mark anything). */
+    fun startPostSkipLockdown(context: Context) {
+        val minutes = CheckmatePrefs.getInt(KEY_LOCKDOWN_MINUTES, DEFAULT_LOCKDOWN_MIN)
+            .let { if (it <= 0) DEFAULT_LOCKDOWN_MIN else it }
+        // TrustedTime, not the raw device clock: moving Settings > Date & time forward by the
+        // window length used to end the lockdown at once (see LockdownWindow).
+        val until = LockdownWindow.untilMs(TrustedTime.nowMillis(), minutes)
+        CheckmatePrefs.putLong(KEY_LOCKDOWN_UNTIL, until)
+        TelemetryClient.emit(
+            "POST_SKIP_LOCKDOWN_STARTED", null,
+            payload = JSONObject().put("minutes", minutes).put("until_ms", until)
+        )
+    }
+
+    /** True while a post-skip lockdown window is active. AppAutomationService checks this
+     *  alongside the normal blocklist to decide whether to skip DistractionGuard's 3-attempt
+     *  grace period for apps on [getEscalationWatchlist]. */
+    fun isInPostSkipLockdown(): Boolean =
+        LockdownWindow.isActive(TrustedTime.nowMillis(), CheckmatePrefs.getLong(KEY_LOCKDOWN_UNTIL, 0L))
+
+    /**
+     * Returns [getBlockedApps] plus a fixed distraction-prone watchlist (extendable via
+     * prefs), plus (BUGFIX, silent delay never enforced) whichever single app
+     * [setOverdueTopApp] most recently recorded as the top time-consumer during an
+     * overdue-PENDING window. That last piece is what lets this catch a student's actual
+     * procrastination target — a game, a browser tab, anything not on the fixed list —
+     * rather than only ever blocking the same static seven apps.
+     */
+    fun getEscalationWatchlist(): Set<String> {
+        val extra = CheckmatePrefs.getString("escalation_watchlist", "") ?: ""
+        val extraSet = extra.split(",").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val overdueTop = CheckmatePrefs.getString(KEY_OVERDUE_TOP_APP, "")
+            ?.takeIf { it.isNotBlank() }
+        return getBlockedApps() + DEFAULT_ESCALATION_WATCHLIST + extraSet + setOfNotNull(overdueTop)
+    }
+
+    /**
+     * Reconciles [isActive] with the hardcoded schedule. Call on app start,
+     * boot, from the twice-daily schedule alarms (WorkModeScheduleReceiver),
+     * and periodically from the accessibility service.
+     *
+     * Only ever force-starts or force-stops sessions that IT started
+     * (tracked via [KEY_ACTIVE_SOURCE] = "schedule") — a manual task session
+     * that happens to be running is never auto-cancelled here, and a manual
+     * session that outlasts the window keeps running under student control
+     * exactly as before.
+     */
+    fun evaluateSchedule(context: Context) {
+        val inWindow = WorkModeSchedule.isWithinScheduledWindow()
+        val currentSource = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "")
+
+        if (inWindow && !_isActive.value) {
+            activate(context, source = SOURCE_SCHEDULE)
+        } else if (!inWindow && _isActive.value && currentSource == SOURCE_SCHEDULE) {
+            // Window ended naturally and nothing manual took over — release
+            // it without requiring a PIN, since this isn't a student action.
+            deactivate(context)
+        }
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * exposes the currently-recorded [KEY_ACTIVE_SOURCE] tag so a caller can tell
+     * *why* Work Mode is on before deciding whether it's safe to turn off — e.g.
+     * [com.checkmate.service.WorkModeTaskReconciler] must not deactivate a session
+     * that a guardian toggled on manually or that the hardcoded schedule opened,
+     * only one it opened itself (tagged [SOURCE_TASK]). Was private before this
+     * fix; nothing outside this object needed to read it.
+     */
+    fun activeSource(): String = CheckmatePrefs.getString(KEY_ACTIVE_SOURCE, "") ?: ""
+
+    /**
+     * BUGFIX (silent delay never enforced): true once overdue enforcement has already
+     * been applied for this specific task id. [InterventionTriggerWorker] calls
+     * [OverdueEnforcementGateway.applyOverdueEnforcement] every ~15-minute cycle the task
+     * stays PENDING past threshold — this is what stops that from re-running
+     * startPostSkipLockdown()/re-detecting the top app on every single cycle
+     * (09:35 apply, 09:50 no-op, 10:05 no-op, ...) instead of exactly once per overdue
+     * episode. Keyed on StudyTask.id (a fresh UUID per generated task — see StudyTask's
+     * own doc — never reused across days), not a global flag, so one overdue task doesn't
+     * suppress detection for a different one.
+     */
+    fun hasAppliedOverdueEnforcement(taskId: String): Boolean =
+        overdueEscalatedIds().contains(taskId)
+
+    /** Records that overdue enforcement has now been applied for [taskId] — call exactly
+     *  once, from the same code path that calls [startPostSkipLockdown] for this reason. */
+    fun markOverdueEnforcementApplied(taskId: String) {
+        persistOverdueEscalatedIds(overdueEscalatedIds() + taskId)
+    }
+
+    /**
+     * Drops every escalated-task id NOT in [stillPendingTaskIds]. Call from
+     * [com.checkmate.service.WorkModeTaskReconciler] on every PlanStore.todayTasks
+     * emission — that's the one place that already observes every task leaving PENDING,
+     * regardless of why (started, done, skipped, reverted back to PENDING by
+     * GapTaskManager's resolveDoneConcept path, or dropped off today's list entirely by
+     * day rollover). A task that's since been resolved has nothing left to guard against
+     * re-escalating, and if it ever legitimately becomes PENDING again later (the
+     * GapTaskManager revert case), it deserves a fresh overdue evaluation rather than
+     * being permanently suppressed by a stale flag from its last time around.
+     *
+     * Also clears the detected top-app watchlist entry once nothing is left escalated, so
+     * a stale detection from an already-resolved delay doesn't linger in
+     * [getEscalationWatchlist] indefinitely.
+     */
+    fun retainOverdueEnforcementOnly(stillPendingTaskIds: Set<String>) {
+        val current = overdueEscalatedIds()
+        val retained = current.intersect(stillPendingTaskIds)
+        if (retained != current) persistOverdueEscalatedIds(retained)
+        if (retained.isEmpty() && current.isNotEmpty()) setOverdueTopApp(null)
+    }
+
+    /** Records which app [com.checkmate.core.AppUsageTracker.getTopAppInRange] found was
+     *  eating the most time during the current overdue-PENDING window — folded into
+     *  [getEscalationWatchlist] alongside the fixed watchlist. Pass null to clear it. */
+    fun setOverdueTopApp(pkg: String?) {
+        CheckmatePrefs.putString(KEY_OVERDUE_TOP_APP, pkg ?: "")
+    }
+
+    private fun overdueEscalatedIds(): Set<String> {
+        val saved = CheckmatePrefs.getString(KEY_OVERDUE_ESCALATED_TASK_IDS, "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun persistOverdueEscalatedIds(ids: Set<String>) {
+        CheckmatePrefs.putString(KEY_OVERDUE_ESCALATED_TASK_IDS, ids.joinToString(","))
+    }
+
+    /**
+     * LOOPHOLE FIX (adaptive app block over-blocking): packages that must never be treated
+     * as "blocked" no matter what's saved in "blocked_apps" — blocking the student's own
+     * launcher, phone/dialer, or system Settings app bricks device navigation outright
+     * (there'd be no way back to Home or Settings to even fix the block list), and ChatGPT
+     * is kept reachable for legitimate doubt-solving during study, per guardian policy.
+     *
+     * Launcher/dialer/Settings are resolved dynamically via PackageManager rather than
+     * hardcoded: exact package names for these vary across OEM skins (e.g. this device's
+     * Settings/launcher fork), and a wrong hardcoded guess would silently exempt nothing.
+     * ChatGPT has no resolvable Intent category ("the doubt-solving app" isn't a system
+     * role), so it's a fixed constant instead — add more the same way, or via
+     * "essential_apps_extra" for anything the guardian wants exempted without a rebuild.
+     */
+    fun essentialPackages(context: Context): Set<String> {
+        val pm = context.packageManager
+        val result = mutableSetOf<String>()
+
+        // Home launcher — query all resolvable launchers, not just the current default,
+        // so switching launchers later doesn't reopen this loophole.
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        try {
+            pm.resolveActivity(homeIntent, 0)?.activityInfo?.packageName?.let { result.add(it) }
+            pm.queryIntentActivities(homeIntent, 0).forEach { info ->
+                info.activityInfo?.packageName?.let { result.add(it) }
+            }
+        } catch (_: Exception) { /* best-effort — never let this crash the guard */ }
+
+        // Phone / dialer
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                telecom?.defaultDialerPackage?.let { result.add(it) }
+            }
+            pm.resolveActivity(Intent(Intent.ACTION_DIAL), 0)?.activityInfo?.packageName?.let { result.add(it) }
+        } catch (_: Exception) { }
+
+        // System Settings app — covers OEM forks (e.g. OnePlus/ColorOS) regardless of
+        // their actual package name, since it's resolved by intent action, not guessed.
+        try {
+            pm.resolveActivity(Intent(AndroidSettings.ACTION_SETTINGS), 0)?.activityInfo?.packageName?.let {
+                result.add(it)
+            }
+        } catch (_: Exception) { }
+
+        // Never block Checkmate's own UI.
+        result.add(context.packageName)
+
+        // Fixed doubt-solving exemption.
+        result.add(CHATGPT_PKG)
+        result.add(GOOGLE_PKG)
+        result.add(GEMINI_PKG)
+        result.add(PW_PKG)
+        result.add(YTMUSIC_PKG)
+        result.add(FIIO_PKG)
+        result.add(HIKCONNECT_PKG)
+        // Guardian-extendable list — same comma-separated storage pattern as
+        // "escalation_watchlist" above.
+        val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""
+        extra.split(",").map { it.trim() }.filterTo(result) { it.isNotBlank() }
+
+        return result
+    }
+
+    /**
+     * Returns package names of apps to block. Stored as comma-separated values under
+     * "blocked_apps" (via AppSelectorScreen).
+     */
+    fun getBlockedApps(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_apps", "") ?: ""
+        val base = saved.split(",").filter { it.isNotBlank() }.toSet()
+        // Hardcoded additions only apply once the free period is over (usual window).
+        return if (WorkModeSchedule.isAfterFreePeriod()) base + AFTER_FREE_PERIOD_BLOCKED_APPS else base
+    }
+
+    /**
+     * Returns hostnames of websites to block (e.g. "youtube.com", "instagram.com").
+     * Stored as comma-separated values under "blocked_domains".
+     */
+    fun getBlockedDomains(): Set<String> {
+        val saved = CheckmatePrefs.getString("blocked_domains", "") ?: ""
+        return saved.split(",").filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun startService(context: Context) {
+        val intent = Intent(context, WorkModeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            context.startForegroundService(intent)
+        else
+            context.startService(intent)
+    }
+
+    /**
+     * BUGFIX (notification-Start / cross-device-sync never activated WorkMode):
+     * public (was folded into the private SOURCE_* consts before this fix) so
+     * `app`'s [WorkModeTaskReconciler] — a different Gradle module — can tag its
+     * own activate() calls and compare against [activeSource]. Kept as a plain
+     * string constant to match every other source tag's storage as raw
+     * CheckmatePrefs strings.
+     */
+    const val SOURCE_TASK = "task"
+}
+
+
+//===== FILE: modules/workmode/src/main/kotlin/com/checkmate/workmode/WorkModeSchedule.kt =====
+package com.checkmate.workmode
+
+import java.util.Calendar
+
+/**
+ * WorkModeSchedule — the hardcoded daily Block Mode window.
+ *
+ * Checkmate enforces Work Mode (app + website blocking, plus the Work Mode
+ * settings lock in WorkModeLockGate) every day from 18:00 (6 PM) to 07:00
+ * (7 AM) the following morning — on top of whatever task-based sessions the
+ * student starts manually.
+ *
+ * UPDATE: the usual hardcoded window's end was moved from 02:00 to 05:00,
+ * and then to 07:00. Per Sir (msg 5958) the free window is now exactly
+ * 16:30-18:00: the usual window starts at 18:00 and the extra lock window
+ * runs 01:00 to 16:30, so every non-holiday day the student is locked out
+ * almost all day with only a short 16:30-18:00 gap before the usual
+ * 18:00-07:00 window takes back over ("locked twice" per day). Previously
+ * the gap was 15:10-19:00.
+ *
+ * This window is intentionally a compile-time constant. There is no
+ * Settings screen, SharedPrefs key, or remote config that can change it —
+ * changing the hours means editing this file and shipping a new build, not
+ * something reachable from the student's phone. That's deliberate: a
+ * schedule the student can adjust "just this once" isn't a schedule.
+ *
+ * The ONE exception is [HolidaySchedule]: specific calendar dates a guardian
+ * has explicitly marked exempt (see that file's doc for why it's gated
+ * behind a guardian PIN unlock rather than being freely editable). On a
+ * marked holiday, the usual 18:00-07:00 window is replaced by a single
+ * reduced 01:00-16:30 lock instead — a holiday eases the schedule for the
+ * day, it doesn't remove it. Every other day, this schedule behaves exactly
+ * as before.
+ */
+object WorkModeSchedule {
+
+    /** 24h clock hour the usual daily window begins (6 PM), every day. */
+    const val START_HOUR = 18
+
+    /**
+     * 24h clock hour the usual daily window ends, on the next calendar day
+     * (7 AM). Previously 2 AM, then 5 AM.
+     */
+    const val END_HOUR = 7
+
+    /** 24h clock hour the extra lock window begins (1 AM), every day. */
+    const val SPECIAL_START_HOUR = 1
+    const val SPECIAL_START_MINUTE = 0
+
+    /** 24h clock hour/minute the extra lock window ends (4:30 PM), every day. */
+    const val SPECIAL_END_HOUR = 16
+    const val SPECIAL_END_MINUTE = 30
+
+    /** Human-readable label for display in Settings only — not configurable from there. */
+    const val LABEL =
+        "6:00 PM \u2013 4:30 PM daily, with a 4:30 PM \u2013 6:00 PM gap"
+
+    /**
+     * True if [cal] (defaults to the trusted, tamper-resistant "now" — see
+     * TrustedTime — NOT the raw device clock) falls inside a locked window:
+     *  - the usual 18:00-07:00 window, every day, OR
+     *  - the extra 01:00-16:30 window, every day.
+     *  - EXCEPT on a guardian-marked holiday (HolidaySchedule.isHoliday): the usual
+     *    18:00-07:00 window is replaced by a single reduced 01:00-16:30 lock, same
+     *    hours as the regular extra window. A holiday eases the schedule for the
+     *    day — it doesn't remove structure from it entirely.
+     *
+     * Deliberately does NOT default to Calendar.getInstance() (raw device
+     * time) — that was spoofable by simply changing Settings > Date & time,
+     * which made evaluateSchedule() see "outside the window" and turn
+     * blocking off for real. TrustedTime.nowMillis() is anchored to a
+     * network-verified timestamp plus elapsedRealtime (monotonic, unaffected
+     * by clock changes), so this now only trusts the device's own clock
+     * before any network sync has ever completed.
+     */
+    fun isWithinScheduledWindow(
+        cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
+    ): Boolean {
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val minute = cal.get(Calendar.MINUTE)
+
+        fun withinSpecialWindow(): Boolean {
+            val afterSpecialStart = hour > SPECIAL_START_HOUR ||
+                (hour == SPECIAL_START_HOUR && minute >= SPECIAL_START_MINUTE)
+            val beforeSpecialEnd = hour < SPECIAL_END_HOUR ||
+                (hour == SPECIAL_END_HOUR && minute < SPECIAL_END_MINUTE)
+            return afterSpecialStart && beforeSpecialEnd
+        }
+
+        // Guardian-marked holiday: the usual 18:00-07:00 window is replaced by just
+        // the reduced 01:00-16:30 window — see HolidaySchedule's doc for why this can
+        // only be set behind a guardian PIN unlock.
+        if (HolidaySchedule.isHoliday(cal)) return withinSpecialWindow()
+
+        // Usual window wraps past midnight: active from START_HOUR..23:59 AND
+        // 00:00..(END_HOUR-1):59. Applies every day of the week.
+        if (hour >= START_HOUR || hour < END_HOUR) return true
+
+        // Extra window: 01:00 (inclusive) to 16:30 (exclusive), every non-holiday day
+        // — leaves the 16:30-18:00 gap free before the usual window resumes.
+        if (withinSpecialWindow()) return true
+
+        return false
+    }
+
+    /**
+     * True once the free period is over: inside the usual 18:00-07:00 window on a
+     * non-holiday day. Used for apps that must stay reachable during the daytime lock and
+     * the 16:30-18:00 free gap but are blocked from 18:00 onward (e.g. Phone Manager).
+     * On a guardian-marked holiday the usual window doesn't apply, so this is false.
+     * Uses the trusted clock, same as [isWithinScheduledWindow].
+     */
+    fun isAfterFreePeriod(
+        cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
+    ): Boolean {
+        if (HolidaySchedule.isHoliday(cal)) return false
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        return hour >= START_HOUR || hour < END_HOUR
+    }
+
+    /**
+     * Milliseconds from [cal] (defaults to now) until the next boundary
+     * clock-time (01:00, 07:00, 16:30, or 18:00). Used only for
+     * logging/diagnostics — the actual enforcement alarms are four fixed
+     * daily clock-time alarms registered by WorkModeScheduleReceiver, not a
+     * self-rescheduling "next boundary" alarm, so a missed tick can't drift
+     * the schedule.
+     */
+    fun millisUntilNextBoundary(cal: Calendar = Calendar.getInstance()): Long {
+        val now = cal.timeInMillis
+        val boundaryHours = intArrayOf(
+            SPECIAL_START_HOUR, END_HOUR, SPECIAL_END_HOUR, START_HOUR
+        )
+
+        var best: Long = -1L
+        for (h in boundaryHours) {
+            val target = (cal.clone() as Calendar).apply {
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+                set(Calendar.HOUR_OF_DAY, h)
+                set(Calendar.MINUTE, if (h == SPECIAL_END_HOUR) SPECIAL_END_MINUTE else 0)
+            }
+            if (target.timeInMillis <= now) target.add(Calendar.DAY_OF_YEAR, 1)
+            val diff = target.timeInMillis - now
+            if (best < 0 || diff < best) best = diff
+        }
+        // Defensive fallback — boundaryHours is never empty, but keep the
+        // same "never return non-positive" contract the old code had.
+        return if (best > 0) best else 60_000L
+    }
+}
