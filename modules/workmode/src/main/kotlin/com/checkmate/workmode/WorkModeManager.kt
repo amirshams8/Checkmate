@@ -45,8 +45,11 @@ object WorkModeManager {
     // usual 18:00-07:00 window — and stay reachable during the daytime lock and the free gap.
     // Phone Manager (ColorOS/OxygenOS system app) can force-stop / freeze / clear data of other
     // apps. Package confirmed on-device via `dumpsys window | grep mCurrentFocus`.
+    // MX Player (free "ad" build and Pro build) is blocked on the same schedule.
     private val AFTER_FREE_PERIOD_BLOCKED_APPS = setOf(
-        "com.oplus.phonemanager"
+        "com.oplus.phonemanager",
+        "com.mxtech.videoplayer.ad",
+        "com.mxtech.videoplayer.pro"
     )
 
     // Mentor v2 (spec 3.5): skip-rate threshold that escalates the guardian-PIN lock.

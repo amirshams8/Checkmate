@@ -198,7 +198,12 @@ object UninstallGuard {
         // covered by the "com.oplus." prefix in isLikelySystemSurface() below for the
         // STATE_CHANGED path; listed here too so the CONTENT_CHANGED path also
         // applies to it, in case that screen swaps tabs without a full window change.
-        "com.oplus.battery"
+        "com.oplus.battery",
+        // OnePlus/ColorOS Phone Manager (confirmed via `dumpsys window | grep mCurrentFocus`:
+        // com.oplus.phonemanager/.opt.SystemOptActivity). It can force-stop / freeze / clear
+        // data for other apps, so its screens get the same guarded-screen watch (and the
+        // accessibility-off PIN gate in ForegroundPinGate) as Settings.
+        "com.oplus.phonemanager"
     )
 
     // LOOPHOLE FIX (Force Stop reachable via a Battery/App-info card that doesn't run
