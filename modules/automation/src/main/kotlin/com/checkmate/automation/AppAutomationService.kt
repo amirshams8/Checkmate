@@ -22,6 +22,7 @@ import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DomainPolicy
 import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.LockdownSweepRequest
+import com.checkmate.workmode.ScreenTimeLock
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
 import com.checkmate.workmode.TrustedTime
@@ -273,6 +274,16 @@ class AppAutomationService : AccessibilityService() {
         DistractionGuard.recordAppAttempt(this, pkg)
     }
 
+    /** Double-Home for an app blocked by the daily screen-time lock. Debounced, no attempt record. */
+    private fun bounceScreenTimeApp(pkg: String) {
+        val now = SystemClock.uptimeMillis()
+        val key = "screentime:$pkg"
+        if (now - (lastBounceAt[key] ?: 0L) < BOUNCE_DEBOUNCE_MS) return
+        lastBounceAt[key] = now
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        touchBlockerHandler.postDelayed({ performGlobalAction(GLOBAL_ACTION_HOME) }, DOUBLE_HOME_DELAY_MS)
+    }
+
     /**
      * Looks at every visible window (not only the active one) for a blocked
      * package. If found: bounce it, and cover it if it is not a plain full-screen
@@ -441,6 +452,16 @@ class AppAutomationService : AccessibilityService() {
             WorkModeManager.evaluateSchedule(applicationContext)
             // T8b: liveness heartbeat for KillGapGuard (throttled inside).
             KillGapGuard.heartbeat(applicationContext)
+        }
+
+        // ── Daily screen-time lock ─────────────────────────────────────────────
+        // Once today's total screen time reaches the limit (3 h), only the allowlist in
+        // ScreenTimeLock stays usable. Independent of Work Mode; quiet bounce, no attempt
+        // recording, so it never feeds the guardian-alert counter.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            ScreenTimeLock.shouldBlock(applicationContext, pkg)) {
+            bounceScreenTimeApp(pkg)
+            return
         }
 
         // ── Anti-scroll: always-on doomscroll interrupt for Reels/Shorts ───────

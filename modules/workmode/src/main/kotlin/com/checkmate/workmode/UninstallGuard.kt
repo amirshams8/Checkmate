@@ -117,7 +117,7 @@ object UninstallGuard {
     const val HARD_LOCK_THRESHOLD = 3
 
     /** How long the hard lock holds the entire screen's touch input. */
-    const val HARD_LOCK_DURATION_MS = 5 * 60 * 1000L
+    const val HARD_LOCK_DURATION_MS = 5L * 60 * 60 * 1000L // 5 hours (was 5 minutes)
 
     /**
      * Text fragments that identify a screen worth blocking, matched case-insensitively.
