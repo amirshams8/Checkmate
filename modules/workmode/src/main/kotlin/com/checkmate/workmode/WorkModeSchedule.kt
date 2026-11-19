@@ -119,6 +119,23 @@ object WorkModeSchedule {
     }
 
     /**
+     * True during the daily 16:30-18:00 free window (16:30 inclusive, 18:00 exclusive),
+     * every day. Purely clock-based: it ignores holidays, so it is the same window
+     * everywhere it is used. Used to exempt the daily screen-time lock
+     * ([ScreenTimeLock]) so it doesn't fire while the student is free.
+     * Uses the trusted clock, same as [isWithinScheduledWindow].
+     */
+    fun isInFreeWindow(
+        cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
+    ): Boolean {
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val minute = cal.get(Calendar.MINUTE)
+        val afterFreeStart = hour > SPECIAL_END_HOUR ||
+            (hour == SPECIAL_END_HOUR && minute >= SPECIAL_END_MINUTE)
+        return afterFreeStart && hour < START_HOUR
+    }
+
+    /**
      * Milliseconds from [cal] (defaults to now) until the next boundary
      * clock-time (01:00, 07:00, 16:30, or 18:00). Used only for
      * logging/diagnostics — the actual enforcement alarms are four fixed

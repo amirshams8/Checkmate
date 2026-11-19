@@ -10,6 +10,7 @@ import com.checkmate.core.CheckmatePrefs
  * Daily screen-time lock: once today's total foreground time reaches the limit
  * (default 3 h), only an allowlist of essential apps stays usable. Everything
  * else that has a launcher icon is sent Home. Resets at midnight with the usage stats.
+ * Suspended during the daily 16:30-18:00 free window (see [WorkModeSchedule.isInFreeWindow]).
  *
  * Deliberately separate from [WorkModeManager.essentialPackages]: that set exempts apps
  * from the study-time blocklist, and widening it (WhatsApp, Apple Music, ...) would
@@ -66,10 +67,15 @@ object ScreenTimeLock {
         (CheckmatePrefs.getString(KEY_LIMIT_MS, "") ?: "").toLongOrNull()?.takeIf { it > 0 }
             ?: DEFAULT_LIMIT_MS
 
-    /** True once today's total screen time has reached the limit. Cached for 30 s. */
+    /**
+     * True once today's total screen time has reached the limit. Cached for 30 s.
+     * Never locked during the daily 16:30-18:00 free window ([WorkModeSchedule.isInFreeWindow]);
+     * the lock resumes at 18:00 if the limit has been hit.
+     */
     @Synchronized
     fun isLocked(context: Context): Boolean {
         if (!isEnabled()) return false
+        if (WorkModeSchedule.isInFreeWindow()) return false
         val now = SystemClock.elapsedRealtime()
         if (now - cachedLockedAt >= USAGE_CACHE_MS) {
             cachedLockedAt = now
