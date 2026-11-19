@@ -43,6 +43,8 @@ object ScreenTimeLock {
         "com.jarvismini",                               // Jarvis
         "com.jarvismini.devtools",
         "xyz.penpencil.physicswala",                    // PW (PhysicsWallah)
+        "org.telegram.messenger",                       // Telegram
+        "com.oneplus.calculator",                       // Calculator
         // The rest of the Music folder:
         "com.sony.songpal",                             // Music Center
         "com.sony.songpal.mdr",                         // Sound Connect
