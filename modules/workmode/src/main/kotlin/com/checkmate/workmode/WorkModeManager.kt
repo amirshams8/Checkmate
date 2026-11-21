@@ -411,6 +411,8 @@ object WorkModeManager {
         result.add(YTMUSIC_PKG)
         result.add(FIIO_PKG)
         result.add(HIKCONNECT_PKG)
+        // Camera is always allowed (Work Mode, lockdown and screen-time lock).
+        result.add("com.oplus.camera")
         // Guardian-extendable list — same comma-separated storage pattern as
         // "escalation_watchlist" above.
         val extra = CheckmatePrefs.getString(KEY_ESSENTIAL_EXTRA, "") ?: ""

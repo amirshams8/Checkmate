@@ -45,6 +45,7 @@ object ScreenTimeLock {
         "xyz.penpencil.physicswala",                    // PW (PhysicsWallah)
         "org.telegram.messenger",                       // Telegram
         "com.oneplus.calculator",                       // Calculator
+        "com.oplus.camera",                             // Camera (always allowed)
         // The rest of the Music folder:
         "com.sony.songpal",                             // Music Center
         "com.sony.songpal.mdr",                         // Sound Connect
