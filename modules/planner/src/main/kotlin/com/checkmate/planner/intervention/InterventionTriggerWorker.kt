@@ -68,16 +68,8 @@ class InterventionTriggerWorker(
         PlanStore.todayTasks.value.forEach { task ->
             val signal = TriggerEvaluator.evaluate(task, now) ?: return@forEach
 
-            // BUGFIX (silent delay never enforced): real consequence for a badly-overdue
-            // PENDING task, independent of whatever this cycle's notification escrow below
-            // ends up doing. Fires every cycle past threshold — OverdueEnforcementBridge's
-            // implementation is responsible for only actually applying anything once per
-            // overdue episode (see its own doc) and for never mutating this task's state.
-            if (signal.lateMinutes >= TriggerEvaluator.OVERDUE_ENFORCEMENT_THRESHOLD_MINUTES) {
-                OverdueEnforcementBridge.gateway?.applyOverdueEnforcement(
-                    applicationContext, task, signal.lateMinutes
-                )
-            }
+            // Overdue-delay enforcement (lockdown for a badly-late PENDING task) has been
+            // removed on request: a late task now only gets the notification/escrow flow below.
 
             val ttlMillis = if (gateway != null) {
                 InterventionNotificationBridge.PROMPT_TTL_MILLIS
