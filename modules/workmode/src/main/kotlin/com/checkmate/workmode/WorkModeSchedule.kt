@@ -34,6 +34,13 @@ import java.util.Calendar
  */
 object WorkModeSchedule {
 
+    /**
+     * TABLET-LOCK BUILD (branch tablet-lock only): Work Mode is enforced 24/7. There is no
+     * free window and no holiday easing, so only the always-allow (essentials / exempt) apps
+     * stay reachable. Never merge this into main - the phone build keeps the timed schedule.
+     */
+    const val TABLET_ALWAYS_LOCKED = true
+
     /** 24h clock hour the usual daily window begins (6 PM), every day. */
     const val START_HOUR = 18
 
@@ -76,6 +83,7 @@ object WorkModeSchedule {
     fun isWithinScheduledWindow(
         cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
     ): Boolean {
+        if (TABLET_ALWAYS_LOCKED) return true
         val hour = cal.get(Calendar.HOUR_OF_DAY)
         val minute = cal.get(Calendar.MINUTE)
 
@@ -113,6 +121,7 @@ object WorkModeSchedule {
     fun isAfterFreePeriod(
         cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
     ): Boolean {
+        if (TABLET_ALWAYS_LOCKED) return true
         if (HolidaySchedule.isHoliday(cal)) return false
         val hour = cal.get(Calendar.HOUR_OF_DAY)
         return hour >= START_HOUR || hour < END_HOUR
@@ -128,6 +137,7 @@ object WorkModeSchedule {
     fun isInFreeWindow(
         cal: Calendar = Calendar.getInstance().apply { timeInMillis = TrustedTime.nowMillis() }
     ): Boolean {
+        if (TABLET_ALWAYS_LOCKED) return false
         val hour = cal.get(Calendar.HOUR_OF_DAY)
         val minute = cal.get(Calendar.MINUTE)
         val afterFreeStart = hour > SPECIAL_END_HOUR ||
