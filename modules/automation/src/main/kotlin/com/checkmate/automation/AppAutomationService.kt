@@ -22,6 +22,7 @@ import com.checkmate.workmode.DistractionGuard
 import com.checkmate.workmode.DomainPolicy
 import com.checkmate.workmode.KillGapGuard
 import com.checkmate.workmode.LockdownSweepRequest
+import com.checkmate.workmode.NightCurfew
 import com.checkmate.workmode.ScreenTimeLock
 import com.checkmate.workmode.ScrollGuard
 import com.checkmate.workmode.SweepPolicy
@@ -227,7 +228,9 @@ class AppAutomationService : AccessibilityService() {
     private var lastAlwaysGuardedAt = 0L
 
     private fun releaseIfNotConfirmedGuarded() {
-        if (System.currentTimeMillis() >= guardConfirmedUntil) {
+        // Night curfew freeze is also off-limits to the "not guarded" early exits (curfewFrozen is
+        // cleared before this is called from enforceNightCurfew's own release path).
+        if (System.currentTimeMillis() >= guardConfirmedUntil && !curfewFrozen) {
             removeTouchBlocker()
         }
     }
@@ -403,9 +406,46 @@ class AppAutomationService : AccessibilityService() {
         }
     }
 
+    // ── Night curfew (OnePlus build): fixed 23:00-06:00 touch freeze ───────────────────────
+    // Time-based on the trusted clock (NightCurfew), independent of any accessibility event so a
+    // static screen can't outlast it: a self-rescheduling tick re-arms the existing touch-blocker
+    // overlay in short slices. Short slices (not one 7-hour block) so a guardian remote override or
+    // the 06:00 end releases the freeze within one tick. blockTouchesBriefly only ever extends, so
+    // this can never shorten an uninstall-guard hard lock already in flight.
+    private val CURFEW_TICK_MS = 10_000L
+    private val CURFEW_ARM_MS = 25_000L
+    private var curfewFrozen = false
+    private val curfewTickRunnable = object : Runnable {
+        override fun run() {
+            enforceNightCurfew()
+            touchBlockerHandler.postDelayed(this, CURFEW_TICK_MS)
+        }
+    }
+
+    private fun enforceNightCurfew() {
+        try {
+            if (NightCurfew.shouldFreeze()) {
+                if (!curfewFrozen) {
+                    curfewFrozen = true
+                    performGlobalAction(GLOBAL_ACTION_HOME) // don't leave an app up under the freeze
+                }
+                blockTouchesBriefly(CURFEW_ARM_MS)
+            } else if (curfewFrozen) {
+                curfewFrozen = false
+                // Curfew ended or guardian override: lift only OUR freeze, never a confirmed
+                // uninstall-guard block.
+                releaseIfNotConfirmedGuarded()
+            }
+        } catch (e: Exception) {
+            Log.w(GUARD_TAG, "night curfew tick failed", e)
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d(TAG, "=== AutomationService CONNECTED ===")
+        touchBlockerHandler.removeCallbacks(curfewTickRunnable)
+        touchBlockerHandler.post(curfewTickRunnable)
         // BUGFIX (post-restart Force Stop loophole): this is the moment the normal
         // UninstallGuard watchdog goes live after a reboot. Tells BootGapGuard (which
         // covers the window before this point via foreground-package polling) that its
@@ -958,6 +998,7 @@ class AppAutomationService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        touchBlockerHandler.removeCallbacks(curfewTickRunnable)
         removeTouchBlocker()
         removeFloatCover()
         BootGapGuard.onAccessibilityDisconnected()
